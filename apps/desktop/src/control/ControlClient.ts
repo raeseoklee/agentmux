@@ -194,6 +194,11 @@ export interface ControlClient {
     cwd: string | null
   ): Promise<TerminalSession>;
   spawnSshTerminal(workspaceId: string, target: string): Promise<TerminalSession>;
+  spawnAgentTerminal(
+    workspaceId: string,
+    command: string[],
+    distribution: string | null
+  ): Promise<TerminalSession>;
   getSession(sessionId: string): Promise<TerminalSession>;
   readRecent(sessionId: string, maxBytes: number): Promise<string>;
   sendText(sessionId: string, text: string): Promise<void>;
@@ -577,6 +582,29 @@ class TauriControlClient implements ControlClient {
     return {
       sessionId: result.session_id,
       backendKind: "ssh",
+      state: "running"
+    };
+  }
+
+  async spawnAgentTerminal(
+    workspaceId: string,
+    command: string[],
+    distribution: string | null
+  ): Promise<TerminalSession> {
+    const result = await this.call<{ session_id: string }>("session.spawn", {
+      workspace_id: workspaceId,
+      backend: "wsl-tmux-control",
+      backend_profile: distribution,
+      command,
+      cwd: null,
+      columns: 120,
+      rows: 30,
+      durability: "durable"
+    });
+
+    return {
+      sessionId: result.session_id,
+      backendKind: "wsl-tmux-control",
       state: "running"
     };
   }
@@ -1158,6 +1186,28 @@ class BrowserPreviewControlClient implements ControlClient {
     this.output = [
       "\r\n$ ssh " + target,
       "\r\nagentmux SSH desktop preview (실제 접속은 Tauri 실행에서 동작)",
+      "\r\n"
+    ].join("");
+    return this.session;
+  }
+
+  async spawnAgentTerminal(
+    workspaceId: string,
+    command: string[],
+    distribution: string | null
+  ): Promise<TerminalSession> {
+    this.findWorkspace(workspaceId);
+    this.mountPreviewSurface(workspaceId);
+    this.session = {
+      sessionId: "ses_browser_preview_agent",
+      backendKind: "wsl-tmux-control",
+      state: "preview"
+    };
+    this.sessionWorkspaceId = workspaceId;
+    const label = command.join(" ") || "agent";
+    this.output = [
+      "\r\n$ " + label + "   (durable tmux · " + (distribution ?? "WSL") + ")",
+      "\r\nagentmux 에이전트 세션 preview — 실제 실행/durable 복원은 Tauri에서 동작",
       "\r\n"
     ].join("");
     return this.session;

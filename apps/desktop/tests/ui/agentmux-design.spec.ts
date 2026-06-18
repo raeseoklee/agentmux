@@ -97,3 +97,31 @@ test("OMC telemetry bar renders", async ({ page }) => {
   );
   await expect(page.getByText("[OMC]").first()).toBeVisible({ timeout: 5000 });
 });
+
+test("launches an agent in a durable WSL-tmux session", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
+        .__AGENTMUX_PREVIEW_READY__ === true
+  );
+  await page.getByRole("button", { name: /에이전트 실행/ }).first().click();
+  await expect(page.getByText("wsl-tmux-control").first()).toBeVisible({ timeout: 5000 });
+});
+
+test("command palette opens over a focused terminal", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
+        .__AGENTMUX_PREVIEW_READY__ === true
+  );
+  await page.getByRole("button", { name: /에이전트 실행/ }).first().click();
+  await page.waitForTimeout(800);
+  await page.keyboard.down("Control");
+  await page.keyboard.press("K");
+  await page.keyboard.up("Control");
+  await expect(
+    page.getByText("Claude Code 실행 (durable tmux)").first()
+  ).toBeVisible();
+});

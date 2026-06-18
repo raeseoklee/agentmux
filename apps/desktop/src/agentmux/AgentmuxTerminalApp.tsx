@@ -126,23 +126,30 @@ export function AgentmuxTerminalApp() {
   const [fontSize, setFontSize] = useState(12.5);
 
   useEffect(() => {
+    // Capture phase so global shortcuts win over a focused xterm terminal
+    // (essential for a multiplexer). Escape is only intercepted while an
+    // overlay is open, so it still reaches the terminal otherwise.
     function onKey(event: KeyboardEvent) {
       const mod = event.metaKey || event.ctrlKey;
       const key = (event.key || "").toLowerCase();
       if (mod && key === "k") {
         event.preventDefault();
+        event.stopPropagation();
         setOverlay("palette");
         setQuery("");
       } else if (mod && key === "f") {
         event.preventDefault();
+        event.stopPropagation();
         setOverlay("search");
-      } else if (key === "escape") {
+      } else if (key === "escape" && overlay) {
+        event.preventDefault();
+        event.stopPropagation();
         setOverlay(null);
       }
     }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [overlay]);
 
   const T = THEMES[theme];
   const accent = ACCENTS.find((a) => a.key === accentKey) ?? ACCENTS[0];
@@ -246,7 +253,23 @@ export function AgentmuxTerminalApp() {
 
   // ---- command palette (live actions) ----
   const q = query.trim().toLowerCase();
+  const promptCustomAgent = () => {
+    const raw = window.prompt("durable 세션으로 실행할 에이전트 명령 (예: claude --resume)");
+    const parts = (raw ?? "").trim().split(/\s+/).filter(Boolean);
+    if (parts.length > 0) {
+      void ctl.spawnAgent(parts);
+    }
+    closeOverlay();
+  };
   const rawGroups: { label: string; items: PaletteItem[] }[] = [
+    {
+      label: "에이전트",
+      items: [
+        { title: "Claude Code 실행 (durable tmux)", hint: "claude", highlighted: false, onClick: () => { void ctl.spawnAgent(["claude"]); closeOverlay(); } },
+        { title: "Codex 실행 (durable tmux)", hint: "codex", highlighted: false, onClick: () => { void ctl.spawnAgent(["codex"]); closeOverlay(); } },
+        { title: "커스텀 에이전트 실행…", hint: "tmux", highlighted: false, onClick: promptCustomAgent }
+      ]
+    },
     {
       label: "터미널",
       items: [
@@ -444,6 +467,15 @@ export function AgentmuxTerminalApp() {
           <span style={{ font: `500 11px/1 ${FONT_SANS}`, color: "var(--fg4)", paddingLeft: 4 }}>멀티플렉스 터미널</span>
         </div>
         <div style={{ flex: 1 }} />
+
+        <button
+          type="button"
+          onClick={() => void ctl.spawnAgent(["claude"])}
+          title="Claude Code를 durable WSL-tmux 세션으로 실행 (분리/재시작에도 유지)"
+          style={{ display: "flex", alignItems: "center", gap: 7, background: "var(--accent)", color: "#fff", border: 0, borderRadius: 8, padding: "7px 13px", cursor: "pointer", font: `700 12px/1 ${FONT_SANS}` }}
+        >
+          <span style={{ fontWeight: 700 }}>✳</span> 에이전트 실행
+        </button>
 
         <span style={{ font: `600 10.5px/1 ${FONT_SANS}`, letterSpacing: ".06em", textTransform: "uppercase", color: "var(--fg4)" }}>분할</span>
         <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 9, padding: 3, gap: 2 }}>

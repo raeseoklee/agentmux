@@ -36,6 +36,7 @@ export interface AgentmuxControl {
   closeWorkspace: (workspaceId: string, policy: string) => Promise<void>;
   spawnNativeTerminal: () => Promise<void>;
   spawnWslTerminal: (distribution: string) => Promise<void>;
+  spawnAgent: (command: string[]) => Promise<void>;
   splitActivePane: (axis: "horizontal" | "vertical") => Promise<void>;
   resizePane: (paneId: string, ratio: number) => void;
   focusPane: (paneId: string) => Promise<void>;
@@ -244,6 +245,20 @@ export function useAgentmuxControl(): AgentmuxControl {
     [client, withActive]
   );
 
+  const spawnAgent = useCallback(
+    (command: string[]) =>
+      withActive((workspaceId) => {
+        // Launch the agent CLI in a durable WSL-tmux session so it survives
+        // detach/restart. Uses the default WSL distribution.
+        const distribution =
+          wslDistributions.find((distro) => distro.isDefault)?.name ??
+          wslDistributions[0]?.name ??
+          null;
+        return client.spawnAgentTerminal(workspaceId, command, distribution);
+      }),
+    [client, withActive, wslDistributions]
+  );
+
   const splitActivePane = useCallback(
     (axis: "horizontal" | "vertical") =>
       withActive((workspaceId) => {
@@ -377,6 +392,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     closeWorkspace,
     spawnNativeTerminal,
     spawnWslTerminal,
+    spawnAgent,
     splitActivePane,
     resizePane,
     focusPane,
