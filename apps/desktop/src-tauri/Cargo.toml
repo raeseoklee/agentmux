@@ -1,0 +1,34 @@
+[package]
+name = "agentmux-desktop-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agentmux-backend = { path = "../../../crates/agentmux-backend" }
+agentmux-backend-conpty = { path = "../../../crates/agentmux-backend-conpty" }
+agentmux-backend-tmux = { path = "../../../crates/agentmux-backend-tmux" }
+agentmux-backend-wsl = { path = "../../../crates/agentmux-backend-wsl" }
+agentmux-browser = { path = "../../../crates/agentmux-browser" }
+agentmux-core = { path = "../../../crates/agentmux-core" }
+agentmux-ipc = { path = "../../../crates/agentmux-ipc" }
+agentmux-store = { path = "../../../crates/agentmux-store" }
+getrandom = "0.2"
+serde = "1"
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-notification = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

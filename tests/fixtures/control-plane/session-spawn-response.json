@@ -1,0 +1,9 @@
+{
+  "schema": "agentmux.control.v1",
+  "id": "req_spawn",
+  "outcome": {
+    "Ok": {
+      "result_json": "{\"session_id\":\"ses_fixture\"}"
+    }
+  }
+}

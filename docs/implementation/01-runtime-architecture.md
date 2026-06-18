@@ -209,6 +209,16 @@ States:
 
 Agent state must not be the only source for process lifecycle decisions. It is a product signal, not process truth.
 
+Current marker boundary:
+
+- Control API calls use `agent.set_state`.
+- Shell hooks may print `::agentmux-agent {json}` marker lines.
+- Terminal integrations may emit OSC 777 as `ESC]777;agentmux;{json}BEL` or ST.
+- Marker payloads require `state` or `event`, and may include `reason` or
+  `message`.
+- Explicit markers are parsed before optional heuristics. Heuristics remain a
+  separate detector layer and must not terminate or detach sessions directly.
+
 ## State Persistence
 
 SQLite is the source of truth for metadata:

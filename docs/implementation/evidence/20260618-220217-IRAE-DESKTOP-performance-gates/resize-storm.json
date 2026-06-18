@@ -1,0 +1,30 @@
+{
+  "benchmark": "bench_resize_storm",
+  "backend_kind": "conpty",
+  "iterations": 200,
+  "resize_request_stats": {
+    "count": 200,
+    "min_ms": 0.0068000000000000005,
+    "p50_ms": 0.0072,
+    "p95_ms": 0.01,
+    "p99_ms": 0.0177,
+    "max_ms": 0.0266
+  },
+  "storm_elapsed_ms": 1.5644,
+  "final_requested_columns": 117,
+  "final_requested_rows": 44,
+  "post_storm_echo_ms": 10.6617,
+  "process_after": {
+    "working_set_bytes": 9928704,
+    "commit_bytes": 2252800,
+    "handle_count": 175
+  },
+  "queue_after": {
+    "event_queue_depth": 203,
+    "event_history_depth": 203,
+    "event_backlog_limit": 1024,
+    "dropped_event_count": 0,
+    "notification_depth": 0,
+    "notification_limit": 256
+  }
+}

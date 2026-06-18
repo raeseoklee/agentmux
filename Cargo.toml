@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/agentmux-backend",
+  "crates/agentmux-backend-conpty",
+  "crates/agentmux-backend-tmux",
+  "crates/agentmux-backend-wsl",
+  "crates/agentmux-browser",
+  "crates/agentmux-cli",
+  "crates/agentmux-core",
+  "crates/agentmux-ipc",
+  "crates/agentmux-store",
+  "crates/agentmux-telemetry",
+  "apps/desktop/src-tauri",
+  "benches/support",
+  "benches/single-terminal-latency",
+  "benches/many-idle-sessions",
+  "benches/high-output",
+  "benches/resize-storm",
+  "benches/restart-recovery",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+repository = "https://github.com/agentmux/agentmux"

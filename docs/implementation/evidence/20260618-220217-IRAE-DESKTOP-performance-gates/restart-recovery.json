@@ -1,0 +1,35 @@
+{
+  "benchmark": "bench_restart_recovery",
+  "backend_kind": "wsl-tmux-control",
+  "recovery_mode": "simulated durable attach",
+  "durable_session_count": 5,
+  "restart_to_attach_all_ms": 0.1098,
+  "attach_latency_stats": {
+    "count": 5,
+    "min_ms": 0.018000000000000002,
+    "p50_ms": 0.018600000000000002,
+    "p95_ms": 0.0286,
+    "p99_ms": 0.0286,
+    "max_ms": 0.0286
+  },
+  "recovered_output_latency_stats": {
+    "count": 5,
+    "min_ms": 0.0165,
+    "p50_ms": 0.0183,
+    "p95_ms": 0.0432,
+    "p99_ms": 0.0432,
+    "max_ms": 0.0432
+  },
+  "backend_spawns_before_restart": 5,
+  "backend_spawns_after_recovery": 5,
+  "backend_attach_count": 5,
+  "duplicate_backend_ref_count": 0,
+  "queue_after_recovery": {
+    "event_queue_depth": 10,
+    "event_history_depth": 10,
+    "event_backlog_limit": 1024,
+    "dropped_event_count": 0,
+    "notification_depth": 0,
+    "notification_limit": 256
+  }
+}

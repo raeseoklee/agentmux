@@ -1,0 +1,17 @@
+{
+  "name": "agentmux-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "check": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/check.ps1",
+    "docs:check": "node tools/check-doc-links.mjs",
+    "perf:gates": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-performance-gates.ps1",
+    "diagnostics:packaged-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-packaged-diagnostics-smoke.ps1",
+    "desktop:gates": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-desktop-ui-gates.ps1",
+    "installer:build-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installer-build-smoke.ps1",
+    "tmux:reattach-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tmux-reattach-smoke.ps1",
+    "browser:cdp-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-browser-cdp-smoke.ps1",
+    "desktop:dev": "npm --prefix apps/desktop run dev",
+    "desktop:build": "npm --prefix apps/desktop run build"
+  }
+}

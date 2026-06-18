@@ -106,14 +106,14 @@ Discovery must distinguish:
 | `wsl.exe` missing | WSL feature unavailable |
 | no distributions | User must install a distribution |
 | distribution stopped | Not an error; launch may start it |
-| command timeout | WSL subsystem unhealthy or blocked |
+| command timeout | `wsl_launch_timeout`: WSL subsystem unhealthy or blocked |
 
 ## Windows Path to WSL Path
 
 Path resolution policy:
 
 1. If user supplies explicit WSL path, use it as-is.
-2. If workspace root is a Windows drive path, convert through `wslpath`.
+2. If workspace root is a Windows drive path, convert through `wslpath -a` inside the selected distribution.
 3. If `wslpath` fails, fall back to `/mnt/<drive>/...` only when deterministic.
 4. Persist both original Windows path and resolved WSL path.
 
@@ -217,6 +217,8 @@ Attach sequence:
 7. Rebuild mapping with persisted metadata.
 8. Subscribe output events.
 9. Publish recovered sessions to core.
+
+Current implementation note: the tmux-control slice launches `tmux -C new-session -A -s <agentmux-workspace-name>` and `tmux -C attach-session -t <agentmux-workspace-name>` through the WSL Direct transport. It also translates input, resize, detach, interrupt, and kill operations into tmux control commands. Desktop startup now attempts best-effort attach for persisted `recovering` durable tmux sessions that have a saved backend-native id.
 
 Detach sequence:
 

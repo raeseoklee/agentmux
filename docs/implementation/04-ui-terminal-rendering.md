@@ -207,6 +207,26 @@ Notification fields:
 
 The panel must support filtering by workspace and severity.
 
+Current implementation note: the desktop UI polls the local control plane for
+persisted attention state and notification history. It shows workspace attention
+counts in the sidebar, pane-title attention badges for mounted sessions,
+dismissible attention rows, and a notification list filtered by active workspace
+and severity.
+
+The Tauri host also dispatches OS desktop notifications for agent attention,
+completion, failure events, and browser action failures. Delivery is
+best-effort, deduplicated by notification id for the current host run, and does
+not replace the in-app notification history.
+
+Synthetic attention coverage is automated in
+`apps/desktop/tests/ui/synthetic-attention.spec.ts`, which exercises the
+browser-preview control hook, workspace badge, pane badge, attention clearing,
+notification history, and notification dismissal.
+
+Opt-in heuristic attention uses the same advisory state and dismissal UI as
+explicit agent markers, so false positives can be cleared without changing the
+underlying process lifecycle.
+
 ## Browser Surface
 
 Browser surface is a first-class surface type, not a modal-only tool.
@@ -220,6 +240,17 @@ Browser UI responsibilities:
 - surface automation failures in diagnostics
 
 Browser automation should be scoped to the surface id. UI must make it clear which browser surface is being automated.
+
+Current implementation note: browser surface creation and automation command
+routing are available through the desktop control plane. The desktop UI exposes
+a browser surface action, renders browser panes in the pane tree, and provides
+controls for navigation, DOM snapshot, screenshot, click, type, and evaluate
+commands against the mounted browser surface. Browser command failures remain
+visible in the pane error state and are also refreshed through the notification
+panel via persisted `browser.action_failed` entries. The desktop host can route
+those commands to the CDP real browser adapter, but the current pane UI still
+renders the visible viewport through an embedded URL frame that is not yet the
+same CDP target used for automation.
 
 ## Accessibility and Usability
 

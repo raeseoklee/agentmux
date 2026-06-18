@@ -29,6 +29,17 @@ Date: 2026-06-18
 6. [05-performance-and-observability.md](./05-performance-and-observability.md)
 7. [06-testing-and-release-plan.md](./06-testing-and-release-plan.md)
 8. [07-repo-scaffold-and-first-tasks.md](./07-repo-scaffold-and-first-tasks.md)
+9. [08-goal-groups.md](./08-goal-groups.md)
+10. [09-goal-1-native-terminal-slice-status.md](./09-goal-1-native-terminal-slice-status.md)
+11. [10-goal-2-persistence-status.md](./10-goal-2-persistence-status.md)
+12. [11-goal-3-wsl-direct-status.md](./11-goal-3-wsl-direct-status.md)
+13. [12-goal-4-durable-tmux-status.md](./12-goal-4-durable-tmux-status.md)
+14. [13-goal-5-workspace-pane-ux-status.md](./13-goal-5-workspace-pane-ux-status.md)
+15. [14-goal-6-control-plane-cli-status.md](./14-goal-6-control-plane-cli-status.md)
+16. [15-goal-7-agent-notifications-status.md](./15-goal-7-agent-notifications-status.md)
+17. [16-goal-8-browser-surface-automation-status.md](./16-goal-8-browser-surface-automation-status.md)
+18. [17-goal-9-performance-diagnostics-status.md](./17-goal-9-performance-diagnostics-status.md)
+19. [18-goal-9-release-candidate-checklist.md](./18-goal-9-release-candidate-checklist.md)
 
 ## 구현 원칙
 
