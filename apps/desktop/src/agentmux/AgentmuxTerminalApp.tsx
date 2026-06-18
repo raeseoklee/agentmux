@@ -101,6 +101,25 @@ function sessionLabel(session: TerminalSession | undefined, attention: boolean):
   }
 }
 
+type TauriWindowApi = {
+  getCurrentWindow?: () => {
+    minimize: () => Promise<void>;
+    toggleMaximize: () => Promise<void>;
+    close: () => Promise<void>;
+  };
+};
+
+// Drive the real OS window from the custom (frameless) titlebar. No-ops in a
+// plain browser, where window.__TAURI__ is absent.
+function tauriWindow(action: "minimize" | "toggleMaximize" | "close"): void {
+  const api = (window as unknown as { __TAURI__?: { window?: TauriWindowApi } }).__TAURI__?.window;
+  const current = api?.getCurrentWindow?.();
+  if (!current) return;
+  if (action === "minimize") void current.minimize();
+  else if (action === "toggleMaximize") void current.toggleMaximize();
+  else void current.close();
+}
+
 export function AgentmuxTerminalApp() {
   const ctl = useAgentmuxControl();
   const {
@@ -224,18 +243,15 @@ export function AgentmuxTerminalApp() {
 
   const rootStyle: CSSProperties = {
     ...buildRootVars(T, accent, fontSize),
-    minHeight: "100vh",
-    width: "100%",
+    height: "100vh",
+    width: "100vw",
     boxSizing: "border-box",
-    background: T.desk,
-    padding: "28px 28px 40px",
+    background: "var(--canvas)",
     display: "flex",
     flexDirection: "column",
-    alignItems: "center",
-    gap: "18px",
+    overflow: "hidden",
     fontFamily: `${FONT_SANS},Pretendard,-apple-system,'Segoe UI',sans-serif`,
-    color: T.fg1,
-    transition: "background .2s"
+    color: T.fg1
   };
   const iconBtn: CSSProperties = {
     width: 30,
@@ -459,62 +475,41 @@ export function AgentmuxTerminalApp() {
 
   return (
     <div style={rootStyle}>
-      {/* ============ CONTROL RAIL ============ */}
-      <div style={{ width: 1320, maxWidth: "100%", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9, marginRight: 4 }}>
-          <BrandLogo size={22} />
-          <span style={{ font: `700 15px/1 ${FONT_MONO}`, letterSpacing: "-0.02em", color: "var(--fg1)" }}>agentmux</span>
-          <span style={{ font: `500 11px/1 ${FONT_SANS}`, color: "var(--fg4)", paddingLeft: 4 }}>멀티플렉스 터미널</span>
-        </div>
-        <div style={{ flex: 1 }} />
-
-        <button
-          type="button"
-          onClick={() => void ctl.spawnAgent(["claude"])}
-          title="Claude Code를 durable WSL-tmux 세션으로 실행 (분리/재시작에도 유지)"
-          style={{ display: "flex", alignItems: "center", gap: 7, background: "var(--accent)", color: "#fff", border: 0, borderRadius: 8, padding: "7px 13px", cursor: "pointer", font: `700 12px/1 ${FONT_SANS}` }}
-        >
-          <span style={{ fontWeight: 700 }}>✳</span> 에이전트 실행
-        </button>
-
-        <span style={{ font: `600 10.5px/1 ${FONT_SANS}`, letterSpacing: ".06em", textTransform: "uppercase", color: "var(--fg4)" }}>분할</span>
-        <div style={{ display: "flex", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 9, padding: 3, gap: 2 }}>
-          <button type="button" onClick={() => { if (activePaneId) void splitPaneBy(activePaneId, "vertical"); }} style={{ border: 0, cursor: "pointer", borderRadius: 6, padding: "6px 12px", font: `600 12px/1 ${FONT_SANS}`, background: "transparent", color: "var(--fg2)" }}>세로</button>
-          <button type="button" onClick={() => { if (activePaneId) void splitPaneBy(activePaneId, "horizontal"); }} style={{ border: 0, cursor: "pointer", borderRadius: 6, padding: "6px 12px", font: `600 12px/1 ${FONT_SANS}`, background: "transparent", color: "var(--fg2)" }}>가로</button>
-          <button type="button" onClick={() => void addTerminal()} style={{ border: 0, cursor: "pointer", borderRadius: 6, padding: "6px 12px", font: `600 12px/1 ${FONT_SANS}`, background: "var(--accent-soft)", color: "var(--accent)" }}>새 터미널</button>
-        </div>
-
-        <span style={{ font: `600 10.5px/1 ${FONT_SANS}`, letterSpacing: ".06em", textTransform: "uppercase", color: "var(--fg4)", marginLeft: 6 }}>액센트</span>
-        <div style={{ display: "flex", gap: 6 }}>
-          {ACCENTS.map((a) => (
-            <button key={a.key} type="button" title={a.label} onClick={() => setAccentKey(a.key)} style={{ width: 24, height: 24, borderRadius: 7, cursor: "pointer", background: a.hex, border: 0, boxShadow: a.key === accentKey ? "0 0 0 2px var(--canvas),0 0 0 4px var(--fg2)" : "none" }} />
-          ))}
-        </div>
-
-        <button type="button" onClick={() => setTheme(isDark ? "light" : "dark")} style={{ marginLeft: 6, display: "flex", alignItems: "center", gap: 7, background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, padding: "7px 12px", cursor: "pointer", font: `600 12px/1 ${FONT_SANS}`, color: "var(--fg1)" }}>
-          {isDark ? <IconMoon /> : <IconSun />}
-          {isDark ? "다크" : "라이트"}
-        </button>
-      </div>
-
-      {/* ============ APP WINDOW ============ */}
-      <div style={{ position: "relative", width: 1320, maxWidth: "100%", height: 812, background: "var(--canvas)", border: "1px solid var(--border)", borderRadius: 11, boxShadow: "0 24px 70px rgba(0,0,0,0.5)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
-        {/* titlebar */}
-        <div style={{ height: 40, flex: "none", display: "flex", alignItems: "center", padding: "0 0 0 12px", background: "var(--surface)", borderBottom: "1px solid var(--border)" }}>
+      {/* ============ APP SHELL (fills the OS window) ============ */}
+      <div style={{ position: "relative", flex: "1 1 0", minHeight: 0, minWidth: 0, background: "var(--canvas)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        {/* titlebar — custom/frameless (decorations: false) */}
+        <div data-tauri-drag-region style={{ height: 40, flex: "none", display: "flex", alignItems: "center", padding: "0 0 0 12px", background: "var(--surface)", borderBottom: "1px solid var(--border)" }}>
           <BrandLogo size={17} radius={14} />
           <span style={{ font: `700 13px/1 ${FONT_MONO}`, letterSpacing: "-0.02em", color: "var(--fg1)", marginLeft: 9 }}>agentmux</span>
           <span style={{ color: "var(--fg4)", fontSize: 12, margin: "0 8px" }}>›</span>
           <span style={{ color: "var(--fg3)", display: "flex" }}><IconFolder /></span>
           <span style={{ font: `600 12.5px/1 ${FONT_SANS}`, color: "var(--fg2)", marginLeft: 7 }}>{activeWorkspace?.name ?? "—"}</span>
           <div style={{ flex: 1, height: "100%" }} />
+          <button
+            type="button"
+            onClick={() => void ctl.spawnAgent(["claude"])}
+            title="Claude Code를 durable WSL-tmux 세션으로 실행 (분리/재시작에도 유지)"
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "var(--accent)", color: "#fff", border: 0, borderRadius: 7, padding: "6px 11px", cursor: "pointer", font: `700 11.5px/1 ${FONT_SANS}`, marginRight: 8 }}
+          >
+            <span style={{ fontWeight: 700 }}>✳</span> 에이전트 실행
+          </button>
+          <Hov
+            tag="button"
+            style={{ height: 30, borderRadius: 7, border: 0, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, padding: "0 9px", color: "var(--fg2)", font: `600 11px/1 ${FONT_SANS}`, marginRight: 2 }}
+            hover={iconBtnHover}
+            onClick={() => setTheme(isDark ? "light" : "dark")}
+          >
+            {isDark ? <IconMoon /> : <IconSun />}
+            {isDark ? "다크" : "라이트"}
+          </Hov>
           <Hov tag="button" style={{ ...iconBtn, marginRight: 2 }} hover={iconBtnHover} onClick={() => setOverlay("search")}><IconSearch /></Hov>
           <Hov tag="button" style={{ ...iconBtn, marginRight: 2 }} hover={iconBtnHover} onClick={() => { setOverlay("palette"); setQuery(""); }}><IconGrid /></Hov>
           <Hov tag="button" style={iconBtn} hover={iconBtnHover} onClick={() => setOverlay("settings")}><IconGear /></Hov>
           <div style={{ width: 1, height: 18, background: "var(--border)", margin: "0 6px" }} />
           <div style={{ display: "flex", alignItems: "center", height: "100%" }}>
-            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "var(--s2)" }}><IconWinMinimize /></Hov>
-            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "var(--s2)" }}><IconWinMaximize /></Hov>
-            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "#E81123", color: "#fff" }}><IconClose /></Hov>
+            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "var(--s2)" }} onClick={() => tauriWindow("minimize")}><IconWinMinimize /></Hov>
+            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "var(--s2)" }} onClick={() => tauriWindow("toggleMaximize")}><IconWinMaximize /></Hov>
+            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "#E81123", color: "#fff" }} onClick={() => tauriWindow("close")}><IconClose /></Hov>
           </div>
         </div>
 
