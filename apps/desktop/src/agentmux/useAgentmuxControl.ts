@@ -37,8 +37,10 @@ export interface AgentmuxControl {
   spawnNativeTerminal: () => Promise<void>;
   spawnWslTerminal: (distribution: string) => Promise<void>;
   splitActivePane: (axis: "horizontal" | "vertical") => Promise<void>;
+  resizePane: (paneId: string, ratio: number) => void;
   focusPane: (paneId: string) => Promise<void>;
   closePane: (paneId: string) => Promise<void>;
+  createBrowserSurface: () => Promise<void>;
   clearAttention: (sessionId: string) => Promise<void>;
   dismissNotification: (notificationId: string) => Promise<void>;
   createProfile: (input: SshProfileInput) => Promise<void>;
@@ -253,6 +255,34 @@ export function useAgentmuxControl(): AgentmuxControl {
     [client, detail?.workspace.activePaneId, withActive]
   );
 
+  const resizePane = useCallback(
+    (paneId: string, ratio: number) => {
+      const clamped = Math.min(0.9, Math.max(0.1, ratio));
+      setDetail((current) =>
+        current
+          ? {
+              ...current,
+              panes: current.panes.map((pane) =>
+                pane.paneId === paneId ? { ...pane, splitRatio: clamped } : pane
+              )
+            }
+          : current
+      );
+      const workspaceId = activeRef.current;
+      if (workspaceId) {
+        void client.resizePaneLayout(workspaceId, paneId, clamped).catch(() => undefined);
+      }
+    },
+    [client]
+  );
+
+  const createBrowserSurface = useCallback(
+    () =>
+      // pane omitted -> backend mounts the browser surface on the active pane.
+      withActive((workspaceId) => client.createBrowserSurface(workspaceId, undefined, "default")),
+    [client, withActive]
+  );
+
   const focusPane = useCallback(
     (paneId: string) => withActive((workspaceId) => client.focusPane(workspaceId, paneId)),
     [client, withActive]
@@ -336,8 +366,10 @@ export function useAgentmuxControl(): AgentmuxControl {
     spawnNativeTerminal,
     spawnWslTerminal,
     splitActivePane,
+    resizePane,
     focusPane,
     closePane,
+    createBrowserSurface,
     clearAttention,
     dismissNotification,
     createProfile,

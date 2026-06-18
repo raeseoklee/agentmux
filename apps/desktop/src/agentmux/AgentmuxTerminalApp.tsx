@@ -11,8 +11,10 @@ import type {
   WorkspaceSummary
 } from "../control/ControlClient";
 import { KEYMAPS } from "./data";
+import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
 import { Hov } from "./Hov";
 import { LiveTerminal } from "./LiveTerminal";
+import { SplitHandle } from "./SplitHandle";
 import { useAgentmuxControl } from "./useAgentmuxControl";
 import { ACCENTS, buildRootVars, THEMES, type ThemeName, type ThemeTokens } from "./theme";
 import {
@@ -250,7 +252,8 @@ export function AgentmuxTerminalApp() {
       items: [
         { title: "새 터미널", hint: "⌘ T", highlighted: false, onClick: () => { void addTerminal(); closeOverlay(); } },
         { title: "세로 분할", hint: "⌘ D", highlighted: false, onClick: () => { if (activePaneId) void splitPaneBy(activePaneId, "vertical"); closeOverlay(); } },
-        { title: "가로 분할", hint: "⌘ G", highlighted: false, onClick: () => { if (activePaneId) void splitPaneBy(activePaneId, "horizontal"); closeOverlay(); } }
+        { title: "가로 분할", hint: "⌘ G", highlighted: false, onClick: () => { if (activePaneId) void splitPaneBy(activePaneId, "horizontal"); closeOverlay(); } },
+        { title: "브라우저 surface 열기", hint: "", highlighted: false, onClick: () => { void ctl.createBrowserSurface(); closeOverlay(); } }
       ]
     },
     {
@@ -307,26 +310,32 @@ export function AgentmuxTerminalApp() {
       const children = childrenByParent.get(pane.paneId) ?? [];
       const ratio = pane.splitRatio ?? 0.5;
       const column = pane.splitAxis === "horizontal";
+      const [first, second] = children;
       return (
         <div
           key={pane.paneId}
           style={{
             display: "flex",
             flexDirection: column ? "column" : "row",
-            gap: 9,
+            gap: 2,
             minWidth: 0,
             minHeight: 0,
             flex: "1 1 0"
           }}
         >
-          {children.map((child, index) => (
-            <div
-              key={child.paneId}
-              style={{ flex: `${index === 0 ? ratio : 1 - ratio} 1 0`, minWidth: 0, minHeight: 0, display: "flex" }}
-            >
-              {renderPane(child.paneId)}
+          {first ? (
+            <div style={{ flex: `${ratio} 1 0`, minWidth: 0, minHeight: 0, display: "flex" }}>
+              {renderPane(first.paneId)}
             </div>
-          ))}
+          ) : null}
+          {first && second ? (
+            <SplitHandle vertical={!column} onResize={(value) => ctl.resizePane(pane.paneId, value)} />
+          ) : null}
+          {second ? (
+            <div style={{ flex: `${1 - ratio} 1 0`, minWidth: 0, minHeight: 0, display: "flex" }}>
+              {renderPane(second.paneId)}
+            </div>
+          ) : null}
         </div>
       );
     }
@@ -404,10 +413,8 @@ export function AgentmuxTerminalApp() {
                 onFocus={() => void ctl.focusPane(pane.paneId)}
                 onError={() => void ctl.refresh()}
               />
-            ) : isBrowser ? (
-              <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg4)", font: `500 12px/1.5 ${FONT_SANS}` }}>
-                브라우저 surface · {surface?.browserId ?? surface?.surfaceId}
-              </div>
+            ) : isBrowser && surface ? (
+              <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
             ) : (
               <div style={{ height: "100%", display: "flex", flexDirection: "column", gap: 10, alignItems: "center", justifyContent: "center", color: "var(--fg4)" }}>
                 <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>빈 페인</span>
