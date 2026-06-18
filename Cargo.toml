@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/agentmux-backend",
   "crates/agentmux-backend-conpty",
+  "crates/agentmux-backend-ssh",
   "crates/agentmux-backend-tmux",
   "crates/agentmux-backend-wsl",
   "crates/agentmux-browser",

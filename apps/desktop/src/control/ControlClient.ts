@@ -193,6 +193,7 @@ export interface ControlClient {
     distribution: string | null,
     cwd: string | null
   ): Promise<TerminalSession>;
+  spawnSshTerminal(workspaceId: string, target: string): Promise<TerminalSession>;
   getSession(sessionId: string): Promise<TerminalSession>;
   readRecent(sessionId: string, maxBytes: number): Promise<string>;
   sendText(sessionId: string, text: string): Promise<void>;
@@ -557,6 +558,25 @@ class TauriControlClient implements ControlClient {
     return {
       sessionId: result.session_id,
       backendKind: "wsl-direct",
+      state: "running"
+    };
+  }
+
+  async spawnSshTerminal(workspaceId: string, target: string): Promise<TerminalSession> {
+    const result = await this.call<{ session_id: string }>("session.spawn", {
+      workspace_id: workspaceId,
+      backend: "ssh",
+      backend_profile: target,
+      command: [],
+      cwd: null,
+      columns: 120,
+      rows: 30,
+      durability: "ephemeral"
+    });
+
+    return {
+      sessionId: result.session_id,
+      backendKind: "ssh",
       state: "running"
     };
   }
@@ -1121,6 +1141,23 @@ class BrowserPreviewControlClient implements ControlClient {
     this.output = [
       "\r\n$ wsl " + (distribution ?? "default") + " " + (cwd ?? "~"),
       "\r\nagentmux WSL desktop preview",
+      "\r\n"
+    ].join("");
+    return this.session;
+  }
+
+  async spawnSshTerminal(workspaceId: string, target: string): Promise<TerminalSession> {
+    this.findWorkspace(workspaceId);
+    this.mountPreviewSurface(workspaceId);
+    this.session = {
+      sessionId: "ses_browser_preview_ssh",
+      backendKind: "ssh",
+      state: "preview"
+    };
+    this.sessionWorkspaceId = workspaceId;
+    this.output = [
+      "\r\n$ ssh " + target,
+      "\r\nagentmux SSH desktop preview (실제 접속은 Tauri 실행에서 동작)",
       "\r\n"
     ].join("");
     return this.session;

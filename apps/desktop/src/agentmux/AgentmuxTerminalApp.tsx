@@ -520,7 +520,7 @@ export function AgentmuxTerminalApp() {
 
               <div style={{ font: `700 10px/1 ${FONT_SANS}`, letterSpacing: ".08em", textTransform: "uppercase", color: "var(--fg4)", padding: "16px 6px 6px" }}>원격 · SSH</div>
               {profiles.map((p) => (
-                <Hov key={p.profileId} style={{ display: "flex", alignItems: "center", gap: 8, margin: "1px 0", padding: "7px 8px", borderRadius: 7, cursor: "pointer", color: "var(--fg2)" }} hover={{ background: "var(--s2)" }} onClick={() => setOverlay("settings")}>
+                <Hov key={p.profileId} title={`접속: ${p.user}@${p.host}`} style={{ display: "flex", alignItems: "center", gap: 8, margin: "1px 0", padding: "7px 8px", borderRadius: 7, cursor: "pointer", color: "var(--fg2)" }} hover={{ background: "var(--s2)" }} onClick={() => void ctl.connectProfile(p)}>
                   <span style={{ color: "var(--fg4)", display: "flex" }}><IconServer /></span>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ font: `500 12px/1.3 ${FONT_SANS}` }}>{p.name}</div>
@@ -620,6 +620,10 @@ export function AgentmuxTerminalApp() {
             onDismissNotification={(id) => void ctl.dismissNotification(id)}
             onCreateProfile={(input) => void ctl.createProfile(input)}
             onDeleteProfile={(id) => void ctl.deleteProfile(id)}
+            onConnectProfile={(profile) => {
+              void ctl.connectProfile(profile);
+              closeOverlay();
+            }}
           />
         ) : null}
       </div>
@@ -791,10 +795,11 @@ interface SettingsModalProps {
   onDismissNotification: (id: string) => void;
   onCreateProfile: (input: SshProfileInput) => void;
   onDeleteProfile: (id: string) => void;
+  onConnectProfile: (profile: SshProfile) => void;
 }
 
 function SettingsModal(props: SettingsModalProps) {
-  const { isDark, accentKey, fontSize, settingsTab, notifications, profiles, onClose, stop, setSettingsTab, setTheme, setAccentKey, setFontSize, onDismissNotification, onCreateProfile, onDeleteProfile } = props;
+  const { isDark, accentKey, fontSize, settingsTab, notifications, profiles, onClose, stop, setSettingsTab, setTheme, setAccentKey, setFontSize, onDismissNotification, onCreateProfile, onDeleteProfile, onConnectProfile } = props;
 
   const promptNewProfile = () => {
     const name = window.prompt("프로필 이름")?.trim();
@@ -877,17 +882,20 @@ function SettingsModal(props: SettingsModalProps) {
                 </button>
               </div>
               <div style={{ border: "1px solid var(--border)", borderRadius: 8, overflow: "hidden" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1.5fr 1fr 64px", padding: "10px 14px", background: "var(--bg)", borderBottom: "1px solid var(--border)", font: `700 10.5px/1 ${FONT_SANS}`, letterSpacing: ".05em", textTransform: "uppercase", color: "var(--fg4)" }}>
-                  <span>이름</span><span>호스트</span><span>사용자</span><span style={{ textAlign: "right" }}>삭제</span>
+                <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1.4fr 0.9fr auto", padding: "10px 14px", background: "var(--bg)", borderBottom: "1px solid var(--border)", font: `700 10.5px/1 ${FONT_SANS}`, letterSpacing: ".05em", textTransform: "uppercase", color: "var(--fg4)" }}>
+                  <span>이름</span><span>호스트</span><span>사용자</span><span style={{ textAlign: "right" }}>동작</span>
                 </div>
                 {profiles.map((p) => (
-                  <div key={p.profileId} style={{ display: "grid", gridTemplateColumns: "1.3fr 1.5fr 1fr 64px", alignItems: "center", padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
+                  <div key={p.profileId} style={{ display: "grid", gridTemplateColumns: "1.2fr 1.4fr 0.9fr auto", alignItems: "center", padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)" }}>
                     <span style={{ font: `600 12.5px/1 ${FONT_SANS}`, color: "var(--fg1)" }}>{p.name}</span>
                     <span style={{ font: `400 12px/1 ${FONT_MONO}`, color: "var(--fg3)" }}>{p.host}{p.port ? `:${p.port}` : ""}</span>
                     <span style={{ font: `400 12px/1 ${FONT_MONO}`, color: "var(--fg3)" }}>{p.user}</span>
-                    <Hov tag="span" style={{ justifySelf: "end", width: 26, height: 26, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg4)", cursor: "pointer" }} hover={{ background: "var(--s2)", color: "var(--red, #F87171)" }} onClick={() => onDeleteProfile(p.profileId)}>
-                      <IconClose size={12} />
-                    </Hov>
+                    <div style={{ justifySelf: "end", display: "flex", alignItems: "center", gap: 6 }}>
+                      <button type="button" onClick={() => onConnectProfile(p)} style={{ background: "var(--accent-soft)", color: "var(--accent)", border: 0, borderRadius: 6, padding: "5px 10px", cursor: "pointer", font: `600 11px/1 ${FONT_SANS}` }}>접속</button>
+                      <Hov tag="span" style={{ width: 26, height: 26, borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg4)", cursor: "pointer" }} hover={{ background: "var(--s2)", color: "var(--red, #F87171)" }} onClick={() => onDeleteProfile(p.profileId)}>
+                        <IconClose size={12} />
+                      </Hov>
+                    </div>
                   </div>
                 ))}
                 {profiles.length === 0 ? (

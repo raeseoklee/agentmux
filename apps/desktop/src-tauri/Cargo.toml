@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 agentmux-backend = { path = "../../../crates/agentmux-backend" }
 agentmux-backend-conpty = { path = "../../../crates/agentmux-backend-conpty" }
+agentmux-backend-ssh = { path = "../../../crates/agentmux-backend-ssh" }
 agentmux-backend-tmux = { path = "../../../crates/agentmux-backend-tmux" }
 agentmux-backend-wsl = { path = "../../../crates/agentmux-backend-wsl" }
 agentmux-browser = { path = "../../../crates/agentmux-browser" }

@@ -96,6 +96,7 @@ pub enum BackendKind {
     Conpty,
     WslDirect,
     WslTmuxControl,
+    Ssh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1772,6 +1773,7 @@ fn parse_backend_kind(value: Option<&str>) -> Result<Option<BackendKind>, Contro
         None | Some("conpty") => Ok(value.map(|_| BackendKind::Conpty)),
         Some("wsl-direct") => Ok(Some(BackendKind::WslDirect)),
         Some("wsl-tmux-control") => Ok(Some(BackendKind::WslTmuxControl)),
+        Some("ssh") => Ok(Some(BackendKind::Ssh)),
         Some(other) => Err(ControlError::new(
             ErrorCode::InvalidRequest,
             format!("Unknown backend '{other}'."),
@@ -1832,6 +1834,11 @@ fn control_error_from_backend(error: BackendError) -> ControlError {
             ErrorCode::AttachFailed
         }
         "tmux_control_timeout" => ErrorCode::Timeout,
+        "ssh_connect_failed" | "ssh_identity_missing" => ErrorCode::BackendUnavailable,
+        "ssh_auth_failed" => ErrorCode::PermissionDenied,
+        "ssh_identity_invalid" => ErrorCode::InvalidRequest,
+        "ssh_protocol_error" => ErrorCode::BackendDegraded,
+        "unsupported_backend_operation" => ErrorCode::InvalidRequest,
         "timeout" => ErrorCode::Timeout,
         "permission_denied" => ErrorCode::PermissionDenied,
         "invalid_request" => ErrorCode::InvalidRequest,
@@ -1858,6 +1865,7 @@ fn backend_kind_label(kind: BackendKind) -> &'static str {
         BackendKind::Conpty => "conpty",
         BackendKind::WslDirect => "wsl-direct",
         BackendKind::WslTmuxControl => "wsl-tmux-control",
+        BackendKind::Ssh => "ssh",
     }
 }
 
@@ -1879,6 +1887,7 @@ fn backend_kind_from_backend(kind: BackendTraitKind) -> BackendKind {
         BackendTraitKind::Conpty => BackendKind::Conpty,
         BackendTraitKind::WslDirect => BackendKind::WslDirect,
         BackendTraitKind::WslTmuxControl => BackendKind::WslTmuxControl,
+        BackendTraitKind::Ssh => BackendKind::Ssh,
     }
 }
 
@@ -1887,6 +1896,7 @@ fn backend_kind_to_backend(kind: BackendKind) -> BackendTraitKind {
         BackendKind::Conpty => BackendTraitKind::Conpty,
         BackendKind::WslDirect => BackendTraitKind::WslDirect,
         BackendKind::WslTmuxControl => BackendTraitKind::WslTmuxControl,
+        BackendKind::Ssh => BackendTraitKind::Ssh,
     }
 }
 

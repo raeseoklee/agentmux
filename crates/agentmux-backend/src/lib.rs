@@ -5,6 +5,7 @@ pub enum BackendKind {
     Conpty,
     WslDirect,
     WslTmuxControl,
+    Ssh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

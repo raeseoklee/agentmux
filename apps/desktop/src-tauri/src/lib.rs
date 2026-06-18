@@ -14,6 +14,7 @@ use agentmux_backend::{
     InputEvent, SessionBackend, SessionHandle, SpawnRequest, TerminalSize, TerminationMode,
 };
 use agentmux_backend_conpty::ConptyBackend;
+use agentmux_backend_ssh::SshDirectBackend;
 use agentmux_backend_tmux::TmuxControlBackend;
 use agentmux_backend_wsl::{
     discover_wsl_distributions as discover_wsl_distributions_from_backend, WslDiagnosticCode,
@@ -58,6 +59,7 @@ pub struct DesktopBackendRouter {
     conpty: ConptyBackend,
     wsl_direct: WslDirectBackend,
     tmux_control: TmuxControlBackend,
+    ssh: SshDirectBackend,
     routes: HashMap<String, BackendTraitKind>,
 }
 
@@ -67,6 +69,7 @@ impl DesktopBackendRouter {
             conpty: ConptyBackend::new(),
             wsl_direct: WslDirectBackend::with_config(WslDirectConfig::default()),
             tmux_control: TmuxControlBackend::new(),
+            ssh: SshDirectBackend::new(),
             routes: HashMap::new(),
         }
     }
@@ -76,6 +79,7 @@ impl DesktopBackendRouter {
             Some(BackendTraitKind::Conpty) => Ok(&mut self.conpty),
             Some(BackendTraitKind::WslDirect) => Ok(&mut self.wsl_direct),
             Some(BackendTraitKind::WslTmuxControl) => Ok(&mut self.tmux_control),
+            Some(BackendTraitKind::Ssh) => Ok(&mut self.ssh),
             None => Err(BackendError::session_not_found(session_id)),
         }
     }
@@ -99,6 +103,7 @@ impl SessionBackend for DesktopBackendRouter {
             BackendTraitKind::Conpty => self.conpty.spawn(request)?,
             BackendTraitKind::WslDirect => self.wsl_direct.spawn(request)?,
             BackendTraitKind::WslTmuxControl => self.tmux_control.spawn(request)?,
+            BackendTraitKind::Ssh => self.ssh.spawn(request)?,
         };
         self.routes
             .insert(handle.session_id.clone(), handle.backend_kind);
@@ -111,6 +116,7 @@ impl SessionBackend for DesktopBackendRouter {
             BackendTraitKind::Conpty => self.conpty.attach(request)?,
             BackendTraitKind::WslDirect => self.wsl_direct.attach(request)?,
             BackendTraitKind::WslTmuxControl => self.tmux_control.attach(request)?,
+            BackendTraitKind::Ssh => self.ssh.attach(request)?,
         };
         self.routes
             .insert(handle.session_id.clone(), handle.backend_kind);
@@ -140,6 +146,7 @@ impl SessionBackend for DesktopBackendRouter {
         let mut events = self.conpty.drain_events();
         events.extend(self.wsl_direct.drain_events());
         events.extend(self.tmux_control.drain_events());
+        events.extend(self.ssh.drain_events());
         events
     }
 }

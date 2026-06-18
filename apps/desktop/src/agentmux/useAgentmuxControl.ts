@@ -45,6 +45,7 @@ export interface AgentmuxControl {
   dismissNotification: (notificationId: string) => Promise<void>;
   createProfile: (input: SshProfileInput) => Promise<void>;
   deleteProfile: (profileId: string) => Promise<void>;
+  connectProfile: (profile: SshProfile) => Promise<void>;
   refresh: () => Promise<void>;
 }
 
@@ -326,6 +327,17 @@ export function useAgentmuxControl(): AgentmuxControl {
     [client]
   );
 
+  const connectProfile = useCallback(
+    (profile: SshProfile) =>
+      withActive((workspaceId) => {
+        const target = profile.port
+          ? `${profile.user}@${profile.host}:${profile.port}`
+          : `${profile.user}@${profile.host}`;
+        return client.spawnSshTerminal(workspaceId, target);
+      }),
+    [client, withActive]
+  );
+
   const attentionByWorkspace = useMemo(() => {
     const counts = new Map<string, number>();
     for (const state of attention) {
@@ -374,6 +386,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     dismissNotification,
     createProfile,
     deleteProfile,
+    connectProfile,
     refresh
   };
 }
