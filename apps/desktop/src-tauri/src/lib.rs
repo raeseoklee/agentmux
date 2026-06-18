@@ -26,25 +26,27 @@ use agentmux_browser::{
 use agentmux_core::{PaneId, RuntimeControlPlane, SurfaceId, TerminalRuntime, WorkspaceId};
 use agentmux_ipc::{
     AckResult, AgentAttentionListResult, AgentListAttentionParams, AgentStateResult,
-    BrowserActionResult, BrowserClickParams, BrowserDiagnosticResult, BrowserDiagnosticsParams,
-    BrowserDiagnosticsResult, BrowserDomSnapshotParams, BrowserDomSnapshotResult,
-    BrowserEvaluateParams, BrowserEvaluateResult, BrowserNavigateParams, BrowserNavigationResult,
-    BrowserScreenshotParams, BrowserScreenshotResult, BrowserTypeParams, ControlError,
-    ControlPipeConnection, DiagnosticsBackendHealthResult, DiagnosticsExportResult,
+    AgentTelemetry, BrowserActionResult, BrowserClickParams, BrowserDiagnosticResult,
+    BrowserDiagnosticsParams, BrowserDiagnosticsResult, BrowserDomSnapshotParams,
+    BrowserDomSnapshotResult, BrowserEvaluateParams, BrowserEvaluateResult, BrowserNavigateParams,
+    BrowserNavigationResult, BrowserScreenshotParams, BrowserScreenshotResult, BrowserTypeParams,
+    ControlError, ControlPipeConnection, DiagnosticsBackendHealthResult, DiagnosticsExportResult,
     DiagnosticsQueuePressureResult, ErrorCode, EventSubscribeParams, EventSubscribeResult,
     NotificationDismissParams, NotificationListParams, NotificationListResult,
     NotificationSummaryResult, PaneCloseParams, PaneFocusParams, PaneMountSurfaceParams,
     PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, PaneUnmountSurfaceParams,
-    RecoveryDiagnosticsResult, RecoverySessionResult, RequestEnvelope, ResponseEnvelope,
-    ResponseOutcome, SessionIdParams, SessionSpawnParams, SessionSpawnResult, SessionSummaryResult,
-    SurfaceCreateBrowserParams, SurfaceSummaryResult, WorkspaceCloseParams, WorkspaceCloseResult,
-    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceIdParams, WorkspaceListResult,
-    WorkspaceRenameParams, WorkspaceSummaryResult, WslDistributionListResult,
+    ProfileCreateParams, ProfileIdParams, ProfileListResult, ProfileSummaryResult,
+    ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult, RequestEnvelope,
+    ResponseEnvelope, ResponseOutcome, SessionIdParams, SessionSpawnParams, SessionSpawnResult,
+    SessionSummaryResult, SurfaceCreateBrowserParams, SurfaceSummaryResult, WorkspaceCloseParams,
+    WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceIdParams,
+    WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult, WslDistributionListResult,
     WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
 };
 use agentmux_store::{
-    PersistedAgentState, PersistedNotification, PersistedPane, PersistedSession, PersistedSurface,
-    PersistedWorkspace, RecoverySnapshot, SqliteStore, StoreError, WorkspaceBundle,
+    PersistedAgentState, PersistedNotification, PersistedPane, PersistedProfile, PersistedSession,
+    PersistedSurface, PersistedWorkspace, RecoverySnapshot, SqliteStore, StoreError,
+    WorkspaceBundle,
 };
 
 pub const DESKTOP_CONTROL_TOKEN: &str = DEFAULT_LOCAL_CONTROL_TOKEN;
@@ -452,8 +454,13 @@ impl DesktopControlState {
             "browser.evaluate" => self.handle_browser_evaluate(&request),
             "agent.get_state" => self.handle_agent_get_state(&request),
             "agent.list_attention" => self.handle_agent_list_attention(&request),
+            "agent.list" => self.handle_agent_list(&request),
             "notification.list" => self.handle_notification_list(&request),
             "notification.dismiss" => self.handle_notification_dismiss(&request),
+            "profile.list" => self.handle_profile_list(&request),
+            "profile.create" => self.handle_profile_create(&request),
+            "profile.update" => self.handle_profile_update(&request),
+            "profile.delete" => self.handle_profile_delete(&request),
             "diagnostics.browser" => self.handle_browser_diagnostics(&request),
             "diagnostics.export" => self.handle_diagnostics_export(&request),
             "diagnostics.recovery" => self.handle_recovery_diagnostics(&request),
@@ -1237,6 +1244,7 @@ impl DesktopControlState {
                 attention: false,
                 reason: None,
                 updated_at: None,
+                telemetry: None,
             },
         ))
     }
@@ -1253,6 +1261,27 @@ impl DesktopControlState {
         };
         let sessions = store
             .list_agent_attention(params.workspace_id.as_deref())?
+            .iter()
+            .map(agent_state_result_from_persisted)
+            .collect();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &AgentAttentionListResult { sessions },
+        ))
+    }
+
+    fn handle_agent_list(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: AgentListAttentionParams = request.parse_params()?;
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let sessions = store
+            .list_agent_states(params.workspace_id.as_deref())?
             .iter()
             .map(agent_state_result_from_persisted)
             .collect();
@@ -1304,6 +1333,109 @@ impl DesktopControlState {
             )));
         }
 
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &AckResult { ok: true },
+        ))
+    }
+
+    fn handle_profile_list(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let profiles = store.list_profiles()?.iter().map(profile_summary).collect();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &ProfileListResult { profiles },
+        ))
+    }
+
+    fn handle_profile_create(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: ProfileCreateParams = request.parse_params()?;
+        validate_profile_fields(&params.name, &params.host, &params.user)?;
+        let now = timestamp();
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let profile = PersistedProfile {
+            profile_id: format!("prof_{millis}"),
+            name: params.name,
+            host: params.host,
+            user: params.user,
+            port: params.port,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        store.upsert_profile(&profile)?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &profile_summary(&profile),
+        ))
+    }
+
+    fn handle_profile_update(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: ProfileUpdateParams = request.parse_params()?;
+        validate_profile_fields(&params.name, &params.host, &params.user)?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let existing = store.load_profile(&params.profile_id)?.ok_or_else(|| {
+            DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Profile not found.",
+            ))
+        })?;
+        let profile = PersistedProfile {
+            profile_id: existing.profile_id,
+            name: params.name,
+            host: params.host,
+            user: params.user,
+            port: params.port,
+            created_at: existing.created_at,
+            updated_at: timestamp(),
+        };
+        store.upsert_profile(&profile)?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &profile_summary(&profile),
+        ))
+    }
+
+    fn handle_profile_delete(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: ProfileIdParams = request.parse_params()?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        if !store.delete_profile(&params.profile_id)? {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Profile not found.",
+            )));
+        }
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &AckResult { ok: true },
@@ -2266,8 +2398,13 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "browser.evaluate"
             | "agent.get_state"
             | "agent.list_attention"
+            | "agent.list"
             | "notification.list"
             | "notification.dismiss"
+            | "profile.list"
+            | "profile.create"
+            | "profile.update"
+            | "profile.delete"
             | "diagnostics.browser"
             | "diagnostics.export"
             | "diagnostics.recovery"
@@ -2750,6 +2887,26 @@ fn surface_summary(surface: &PersistedSurface) -> SurfaceSummaryResult {
     }
 }
 
+fn profile_summary(profile: &PersistedProfile) -> ProfileSummaryResult {
+    ProfileSummaryResult {
+        profile_id: profile.profile_id.clone(),
+        name: profile.name.clone(),
+        host: profile.host.clone(),
+        user: profile.user.clone(),
+        port: profile.port,
+    }
+}
+
+fn validate_profile_fields(name: &str, host: &str, user: &str) -> Result<(), DesktopHostError> {
+    if name.trim().is_empty() || host.trim().is_empty() || user.trim().is_empty() {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            "profile requires non-empty name, host, and user.",
+        )));
+    }
+    Ok(())
+}
+
 fn persisted_session_summary(session: &PersistedSession) -> SessionSummaryResult {
     SessionSummaryResult {
         session_id: session.session_id.clone(),
@@ -2775,6 +2932,11 @@ fn persisted_agent_state_from_result(
             .updated_at
             .clone()
             .unwrap_or_else(|| fallback_updated_at.to_string()),
+        telemetry_json: state
+            .telemetry
+            .as_ref()
+            .filter(|telemetry| !telemetry.is_empty())
+            .and_then(|telemetry| serde_json::to_string(telemetry).ok()),
     }
 }
 
@@ -2786,6 +2948,10 @@ fn agent_state_result_from_persisted(state: &PersistedAgentState) -> AgentStateR
         attention: state.attention,
         reason: state.reason.clone(),
         updated_at: Some(state.updated_at.clone()),
+        telemetry: state
+            .telemetry_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok()),
     }
 }
 
@@ -3773,6 +3939,7 @@ mod tests {
                     attention: true,
                     reason: Some("review needed".to_string()),
                     updated_at: "2026-06-18T00:10:00Z".to_string(),
+                    telemetry_json: None,
                 })
                 .unwrap();
             store

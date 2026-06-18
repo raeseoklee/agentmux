@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("synthetic attention appears in workspace, pane, and notification UI", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/#console");
   await page.waitForFunction(() => window.__AGENTMUX_PREVIEW_READY__ === true);
 
   await expect(page.getByRole("button", { name: /Local project/ })).toBeVisible();
@@ -32,7 +32,7 @@ test("synthetic attention appears in workspace, pane, and notification UI", asyn
 });
 
 test("browser surface can be created and driven from the pane UI", async ({ page }) => {
-  await page.goto("/");
+  await page.goto("/#console");
   await page.waitForFunction(() => window.__AGENTMUX_PREVIEW_READY__ === true);
 
   await expect(page.getByRole("button", { name: /Local project/ })).toBeVisible();

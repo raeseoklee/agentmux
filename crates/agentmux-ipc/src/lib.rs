@@ -385,11 +385,36 @@ pub struct EventSubscribeParams {
     pub after_event_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTelemetry {
+    pub activity: Option<String>,
+    pub session: Option<String>,
+    pub cost: Option<String>,
+    pub tokens: Option<String>,
+    pub cache: Option<String>,
+    pub rate: Option<String>,
+    pub ctx: Option<String>,
+}
+
+impl AgentTelemetry {
+    pub fn is_empty(&self) -> bool {
+        self.activity.is_none()
+            && self.session.is_none()
+            && self.cost.is_none()
+            && self.tokens.is_none()
+            && self.cache.is_none()
+            && self.rate.is_none()
+            && self.ctx.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentSetStateParams {
     pub session_id: String,
     pub state: String,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub telemetry: Option<AgentTelemetry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -551,6 +576,8 @@ pub struct AgentStateResult {
     pub attention: bool,
     pub reason: Option<String>,
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub telemetry: Option<AgentTelemetry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -680,6 +707,42 @@ pub struct WslDistributionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WslDistributionListResult {
     pub distributions: Vec<WslDistributionResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileCreateParams {
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileUpdateParams {
+    pub profile_id: String,
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileIdParams {
+    pub profile_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileSummaryResult {
+    pub profile_id: String,
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProfileListResult {
+    pub profiles: Vec<ProfileSummaryResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

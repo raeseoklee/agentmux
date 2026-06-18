@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 "#;
 
+pub const AGENT_TELEMETRY_SCHEMA: &str = r#"
+ALTER TABLE agent_states ADD COLUMN telemetry_json TEXT;
+"#;
+
+pub const SSH_PROFILES_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS ssh_profiles (
+  profile_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  host TEXT NOT NULL,
+  user TEXT NOT NULL,
+  port INTEGER,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -116,6 +132,16 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "agent_state_notification_schema",
         sql: AGENT_NOTIFICATIONS_SCHEMA,
+    },
+    Migration {
+        version: 3,
+        name: "agent_telemetry_column",
+        sql: AGENT_TELEMETRY_SCHEMA,
+    },
+    Migration {
+        version: 4,
+        name: "ssh_profiles_schema",
+        sql: SSH_PROFILES_SCHEMA,
     },
 ];
 
@@ -217,6 +243,18 @@ pub struct PersistedAgentState {
     pub state: String,
     pub attention: bool,
     pub reason: Option<String>,
+    pub updated_at: String,
+    pub telemetry_json: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedProfile {
+    pub profile_id: String,
+    pub name: String,
+    pub host: String,
+    pub user: String,
+    pub port: Option<u16>,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -487,22 +525,24 @@ impl SqliteStore {
     pub fn upsert_agent_state(&mut self, state: &PersistedAgentState) -> StoreResult<()> {
         self.connection.execute(
             "INSERT INTO agent_states (
-                session_id, workspace_id, state, attention, reason, updated_at
+                session_id, workspace_id, state, attention, reason, updated_at, telemetry_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(session_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 state = excluded.state,
                 attention = excluded.attention,
                 reason = excluded.reason,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                telemetry_json = excluded.telemetry_json",
             params![
                 state.session_id,
                 state.workspace_id,
                 state.state,
                 state.attention,
                 state.reason,
-                state.updated_at
+                state.updated_at,
+                state.telemetry_json
             ],
         )?;
         Ok(())
@@ -511,7 +551,7 @@ impl SqliteStore {
     pub fn load_agent_state(&self, session_id: &str) -> StoreResult<Option<PersistedAgentState>> {
         self.connection
             .query_row(
-                "SELECT session_id, workspace_id, state, attention, reason, updated_at
+                "SELECT session_id, workspace_id, state, attention, reason, updated_at, telemetry_json
                  FROM agent_states
                  WHERE session_id = ?1",
                 [session_id],
@@ -527,7 +567,7 @@ impl SqliteStore {
     ) -> StoreResult<Vec<PersistedAgentState>> {
         if let Some(workspace_id) = workspace_id {
             let mut statement = self.connection.prepare(
-                "SELECT session_id, workspace_id, state, attention, reason, updated_at
+                "SELECT session_id, workspace_id, state, attention, reason, updated_at, telemetry_json
                  FROM agent_states
                  WHERE attention = 1 AND workspace_id = ?1
                  ORDER BY updated_at DESC, session_id ASC",
@@ -537,9 +577,33 @@ impl SqliteStore {
         }
 
         let mut statement = self.connection.prepare(
-            "SELECT session_id, workspace_id, state, attention, reason, updated_at
+            "SELECT session_id, workspace_id, state, attention, reason, updated_at, telemetry_json
              FROM agent_states
              WHERE attention = 1
+             ORDER BY updated_at DESC, session_id ASC",
+        )?;
+        let rows = statement.query_map([], agent_state_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn list_agent_states(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> StoreResult<Vec<PersistedAgentState>> {
+        if let Some(workspace_id) = workspace_id {
+            let mut statement = self.connection.prepare(
+                "SELECT session_id, workspace_id, state, attention, reason, updated_at, telemetry_json
+                 FROM agent_states
+                 WHERE workspace_id = ?1
+                 ORDER BY updated_at DESC, session_id ASC",
+            )?;
+            let rows = statement.query_map([workspace_id], agent_state_from_row)?;
+            return collect_rows(rows);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT session_id, workspace_id, state, attention, reason, updated_at, telemetry_json
+             FROM agent_states
              ORDER BY updated_at DESC, session_id ASC",
         )?;
         let rows = statement.query_map([], agent_state_from_row)?;
@@ -639,6 +703,62 @@ impl SqliteStore {
             params![notification_id],
         )?;
         Ok(updated > 0)
+    }
+
+    pub fn upsert_profile(&mut self, profile: &PersistedProfile) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO ssh_profiles (
+                profile_id, name, host, user, port, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(profile_id) DO UPDATE SET
+                name = excluded.name,
+                host = excluded.host,
+                user = excluded.user,
+                port = excluded.port,
+                updated_at = excluded.updated_at",
+            params![
+                profile.profile_id,
+                profile.name,
+                profile.host,
+                profile.user,
+                profile.port,
+                profile.created_at,
+                profile.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_profiles(&self) -> StoreResult<Vec<PersistedProfile>> {
+        let mut statement = self.connection.prepare(
+            "SELECT profile_id, name, host, user, port, created_at, updated_at
+             FROM ssh_profiles
+             ORDER BY created_at ASC, profile_id ASC",
+        )?;
+        let rows = statement.query_map([], profile_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn load_profile(&self, profile_id: &str) -> StoreResult<Option<PersistedProfile>> {
+        self.connection
+            .query_row(
+                "SELECT profile_id, name, host, user, port, created_at, updated_at
+                 FROM ssh_profiles
+                 WHERE profile_id = ?1",
+                [profile_id],
+                profile_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_profile(&mut self, profile_id: &str) -> StoreResult<bool> {
+        let deleted = self.connection.execute(
+            "DELETE FROM ssh_profiles WHERE profile_id = ?1",
+            params![profile_id],
+        )?;
+        Ok(deleted > 0)
     }
 
     fn list_panes_for_workspace(&self, workspace_id: &str) -> StoreResult<Vec<PersistedPane>> {
@@ -1029,6 +1149,19 @@ fn agent_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedAg
         attention: row.get(3)?,
         reason: row.get(4)?,
         updated_at: row.get(5)?,
+        telemetry_json: row.get(6)?,
+    })
+}
+
+fn profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedProfile> {
+    Ok(PersistedProfile {
+        profile_id: row.get(0)?,
+        name: row.get(1)?,
+        host: row.get(2)?,
+        user: row.get(3)?,
+        port: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -1067,7 +1200,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -1149,6 +1282,7 @@ mod tests {
                 attention: true,
                 reason: Some("needs prompt".to_string()),
                 updated_at: "2026-06-18T00:03:00Z".to_string(),
+                telemetry_json: None,
             })
             .unwrap();
         store
@@ -1196,6 +1330,7 @@ mod tests {
                 attention: true,
                 reason: None,
                 updated_at: "2026-06-18T00:01:30Z".to_string(),
+                telemetry_json: None,
             })
             .unwrap();
 
@@ -1229,6 +1364,7 @@ mod tests {
                     attention: true,
                     reason: Some("confirm change".to_string()),
                     updated_at: "2026-06-18T00:04:00Z".to_string(),
+                    telemetry_json: None,
                 })
                 .unwrap();
             store

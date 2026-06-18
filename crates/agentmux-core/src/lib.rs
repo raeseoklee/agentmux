@@ -9,10 +9,10 @@ use agentmux_backend::{
 };
 use agentmux_ipc::{
     AckResult, AgentAttentionListResult, AgentListAttentionParams, AgentSetStateParams,
-    AgentStateResult, ControlError, ErrorCode, EventFrame, EventPollParams, EventPollResult,
-    EventSubscribeParams, EventSubscribeResult, NotificationDismissParams, NotificationListParams,
-    NotificationListResult, NotificationSummaryResult, RequestEnvelope, ResponseEnvelope,
-    SessionAttachParams, SessionIdParams, SessionListParams, SessionListResult,
+    AgentStateResult, AgentTelemetry, ControlError, ErrorCode, EventFrame, EventPollParams,
+    EventPollResult, EventSubscribeParams, EventSubscribeResult, NotificationDismissParams,
+    NotificationListParams, NotificationListResult, NotificationSummaryResult, RequestEnvelope,
+    ResponseEnvelope, SessionAttachParams, SessionIdParams, SessionListParams, SessionListResult,
     SessionReadRecentParams, SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams,
     SessionSendTextParams, SessionSpawnParams, SessionSpawnResult, SessionSummaryResult,
     SessionTerminateParams,
@@ -169,6 +169,7 @@ struct AgentStateRecord {
     attention: bool,
     reason: Option<String>,
     updated_at: String,
+    telemetry: Option<AgentTelemetry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -297,6 +298,7 @@ pub enum CoreEvent {
         state: AgentState,
         reason: Option<String>,
         source: String,
+        telemetry: Option<AgentTelemetry>,
     },
     NotificationCreated {
         notification: NotificationRecord,
@@ -685,6 +687,7 @@ where
                     signal.state,
                     signal.reason,
                     signal.source,
+                    None,
                 ) {
                     let _ = result;
                 }
@@ -1071,8 +1074,13 @@ where
         let params: AgentSetStateParams = request.parse_params()?;
         let state = parse_agent_state(&params.state)?;
         let session_id = SessionId::from_string(params.session_id);
-        let result =
-            self.apply_agent_state_transition(session_id, state, params.reason, "control_api")?;
+        let result = self.apply_agent_state_transition(
+            session_id,
+            state,
+            params.reason,
+            "control_api",
+            params.telemetry,
+        )?;
 
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
@@ -1099,6 +1107,7 @@ where
                 attention: false,
                 reason: None,
                 updated_at: None,
+                telemetry: None,
             });
 
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
@@ -1211,12 +1220,20 @@ where
         state: AgentState,
         reason: Option<String>,
         source: &str,
+        telemetry: Option<AgentTelemetry>,
     ) -> Result<AgentStateResult, ControlError> {
         let summary = self
             .runtime
             .session_summary(&session_id)
             .ok_or_else(|| ControlError::new(ErrorCode::SessionNotFound, "Session not found."))?;
         let attention = agent_state_requires_attention(state);
+        // Carry forward the last known telemetry when a transition omits it, so a
+        // bare state change (e.g. waiting-for-input) does not erase the metrics.
+        let telemetry = telemetry.or_else(|| {
+            self.agent_states
+                .get(&session_id.to_string())
+                .and_then(|previous| previous.telemetry.clone())
+        });
         let record = AgentStateRecord {
             session_id: session_id.clone(),
             workspace_id: summary.workspace_id.clone(),
@@ -1224,6 +1241,7 @@ where
             attention,
             reason,
             updated_at: event_timestamp(),
+            telemetry,
         };
         let duplicate = self
             .agent_states
@@ -1232,6 +1250,7 @@ where
                 previous.state == record.state
                     && previous.reason == record.reason
                     && previous.attention == record.attention
+                    && previous.telemetry == record.telemetry
             });
         self.agent_states
             .insert(session_id.to_string(), record.clone());
@@ -1242,6 +1261,7 @@ where
                 state,
                 reason: record.reason.clone(),
                 source: source.to_string(),
+                telemetry: record.telemetry.clone(),
             });
             if let Some(notification) = self.notification_for_agent_state(&record) {
                 self.push_notification(notification);
@@ -1398,6 +1418,7 @@ where
                 state,
                 reason,
                 source,
+                telemetry,
             } => {
                 let mut frame = EventFrame::new(event_id, "agent.state_changed");
                 frame.workspace_id = self
@@ -1409,6 +1430,7 @@ where
                     "state": agent_state_label(state),
                     "reason": reason,
                     "source": source,
+                    "telemetry": telemetry,
                 })
                 .to_string();
                 frame
@@ -1510,6 +1532,7 @@ fn agent_state_result(record: &AgentStateRecord) -> AgentStateResult {
         attention: record.attention,
         reason: record.reason.clone(),
         updated_at: Some(record.updated_at.clone()),
+        telemetry: record.telemetry.clone(),
     }
 }
 

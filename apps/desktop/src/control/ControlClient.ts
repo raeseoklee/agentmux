@@ -5,6 +5,16 @@ export interface TerminalSession {
   backendNativeId?: string | null;
 }
 
+export interface AgentTelemetry {
+  activity?: string | null;
+  session?: string | null;
+  cost?: string | null;
+  tokens?: string | null;
+  cache?: string | null;
+  rate?: string | null;
+  ctx?: string | null;
+}
+
 export interface AgentState {
   sessionId: string;
   workspaceId: string;
@@ -12,6 +22,7 @@ export interface AgentState {
   attention: boolean;
   reason?: string | null;
   updatedAt?: string | null;
+  telemetry?: AgentTelemetry | null;
 }
 
 export interface NotificationSummary {
@@ -79,6 +90,21 @@ export interface RecoveryDiagnostics {
 export interface WslDistribution {
   name: string;
   isDefault: boolean;
+}
+
+export interface SshProfile {
+  profileId: string;
+  name: string;
+  host: string;
+  user: string;
+  port?: number | null;
+}
+
+export interface SshProfileInput {
+  name: string;
+  host: string;
+  user: string;
+  port?: number | null;
 }
 
 export interface BrowserNavigationResult {
@@ -157,6 +183,10 @@ export interface ControlClient {
   }): Promise<BrowserDiagnostic[]>;
   recoveryDiagnostics(): Promise<RecoveryDiagnostics>;
   listWslDistributions(): Promise<WslDistribution[]>;
+  listProfiles(): Promise<SshProfile[]>;
+  createProfile(input: SshProfileInput): Promise<SshProfile>;
+  updateProfile(profileId: string, input: SshProfileInput): Promise<SshProfile>;
+  deleteProfile(profileId: string): Promise<void>;
   spawnNativeTerminal(workspaceId: string, command: string[]): Promise<TerminalSession>;
   spawnWslTerminal(
     workspaceId: string,
@@ -169,6 +199,7 @@ export interface ControlClient {
   sendKey(sessionId: string, key: string): Promise<void>;
   resize(sessionId: string, columns: number, rows: number): Promise<void>;
   listAgentAttention(workspaceId?: string | null): Promise<AgentState[]>;
+  listAgentStates(workspaceId?: string | null): Promise<AgentState[]>;
   clearAgentAttention(sessionId: string): Promise<void>;
   listNotifications(options: {
     workspaceId?: string | null;
@@ -459,6 +490,36 @@ class TauriControlClient implements ControlClient {
     return result.distributions.map(mapWslDistribution);
   }
 
+  async listProfiles(): Promise<SshProfile[]> {
+    const result = await this.call<{ profiles: SshProfileWire[] }>("profile.list", {});
+    return result.profiles.map(mapProfile);
+  }
+
+  async createProfile(input: SshProfileInput): Promise<SshProfile> {
+    const result = await this.call<SshProfileWire>("profile.create", {
+      name: input.name,
+      host: input.host,
+      user: input.user,
+      port: input.port ?? null
+    });
+    return mapProfile(result);
+  }
+
+  async updateProfile(profileId: string, input: SshProfileInput): Promise<SshProfile> {
+    const result = await this.call<SshProfileWire>("profile.update", {
+      profile_id: profileId,
+      name: input.name,
+      host: input.host,
+      user: input.user,
+      port: input.port ?? null
+    });
+    return mapProfile(result);
+  }
+
+  async deleteProfile(profileId: string): Promise<void> {
+    await this.call("profile.delete", { profile_id: profileId });
+  }
+
   async spawnNativeTerminal(workspaceId: string, command: string[]): Promise<TerminalSession> {
     const result = await this.call<{ session_id: string }>("session.spawn", {
       workspace_id: workspaceId,
@@ -539,6 +600,13 @@ class TauriControlClient implements ControlClient {
 
   async listAgentAttention(workspaceId?: string | null): Promise<AgentState[]> {
     const result = await this.call<{ sessions: AgentStateWire[] }>("agent.list_attention", {
+      workspace_id: workspaceId ?? null
+    });
+    return result.sessions.map(mapAgentState);
+  }
+
+  async listAgentStates(workspaceId?: string | null): Promise<AgentState[]> {
+    const result = await this.call<{ sessions: AgentStateWire[] }>("agent.list", {
       workspace_id: workspaceId ?? null
     });
     return result.sessions.map(mapAgentState);
@@ -626,6 +694,12 @@ class BrowserPreviewControlClient implements ControlClient {
   private session?: TerminalSession;
   private sessionWorkspaceId?: string;
   private output = "";
+  private profileCounter = 3;
+  private readonly profiles: SshProfile[] = [
+    { profileId: "prof_preview_1", name: "prod-server", host: "10.0.4.12", user: "deploy", port: 22 },
+    { profileId: "prof_preview_2", name: "staging-db", host: "10.0.7.3", user: "ops", port: 22 },
+    { profileId: "prof_preview_3", name: "gpu-box", host: "gpu.lan", user: "ml", port: 22 }
+  ];
 
   constructor() {
     const previewApi: BrowserPreviewApi = {
@@ -978,6 +1052,41 @@ class BrowserPreviewControlClient implements ControlClient {
     ];
   }
 
+  async listProfiles(): Promise<SshProfile[]> {
+    return this.profiles.map((profile) => ({ ...profile }));
+  }
+
+  async createProfile(input: SshProfileInput): Promise<SshProfile> {
+    const profile: SshProfile = {
+      profileId: `prof_preview_${++this.profileCounter}`,
+      name: input.name,
+      host: input.host,
+      user: input.user,
+      port: input.port ?? null
+    };
+    this.profiles.push(profile);
+    return { ...profile };
+  }
+
+  async updateProfile(profileId: string, input: SshProfileInput): Promise<SshProfile> {
+    const profile = this.profiles.find((candidate) => candidate.profileId === profileId);
+    if (!profile) {
+      throw new Error(`Profile '${profileId}' was not found.`);
+    }
+    profile.name = input.name;
+    profile.host = input.host;
+    profile.user = input.user;
+    profile.port = input.port ?? null;
+    return { ...profile };
+  }
+
+  async deleteProfile(profileId: string): Promise<void> {
+    const index = this.profiles.findIndex((candidate) => candidate.profileId === profileId);
+    if (index >= 0) {
+      this.profiles.splice(index, 1);
+    }
+  }
+
   async spawnNativeTerminal(workspaceId: string, command: string[]): Promise<TerminalSession> {
     this.findWorkspace(workspaceId);
     this.mountPreviewSurface(workspaceId);
@@ -1051,6 +1160,12 @@ class BrowserPreviewControlClient implements ControlClient {
   async listAgentAttention(workspaceId?: string | null): Promise<AgentState[]> {
     return [...this.agentStates.values()].filter(
       (state) => state.attention && (!workspaceId || state.workspaceId === workspaceId)
+    );
+  }
+
+  async listAgentStates(workspaceId?: string | null): Promise<AgentState[]> {
+    return [...this.agentStates.values()].filter(
+      (state) => !workspaceId || state.workspaceId === workspaceId
     );
   }
 
@@ -1134,7 +1249,8 @@ class BrowserPreviewControlClient implements ControlClient {
       state,
       attention,
       reason,
-      updatedAt: now
+      updatedAt: now,
+      telemetry: detail.telemetry ?? null
     });
 
     if (!["waiting_for_input", "completed", "failed"].includes(state)) {
@@ -1178,6 +1294,7 @@ interface SyntheticAgentStateDetail {
   state?: string;
   reason?: string;
   notificationId?: string;
+  telemetry?: AgentTelemetry;
 }
 
 interface BrowserPreviewApi {
@@ -1233,6 +1350,7 @@ interface AgentStateWire {
   attention: boolean;
   reason?: string | null;
   updated_at?: string | null;
+  telemetry?: AgentTelemetry | null;
 }
 
 interface NotificationSummaryWire {
@@ -1265,6 +1383,14 @@ interface RecoveryDiagnosticsWire {
 interface WslDistributionWire {
   name: string;
   is_default: boolean;
+}
+
+interface SshProfileWire {
+  profile_id: string;
+  name: string;
+  host: string;
+  user: string;
+  port?: number | null;
 }
 
 interface BrowserNavigationResultWire {
@@ -1353,7 +1479,8 @@ function mapAgentState(value: AgentStateWire): AgentState {
     state: value.state,
     attention: value.attention,
     reason: value.reason,
-    updatedAt: value.updated_at
+    updatedAt: value.updated_at,
+    telemetry: value.telemetry ?? null
   };
 }
 
@@ -1375,6 +1502,16 @@ function mapWslDistribution(value: WslDistributionWire): WslDistribution {
   return {
     name: value.name,
     isDefault: value.is_default
+  };
+}
+
+function mapProfile(value: SshProfileWire): SshProfile {
+  return {
+    profileId: value.profile_id,
+    name: value.name,
+    host: value.host,
+    user: value.user,
+    port: value.port ?? null
   };
 }
 

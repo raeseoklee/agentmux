@@ -829,6 +829,7 @@ fn parse_agent_set_state_options(args: &[String]) -> Result<AgentSetStateOptions
                 CliError::InvalidArgs("agent set-state requires a state.".to_string())
             })?,
             reason,
+            telemetry: None,
         },
     })
 }
