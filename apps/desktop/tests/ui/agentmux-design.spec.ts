@@ -24,6 +24,27 @@ test("opens a live terminal", async ({ page }) => {
   await expect(page.getByText("conpty").first()).toBeVisible({ timeout: 5000 });
 });
 
+test("new terminal adds a mounted tab instead of replacing the active one", async ({ page }) => {
+  await page.goto("/");
+  await page.waitForFunction(
+    () =>
+      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
+        .__AGENTMUX_PREVIEW_READY__ === true
+  );
+
+  await page.getByRole("button", { name: "터미널 열기" }).first().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+  await expect(page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]')).toHaveCount(1);
+
+  await page.keyboard.down("Control");
+  await page.keyboard.press("K");
+  await page.keyboard.up("Control");
+  await page.getByText("새 터미널", { exact: true }).click();
+
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
+  await expect(page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]')).toHaveCount(2);
+});
+
 test("command palette lists actions", async ({ page }) => {
   await page.goto("/");
   await page.waitForFunction(

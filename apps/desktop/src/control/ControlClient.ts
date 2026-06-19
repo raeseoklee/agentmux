@@ -737,11 +737,13 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly panes = new Map<string, PaneSummary[]>();
   private readonly agentStates = new Map<string, AgentState>();
   private readonly notifications: NotificationSummary[] = [];
+  private readonly terminalSurfaces: SurfaceSummary[] = [];
+  private readonly sessions = new Map<string, TerminalSession>();
+  private readonly outputs = new Map<string, string>();
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
-  private session?: TerminalSession;
-  private sessionWorkspaceId?: string;
-  private output = "";
+  private terminalCounter = 0;
+  private lastSessionId?: string;
   private profileCounter = 3;
   private readonly profiles: SshProfile[] = [
     { profileId: "prof_preview_1", name: "prod-server", host: "10.0.4.12", user: "deploy", port: 22 },
@@ -794,25 +796,20 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
     const workspace = this.findWorkspace(workspaceId);
+    const terminalSurfaces = this.terminalSurfaces.filter(
+      (surface) => surface.workspaceId === workspaceId
+    );
+    const sessionIds = new Set(
+      terminalSurfaces.map((surface) => surface.sessionId).filter(Boolean)
+    );
     return {
       workspace,
       panes: [...(this.panes.get(workspaceId) ?? [])],
       surfaces: [
-        ...(this.session
-          ? [
-              {
-                surfaceId: "surf_browser_preview",
-                workspaceId,
-                surfaceType: "terminal",
-                title: this.session.backendKind,
-                sessionId: this.session.sessionId,
-                browserId: null
-              }
-            ]
-          : []),
+        ...terminalSurfaces,
         ...this.browserSurfaces.filter((surface) => surface.workspaceId === workspaceId)
       ],
-      sessions: this.session ? [this.session] : []
+      sessions: [...this.sessions.values()].filter((session) => sessionIds.has(session.sessionId))
     };
   }
 
@@ -829,6 +826,23 @@ class BrowserPreviewControlClient implements ControlClient {
     }
     this.workspaces.splice(index, 1);
     this.panes.delete(workspaceId);
+    for (let i = this.terminalSurfaces.length - 1; i >= 0; i -= 1) {
+      if (this.terminalSurfaces[i].workspaceId === workspaceId) {
+        const sessionId = this.terminalSurfaces[i].sessionId;
+        if (sessionId) {
+          this.sessions.delete(sessionId);
+          this.outputs.delete(sessionId);
+          this.agentStates.delete(sessionId);
+        }
+        this.terminalSurfaces.splice(i, 1);
+      }
+    }
+    for (let i = this.browserSurfaces.length - 1; i >= 0; i -= 1) {
+      if (this.browserSurfaces[i].workspaceId === workspaceId) {
+        this.browserUrls.delete(this.browserSurfaces[i].surfaceId);
+        this.browserSurfaces.splice(i, 1);
+      }
+    }
     return true;
   }
 
@@ -899,9 +913,14 @@ class BrowserPreviewControlClient implements ControlClient {
     if (!target || target.kind !== "leaf" || !target.parentPaneId) {
       throw new Error(`Pane '${paneId}' cannot be closed.`);
     }
-    if (surfacePolicy === "fail_if_session_running" && target.mountedSurfaceId && this.session) {
+    if (
+      surfacePolicy === "fail_if_session_running" &&
+      target.mountedSurfaceId &&
+      this.surfaceHasRunningSession(target.mountedSurfaceId)
+    ) {
       throw new Error("Pane has a running session.");
     }
+    const closedSurfaceId = target.mountedSurfaceId ?? null;
 
     const parent = panes.find((pane) => pane.paneId === target.parentPaneId);
     const siblings = panes.filter((pane) => pane.parentPaneId === target.parentPaneId);
@@ -924,6 +943,13 @@ class BrowserPreviewControlClient implements ControlClient {
       if (workspace.activePaneId === paneId || workspace.activePaneId === remaining.paneId) {
         workspace.activePaneId = parent.paneId;
       }
+    }
+
+    if (
+      closedSurfaceId &&
+      (surfacePolicy === "close_surface" || surfacePolicy === "fail_if_session_running")
+    ) {
+      this.closeSurface(closedSurfaceId);
     }
 
     return this.getWorkspace(workspaceId);
@@ -1066,24 +1092,25 @@ class BrowserPreviewControlClient implements ControlClient {
   }
 
   async recoveryDiagnostics(): Promise<RecoveryDiagnostics> {
+    const sessions = [...this.sessions.values()];
     return {
       workspaceCount: this.workspaces.length,
-      paneCount: this.workspaces.length,
-      surfaceCount: this.session ? 1 : 0,
-      sessionCount: this.session ? 1 : 0,
-      sessions: this.session
-        ? [
-            {
-              sessionId: this.session.sessionId,
-              workspaceId:
-                this.sessionWorkspaceId ?? this.workspaces[0]?.workspaceId ?? "ws_browser_preview",
-              backendKind: this.session.backendKind,
-              state: this.session.state,
-              durability: "ephemeral",
-              backendNativeId: null
-            }
-          ]
-        : []
+      paneCount: [...this.panes.values()].reduce((count, panes) => count + panes.length, 0),
+      surfaceCount: this.terminalSurfaces.length + this.browserSurfaces.length,
+      sessionCount: sessions.length,
+      sessions: sessions.map((session) => {
+        const surface = this.terminalSurfaces.find(
+          (candidate) => candidate.sessionId === session.sessionId
+        );
+        return {
+          sessionId: session.sessionId,
+          workspaceId: surface?.workspaceId ?? this.workspaces[0]?.workspaceId ?? "ws_browser_preview",
+          backendKind: session.backendKind,
+          state: session.state,
+          durability: "ephemeral",
+          backendNativeId: null
+        };
+      })
     };
   }
 
@@ -1136,21 +1163,12 @@ class BrowserPreviewControlClient implements ControlClient {
   }
 
   async spawnNativeTerminal(workspaceId: string, command: string[]): Promise<TerminalSession> {
-    this.findWorkspace(workspaceId);
-    this.mountPreviewSurface(workspaceId);
     const commandText = command.join(" ");
-    this.session = {
-      sessionId: "ses_browser_preview",
-      backendKind: "conpty",
-      state: "preview"
-    };
-    this.sessionWorkspaceId = workspaceId;
-    this.output = [
+    return this.createPreviewTerminal(workspaceId, "conpty", "conpty", [
       "\r\n$ " + commandText,
       "\r\nagentmux desktop preview",
       "\r\n"
-    ].join("");
-    return this.session;
+    ].join(""));
   }
 
   async spawnWslTerminal(
@@ -1158,37 +1176,19 @@ class BrowserPreviewControlClient implements ControlClient {
     distribution: string | null,
     cwd: string | null
   ): Promise<TerminalSession> {
-    this.findWorkspace(workspaceId);
-    this.mountPreviewSurface(workspaceId);
-    this.session = {
-      sessionId: "ses_browser_preview_wsl",
-      backendKind: "wsl-direct",
-      state: "preview"
-    };
-    this.sessionWorkspaceId = workspaceId;
-    this.output = [
+    return this.createPreviewTerminal(workspaceId, "wsl-direct", "wsl-direct", [
       "\r\n$ wsl " + (distribution ?? "default") + " " + (cwd ?? "~"),
       "\r\nagentmux WSL desktop preview",
       "\r\n"
-    ].join("");
-    return this.session;
+    ].join(""));
   }
 
   async spawnSshTerminal(workspaceId: string, target: string): Promise<TerminalSession> {
-    this.findWorkspace(workspaceId);
-    this.mountPreviewSurface(workspaceId);
-    this.session = {
-      sessionId: "ses_browser_preview_ssh",
-      backendKind: "ssh",
-      state: "preview"
-    };
-    this.sessionWorkspaceId = workspaceId;
-    this.output = [
+    return this.createPreviewTerminal(workspaceId, "ssh", "ssh", [
       "\r\n$ ssh " + target,
       "\r\nagentmux SSH desktop preview (실제 접속은 Tauri 실행에서 동작)",
       "\r\n"
-    ].join("");
-    return this.session;
+    ].join(""));
   }
 
   async spawnAgentTerminal(
@@ -1196,47 +1196,40 @@ class BrowserPreviewControlClient implements ControlClient {
     command: string[],
     distribution: string | null
   ): Promise<TerminalSession> {
-    this.findWorkspace(workspaceId);
-    this.mountPreviewSurface(workspaceId);
-    this.session = {
-      sessionId: "ses_browser_preview_agent",
-      backendKind: "wsl-tmux-control",
-      state: "preview"
-    };
-    this.sessionWorkspaceId = workspaceId;
     const label = command.join(" ") || "agent";
-    this.output = [
+    return this.createPreviewTerminal(workspaceId, "wsl-tmux-control", "wsl-tmux-control", [
       "\r\n$ " + label + "   (durable tmux · " + (distribution ?? "WSL") + ")",
       "\r\nagentmux 에이전트 세션 preview — 실제 실행/durable 복원은 Tauri에서 동작",
       "\r\n"
-    ].join("");
-    return this.session;
+    ].join(""));
   }
 
-  async readRecent(_sessionId: string, _maxBytes: number): Promise<string> {
-    return this.output;
+  async readRecent(sessionId: string, _maxBytes: number): Promise<string> {
+    return this.outputs.get(sessionId) ?? "";
   }
 
-  async getSession(): Promise<TerminalSession> {
+  async getSession(sessionId: string): Promise<TerminalSession> {
     return (
-      this.session ?? {
-        sessionId: "ses_browser_preview",
+      this.sessions.get(sessionId) ?? {
+        sessionId,
         backendKind: "conpty",
-        state: "preview"
+        state: "lost"
       }
     );
   }
 
-  async sendText(_sessionId: string, text: string): Promise<void> {
-    this.output += text;
+  async sendText(sessionId: string, text: string): Promise<void> {
+    let output = this.outputs.get(sessionId) ?? "";
+    output += text;
     if (text.includes("\r")) {
-      this.output += "C:\\agentmux> ";
+      output += "C:\\agentmux> ";
     }
+    this.outputs.set(sessionId, output);
   }
 
-  async sendKey(_sessionId: string, key: string): Promise<void> {
+  async sendKey(sessionId: string, key: string): Promise<void> {
     if (key === "enter") {
-      this.output += "\r\n";
+      this.outputs.set(sessionId, (this.outputs.get(sessionId) ?? "") + "\r\n");
     }
   }
 
@@ -1308,24 +1301,104 @@ class BrowserPreviewControlClient implements ControlClient {
     return surface;
   }
 
-  private mountPreviewSurface(workspaceId: string): void {
+  private createPreviewTerminal(
+    workspaceId: string,
+    backendKind: string,
+    title: string,
+    output: string
+  ): TerminalSession {
+    this.findWorkspace(workspaceId);
+    const suffix = ++this.terminalCounter;
+    const sessionId = `ses_browser_preview_${suffix}`;
+    const surfaceId = `surf_browser_preview_terminal_${suffix}`;
+    const session: TerminalSession = {
+      sessionId,
+      backendKind,
+      state: "preview"
+    };
+    this.sessions.set(sessionId, session);
+    this.terminalSurfaces.push({
+      surfaceId,
+      workspaceId,
+      surfaceType: "terminal",
+      title,
+      sessionId,
+      browserId: null
+    });
+    this.outputs.set(sessionId, output);
+    this.lastSessionId = sessionId;
+    this.mountPreviewSurface(workspaceId, surfaceId);
+    return session;
+  }
+
+  private mountPreviewSurface(workspaceId: string, surfaceId: string): void {
     const workspace = this.findWorkspace(workspaceId);
     const pane = (this.panes.get(workspaceId) ?? []).find(
       (candidate) => candidate.paneId === workspace.activePaneId
     );
     if (pane) {
-      pane.mountedSurfaceId = "surf_browser_preview";
+      for (const candidate of this.panes.get(workspaceId) ?? []) {
+        if (candidate.mountedSurfaceId === surfaceId) {
+          candidate.mountedSurfaceId = null;
+        }
+      }
+      pane.mountedSurfaceId = surfaceId;
+    }
+  }
+
+  private surfaceHasRunningSession(surfaceId: string): boolean {
+    const surface = this.terminalSurfaces.find((candidate) => candidate.surfaceId === surfaceId);
+    if (!surface?.sessionId) {
+      return false;
+    }
+    const session = this.sessions.get(surface.sessionId);
+    return Boolean(session && !["exited", "failed", "lost", "disconnected"].includes(session.state));
+  }
+
+  private closeSurface(surfaceId: string): void {
+    for (const panes of this.panes.values()) {
+      for (const pane of panes) {
+        if (pane.mountedSurfaceId === surfaceId) {
+          pane.mountedSurfaceId = null;
+        }
+      }
+    }
+
+    const terminalIndex = this.terminalSurfaces.findIndex(
+      (surface) => surface.surfaceId === surfaceId
+    );
+    if (terminalIndex >= 0) {
+      const sessionId = this.terminalSurfaces[terminalIndex].sessionId;
+      if (sessionId) {
+        this.sessions.delete(sessionId);
+        this.outputs.delete(sessionId);
+        this.agentStates.delete(sessionId);
+      }
+      this.terminalSurfaces.splice(terminalIndex, 1);
+      return;
+    }
+
+    const browserIndex = this.browserSurfaces.findIndex(
+      (surface) => surface.surfaceId === surfaceId
+    );
+    if (browserIndex >= 0) {
+      this.browserUrls.delete(surfaceId);
+      this.browserSurfaces.splice(browserIndex, 1);
     }
   }
 
   private applySyntheticAgentState(detail: SyntheticAgentStateDetail = {}): void {
-    const workspaceId = detail.workspaceId ?? this.sessionWorkspaceId;
+    const sessionId = detail.sessionId ?? this.lastSessionId;
+    const session = sessionId ? this.sessions.get(sessionId) : undefined;
+    const surface = sessionId
+      ? this.terminalSurfaces.find((candidate) => candidate.sessionId === sessionId)
+      : undefined;
+    const workspaceId = detail.workspaceId ?? surface?.workspaceId;
     const workspace = workspaceId ? this.findWorkspace(workspaceId) : this.workspaces[0] ?? null;
-    if (!workspace || !this.session) {
+    if (!workspace || !session || !sessionId) {
       return;
     }
 
-    const sessionId = detail.sessionId ?? this.session.sessionId;
     const state = detail.state ?? "waiting_for_input";
     const reason = detail.reason ?? "Synthetic attention requested.";
     const now = new Date().toISOString();

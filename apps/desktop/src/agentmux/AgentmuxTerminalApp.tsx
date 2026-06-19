@@ -207,13 +207,7 @@ export function AgentmuxTerminalApp() {
     await ctl.spawnNativeTerminal();
   };
   const addTerminal = async () => {
-    const active = activePaneId ? paneById.get(activePaneId) : undefined;
-    if (active && active.kind === "leaf" && !active.mountedSurfaceId) {
-      await ctl.spawnNativeTerminal();
-    } else {
-      // Create an empty pane the user can fill (avoids replacing a live terminal).
-      await ctl.splitActivePane("vertical");
-    }
+    await ctl.spawnNativeTerminal();
   };
   const splitPaneBy = async (paneId: string, axis: "horizontal" | "vertical") => {
     await ctl.focusPane(paneId);
@@ -383,6 +377,9 @@ export function AgentmuxTerminalApp() {
     return (
       <div
         key={pane.paneId}
+        data-agentmux-pane={pane.paneId}
+        data-agentmux-mounted={surface ? "true" : "false"}
+        data-agentmux-active={active ? "true" : "false"}
         onMouseDown={() => void ctl.focusPane(pane.paneId)}
         style={{
           minHeight: 0,
@@ -542,14 +539,14 @@ export function AgentmuxTerminalApp() {
           {/* right: tabs + mosaic */}
           <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", background: "var(--canvas)" }}>
             <div style={{ height: 38, flex: "none", display: "flex", alignItems: "stretch", background: "var(--surface)", borderBottom: "1px solid var(--border)", overflow: "hidden" }}>
-              {terminalSurfaces.map((surface) => {
+              {surfaces.map((surface) => {
                 const host = paneHostingSurface(surface.surfaceId);
                 const on = host?.paneId === activePaneId;
                 const session = surface.sessionId ? sessionById.get(surface.sessionId) : undefined;
                 const att = session ? Boolean(attentionBySession.get(session.sessionId)) : false;
                 return (
-                  <Hov key={surface.surfaceId} style={{ display: "flex", alignItems: "center", gap: 7, padding: "0 11px 0 13px", maxWidth: 240, borderRight: "1px solid var(--border-subtle)", cursor: "pointer", background: on ? "var(--canvas)" : "transparent", boxShadow: on ? "inset 0 2px 0 var(--accent)" : "none" }} hover={on ? {} : { background: "var(--s2)" }} onClick={() => { if (host) void ctl.focusPane(host.paneId); }}>
-                    <span style={{ color: "var(--fg4)", display: "flex", flex: "none" }}><IconShellArrow /></span>
+                  <Hov key={surface.surfaceId} className="agentmux-surface-tab" style={{ display: "flex", alignItems: "center", gap: 7, padding: "0 11px 0 13px", maxWidth: 240, borderRight: "1px solid var(--border-subtle)", cursor: "pointer", background: on ? "var(--canvas)" : "transparent", boxShadow: on ? "inset 0 2px 0 var(--accent)" : "none" }} hover={on ? {} : { background: "var(--s2)" }} onClick={() => { if (host) void ctl.focusPane(host.paneId); else void ctl.mountSurface(surface.surfaceId); }}>
+                    <span style={{ color: "var(--fg4)", display: "flex", flex: "none" }}>{surface.surfaceType === "browser" ? <IconGrid size={12} /> : <IconShellArrow />}</span>
                     <span style={{ font: `500 12px/1 ${FONT_SANS}`, color: on ? "var(--fg1)" : "var(--fg3)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{surface.title}</span>
                     {att ? <span style={{ width: 6, height: 6, borderRadius: "50%", background: T.warn, flex: "none" }} /> : null}
                     <Hov tag="span" style={{ width: 17, height: 17, borderRadius: 5, flex: "none", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg4)" }} hover={{ background: "var(--s3)", color: "var(--fg1)" }} onClick={(e) => { e.stopPropagation(); if (host?.parentPaneId) void ctl.closePane(host.paneId); }}>
@@ -589,7 +586,7 @@ export function AgentmuxTerminalApp() {
           <div style={{ width: 1, height: 13, background: "var(--border)", margin: "0 12px" }} />
           <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>{activeWorkspace?.projectRoot ?? ""}</span>
           <div style={{ flex: 1 }} />
-          <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>{terminalSurfaces.length}터미널 · {runningCount}실행</span>
+          <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>{surfaces.length}surface · {terminalSurfaces.length}터미널 · {runningCount}실행</span>
           <div style={{ width: 1, height: 13, background: "var(--border)", margin: "0 12px" }} />
           <span style={{ fontSize: 11, color: "var(--fg3)" }}>{activeSessionState?.backendKind ?? "agentmux"}</span>
           <div style={{ width: 1, height: 13, background: "var(--border)", margin: "0 12px" }} />

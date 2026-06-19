@@ -41,6 +41,7 @@ export interface AgentmuxControl {
   resizePane: (paneId: string, ratio: number) => void;
   focusPane: (paneId: string) => Promise<void>;
   closePane: (paneId: string) => Promise<void>;
+  mountSurface: (surfaceId: string, paneId?: string) => Promise<void>;
   createBrowserSurface: () => Promise<void>;
   clearAttention: (sessionId: string) => Promise<void>;
   dismissNotification: (notificationId: string) => Promise<void>;
@@ -67,12 +68,14 @@ export function useAgentmuxControl(): AgentmuxControl {
   const [profiles, setProfiles] = useState<SshProfile[]>([]);
 
   const activeRef = useRef<string | null>(null);
+  const detailRef = useRef<WorkspaceDetail | null>(null);
   activeRef.current = activeWorkspaceId;
 
   const loadDetail = useCallback(
     async (workspaceId: string) => {
       const next = await client.getWorkspace(workspaceId);
       if (activeRef.current === workspaceId) {
+        detailRef.current = next;
         setDetail(next);
       }
       return next;
@@ -209,6 +212,7 @@ export function useAgentmuxControl(): AgentmuxControl {
       if (next) {
         await loadDetail(next);
       } else {
+        detailRef.current = null;
         setDetail(null);
       }
     },
@@ -216,7 +220,7 @@ export function useAgentmuxControl(): AgentmuxControl {
   );
 
   const withActive = useCallback(
-    async (action: (workspaceId: string) => Promise<unknown>) => {
+    async (action: (workspaceId: string) => Promise<unknown>): Promise<void> => {
       const workspaceId = activeRef.current;
       if (!workspaceId) {
         return;
@@ -232,22 +236,60 @@ export function useAgentmuxControl(): AgentmuxControl {
     [loadDetail]
   );
 
+  const getCurrentDetail = useCallback(
+    async (workspaceId: string) => {
+      const current = detailRef.current;
+      if (current?.workspace.workspaceId === workspaceId) {
+        return current;
+      }
+      return client.getWorkspace(workspaceId);
+    },
+    [client]
+  );
+
+  const prepareActivePaneForNewSurface = useCallback(
+    async (workspaceId: string) => {
+      const current = await getCurrentDetail(workspaceId);
+      const activePane = current.panes.find(
+        (pane) => pane.paneId === current.workspace.activePaneId
+      );
+      if (!activePane || activePane.kind !== "leaf" || !activePane.mountedSurfaceId) {
+        return;
+      }
+
+      const split = await client.splitPane(workspaceId, activePane.paneId, "vertical");
+      const emptyChild = split.panes.find(
+        (pane) => pane.parentPaneId === activePane.paneId && !pane.mountedSurfaceId
+      );
+      if (emptyChild) {
+        await client.focusPane(workspaceId, emptyChild.paneId);
+      }
+    },
+    [client, getCurrentDetail]
+  );
+
   const spawnNativeTerminal = useCallback(
-    () => withActive((workspaceId) => client.spawnNativeTerminal(workspaceId, ["cmd.exe", "/d", "/q"])),
-    [client, withActive]
+    () =>
+      withActive(async (workspaceId) => {
+        await prepareActivePaneForNewSurface(workspaceId);
+        return client.spawnNativeTerminal(workspaceId, ["cmd.exe", "/d", "/q"]);
+      }),
+    [client, prepareActivePaneForNewSurface, withActive]
   );
 
   const spawnWslTerminal = useCallback(
     (distribution: string) =>
-      withActive((workspaceId) =>
-        client.spawnWslTerminal(workspaceId, distribution || null, DEFAULT_PROJECT_ROOT)
-      ),
-    [client, withActive]
+      withActive(async (workspaceId) => {
+        await prepareActivePaneForNewSurface(workspaceId);
+        return client.spawnWslTerminal(workspaceId, distribution || null, DEFAULT_PROJECT_ROOT);
+      }),
+    [client, prepareActivePaneForNewSurface, withActive]
   );
 
   const spawnAgent = useCallback(
     (command: string[]) =>
-      withActive((workspaceId) => {
+      withActive(async (workspaceId) => {
+        await prepareActivePaneForNewSurface(workspaceId);
         // Launch the agent CLI in a durable WSL-tmux session so it survives
         // detach/restart. Uses the default WSL distribution.
         const distribution =
@@ -256,34 +298,37 @@ export function useAgentmuxControl(): AgentmuxControl {
           null;
         return client.spawnAgentTerminal(workspaceId, command, distribution);
       }),
-    [client, withActive, wslDistributions]
+    [client, prepareActivePaneForNewSurface, withActive, wslDistributions]
   );
 
   const splitActivePane = useCallback(
     (axis: "horizontal" | "vertical") =>
-      withActive((workspaceId) => {
-        const paneId = detail?.workspace.activePaneId;
+      withActive(async (workspaceId) => {
+        const current = await getCurrentDetail(workspaceId);
+        const paneId = current.workspace.activePaneId;
         if (!paneId) {
           return Promise.resolve();
         }
         return client.splitPane(workspaceId, paneId, axis);
       }),
-    [client, detail?.workspace.activePaneId, withActive]
+    [client, getCurrentDetail, withActive]
   );
 
   const resizePane = useCallback(
     (paneId: string, ratio: number) => {
       const clamped = Math.min(0.9, Math.max(0.1, ratio));
-      setDetail((current) =>
-        current
+      setDetail((current) => {
+        const next = current
           ? {
               ...current,
               panes: current.panes.map((pane) =>
                 pane.paneId === paneId ? { ...pane, splitRatio: clamped } : pane
               )
             }
-          : current
-      );
+          : current;
+        detailRef.current = next;
+        return next;
+      });
       const workspaceId = activeRef.current;
       if (workspaceId) {
         void client.resizePaneLayout(workspaceId, paneId, clamped).catch(() => undefined);
@@ -295,8 +340,35 @@ export function useAgentmuxControl(): AgentmuxControl {
   const createBrowserSurface = useCallback(
     () =>
       // pane omitted -> backend mounts the browser surface on the active pane.
-      withActive((workspaceId) => client.createBrowserSurface(workspaceId, undefined, "default")),
-    [client, withActive]
+      withActive(async (workspaceId) => {
+        await prepareActivePaneForNewSurface(workspaceId);
+        return client.createBrowserSurface(workspaceId, undefined, "default");
+      }),
+    [client, prepareActivePaneForNewSurface, withActive]
+  );
+
+  const mountSurface = useCallback(
+    (surfaceId: string, paneId?: string) =>
+      withActive(async (workspaceId) => {
+        if (paneId) {
+          return client.mountSurface(workspaceId, paneId, surfaceId);
+        }
+
+        const current = await getCurrentDetail(workspaceId);
+        const activePane = current.panes.find(
+          (pane) => pane.paneId === current.workspace.activePaneId
+        );
+        if (
+          activePane?.mountedSurfaceId &&
+          activePane.mountedSurfaceId !== surfaceId
+        ) {
+          await prepareActivePaneForNewSurface(workspaceId);
+        }
+
+        const next = await client.getWorkspace(workspaceId);
+        return client.mountSurface(workspaceId, next.workspace.activePaneId, surfaceId);
+      }),
+    [client, getCurrentDetail, prepareActivePaneForNewSurface, withActive]
   );
 
   const focusPane = useCallback(
@@ -344,13 +416,14 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const connectProfile = useCallback(
     (profile: SshProfile) =>
-      withActive((workspaceId) => {
+      withActive(async (workspaceId) => {
+        await prepareActivePaneForNewSurface(workspaceId);
         const target = profile.port
           ? `${profile.user}@${profile.host}:${profile.port}`
           : `${profile.user}@${profile.host}`;
         return client.spawnSshTerminal(workspaceId, target);
       }),
-    [client, withActive]
+    [client, prepareActivePaneForNewSurface, withActive]
   );
 
   const attentionByWorkspace = useMemo(() => {
@@ -397,6 +470,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     resizePane,
     focusPane,
     closePane,
+    mountSurface,
     createBrowserSurface,
     clearAttention,
     dismissNotification,

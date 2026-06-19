@@ -1,5 +1,5 @@
-// Hide the Windows console window in release builds (this is a GUI app).
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Hide the Windows console window for the GUI app, including local dev/debug launches.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::sync::Arc;
 
