@@ -1,3 +1,6 @@
+// Hide the Windows console window in release builds (this is a GUI app).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::sync::Arc;
 
 use agentmux_desktop_host::{

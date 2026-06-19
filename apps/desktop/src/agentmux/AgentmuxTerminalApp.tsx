@@ -35,9 +35,7 @@ import {
   IconShellArrow,
   IconSplitCols,
   IconSplitRows,
-  IconSun,
-  IconWinMaximize,
-  IconWinMinimize
+  IconSun
 } from "./icons";
 
 type Overlay = "palette" | "search" | "settings" | null;
@@ -99,25 +97,6 @@ function sessionLabel(session: TerminalSession | undefined, attention: boolean):
     default:
       return session.state;
   }
-}
-
-type TauriWindowApi = {
-  getCurrentWindow?: () => {
-    minimize: () => Promise<void>;
-    toggleMaximize: () => Promise<void>;
-    close: () => Promise<void>;
-  };
-};
-
-// Drive the real OS window from the custom (frameless) titlebar. No-ops in a
-// plain browser, where window.__TAURI__ is absent.
-function tauriWindow(action: "minimize" | "toggleMaximize" | "close"): void {
-  const api = (window as unknown as { __TAURI__?: { window?: TauriWindowApi } }).__TAURI__?.window;
-  const current = api?.getCurrentWindow?.();
-  if (!current) return;
-  if (action === "minimize") void current.minimize();
-  else if (action === "toggleMaximize") void current.toggleMaximize();
-  else void current.close();
 }
 
 export function AgentmuxTerminalApp() {
@@ -478,7 +457,7 @@ export function AgentmuxTerminalApp() {
       {/* ============ APP SHELL (fills the OS window) ============ */}
       <div style={{ position: "relative", flex: "1 1 0", minHeight: 0, minWidth: 0, background: "var(--canvas)", overflow: "hidden", display: "flex", flexDirection: "column" }}>
         {/* titlebar — custom/frameless (decorations: false) */}
-        <div data-tauri-drag-region style={{ height: 40, flex: "none", display: "flex", alignItems: "center", padding: "0 0 0 12px", background: "var(--surface)", borderBottom: "1px solid var(--border)" }}>
+        <div data-tauri-drag-region style={{ height: 40, flex: "none", display: "flex", alignItems: "center", padding: "0 10px 0 12px", background: "var(--surface)", borderBottom: "1px solid var(--border)" }}>
           <BrandLogo size={17} radius={14} />
           <span style={{ font: `700 13px/1 ${FONT_MONO}`, letterSpacing: "-0.02em", color: "var(--fg1)", marginLeft: 9 }}>agentmux</span>
           <span style={{ color: "var(--fg4)", fontSize: 12, margin: "0 8px" }}>›</span>
@@ -505,12 +484,6 @@ export function AgentmuxTerminalApp() {
           <Hov tag="button" style={{ ...iconBtn, marginRight: 2 }} hover={iconBtnHover} onClick={() => setOverlay("search")}><IconSearch /></Hov>
           <Hov tag="button" style={{ ...iconBtn, marginRight: 2 }} hover={iconBtnHover} onClick={() => { setOverlay("palette"); setQuery(""); }}><IconGrid /></Hov>
           <Hov tag="button" style={iconBtn} hover={iconBtnHover} onClick={() => setOverlay("settings")}><IconGear /></Hov>
-          <div style={{ width: 1, height: 18, background: "var(--border)", margin: "0 6px" }} />
-          <div style={{ display: "flex", alignItems: "center", height: "100%" }}>
-            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "var(--s2)" }} onClick={() => tauriWindow("minimize")}><IconWinMinimize /></Hov>
-            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "var(--s2)" }} onClick={() => tauriWindow("toggleMaximize")}><IconWinMaximize /></Hov>
-            <Hov style={{ width: 46, height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--fg3)", cursor: "pointer" }} hover={{ background: "#E81123", color: "#fff" }} onClick={() => tauriWindow("close")}><IconClose /></Hov>
-          </div>
         </div>
 
         {/* body */}
