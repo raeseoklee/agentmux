@@ -17,3 +17,7 @@ serde_json = "1"
 [[bin]]
 name = "agentmux"
 path = "src/main.rs"
+
+[[bin]]
+name = "cmux"
+path = "src/cmux.rs"

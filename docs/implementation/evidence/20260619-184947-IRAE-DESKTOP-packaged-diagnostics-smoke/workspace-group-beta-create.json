@@ -1,0 +1,9 @@
+{
+  "schema": "agentmux.control.v1",
+  "id": "cli_workspace_group_create",
+  "outcome": {
+    "Ok": {
+      "result_json": "{\"group_id\":\"wsg_1781862592599641500\",\"name\":\"SmokeBetaGroup\",\"anchor_workspace_id\":null,\"collapsed\":false,\"pinned\":false,\"color\":null,\"icon\":null,\"sort_order\":1,\"created_at\":\"1781862592.599Z\",\"updated_at\":\"1781862592.599Z\",\"members\":[{\"workspace_id\":\"ws_00000003\",\"position\":0}]}"
+    }
+  }
+}

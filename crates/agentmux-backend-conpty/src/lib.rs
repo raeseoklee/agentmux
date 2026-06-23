@@ -71,6 +71,32 @@ pub fn command_line(command: &CommandSpec) -> String {
         .join(" ")
 }
 
+fn environment_block(overrides: &[(String, String)]) -> Vec<u16> {
+    let mut entries = std::env::vars().collect::<Vec<_>>();
+    for (key, value) in overrides {
+        if key.is_empty() || key.contains('=') {
+            continue;
+        }
+        if let Some((_, existing_value)) = entries
+            .iter_mut()
+            .find(|(existing_key, _)| existing_key.eq_ignore_ascii_case(key))
+        {
+            *existing_value = value.clone();
+        } else {
+            entries.push((key.clone(), value.clone()));
+        }
+    }
+    entries.sort_by_key(|(key, _)| key.to_ascii_uppercase());
+
+    let mut block = Vec::new();
+    for (key, value) in entries {
+        block.extend(format!("{key}={value}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 fn quote_windows_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "\"\"".to_string();
@@ -118,7 +144,7 @@ mod platform {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::Console::{
         ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
@@ -127,7 +153,7 @@ mod platform {
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
         InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
         PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
         STARTUPINFOEXW,
     };
@@ -200,18 +226,19 @@ mod platform {
                 }
 
                 session.exit_reported = true;
-                exited.push(BackendEvent::Exited {
-                    session_id: session.session_id.clone(),
-                    code: if code == u32::MAX {
+                exited.push((
+                    session.session_id.clone(),
+                    if code == u32::MAX {
                         None
                     } else {
                         Some(code as i32)
                     },
-                });
+                ));
             }
 
-            for event in exited {
-                self.push_event(event);
+            for (session_id, code) in exited {
+                self.sessions.remove(&session_id);
+                self.push_event(BackendEvent::Exited { session_id, code });
             }
         }
     }
@@ -264,6 +291,13 @@ mod platform {
                 )));
             }
 
+            unsafe {
+                close_if_nonzero(input_read);
+                close_if_nonzero(output_write);
+            }
+            input_read = null_mut();
+            output_write = null_mut();
+
             let mut attribute_list = match ProcThreadAttributeList::new(hpc) {
                 Ok(list) => list,
                 Err(error) => {
@@ -279,16 +313,20 @@ mod platform {
             };
             let mut startup_info: STARTUPINFOEXW = unsafe { zeroed() };
             startup_info.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+            // Test runners and desktop hosts can have redirected standard handles.
+            // Detach those inherited handles so the child talks through ConPTY.
             startup_info.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-            startup_info.StartupInfo.hStdInput = null_mut();
-            startup_info.StartupInfo.hStdOutput = null_mut();
-            startup_info.StartupInfo.hStdError = null_mut();
+            startup_info.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+            startup_info.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+            startup_info.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
             startup_info.lpAttributeList = attribute_list.as_mut_ptr();
 
             let mut process_info: PROCESS_INFORMATION = unsafe { zeroed() };
             let mut command_line = wide_null(&command_line(&request.command));
             let mut cwd = request.cwd.as_ref().map(|path| wide_null(path));
             let cwd_ptr = cwd.as_mut().map_or(null(), |value| value.as_ptr());
+            let mut environment = environment_block(&request.env);
+            let environment_ptr = environment.as_mut_ptr().cast();
             let session_id = request.session_id.clone();
             let events = Arc::clone(&self.events);
             spawn_output_reader(session_id.clone(), output_read, events);
@@ -300,8 +338,8 @@ mod platform {
                     null(),
                     null(),
                     0,
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                    null(),
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    environment_ptr,
                     cwd_ptr,
                     &startup_info.StartupInfo,
                     &mut process_info,
@@ -319,8 +357,6 @@ mod platform {
             }
 
             unsafe {
-                close_if_nonzero(input_read);
-                close_if_nonzero(output_write);
                 close_if_nonzero(process_info.hThread);
             }
 

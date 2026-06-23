@@ -6,6 +6,7 @@ The current repository contains the product requirements and implementation desi
 
 ## Documentation
 
+- [User-facing feature list](./docs/features.md)
 - [System requirements and detailed design](./docs/ieee-29148-system-design.md)
 - [Implementation documents](./docs/implementation/README.md)
 - [Implementation roadmap](./docs/implementation/00-implementation-roadmap.md)
@@ -32,7 +33,7 @@ cargo test --workspace
 npm --prefix apps/desktop run build
 npm --prefix apps/desktop run tauri:build -- --debug --no-bundle --ci
 cargo run -p agentmux-bench-single-terminal-latency
+npm run skills:install
 ```
 
 Use `tools/bootstrap-windows.ps1` to check whether Git, Rust, Node.js, and npm are available on a Windows development machine.
-

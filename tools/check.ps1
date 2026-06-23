@@ -13,6 +13,9 @@ $cargoPath = if ($cargoCommand) { $cargoCommand.Source } else { $null }
 if (-not $cargoPath -and (Test-Path $localCargo)) {
   $env:CARGO_HOME = $localCargoHome
   $env:RUSTUP_HOME = $localRustupHome
+  if (-not $env:RUSTUP_TOOLCHAIN) {
+    $env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
+  }
   $cargoPath = $localCargo
 }
 

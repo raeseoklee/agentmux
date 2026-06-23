@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentMux Control"
+  short_description: "Control AgentMux CLI, Dock, browser, and diagnostics."
+  default_prompt: "Use $agentmux-control to inspect AgentMux status and run a safe workspace control workflow."

@@ -50,6 +50,22 @@ impl WslDirectConfig {
             ..Self::default()
         }
     }
+
+    pub fn for_interactive_terminal() -> Self {
+        Self {
+            validate_distribution: false,
+            validate_launch: false,
+            prefer_wslpath: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn for_interactive_distribution(distribution: impl Into<String>) -> Self {
+        Self {
+            distribution: Some(distribution.into()),
+            ..Self::for_interactive_terminal()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,9 +191,16 @@ pub fn distribution_discovery_command() -> CommandSpec {
     CommandSpec::with_args(WSL_EXE, vec!["--list".to_string(), "--quiet".to_string()])
 }
 
+pub fn distribution_status_command() -> CommandSpec {
+    CommandSpec::with_args(WSL_EXE, vec!["--status".to_string()])
+}
+
+pub fn distribution_verbose_command() -> CommandSpec {
+    CommandSpec::with_args(WSL_EXE, vec!["--list".to_string(), "--verbose".to_string()])
+}
+
 pub fn parse_distribution_list(output: &str) -> Vec<WslDistribution> {
-    output
-        .replace('\0', "")
+    clean_wsl_output(output)
         .lines()
         .filter_map(|line| {
             let mut name = line.trim().trim_start_matches('\u{feff}').trim();
@@ -197,6 +220,50 @@ pub fn parse_distribution_list(output: &str) -> Vec<WslDistribution> {
         .collect()
 }
 
+pub fn parse_default_distribution_status(output: &str) -> Option<String> {
+    clean_wsl_output(output).lines().find_map(|line| {
+        let line = line.trim().trim_start_matches('\u{feff}').trim();
+        let (label, value) = line.split_once(':')?;
+        let label = label.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if label.contains("default") && label.contains("distribution") && !value.is_empty() {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+pub fn parse_default_distribution_verbose(output: &str) -> Option<String> {
+    clean_wsl_output(output).lines().find_map(|line| {
+        let mut line = line.trim().trim_start_matches('\u{feff}').trim();
+        if !line.starts_with('*') {
+            return None;
+        }
+        line = line.trim_start_matches('*').trim();
+        let name = strip_verbose_distribution_columns(line)?;
+        (!name.is_empty()).then(|| name.to_string())
+    })
+}
+
+pub fn apply_default_distribution(
+    distributions: &mut [WslDistribution],
+    default_name: &str,
+) -> bool {
+    let default_name = default_name.trim();
+    if default_name.is_empty() {
+        return false;
+    }
+
+    let mut matched = false;
+    for distribution in distributions {
+        let is_default = distribution.name.eq_ignore_ascii_case(default_name);
+        distribution.is_default = is_default;
+        matched |= is_default;
+    }
+    matched
+}
+
 pub fn distributions_or_diagnostic(output: &str) -> Result<Vec<WslDistribution>, WslDiagnostic> {
     let distributions = parse_distribution_list(output);
     if distributions.is_empty() {
@@ -208,18 +275,15 @@ pub fn distributions_or_diagnostic(output: &str) -> Result<Vec<WslDistribution>,
 
 pub fn discover_wsl_distributions() -> Result<Vec<WslDistribution>, WslDiagnostic> {
     let command = distribution_discovery_command();
-    let output = Command::new(&command.executable)
-        .args(&command.args)
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                WslDiagnostic::wsl_unavailable("wsl.exe was not found.")
-            } else {
-                WslDiagnostic::wsl_unavailable(format!(
-                    "Failed to run wsl.exe distribution discovery: {error}"
-                ))
-            }
-        })?;
+    let output = hidden_command(&command).output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WslDiagnostic::wsl_unavailable("wsl.exe was not found.")
+        } else {
+            WslDiagnostic::wsl_unavailable(format!(
+                "Failed to run wsl.exe distribution discovery: {error}"
+            ))
+        }
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -231,7 +295,52 @@ pub fn discover_wsl_distributions() -> Result<Vec<WslDistribution>, WslDiagnosti
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    distributions_or_diagnostic(&stdout)
+    let mut distributions = distributions_or_diagnostic(&stdout)?;
+    if let Some(default_name) = discover_default_wsl_distribution() {
+        apply_default_distribution(&mut distributions, &default_name);
+    }
+    Ok(distributions)
+}
+
+fn discover_default_wsl_distribution() -> Option<String> {
+    let verbose = distribution_verbose_command();
+    if let Ok(output) = hidden_command(&verbose).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(default_name) = parse_default_distribution_verbose(&stdout) {
+                return Some(default_name);
+            }
+        }
+    }
+
+    let status = distribution_status_command();
+    if let Ok(output) = hidden_command(&status).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return parse_default_distribution_status(&stdout);
+        }
+    }
+
+    None
+}
+
+fn clean_wsl_output(output: &str) -> String {
+    output.replace('\0', "")
+}
+
+fn strip_verbose_distribution_columns(line: &str) -> Option<&str> {
+    let without_version = trim_last_whitespace_token(line)?;
+    let without_state = trim_last_whitespace_token(without_version)?;
+    Some(without_state.trim())
+}
+
+fn trim_last_whitespace_token(value: &str) -> Option<&str> {
+    let value = value.trim_end();
+    let (index, _) = value
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())?;
+    Some(value[..index].trim_end())
 }
 
 pub fn validate_selected_distribution(
@@ -379,10 +488,7 @@ pub fn resolve_windows_path_with_wslpath(
 ) -> Option<String> {
     fallback_windows_path_to_wsl(windows_path)?;
     let command = wslpath_command(distribution, windows_path);
-    let output = Command::new(command.executable)
-        .args(command.args)
-        .output()
-        .ok()?;
+    let output = hidden_command(&command).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -426,8 +532,8 @@ fn run_command_with_timeout(
     command: &CommandSpec,
     timeout: Duration,
 ) -> std::io::Result<TimedCommandStatus> {
-    let mut child = Command::new(&command.executable)
-        .args(&command.args)
+    let mut command = hidden_command(command);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -451,6 +557,24 @@ fn run_command_with_timeout(
         thread::sleep(sleep_for);
     }
 }
+
+fn hidden_command(spec: &CommandSpec) -> Command {
+    let mut command = Command::new(&spec.executable);
+    command.args(&spec.args);
+    hide_console_window(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_command: &mut Command) {}
 
 #[allow(dead_code)]
 fn legacy_direct_launch_command(
@@ -581,6 +705,23 @@ mod tests {
     }
 
     #[test]
+    fn status_command_uses_wsl_status() {
+        let command = distribution_status_command();
+        assert_eq!(command.executable, WSL_EXE);
+        assert_eq!(command.args, vec!["--status".to_string()]);
+    }
+
+    #[test]
+    fn verbose_command_uses_wsl_list_verbose() {
+        let command = distribution_verbose_command();
+        assert_eq!(command.executable, WSL_EXE);
+        assert_eq!(
+            command.args,
+            vec!["--list".to_string(), "--verbose".to_string()]
+        );
+    }
+
+    #[test]
     fn distribution_parser_handles_quiet_and_default_markers() {
         assert_eq!(
             parse_distribution_list("\u{feff}Ubuntu\0\r\n* Debian\r\n"),
@@ -593,6 +734,55 @@ mod tests {
                     name: "Debian".to_string(),
                     is_default: true
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn status_parser_extracts_default_distribution_from_nul_output() {
+        assert_eq!(
+            parse_default_distribution_status(
+                "\u{feff}Default Distribution:\0 Ubuntu\0\r\nDefault Version:\0 2\0\r\n"
+            ),
+            Some("Ubuntu".to_string())
+        );
+    }
+
+    #[test]
+    fn verbose_parser_extracts_starred_default_distribution() {
+        assert_eq!(
+            parse_default_distribution_verbose(
+                "\u{feff}  NAME      STATE           VERSION\r\n* Ubuntu    Stopped         2\r\n  Debian    Running         2\r\n"
+            ),
+            Some("Ubuntu".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_default_distribution_marks_matching_distribution() {
+        let mut distributions = vec![
+            WslDistribution {
+                name: "Ubuntu".to_string(),
+                is_default: false,
+            },
+            WslDistribution {
+                name: "Debian".to_string(),
+                is_default: true,
+            },
+        ];
+
+        assert!(apply_default_distribution(&mut distributions, "ubuntu"));
+        assert_eq!(
+            distributions,
+            vec![
+                WslDistribution {
+                    name: "Ubuntu".to_string(),
+                    is_default: true,
+                },
+                WslDistribution {
+                    name: "Debian".to_string(),
+                    is_default: false,
+                },
             ]
         );
     }
@@ -730,6 +920,22 @@ mod tests {
             .unwrap(),
             "/mnt/d/work/repo"
         );
+    }
+
+    #[test]
+    fn interactive_terminal_config_skips_preflight_wsl_processes() {
+        let config = WslDirectConfig::for_interactive_terminal();
+        assert_eq!(config.distribution, None);
+        assert!(!config.validate_distribution);
+        assert!(!config.validate_launch);
+        assert!(!config.prefer_wslpath);
+        assert_eq!(config.default_cwd, DEFAULT_WSL_CWD);
+
+        let config = WslDirectConfig::for_interactive_distribution("Ubuntu");
+        assert_eq!(config.distribution.as_deref(), Some("Ubuntu"));
+        assert!(!config.validate_distribution);
+        assert!(!config.validate_launch);
+        assert!(!config.prefer_wslpath);
     }
 
     #[test]

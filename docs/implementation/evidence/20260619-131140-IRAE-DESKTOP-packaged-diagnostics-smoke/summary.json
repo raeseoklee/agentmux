@@ -1,0 +1,17 @@
+﻿{
+    "generated_at":  "2026-06-19T04:12:44.4983327Z",
+    "desktop_executable":  "D:\\Workspace\\irae\\agentmux\\target\\release\\agentmux-desktop-host.exe",
+    "cli_executable":  "D:\\Workspace\\irae\\agentmux\\target\\debug\\agentmux.exe",
+    "pipe_name":  "\\\\.\\pipe\\agentmux-control-smoke-bee3ae86167846a88902426a2fbc2924",
+    "store_path":  "D:\\Workspace\\irae\\agentmux\\docs\\implementation\\evidence\\20260619-131140-IRAE-DESKTOP-packaged-diagnostics-smoke\\runtime\\agentmux-smoke.sqlite3",
+    "token_path":  "D:\\Workspace\\irae\\agentmux\\docs\\implementation\\evidence\\20260619-131140-IRAE-DESKTOP-packaged-diagnostics-smoke\\runtime\\control.token",
+    "app_process_id":  67152,
+    "diagnostics_schema":  "agentmux.control.v1",
+    "diagnostics_format_version":  "agentmux.diagnostics.v1",
+    "backend_health_count":  0,
+    "queue_pressure_count":  4,
+    "notification_count":  0,
+    "browser_failure_count":  0,
+    "diagnostics_stdout":  "diagnostics-export.json",
+    "diagnostics_stderr":  "diagnostics-export.stderr.txt"
+}

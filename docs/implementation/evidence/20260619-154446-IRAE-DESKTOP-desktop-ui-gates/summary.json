@@ -1,0 +1,29 @@
+﻿{
+    "generated_at":  "2026-06-19T06:45:14.0199836Z",
+    "build_command":  "npm --prefix apps/desktop run build",
+    "build_exit_code":  0,
+    "ui_smoke_command":  "npm --prefix apps/desktop run test:ui",
+    "ui_smoke_exit_code":  0,
+    "ui_smoke_result":  "33 passed",
+    "ui_smoke_passed_count":  33,
+    "dist_index":  "apps/desktop/dist/index.html",
+    "archived_dist":  "dist",
+    "dist_files":  [
+                       {
+                           "path":  "index.html",
+                           "bytes":  782
+                       },
+                       {
+                           "path":  "assets/index-Bz-6VhCs.js",
+                           "bytes":  622072
+                       },
+                       {
+                           "path":  "assets/index-DfE1J81K.css",
+                           "bytes":  14182
+                       }
+                   ],
+    "build_stdout":  "desktop-build.stdout.txt",
+    "build_stderr":  "desktop-build.stderr.txt",
+    "ui_stdout":  "ui-smoke.stdout.txt",
+    "ui_stderr":  "ui-smoke.stderr.txt"
+}

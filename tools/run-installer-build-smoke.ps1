@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $desktopDir = Join-Path $root "apps\desktop"
+$prepareSidecarsScript = Join-Path $root "tools\prepare-desktop-bundle-binaries.ps1"
 $localCargoHome = Join-Path $root ".toolchains\cargo"
 $localRustupHome = Join-Path $root ".toolchains\rustup"
 $localCargo = Join-Path $localCargoHome "bin\cargo.exe"
@@ -63,6 +64,27 @@ function Write-JsonFile {
   $Value | ConvertTo-Json -Depth 12 | Set-Content -Encoding UTF8 -Path $Path
 }
 
+function Get-FileSnapshot {
+  param([string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return [ordered]@{
+      path = $Path
+      exists = $false
+    }
+  }
+
+  $item = Get-Item -LiteralPath $Path
+  $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $Path
+  return [ordered]@{
+    path = $Path.Substring($root.Length).TrimStart("\", "/").Replace("\", "/")
+    exists = $true
+    bytes = $item.Length
+    sha256 = $hash.Hash
+    last_write_time = $item.LastWriteTimeUtc.ToString("o")
+  }
+}
+
 $bundleDir = Join-Path $root "target\release\bundle\nsis"
 $resolvedBundleDir = Resolve-Path $bundleDir -ErrorAction SilentlyContinue
 if ($resolvedBundleDir) {
@@ -74,6 +96,19 @@ if ($resolvedBundleDir) {
 
 $stdoutPath = Join-Path $OutputDir "installer-build.stdout.txt"
 $stderrPath = Join-Path $OutputDir "installer-build.stderr.txt"
+$sidecarStdoutPath = Join-Path $OutputDir "prepare-sidecars.stdout.txt"
+$sidecarStderrPath = Join-Path $OutputDir "prepare-sidecars.stderr.txt"
+
+$sidecarExitCode = Invoke-ProcessCapture `
+  -FilePath "powershell" `
+  -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $prepareSidecarsScript) `
+  -StdoutPath $sidecarStdoutPath `
+  -StderrPath $sidecarStderrPath `
+  -WorkingDirectory $root
+
+if ($sidecarExitCode -ne 0) {
+  throw "sidecar preparation failed with exit code $sidecarExitCode. See $sidecarStderrPath"
+}
 
 $exitCode = Invoke-ProcessCapture `
   -FilePath "cmd.exe" `
@@ -102,9 +137,21 @@ if (-not (Test-Path $releaseExe)) {
   throw "installer build did not produce target/release/agentmux-desktop-host.exe"
 }
 
+$sidecars = @(
+  (Get-FileSnapshot -Path (Join-Path $root "apps\desktop\src-tauri\binaries\agentmux-x86_64-pc-windows-msvc.exe")),
+  (Get-FileSnapshot -Path (Join-Path $root "apps\desktop\src-tauri\binaries\cmux-x86_64-pc-windows-msvc.exe"))
+)
+foreach ($sidecar in $sidecars) {
+  if (-not $sidecar.exists) {
+    throw "installer build sidecar preparation did not produce $($sidecar.path)"
+  }
+}
+
 $summary = [ordered]@{
   generated_at = (Get-Date).ToUniversalTime().ToString("o")
   command = "tauri build --ci --no-sign -b nsis"
+  sidecar_prepare_exit_code = $sidecarExitCode
+  sidecars = $sidecars
   exit_code = $exitCode
   installer_path = $installer.FullName.Substring($root.Length).TrimStart("\", "/").Replace("\", "/")
   archived_installer = [System.IO.Path]::GetFileName($archivedInstaller)
@@ -112,6 +159,8 @@ $summary = [ordered]@{
   installer_sha256 = $hash.Hash
   release_executable = "target/release/agentmux-desktop-host.exe"
   release_executable_bytes = (Get-Item -LiteralPath $releaseExe).Length
+  sidecar_stdout = [System.IO.Path]::GetFileName($sidecarStdoutPath)
+  sidecar_stderr = [System.IO.Path]::GetFileName($sidecarStderrPath)
   stdout = [System.IO.Path]::GetFileName($stdoutPath)
   stderr = [System.IO.Path]::GetFileName($stderrPath)
 }

@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Write};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const CONTROL_SCHEMA: &str = "agentmux.control.v1";
 pub const EVENT_SCHEMA: &str = "agentmux.event.v1";
@@ -239,9 +240,19 @@ pub struct SessionSpawnParams {
     pub backend_profile: Option<String>,
     pub command: Vec<String>,
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVarParam>,
     pub columns: u16,
     pub rows: u16,
     pub durability: Option<String>,
+    pub placement: Option<String>,
+    pub pane_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EnvVarParam {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -275,9 +286,60 @@ pub struct WorkspaceRenameParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceUpdateParams {
+    pub workspace_id: String,
+    pub name: String,
+    pub project_root: Option<String>,
+    pub environment_profile_id: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub default_wsl_distribution: Option<String>,
+    pub default_agent_command: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceCloseParams {
     pub workspace_id: String,
     pub close_policy: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupListParams {}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupCreateParams {
+    pub name: String,
+    pub anchor_workspace_id: Option<String>,
+    pub workspace_ids: Option<Vec<String>>,
+    pub collapsed: Option<bool>,
+    pub pinned: Option<bool>,
+    pub color: Option<String>,
+    pub icon: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupUpdateParams {
+    pub group_id: String,
+    pub name: Option<String>,
+    pub anchor_workspace_id: Option<String>,
+    pub collapsed: Option<bool>,
+    pub pinned: Option<bool>,
+    pub color: Option<String>,
+    pub icon: Option<String>,
+    pub sort_order: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupIdParams {
+    pub group_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupMemberParams {
+    pub group_id: String,
+    pub workspace_id: String,
+    pub position: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -326,6 +388,13 @@ pub struct SurfaceCreateBrowserParams {
     pub workspace_id: String,
     pub pane_id: Option<String>,
     pub profile: Option<String>,
+    pub placement: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SurfaceCloseParams {
+    pub workspace_id: String,
+    pub surface_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -430,8 +499,71 @@ pub struct NotificationListParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationCreateParams {
+    pub title: String,
+    pub body: Option<String>,
+    pub subtitle: Option<String>,
+    pub severity: Option<String>,
+    pub workspace_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NotificationDismissParams {
     pub notification_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationClearParams {
+    pub workspace_id: Option<String>,
+    pub severity: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarWorkspaceParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarStatusSetParams {
+    pub workspace_id: Option<String>,
+    pub key: String,
+    pub label: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub priority: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarStatusKeyParams {
+    pub workspace_id: Option<String>,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SidebarProgressSetParams {
+    pub workspace_id: Option<String>,
+    pub value: f64,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarLogAddParams {
+    pub workspace_id: Option<String>,
+    pub level: Option<String>,
+    pub source: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarLogListParams {
+    pub workspace_id: Option<String>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemIdentifyParams {
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -447,6 +579,11 @@ pub struct BrowserNavigateParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserSurfaceParams {
+    pub surface_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserScreenshotParams {
     pub surface_id: String,
     pub format: Option<String>,
@@ -455,6 +592,7 @@ pub struct BrowserScreenshotParams {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserDomSnapshotParams {
     pub surface_id: String,
+    pub frame_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -463,6 +601,7 @@ pub struct BrowserClickParams {
     pub selector: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
+    pub frame_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -470,12 +609,127 @@ pub struct BrowserTypeParams {
     pub surface_id: String,
     pub selector: String,
     pub text: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserFillParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub text: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserPressParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub key: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserSelectParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub values: Vec<String>,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserScrollParams {
+    pub surface_id: String,
+    pub selector: Option<String>,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserHoverParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserCheckParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub checked: Option<bool>,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserGetParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub kind: Option<String>,
+    pub attribute: Option<String>,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserFindParams {
+    pub surface_id: String,
+    pub query: String,
+    pub selector: Option<String>,
+    pub limit: Option<u16>,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserHighlightParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub duration_ms: Option<u64>,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserFocusParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserZoomParams {
+    pub surface_id: String,
+    pub percent: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserWaitForSelectorParams {
+    pub surface_id: String,
+    pub selector: String,
+    pub timeout_ms: Option<u64>,
+    pub frame_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserEvaluateParams {
     pub surface_id: String,
     pub script: String,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserConsoleParams {
+    pub surface_id: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDialogsParams {
+    pub surface_id: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserErrorsParams {
+    pub surface_id: String,
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -491,6 +745,11 @@ pub struct WorkspaceSummaryResult {
     pub active_pane_id: String,
     pub project_root: Option<String>,
     pub environment_profile_id: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub default_wsl_distribution: Option<String>,
+    pub default_agent_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -534,6 +793,32 @@ pub struct WorkspaceCloseResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupMemberResult {
+    pub workspace_id: String,
+    pub position: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupResult {
+    pub group_id: String,
+    pub name: String,
+    pub anchor_workspace_id: Option<String>,
+    pub collapsed: bool,
+    pub pinned: bool,
+    pub color: Option<String>,
+    pub icon: Option<String>,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub members: Vec<WorkspaceGroupMemberResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceGroupListResult {
+    pub groups: Vec<WorkspaceGroupResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSummaryResult {
     pub session_id: String,
     pub workspace_id: String,
@@ -553,6 +838,30 @@ pub struct SessionReadRecentResult {
     pub session_id: String,
     pub text: String,
     pub byte_count: usize,
+}
+
+/// Params for `session.snapshot`: an atomic capture of a session's recent output
+/// ring plus the absolute byte offsets it covers, used to cold-start a
+/// stream-first renderer that then attaches the live stream at `end_offset`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSnapshotParams {
+    pub session_id: String,
+    /// Optional absolute offset; the result then returns only bytes at/after it,
+    /// for efficient delta polling. Omit for a full cold-start snapshot.
+    #[serde(default)]
+    pub since_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSnapshotResult {
+    pub session_id: String,
+    /// Absolute offset of the first byte in `bytes_base64`.
+    pub base_offset: u64,
+    /// Absolute total bytes ever emitted by the session; where the live stream
+    /// attaches. `bytes_base64` covers `[base_offset, end_offset)`.
+    pub end_offset: u64,
+    /// Base64-encoded raw recent-output bytes for `[base_offset, end_offset)`.
+    pub bytes_base64: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -604,6 +913,124 @@ pub struct NotificationListResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotificationClearResult {
+    pub cleared: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarStatusResult {
+    pub workspace_id: String,
+    pub key: String,
+    pub label: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub priority: i64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SidebarProgressResult {
+    pub workspace_id: String,
+    pub value: f64,
+    pub label: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarLogResult {
+    pub log_id: String,
+    pub workspace_id: String,
+    pub level: String,
+    pub source: Option<String>,
+    pub message: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarStatusListResult {
+    pub statuses: Vec<SidebarStatusResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SidebarLogListResult {
+    pub logs: Vec<SidebarLogResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SidebarStateResult {
+    pub workspace_id: String,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_hash: Option<String>,
+    pub ports: Vec<String>,
+    pub statuses: Vec<SidebarStatusResult>,
+    pub progress: Option<SidebarProgressResult>,
+    pub logs: Vec<SidebarLogResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemCapabilitiesResult {
+    pub product: String,
+    pub control_schema: String,
+    pub access_mode: String,
+    pub pipe_name: String,
+    pub cmux_compat: bool,
+    pub methods: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SystemIdentifyResult {
+    pub in_agentmux: bool,
+    pub workspace_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub surface_id: Option<String>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub backend_kind: Option<String>,
+    pub control_pipe: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActionListParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActionRunParams {
+    pub action_id: String,
+    pub workspace_id: Option<String>,
+    pub pane_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActionSummaryResult {
+    pub id: String,
+    pub title: String,
+    pub group: String,
+    pub source: String,
+    pub target: Option<String>,
+    pub command: Vec<String>,
+    pub keywords: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActionListResult {
+    pub workspace_id: Option<String>,
+    pub actions: Vec<ActionSummaryResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActionRunResult {
+    pub action_id: String,
+    pub workspace_id: Option<String>,
+    pub result_type: String,
+    pub session_id: Option<String>,
+    pub surface_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserNavigationResult {
     pub surface_id: String,
     pub url: String,
@@ -624,9 +1051,159 @@ pub struct BrowserDomSnapshotResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserFrameResult {
+    pub frame_id: String,
+    pub parent_frame_id: Option<String>,
+    pub url: String,
+    pub name: Option<String>,
+    pub security_origin: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserFramesResult {
+    pub surface_id: String,
+    pub frames: Vec<BrowserFrameResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserStorageEntryResult {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserStorageResult {
+    pub surface_id: String,
+    pub local_storage: Vec<BrowserStorageEntryResult>,
+    pub session_storage: Vec<BrowserStorageEntryResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserCookieResult {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub expires: Option<String>,
+    pub http_only: bool,
+    pub secure: bool,
+    pub same_site: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserCookiesResult {
+    pub surface_id: String,
+    pub cookies: Vec<BrowserCookieResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDownloadsParams {
+    pub surface_id: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDownloadResult {
+    pub file_name: String,
+    pub path: String,
+    pub byte_count: u64,
+    pub modified_at: Option<String>,
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDownloadsResult {
+    pub surface_id: String,
+    pub directory: String,
+    pub downloads: Vec<BrowserDownloadResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserHistoryEntryResult {
+    pub id: i64,
+    pub url: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserHistoryResult {
+    pub surface_id: String,
+    pub current_index: i64,
+    pub entries: Vec<BrowserHistoryEntryResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserConsoleMessageResult {
+    pub level: String,
+    pub text: String,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserConsoleResult {
+    pub surface_id: String,
+    pub messages: Vec<BrowserConsoleMessageResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDialogMessageResult {
+    pub dialog_type: String,
+    pub message: String,
+    pub default_value: Option<String>,
+    pub response: Option<String>,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDialogsResult {
+    pub surface_id: String,
+    pub messages: Vec<BrowserDialogMessageResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserErrorEventResult {
+    pub kind: String,
+    pub message: String,
+    pub source: String,
+    pub line: u32,
+    pub column: u32,
+    pub stack: String,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserErrorsResult {
+    pub surface_id: String,
+    pub events: Vec<BrowserErrorEventResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserActionResult {
     pub surface_id: String,
     pub ok: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserGetResult {
+    pub surface_id: String,
+    pub selector: String,
+    pub kind: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserFindResult {
+    pub surface_id: String,
+    pub query: String,
+    pub count: usize,
+    pub matches: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserWaitForSelectorResult {
+    pub surface_id: String,
+    pub selector: String,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -707,6 +1284,220 @@ pub struct WslDistributionResult {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WslDistributionListResult {
     pub distributions: Vec<WslDistributionResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TmuxDiagnosticsParams {
+    pub distribution: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TmuxDiagnosticsResult {
+    pub available: bool,
+    pub distribution: Option<String>,
+    pub version: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigAppearance {
+    pub theme: String,
+    pub accent_key: String,
+    pub font_size: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigShortcuts {
+    #[serde(default)]
+    pub bindings: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigActions {
+    #[serde(default)]
+    pub custom: Vec<AppConfigCustomAction>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigUi {
+    #[serde(default)]
+    pub workspace_plus_action: Option<String>,
+    #[serde(default)]
+    pub surface_tab_plus_action: Option<String>,
+    #[serde(default)]
+    pub surface_tab_actions: Option<Vec<String>>,
+    #[serde(default)]
+    pub text_box_max_lines: Option<u8>,
+    #[serde(default)]
+    pub terminal_inner_margin: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigNotifications {
+    #[serde(default)]
+    pub actions: Vec<AppConfigNotificationAction>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigNotificationAction {
+    pub action: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub notification_type: Option<String>,
+    #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
+    pub dismiss_on_run: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigCustomAction {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub group: Option<String>,
+    pub target: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigResult {
+    pub format_version: String,
+    pub config_path: String,
+    pub project_config_path: Option<String>,
+    pub project_config_loaded: bool,
+    pub appearance: AppConfigAppearance,
+    pub shortcuts: AppConfigShortcuts,
+    pub actions: AppConfigActions,
+    pub ui: AppConfigUi,
+    pub notifications: AppConfigNotifications,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigGetParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigExportParams {
+    pub workspace_id: Option<String>,
+    pub scope: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigExportResult {
+    pub json: String,
+    pub config: AppConfigResult,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigImportParams {
+    pub workspace_id: Option<String>,
+    pub scope: Option<String>,
+    pub json: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigResetParams {
+    pub workspace_id: Option<String>,
+    pub scope: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigMigrateProjectParams {
+    pub workspace_id: Option<String>,
+    pub overwrite: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigMigrateProjectResult {
+    pub source_path: String,
+    pub target_path: String,
+    pub overwritten: bool,
+    pub config: AppConfigResult,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigDiagnosticsParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigDiagnosticsEntry {
+    pub source: String,
+    pub path: Option<String>,
+    pub exists: bool,
+    pub valid: bool,
+    pub active: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigDiagnosticsResult {
+    pub entries: Vec<AppConfigDiagnosticsEntry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DockGetParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DockTrustParams {
+    pub workspace_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DockControlResult {
+    pub id: String,
+    pub title: String,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub height: Option<u16>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DockConfigResult {
+    pub source: String,
+    pub config_path: Option<String>,
+    pub requires_trust: bool,
+    pub trusted: bool,
+    pub controls: Vec<DockControlResult>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigAppearanceUpdate {
+    pub theme: Option<String>,
+    pub accent_key: Option<String>,
+    pub font_size: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigShortcutsUpdate {
+    pub bindings: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigUiUpdate {
+    pub workspace_plus_action: Option<String>,
+    pub surface_tab_plus_action: Option<String>,
+    pub surface_tab_actions: Option<Vec<String>>,
+    pub text_box_max_lines: Option<u8>,
+    pub terminal_inner_margin: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AppConfigUpdateParams {
+    pub workspace_id: Option<String>,
+    pub appearance: Option<AppConfigAppearanceUpdate>,
+    pub shortcuts: Option<AppConfigShortcutsUpdate>,
+    pub ui: Option<AppConfigUiUpdate>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1184,6 +1975,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_action_run_params() {
+        let request = RequestEnvelope::new(
+            "req_action_run",
+            "actions.run",
+            r#"{"action_id":"custom.verify","workspace_id":"ws_1","pane_id":"pane_1"}"#,
+            "token",
+        );
+
+        let params: ActionRunParams = request.parse_params().unwrap();
+        assert_eq!(params.action_id, "custom.verify");
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
+        assert_eq!(params.pane_id.as_deref(), Some("pane_1"));
+    }
+
+    #[test]
+    fn parses_app_config_migrate_project_params() {
+        let request = RequestEnvelope::new(
+            "req_config_migrate",
+            "config.migrate_project",
+            r#"{"workspace_id":"ws_1","overwrite":true}"#,
+            "token",
+        );
+
+        let params: AppConfigMigrateProjectParams = request.parse_params().unwrap();
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
+        assert_eq!(params.overwrite, Some(true));
+    }
+
+    #[test]
+    fn parses_app_config_diagnostics_params() {
+        let request = RequestEnvelope::new(
+            "req_config_diagnostics",
+            "config.diagnostics",
+            r#"{"workspace_id":"ws_1"}"#,
+            "token",
+        );
+
+        let params: AppConfigDiagnosticsParams = request.parse_params().unwrap();
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
+    }
+
+    #[test]
+    fn parses_dock_get_params() {
+        let request = RequestEnvelope::new(
+            "req_dock_get",
+            "dock.get",
+            r#"{"workspace_id":"ws_1"}"#,
+            "token",
+        );
+
+        let params: DockGetParams = request.parse_params().unwrap();
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
+    }
+
+    #[test]
+    fn parses_dock_trust_params() {
+        let request = RequestEnvelope::new(
+            "req_dock_trust",
+            "dock.trust",
+            r#"{"workspace_id":"ws_1"}"#,
+            "token",
+        );
+
+        let params: DockTrustParams = request.parse_params().unwrap();
+        assert_eq!(params.workspace_id, "ws_1");
+    }
+
+    #[test]
     fn parses_session_attach_params() {
         let request = RequestEnvelope::new(
             "req_attach",
@@ -1402,6 +2261,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_workspace_update_params() {
+        let request = RequestEnvelope::new(
+            "req_workspace_update",
+            "workspace.update",
+            r##"{"workspace_id":"ws_1","name":"AgentMux","project_root":"D:\\Workspace\\irae\\agentmux","environment_profile_id":"Ubuntu","description":"demo","icon":"AM","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_agent_command":"codex --resume"}"##,
+            "token",
+        );
+        let params: WorkspaceUpdateParams = request.parse_params().unwrap();
+        assert_eq!(params.workspace_id, "ws_1");
+        assert_eq!(params.name, "AgentMux");
+        assert_eq!(params.environment_profile_id.as_deref(), Some("Ubuntu"));
+        assert_eq!(params.description.as_deref(), Some("demo"));
+        assert_eq!(
+            params.default_agent_command.as_deref(),
+            Some("codex --resume")
+        );
+    }
+
+    #[test]
+    fn parses_workspace_group_params() {
+        let request = RequestEnvelope::new(
+            "req_group_create",
+            "workspace_group.create",
+            r##"{"name":"Agents","anchor_workspace_id":"ws_1","workspace_ids":["ws_1","ws_2"],"collapsed":true,"pinned":true,"color":"#22C55E","icon":"A"}"##,
+            "token",
+        );
+
+        let params: WorkspaceGroupCreateParams = request.parse_params().unwrap();
+        assert_eq!(params.name, "Agents");
+        assert_eq!(params.anchor_workspace_id.as_deref(), Some("ws_1"));
+        assert_eq!(params.workspace_ids.as_ref().unwrap().len(), 2);
+        assert_eq!(params.collapsed, Some(true));
+        assert_eq!(params.pinned, Some(true));
+
+        let request = RequestEnvelope::new(
+            "req_group_add",
+            "workspace_group.add_workspace",
+            r#"{"group_id":"grp_1","workspace_id":"ws_2","position":5}"#,
+            "token",
+        );
+
+        let params: WorkspaceGroupMemberParams = request.parse_params().unwrap();
+        assert_eq!(params.group_id, "grp_1");
+        assert_eq!(params.workspace_id, "ws_2");
+        assert_eq!(params.position, Some(5));
+
+        let request = RequestEnvelope::new(
+            "req_group_update",
+            "workspace_group.update",
+            r##"{"group_id":"grp_1","name":"Core","sort_order":7}"##,
+            "token",
+        );
+
+        let params: WorkspaceGroupUpdateParams = request.parse_params().unwrap();
+        assert_eq!(params.group_id, "grp_1");
+        assert_eq!(params.name.as_deref(), Some("Core"));
+        assert_eq!(params.sort_order, Some(7));
+    }
+
+    #[test]
     fn parses_pane_split_params() {
         let request = RequestEnvelope::new(
             "req_pane_split",
@@ -1491,16 +2410,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_surface_close_params() {
+        let request = RequestEnvelope::new(
+            "req_surface_close",
+            "surface.close",
+            r#"{"workspace_id":"ws_1","surface_id":"surf_1"}"#,
+            "token",
+        );
+
+        let params: SurfaceCloseParams = request.parse_params().unwrap();
+        assert_eq!(params.workspace_id, "ws_1");
+        assert_eq!(params.surface_id, "surf_1");
+    }
+
+    #[test]
     fn parses_browser_surface_and_command_params() {
         let request = RequestEnvelope::new(
             "req_create_browser",
             "surface.create_browser",
-            r#"{"workspace_id":"ws_browser","pane_id":"pane_browser","profile":"default"}"#,
+            r#"{"workspace_id":"ws_browser","pane_id":"pane_browser","profile":"default","placement":"active_pane"}"#,
             "token",
         );
         let params: SurfaceCreateBrowserParams = request.parse_params().unwrap();
         assert_eq!(params.workspace_id, "ws_browser");
         assert_eq!(params.pane_id.as_deref(), Some("pane_browser"));
+        assert_eq!(params.placement.as_deref(), Some("active_pane"));
         assert_eq!(params.profile.as_deref(), Some("default"));
 
         let request = RequestEnvelope::new(
@@ -1523,6 +2457,16 @@ mod tests {
         assert_eq!(params.format.as_deref(), Some("png"));
 
         let request = RequestEnvelope::new(
+            "req_browser_dom",
+            "browser.dom_snapshot",
+            r#"{"surface_id":"surf_browser","frame_id":"frame_1"}"#,
+            "token",
+        );
+        let params: BrowserDomSnapshotParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
             "req_browser_click",
             "browser.click",
             r#"{"surface_id":"surf_browser","x":12.0,"y":24.0}"#,
@@ -1531,16 +2475,239 @@ mod tests {
         let params: BrowserClickParams = request.parse_params().unwrap();
         assert_eq!(params.x, Some(12.0));
         assert_eq!(params.y, Some(24.0));
+        assert_eq!(params.frame_id, None);
+
+        let request = RequestEnvelope::new(
+            "req_browser_click_frame",
+            "browser.click",
+            r##"{"surface_id":"surf_browser","selector":"#q","frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserClickParams = request.parse_params().unwrap();
+        assert_eq!(params.selector.as_deref(), Some("#q"));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
 
         let request = RequestEnvelope::new(
             "req_browser_type",
             "browser.type",
-            r##"{"surface_id":"surf_browser","selector":"#q","text":"agentmux"}"##,
+            r##"{"surface_id":"surf_browser","selector":"#q","text":"agentmux","frame_id":"frame_1"}"##,
             "token",
         );
         let params: BrowserTypeParams = request.parse_params().unwrap();
         assert_eq!(params.selector, "#q");
         assert_eq!(params.text, "agentmux");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_fill",
+            "browser.fill",
+            r##"{"surface_id":"surf_browser","selector":"#q","text":"agentmux","frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserFillParams = request.parse_params().unwrap();
+        assert_eq!(params.selector, "#q");
+        assert_eq!(params.text, "agentmux");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_press",
+            "browser.press",
+            r##"{"surface_id":"surf_browser","selector":"#q","key":"Enter","frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserPressParams = request.parse_params().unwrap();
+        assert_eq!(params.key, "Enter");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_select",
+            "browser.select",
+            r##"{"surface_id":"surf_browser","selector":"#choice","values":["one","two"],"frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserSelectParams = request.parse_params().unwrap();
+        assert_eq!(params.values, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_scroll",
+            "browser.scroll",
+            r##"{"surface_id":"surf_browser","selector":"#list","x":0,"y":400,"frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserScrollParams = request.parse_params().unwrap();
+        assert_eq!(params.selector.as_deref(), Some("#list"));
+        assert_eq!(params.y, Some(400));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_hover",
+            "browser.hover",
+            r##"{"surface_id":"surf_browser","selector":"#submit","frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserHoverParams = request.parse_params().unwrap();
+        assert_eq!(params.selector, "#submit");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_check",
+            "browser.check",
+            r##"{"surface_id":"surf_browser","selector":"#agree","checked":true,"frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserCheckParams = request.parse_params().unwrap();
+        assert_eq!(params.checked, Some(true));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_get",
+            "browser.get",
+            r##"{"surface_id":"surf_browser","selector":"#title","kind":"attribute","attribute":"href","frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserGetParams = request.parse_params().unwrap();
+        assert_eq!(params.kind.as_deref(), Some("attribute"));
+        assert_eq!(params.attribute.as_deref(), Some("href"));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_find",
+            "browser.find",
+            r##"{"surface_id":"surf_browser","query":"agentmux","selector":"main","limit":5,"frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserFindParams = request.parse_params().unwrap();
+        assert_eq!(params.query, "agentmux");
+        assert_eq!(params.selector.as_deref(), Some("main"));
+        assert_eq!(params.limit, Some(5));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_highlight",
+            "browser.highlight",
+            r##"{"surface_id":"surf_browser","selector":"#q","duration_ms":750,"frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserHighlightParams = request.parse_params().unwrap();
+        assert_eq!(params.selector, "#q");
+        assert_eq!(params.duration_ms, Some(750));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_focus",
+            "browser.focus",
+            r##"{"surface_id":"surf_browser","selector":"#q","frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserFocusParams = request.parse_params().unwrap();
+        assert_eq!(params.selector, "#q");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_zoom",
+            "browser.zoom",
+            r#"{"surface_id":"surf_browser","percent":125}"#,
+            "token",
+        );
+        let params: BrowserZoomParams = request.parse_params().unwrap();
+        assert_eq!(params.percent, 125);
+
+        let request = RequestEnvelope::new(
+            "req_browser_wait",
+            "browser.wait_for_selector",
+            r##"{"surface_id":"surf_browser","selector":"#ready","timeout_ms":1500,"frame_id":"frame_1"}"##,
+            "token",
+        );
+        let params: BrowserWaitForSelectorParams = request.parse_params().unwrap();
+        assert_eq!(params.selector, "#ready");
+        assert_eq!(params.timeout_ms, Some(1500));
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_current_url",
+            "browser.current_url",
+            r#"{"surface_id":"surf_browser"}"#,
+            "token",
+        );
+        let params: BrowserSurfaceParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+
+        let request = RequestEnvelope::new(
+            "req_browser_frames",
+            "browser.frames",
+            r#"{"surface_id":"surf_browser"}"#,
+            "token",
+        );
+        let params: BrowserSurfaceParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+
+        let request = RequestEnvelope::new(
+            "req_browser_storage",
+            "browser.storage",
+            r#"{"surface_id":"surf_browser"}"#,
+            "token",
+        );
+        let params: BrowserSurfaceParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+
+        let request = RequestEnvelope::new(
+            "req_browser_cookies",
+            "browser.cookies",
+            r#"{"surface_id":"surf_browser"}"#,
+            "token",
+        );
+        let params: BrowserSurfaceParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+
+        let request = RequestEnvelope::new(
+            "req_browser_downloads",
+            "browser.downloads",
+            r#"{"surface_id":"surf_browser","limit":25}"#,
+            "token",
+        );
+        let params: BrowserDownloadsParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+        assert_eq!(params.limit, Some(25));
+
+        let request = RequestEnvelope::new(
+            "req_browser_history",
+            "browser.history",
+            r#"{"surface_id":"surf_browser"}"#,
+            "token",
+        );
+        let params: BrowserSurfaceParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+
+        let request = RequestEnvelope::new(
+            "req_browser_console",
+            "browser.console",
+            r#"{"surface_id":"surf_browser","limit":25}"#,
+            "token",
+        );
+        let params: BrowserConsoleParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+        assert_eq!(params.limit, Some(25));
+
+        let request = RequestEnvelope::new(
+            "req_browser_dialogs",
+            "browser.dialogs",
+            r#"{"surface_id":"surf_browser","limit":25}"#,
+            "token",
+        );
+        let params: BrowserDialogsParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+        assert_eq!(params.limit, Some(25));
+
+        let request = RequestEnvelope::new(
+            "req_browser_errors",
+            "browser.errors",
+            r#"{"surface_id":"surf_browser","limit":25}"#,
+            "token",
+        );
+        let params: BrowserErrorsParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+        assert_eq!(params.limit, Some(25));
 
         let request = RequestEnvelope::new(
             "req_browser_eval",
@@ -1550,6 +2717,17 @@ mod tests {
         );
         let params: BrowserEvaluateParams = request.parse_params().unwrap();
         assert_eq!(params.script, "document.title");
+        assert_eq!(params.frame_id, None);
+
+        let request = RequestEnvelope::new(
+            "req_browser_eval_frame",
+            "browser.evaluate",
+            r#"{"surface_id":"surf_browser","script":"document.body.dataset.ready","frame_id":"frame_1"}"#,
+            "token",
+        );
+        let params: BrowserEvaluateParams = request.parse_params().unwrap();
+        assert_eq!(params.script, "document.body.dataset.ready");
+        assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
     }
 
     #[test]

@@ -242,8 +242,22 @@ pipe path with isolated store, token, and pipe settings.
 `npm run tmux:reattach-smoke` verifies the real WSL/tmux launch and reattach
 path and archives release evidence.
 `npm run installer:build-smoke` verifies that an unsigned NSIS setup executable
-can be produced and records the artifact hash. Manual release signoff still
-requires installing and uninstalling that setup package on a release machine.
+can be produced, prepares the `agentmux.exe` and `cmux.exe` Tauri sidecar
+inputs, compiles the install/uninstall PATH hook, and records the artifact
+hash. Manual release signoff still requires installing and uninstalling that
+setup package on a release machine.
+`npm run installer:contents-gate` opens the generated setup executable without
+installing it, extracts the CLI sidecars with 7-Zip, and compares their hashes
+against the prepared Tauri sidecar inputs. It also verifies that the generated
+installer script includes the AgentMux NSIS hook file and calls the
+install/uninstall PATH hook.
+`npm run installer:lifecycle-gate -- preinstall`, `-- installed`, and
+`-- uninstalled` record non-mutating evidence for each manual installer
+lifecycle phase. The installed phase also verifies registry uninstall metadata,
+the installed executable, an uninstall command, and Start Menu shortcut
+presence. Use `npm run installer:lifecycle-gate -- installed -RequireCli -RequireUserPath`
+for final signoff so installed `agentmux.exe` and `cmux.exe` sidecars plus
+install-directory user PATH registration are also required.
 
 Release candidate must not have:
 

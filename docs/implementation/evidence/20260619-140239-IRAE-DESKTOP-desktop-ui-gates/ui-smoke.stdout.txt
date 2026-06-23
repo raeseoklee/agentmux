@@ -1,0 +1,38 @@
+
+> @agentmux/desktop@0.1.0 test:ui
+> playwright test
+
+
+Running 29 tests using 2 workers
+
+  ok  2 [chromium] › tests\ui\agentmux-design.spec.ts:3:1 › design boots with a live workspace (468ms)
+  ok  3 [chromium] › tests\ui\agentmux-design.spec.ts:16:1 › opens a live terminal (473ms)
+  ok  4 [chromium] › tests\ui\agentmux-design.spec.ts:27:1 › agent launch titlebar button is visible (392ms)
+  ok  5 [chromium] › tests\ui\agentmux-design.spec.ts:37:1 › workspace add creates one uniquely named workspace without duplicating the default (455ms)
+  ok  1 [chromium] › tests\ui\synthetic-attention.spec.ts:3:1 › synthetic attention appears in workspace, pane, and notification UI (2.4s)
+  ok  6 [chromium] › tests\ui\agentmux-design.spec.ts:52:1 › new workspace enters inline rename after creation (630ms)
+  ok  7 [chromium] › tests\ui\synthetic-attention.spec.ts:34:1 › browser surface can be created and driven from the pane UI (706ms)
+  ok  8 [chromium] › tests\ui\agentmux-design.spec.ts:73:1 › workspace project settings update metadata and agent preset (796ms)
+  ok  9 [chromium] › tests\ui\agentmux-design.spec.ts:102:1 › new WSL terminal adds a separate top tab without changing the split layout (613ms)
+  ok 10 [chromium] › tests\ui\agentmux-design.spec.ts:129:1 › split panes stay scoped to their top tab (890ms)
+  ok 11 [chromium] › tests\ui\agentmux-design.spec.ts:166:1 › browser surface opens as a separate top tab (567ms)
+  ok 12 [chromium] › tests\ui\agentmux-design.spec.ts:189:1 › agent tmux session opens as a separate top tab without splitting the current tab (615ms)
+  ok 13 [chromium] › tests\ui\agentmux-design.spec.ts:210:1 › agent tmux launch shows install guidance when tmux is missing (583ms)
+  ok 14 [chromium] › tests\ui\agentmux-design.spec.ts:236:1 › shows WSL install guidance when no distribution is available (468ms)
+  ok 15 [chromium] › tests\ui\agentmux-design.spec.ts:250:1 › command palette lists actions (418ms)
+  ok 16 [chromium] › tests\ui\agentmux-design.spec.ts:267:1 › command palette supports arrow navigation and enter execution (540ms)
+  ok 17 [chromium] › tests\ui\agentmux-design.spec.ts:300:1 › shortcut bindings support config override and two-step chords (409ms)
+  ok 18 [chromium] › tests\ui\agentmux-design.spec.ts:336:1 › settings can edit shortcuts and report conflicts (629ms)
+  ok 19 [chromium] › tests\ui\agentmux-design.spec.ts:374:1 › custom config actions appear in palette and execute through shortcuts (546ms)
+  ok 20 [chromium] › tests\ui\agentmux-design.spec.ts:431:1 › theme toggle switches label (429ms)
+  ok 21 [chromium] › tests\ui\agentmux-design.spec.ts:447:1 › appearance settings persist through reload (526ms)
+  ok 22 [chromium] › tests\ui\agentmux-design.spec.ts:472:1 › settings reload config applies external changes without restart (545ms)
+  ok 23 [chromium] › tests\ui\agentmux-design.spec.ts:521:1 › settings shows seeded SSH profiles (515ms)
+  ok 24 [chromium] › tests\ui\agentmux-design.spec.ts:536:1 › settings edits SSH profile metadata (548ms)
+  ok 25 [chromium] › tests\ui\agentmux-design.spec.ts:559:1 › settings diagnostics runs tmux probe (618ms)
+  ok 26 [chromium] › tests\ui\agentmux-design.spec.ts:576:1 › OMC telemetry bar renders (1.8s)
+  ok 27 [chromium] › tests\ui\agentmux-design.spec.ts:604:1 › sidebar metadata renders status progress and logs (1.7s)
+  ok 28 [chromium] › tests\ui\agentmux-design.spec.ts:644:1 › launches an agent in a durable WSL-tmux session (542ms)
+  ok 29 [chromium] › tests\ui\agentmux-design.spec.ts:656:1 › command palette opens over a focused terminal (1.3s)
+
+  29 passed (20.2s)

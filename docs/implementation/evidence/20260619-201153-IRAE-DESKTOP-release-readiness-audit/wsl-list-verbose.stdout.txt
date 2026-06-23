@@ -1,0 +1,5 @@
+﻿  NAME                                      STATE           VERSION
+* Ubuntu                                    Stopped         2
+  Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2    Stopped         2
+  Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1    Stopped         2
+

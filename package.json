@@ -8,9 +8,17 @@
     "perf:gates": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-performance-gates.ps1",
     "diagnostics:packaged-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-packaged-diagnostics-smoke.ps1",
     "desktop:gates": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-desktop-ui-gates.ps1",
+    "installed:app-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installed-app-smoke.ps1",
+    "installer:contents-gate": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installer-contents-gate.ps1",
+    "installer:lifecycle-gate": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installer-lifecycle-gate.ps1",
     "installer:build-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installer-build-smoke.ps1",
+    "integration:live-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-integration-live-smoke.ps1",
+    "release:readiness-audit": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-release-readiness-audit.ps1",
+    "wsl:state-gate": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-wsl-state-gate.ps1",
     "tmux:reattach-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-tmux-reattach-smoke.ps1",
+    "server:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-server-mode-smoke.ps1",
     "browser:cdp-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-browser-cdp-smoke.ps1",
+    "skills:install": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-agentmux-skill.ps1",
     "desktop:dev": "npm --prefix apps/desktop run dev",
     "desktop:build": "npm --prefix apps/desktop run build"
   }

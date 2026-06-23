@@ -167,6 +167,7 @@ dependencies = [
  "agentmux-backend",
  "agentmux-backend-conpty",
  "agentmux-ipc",
+ "base64 0.22.1",
  "serde_json",
 ]
 
@@ -183,6 +184,7 @@ dependencies = [
  "agentmux-core",
  "agentmux-ipc",
  "agentmux-store",
+ "base64 0.22.1",
  "getrandom 0.2.17",
  "serde",
  "serde_json",

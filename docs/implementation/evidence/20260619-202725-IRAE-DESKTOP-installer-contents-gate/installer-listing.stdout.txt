@@ -1,0 +1,100 @@
+
+7-Zip 22.01 (x64) : Copyright (c) 1999-2022 Igor Pavlov : 2022-07-15
+
+Scanning the drive for archives:
+1 file, 4846604 bytes (4734 KiB)
+
+Listing archive: D:\Workspace\irae\agentmux\docs\implementation\evidence\20260619-202610-IRAE-DESKTOP-installer-build-smoke\AgentMux_0.1.0_x64-setup.exe
+
+--
+Path = D:\Workspace\irae\agentmux\docs\implementation\evidence\20260619-202610-IRAE-DESKTOP-installer-build-smoke\AgentMux_0.1.0_x64-setup.exe
+Type = Nsis
+Physical Size = 4846604
+Method = LZMA:23
+Solid = +
+Headers Size = 74698
+Embedded Stub Size = 52736
+SubType = NSIS-3 Unicode BadCmd=13
+
+----------
+Path = $PLUGINSDIR\System.dll
+Size = 12288
+Packed Size = 4793864
+Modified = 
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 0
+
+Path = $PLUGINSDIR\modern-wizard.bmp
+Size = 26494
+Packed Size = 
+Modified = 2026-06-18 22:34:42.0000000
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 12292
+
+Path = $PLUGINSDIR\nsDialogs.dll
+Size = 9728
+Packed Size = 
+Modified = 
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 38790
+
+Path = $PLUGINSDIR\nsis_tauri_utils.dll
+Size = 34304
+Packed Size = 
+Modified = 
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 48522
+
+Path = $PLUGINSDIR\StartMenu.dll
+Size = 13316
+Packed Size = 
+Modified = 
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 82830
+
+Path = $PLUGINSDIR\NSISdl.dll
+Size = 15360
+Packed Size = 
+Modified = 
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 96150
+
+Path = agentmux-desktop-host.exe
+Size = 16162304
+Packed Size = 
+Modified = 2026-06-19 20:26:44.0000000
+Attributes = 
+Method = LZMA:23
+Solid = +
+Offset = 111514
+
+Path = agentmux.exe
+Size = 2643968
+Packed Size = 
+Modified = 2026-06-19 20:06:24.0000000
+Attributes = A
+Method = LZMA:23
+Solid = +
+Offset = 16273822
+
+Path = cmux.exe
+Size = 
+Packed Size = 
+Modified = 2026-06-19 20:06:24.0000000
+Attributes = A
+Method = LZMA:23
+Solid = +
+Offset = 18917794
+

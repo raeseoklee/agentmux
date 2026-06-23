@@ -15,6 +15,7 @@ agentmux-browser = { path = "../../../crates/agentmux-browser" }
 agentmux-core = { path = "../../../crates/agentmux-core" }
 agentmux-ipc = { path = "../../../crates/agentmux-ipc" }
 agentmux-store = { path = "../../../crates/agentmux-store" }
+base64 = "0.22"
 getrandom = "0.2"
 serde = "1"
 serde_json = "1"

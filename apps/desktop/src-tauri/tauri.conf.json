@@ -19,5 +19,16 @@
         "minHeight": 560
       }
     ]
+  },
+  "bundle": {
+    "externalBin": [
+      "binaries/agentmux",
+      "binaries/cmux"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    }
   }
 }

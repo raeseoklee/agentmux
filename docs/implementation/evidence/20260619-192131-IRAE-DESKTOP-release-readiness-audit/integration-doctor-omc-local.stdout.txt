@@ -1,0 +1,48 @@
+﻿{
+  "base_dir": "C:\\Users\\irae\\.cmuxterm",
+  "bin_dir": "C:\\Users\\irae\\.cmuxterm\\bin",
+  "bin_dir_on_path": false,
+  "integrations": [
+    {
+      "checks": [
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\bin\\omc or C:\\Users\\irae\\.cmuxterm\\bin\\omc.cmd",
+          "fix": "Run `cmux integrations install-shims`.",
+          "name": "persistent-wrapper",
+          "ok": false
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\omc-bin\\tmux or C:\\Users\\irae\\.cmuxterm\\omc-bin\\tmux.cmd",
+          "fix": "Run `cmux integrations setup omc` or `cmux integrations install-shims`.",
+          "name": "tmux-shim",
+          "ok": false
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\bin is not currently on PATH",
+          "fix": null,
+          "name": "wrapper-on-path",
+          "ok": true
+        },
+        {
+          "detail": "C:\\Users\\irae\\AppData\\Roaming\\npm\\omc",
+          "fix": null,
+          "name": "underlying-executable",
+          "ok": true
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\omc-restore-node-options.cjs",
+          "fix": "Run `cmux integrations setup omc` to create the NODE_OPTIONS restore module.",
+          "name": "omc-node-options-restore",
+          "ok": false
+        }
+      ],
+      "command": "omc",
+      "executable": "omc",
+      "install_hint": "Install Claude Code and oh-my-claudecode, then launch with omc.",
+      "integration": "omc",
+      "status": "needs-attention"
+    }
+  ],
+  "wsl_distribution": null
+}
+

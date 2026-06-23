@@ -40,6 +40,14 @@ Date: 2026-06-18
 17. [16-goal-8-browser-surface-automation-status.md](./16-goal-8-browser-surface-automation-status.md)
 18. [17-goal-9-performance-diagnostics-status.md](./17-goal-9-performance-diagnostics-status.md)
 19. [18-goal-9-release-candidate-checklist.md](./18-goal-9-release-candidate-checklist.md)
+20. [19-cmux-windows-parity-gap-analysis.md](./19-cmux-windows-parity-gap-analysis.md)
+21. [20-goal-10-setup-config-status.md](./20-goal-10-setup-config-status.md)
+22. [21-goal-11-action-registry-status.md](./21-goal-11-action-registry-status.md)
+23. [22-goal-12-cli-sidebar-metadata-status.md](./22-goal-12-cli-sidebar-metadata-status.md)
+24. [23-overall-completion-goal-groups.md](./23-overall-completion-goal-groups.md)
+25. [24-goal-14-tmux-compat-status.md](./24-goal-14-tmux-compat-status.md)
+26. [25-goal-15-workspace-groups-status.md](./25-goal-15-workspace-groups-status.md)
+27. [26-goal-16-server-mode-web-terminal-status.md](./26-goal-16-server-mode-web-terminal-status.md)
 
 ## 구현 원칙
 

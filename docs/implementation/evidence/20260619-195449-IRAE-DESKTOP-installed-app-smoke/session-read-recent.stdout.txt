@@ -1,0 +1,9 @@
+{
+  "schema": "agentmux.control.v1",
+  "id": "cli_session_read_recent",
+  "outcome": {
+    "Ok": {
+      "result_json": "{\"session_id\":\"ses_00000003\",\"text\":\"\\u001b[?25l\\u001b[2J\\u001b[m\\u001b[HAGENTMUX_INSTALLED_SMOKE_753a2219992e4e2e8339e94d9b96fa13\\r\\n\\u001b]0;C:\\\\Windows\\\\SYSTEM32\\\\cmd.exe\\u0007\\u001b[?25h\",\"byte_count\":113}"
+    }
+  }
+}

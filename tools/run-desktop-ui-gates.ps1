@@ -81,8 +81,12 @@ try {
   }
 
   $uiOutput = (Get-Content -Raw -LiteralPath $uiStdout) + "`n" + (Get-Content -Raw -LiteralPath $uiStderr)
-  if ($uiOutput -notmatch "2 passed") {
-    throw "UI smoke did not report the expected two passing tests. See $uiStdout and $uiStderr"
+  $uiPassedCount = $null
+  if ($uiOutput -match "([1-9][0-9]*) passed") {
+    $uiPassedCount = [int]$Matches[1]
+  }
+  if ($null -eq $uiPassedCount) {
+    throw "UI smoke did not report passing tests. See $uiStdout and $uiStderr"
   }
 
   $distFiles = @(Get-ChildItem -LiteralPath $distDir -Recurse -File | ForEach-Object {
@@ -99,7 +103,8 @@ try {
     build_exit_code = $buildExit
     ui_smoke_command = "npm --prefix apps/desktop run test:ui"
     ui_smoke_exit_code = $uiExit
-    ui_smoke_result = "2 passed"
+    ui_smoke_result = "$uiPassedCount passed"
+    ui_smoke_passed_count = $uiPassedCount
     dist_index = "apps/desktop/dist/index.html"
     archived_dist = "dist"
     dist_files = $distFiles

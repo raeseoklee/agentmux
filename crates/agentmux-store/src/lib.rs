@@ -122,6 +122,80 @@ CREATE TABLE IF NOT EXISTS ssh_profiles (
 );
 "#;
 
+pub const SIDEBAR_METADATA_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sidebar_status (
+  workspace_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  label TEXT NOT NULL,
+  icon TEXT,
+  color TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS sidebar_progress (
+  workspace_id TEXT PRIMARY KEY,
+  value REAL NOT NULL,
+  label TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sidebar_logs (
+  log_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  level TEXT NOT NULL,
+  source TEXT,
+  message TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+"#;
+
+pub const WORKSPACE_METADATA_SCHEMA: &str = r#"
+ALTER TABLE workspaces ADD COLUMN description TEXT;
+ALTER TABLE workspaces ADD COLUMN icon TEXT;
+ALTER TABLE workspaces ADD COLUMN color TEXT;
+ALTER TABLE workspaces ADD COLUMN default_wsl_distribution TEXT;
+ALTER TABLE workspaces ADD COLUMN default_agent_command TEXT;
+"#;
+
+pub const WORKSPACE_GROUPS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_groups (
+  group_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  anchor_workspace_id TEXT,
+  collapsed INTEGER NOT NULL DEFAULT 0,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  color TEXT,
+  icon TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_group_members (
+  group_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (group_id, workspace_id),
+  UNIQUE (workspace_id)
+);
+"#;
+
+pub const DOCK_TRUSTS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS dock_trusts (
+  workspace_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  config_path TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  trusted_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, source, config_path)
+);
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -142,6 +216,26 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "ssh_profiles_schema",
         sql: SSH_PROFILES_SCHEMA,
+    },
+    Migration {
+        version: 5,
+        name: "sidebar_metadata_schema",
+        sql: SIDEBAR_METADATA_SCHEMA,
+    },
+    Migration {
+        version: 6,
+        name: "workspace_metadata_columns",
+        sql: WORKSPACE_METADATA_SCHEMA,
+    },
+    Migration {
+        version: 7,
+        name: "workspace_groups_schema",
+        sql: WORKSPACE_GROUPS_SCHEMA,
+    },
+    Migration {
+        version: 8,
+        name: "dock_trusts_schema",
+        sql: DOCK_TRUSTS_SCHEMA,
     },
 ];
 
@@ -188,6 +282,11 @@ pub struct PersistedWorkspace {
     pub active_pane_id: String,
     pub project_root: Option<String>,
     pub environment_profile_id: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub default_wsl_distribution: Option<String>,
+    pub default_agent_command: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -269,6 +368,68 @@ pub struct PersistedNotification {
     pub message: String,
     pub created_at: String,
     pub dismissed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedSidebarStatus {
+    pub workspace_id: String,
+    pub key: String,
+    pub label: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub priority: i64,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersistedSidebarProgress {
+    pub workspace_id: String,
+    pub value: f64,
+    pub label: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedSidebarLog {
+    pub log_id: String,
+    pub workspace_id: String,
+    pub level: String,
+    pub source: Option<String>,
+    pub message: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedWorkspaceGroup {
+    pub group_id: String,
+    pub name: String,
+    pub anchor_workspace_id: Option<String>,
+    pub collapsed: bool,
+    pub pinned: bool,
+    pub color: Option<String>,
+    pub icon: Option<String>,
+    pub sort_order: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedWorkspaceGroupMember {
+    pub group_id: String,
+    pub workspace_id: String,
+    pub position: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedDockTrust {
+    pub workspace_id: String,
+    pub source: String,
+    pub config_path: String,
+    pub config_hash: String,
+    pub trusted_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -376,7 +537,9 @@ impl SqliteStore {
     pub fn list_workspaces(&self) -> StoreResult<Vec<PersistedWorkspace>> {
         let mut statement = self.connection.prepare(
             "SELECT workspace_id, name, root_pane_id, active_pane_id, project_root,
-                    environment_profile_id, created_at, updated_at
+                    environment_profile_id, description, icon, color,
+                    default_wsl_distribution, default_agent_command,
+                    created_at, updated_at
              FROM workspaces
              ORDER BY updated_at DESC, workspace_id ASC",
         )?;
@@ -419,7 +582,9 @@ impl SqliteStore {
             .connection
             .query_row(
                 "SELECT workspace_id, name, root_pane_id, active_pane_id, project_root,
-                        environment_profile_id, created_at, updated_at
+                        environment_profile_id, description, icon, color,
+                        default_wsl_distribution, default_agent_command,
+                        created_at, updated_at
                  FROM workspaces
                  WHERE workspace_id = ?1",
                 [workspace_id],
@@ -476,6 +641,26 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Delete a session row. Used by startup recovery to drop a dead ephemeral
+    /// session that has been superseded by a freshly respawned one.
+    pub fn delete_session(&mut self, session_id: &str) -> StoreResult<()> {
+        self.connection.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a surface row. Used by startup recovery to drop the now-orphaned
+    /// surface left behind when an ephemeral terminal is respawned into its pane.
+    pub fn delete_surface(&mut self, surface_id: &str) -> StoreResult<()> {
+        self.connection.execute(
+            "DELETE FROM surfaces WHERE surface_id = ?1",
+            params![surface_id],
+        )?;
+        Ok(())
+    }
+
     pub fn rename_workspace(
         &mut self,
         workspace_id: &str,
@@ -495,7 +680,33 @@ impl SqliteStore {
     pub fn delete_workspace(&mut self, workspace_id: &str) -> StoreResult<bool> {
         let tx = self.connection.transaction()?;
         tx.execute(
+            "DELETE FROM workspace_group_members WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "UPDATE workspace_groups
+             SET anchor_workspace_id = NULL
+             WHERE anchor_workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
             "DELETE FROM notifications WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sidebar_logs WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sidebar_progress WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sidebar_status WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM dock_trusts WHERE workspace_id = ?1",
             params![workspace_id],
         )?;
         tx.execute(
@@ -520,6 +731,198 @@ impl SqliteStore {
         )?;
         tx.commit()?;
         Ok(deleted > 0)
+    }
+
+    pub fn upsert_workspace_group(&mut self, group: &PersistedWorkspaceGroup) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO workspace_groups (
+                group_id, name, anchor_workspace_id, collapsed, pinned,
+                color, icon, sort_order, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(group_id) DO UPDATE SET
+                name = excluded.name,
+                anchor_workspace_id = excluded.anchor_workspace_id,
+                collapsed = excluded.collapsed,
+                pinned = excluded.pinned,
+                color = excluded.color,
+                icon = excluded.icon,
+                sort_order = excluded.sort_order,
+                updated_at = excluded.updated_at",
+            params![
+                group.group_id,
+                group.name,
+                group.anchor_workspace_id,
+                group.collapsed,
+                group.pinned,
+                group.color,
+                group.icon,
+                group.sort_order,
+                group.created_at,
+                group.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_workspace_groups(&self) -> StoreResult<Vec<PersistedWorkspaceGroup>> {
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, name, anchor_workspace_id, collapsed, pinned,
+                    color, icon, sort_order, created_at, updated_at
+             FROM workspace_groups
+             ORDER BY pinned DESC, sort_order ASC, updated_at DESC, group_id ASC",
+        )?;
+        let rows = statement.query_map([], workspace_group_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn load_workspace_group(
+        &self,
+        group_id: &str,
+    ) -> StoreResult<Option<PersistedWorkspaceGroup>> {
+        self.connection
+            .query_row(
+                "SELECT group_id, name, anchor_workspace_id, collapsed, pinned,
+                        color, icon, sort_order, created_at, updated_at
+                 FROM workspace_groups
+                 WHERE group_id = ?1",
+                [group_id],
+                workspace_group_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_workspace_group(&mut self, group_id: &str) -> StoreResult<bool> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "DELETE FROM workspace_group_members WHERE group_id = ?1",
+            params![group_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM workspace_groups WHERE group_id = ?1",
+            params![group_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
+    }
+
+    pub fn upsert_workspace_group_member(
+        &mut self,
+        member: &PersistedWorkspaceGroupMember,
+    ) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "DELETE FROM workspace_group_members WHERE workspace_id = ?1",
+            params![member.workspace_id],
+        )?;
+        tx.execute(
+            "INSERT INTO workspace_group_members (
+                group_id, workspace_id, position, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(group_id, workspace_id) DO UPDATE SET
+                position = excluded.position,
+                updated_at = excluded.updated_at",
+            params![
+                member.group_id,
+                member.workspace_id,
+                member.position,
+                member.created_at,
+                member.updated_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_workspace_group_member(
+        &mut self,
+        group_id: &str,
+        workspace_id: &str,
+    ) -> StoreResult<bool> {
+        let deleted = self.connection.execute(
+            "DELETE FROM workspace_group_members
+             WHERE group_id = ?1 AND workspace_id = ?2",
+            params![group_id, workspace_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    pub fn list_workspace_group_members(
+        &self,
+        group_id: Option<&str>,
+    ) -> StoreResult<Vec<PersistedWorkspaceGroupMember>> {
+        if let Some(group_id) = group_id {
+            let mut statement = self.connection.prepare(
+                "SELECT group_id, workspace_id, position, created_at, updated_at
+                 FROM workspace_group_members
+                 WHERE group_id = ?1
+                 ORDER BY position ASC, updated_at DESC, workspace_id ASC",
+            )?;
+            let rows = statement.query_map([group_id], workspace_group_member_from_row)?;
+            return collect_rows(rows);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, workspace_id, position, created_at, updated_at
+             FROM workspace_group_members
+             ORDER BY group_id ASC, position ASC, updated_at DESC, workspace_id ASC",
+        )?;
+        let rows = statement.query_map([], workspace_group_member_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn upsert_dock_trust(&mut self, trust: &PersistedDockTrust) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO dock_trusts (
+                workspace_id, source, config_path, config_hash, trusted_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(workspace_id, source, config_path) DO UPDATE SET
+                config_hash = excluded.config_hash,
+                trusted_at = excluded.trusted_at,
+                updated_at = excluded.updated_at",
+            params![
+                trust.workspace_id,
+                trust.source,
+                trust.config_path,
+                trust.config_hash,
+                trust.trusted_at,
+                trust.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_dock_trust(
+        &self,
+        workspace_id: &str,
+        source: &str,
+        config_path: &str,
+    ) -> StoreResult<Option<PersistedDockTrust>> {
+        self.connection
+            .query_row(
+                "SELECT workspace_id, source, config_path, config_hash, trusted_at, updated_at
+                 FROM dock_trusts
+                 WHERE workspace_id = ?1 AND source = ?2 AND config_path = ?3",
+                params![workspace_id, source, config_path],
+                dock_trust_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn dock_trust_matches(
+        &self,
+        workspace_id: &str,
+        source: &str,
+        config_path: &str,
+        config_hash: &str,
+    ) -> StoreResult<bool> {
+        Ok(self
+            .load_dock_trust(workspace_id, source, config_path)?
+            .is_some_and(|trust| trust.config_hash == config_hash))
     }
 
     pub fn upsert_agent_state(&mut self, state: &PersistedAgentState) -> StoreResult<()> {
@@ -703,6 +1106,166 @@ impl SqliteStore {
             params![notification_id],
         )?;
         Ok(updated > 0)
+    }
+
+    pub fn clear_notifications(
+        &mut self,
+        workspace_id: Option<&str>,
+        severity: Option<&str>,
+    ) -> StoreResult<usize> {
+        let mut sql = String::from("UPDATE notifications SET dismissed = 1");
+        let mut predicates = Vec::new();
+        let mut values = Vec::new();
+        if let Some(workspace_id) = workspace_id {
+            predicates.push("workspace_id = ?");
+            values.push(workspace_id);
+        }
+        if let Some(severity) = severity {
+            predicates.push("severity = ?");
+            values.push(severity);
+        }
+        if !predicates.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&predicates.join(" AND "));
+        }
+        self.connection
+            .execute(&sql, params_from_iter(values))
+            .map_err(StoreError::from)
+    }
+
+    pub fn upsert_sidebar_status(&mut self, status: &PersistedSidebarStatus) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO sidebar_status (
+                workspace_id, key, label, icon, color, priority, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(workspace_id, key) DO UPDATE SET
+                label = excluded.label,
+                icon = excluded.icon,
+                color = excluded.color,
+                priority = excluded.priority,
+                updated_at = excluded.updated_at",
+            params![
+                status.workspace_id,
+                status.key,
+                status.label,
+                status.icon,
+                status.color,
+                status.priority,
+                status.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_sidebar_status(&mut self, workspace_id: &str, key: &str) -> StoreResult<bool> {
+        let deleted = self.connection.execute(
+            "DELETE FROM sidebar_status WHERE workspace_id = ?1 AND key = ?2",
+            params![workspace_id, key],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    pub fn list_sidebar_status(
+        &self,
+        workspace_id: &str,
+    ) -> StoreResult<Vec<PersistedSidebarStatus>> {
+        let mut statement = self.connection.prepare(
+            "SELECT workspace_id, key, label, icon, color, priority, updated_at
+             FROM sidebar_status
+             WHERE workspace_id = ?1
+             ORDER BY priority DESC, updated_at DESC, key ASC",
+        )?;
+        let rows = statement.query_map([workspace_id], sidebar_status_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn upsert_sidebar_progress(
+        &mut self,
+        progress: &PersistedSidebarProgress,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO sidebar_progress (workspace_id, value, label, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(workspace_id) DO UPDATE SET
+                value = excluded.value,
+                label = excluded.label,
+                updated_at = excluded.updated_at",
+            params![
+                progress.workspace_id,
+                progress.value,
+                progress.label,
+                progress.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_sidebar_progress(
+        &self,
+        workspace_id: &str,
+    ) -> StoreResult<Option<PersistedSidebarProgress>> {
+        self.connection
+            .query_row(
+                "SELECT workspace_id, value, label, updated_at
+                 FROM sidebar_progress
+                 WHERE workspace_id = ?1",
+                [workspace_id],
+                sidebar_progress_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_sidebar_progress(&mut self, workspace_id: &str) -> StoreResult<bool> {
+        let deleted = self.connection.execute(
+            "DELETE FROM sidebar_progress WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    pub fn append_sidebar_log(&mut self, log: &PersistedSidebarLog) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO sidebar_logs (log_id, workspace_id, level, source, message, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                log.log_id,
+                log.workspace_id,
+                log.level,
+                log.source,
+                log.message,
+                log.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_sidebar_logs(
+        &self,
+        workspace_id: &str,
+        limit: Option<usize>,
+    ) -> StoreResult<Vec<PersistedSidebarLog>> {
+        let limit = limit.unwrap_or(20).clamp(1, 200);
+        let mut statement = self.connection.prepare(
+            "SELECT log_id, workspace_id, level, source, message, created_at
+             FROM sidebar_logs
+             WHERE workspace_id = ?1
+             ORDER BY created_at DESC, log_id DESC
+             LIMIT ?2",
+        )?;
+        let rows =
+            statement.query_map(params![workspace_id, limit as i64], sidebar_log_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn clear_sidebar_logs(&mut self, workspace_id: &str) -> StoreResult<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM sidebar_logs WHERE workspace_id = ?1",
+                params![workspace_id],
+            )
+            .map_err(StoreError::from)
     }
 
     pub fn upsert_profile(&mut self, profile: &PersistedProfile) -> StoreResult<()> {
@@ -943,15 +1506,21 @@ fn upsert_workspace(connection: &Connection, workspace: &PersistedWorkspace) -> 
     connection.execute(
         "INSERT INTO workspaces (
             workspace_id, name, root_pane_id, active_pane_id, project_root,
-            environment_profile_id, created_at, updated_at
+            environment_profile_id, description, icon, color,
+            default_wsl_distribution, default_agent_command, created_at, updated_at
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(workspace_id) DO UPDATE SET
             name = excluded.name,
             root_pane_id = excluded.root_pane_id,
             active_pane_id = excluded.active_pane_id,
             project_root = excluded.project_root,
             environment_profile_id = excluded.environment_profile_id,
+            description = excluded.description,
+            icon = excluded.icon,
+            color = excluded.color,
+            default_wsl_distribution = excluded.default_wsl_distribution,
+            default_agent_command = excluded.default_agent_command,
             updated_at = excluded.updated_at",
         params![
             workspace.workspace_id,
@@ -960,6 +1529,11 @@ fn upsert_workspace(connection: &Connection, workspace: &PersistedWorkspace) -> 
             workspace.active_pane_id,
             workspace.project_root,
             workspace.environment_profile_id,
+            workspace.description,
+            workspace.icon,
+            workspace.color,
+            workspace.default_wsl_distribution,
+            workspace.default_agent_command,
             workspace.created_at,
             workspace.updated_at
         ],
@@ -1084,8 +1658,13 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedWork
         active_pane_id: row.get(3)?,
         project_root: row.get(4)?,
         environment_profile_id: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        description: row.get(6)?,
+        icon: row.get(7)?,
+        color: row.get(8)?,
+        default_wsl_distribution: row.get(9)?,
+        default_agent_command: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -1179,6 +1758,78 @@ fn notification_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedN
     })
 }
 
+fn sidebar_status_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedSidebarStatus> {
+    Ok(PersistedSidebarStatus {
+        workspace_id: row.get(0)?,
+        key: row.get(1)?,
+        label: row.get(2)?,
+        icon: row.get(3)?,
+        color: row.get(4)?,
+        priority: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn sidebar_progress_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedSidebarProgress> {
+    Ok(PersistedSidebarProgress {
+        workspace_id: row.get(0)?,
+        value: row.get(1)?,
+        label: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn sidebar_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedSidebarLog> {
+    Ok(PersistedSidebarLog {
+        log_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        level: row.get(2)?,
+        source: row.get(3)?,
+        message: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+fn workspace_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedWorkspaceGroup> {
+    Ok(PersistedWorkspaceGroup {
+        group_id: row.get(0)?,
+        name: row.get(1)?,
+        anchor_workspace_id: row.get(2)?,
+        collapsed: row.get(3)?,
+        pinned: row.get(4)?,
+        color: row.get(5)?,
+        icon: row.get(6)?,
+        sort_order: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn workspace_group_member_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedWorkspaceGroupMember> {
+    Ok(PersistedWorkspaceGroupMember {
+        group_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        position: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn dock_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedDockTrust> {
+    Ok(PersistedDockTrust {
+        workspace_id: row.get(0)?,
+        source: row.get(1)?,
+        config_path: row.get(2)?,
+        config_hash: row.get(3)?,
+        trusted_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,7 +1851,15 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 8);
+    }
+
+    #[test]
+    fn dock_trust_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[7].version, 8);
+        assert!(MIGRATIONS[7]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS dock_trusts"));
     }
 
     #[test]
@@ -1219,6 +1878,20 @@ mod tests {
             let store = SqliteStore::open(&path).unwrap();
             let bundle = store.load_workspace_bundle("ws_test").unwrap().unwrap();
             assert_eq!(bundle.workspace.name, "Test workspace");
+            assert_eq!(
+                bundle.workspace.description.as_deref(),
+                Some("Primary AgentMux workspace")
+            );
+            assert_eq!(bundle.workspace.icon.as_deref(), Some("A"));
+            assert_eq!(bundle.workspace.color.as_deref(), Some("#F97316"));
+            assert_eq!(
+                bundle.workspace.default_wsl_distribution.as_deref(),
+                Some("Ubuntu")
+            );
+            assert_eq!(
+                bundle.workspace.default_agent_command.as_deref(),
+                Some("claude")
+            );
             assert_eq!(bundle.panes.len(), 1);
             assert_eq!(bundle.surfaces.len(), 1);
             assert_eq!(bundle.sessions.len(), 2);
@@ -1428,6 +2101,193 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_metadata_survives_reopen() {
+        let path = unique_temp_db_path("sidebar_metadata_survives_reopen");
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.save_workspace_bundle(&sample_bundle()).unwrap();
+            store
+                .upsert_sidebar_status(&PersistedSidebarStatus {
+                    workspace_id: "ws_test".to_string(),
+                    key: "build".to_string(),
+                    label: "compiling".to_string(),
+                    icon: Some("hammer".to_string()),
+                    color: Some("#ff9500".to_string()),
+                    priority: 80,
+                    updated_at: "2026-06-19T00:00:00Z".to_string(),
+                })
+                .unwrap();
+            store
+                .upsert_sidebar_progress(&PersistedSidebarProgress {
+                    workspace_id: "ws_test".to_string(),
+                    value: 0.5,
+                    label: Some("Building".to_string()),
+                    updated_at: "2026-06-19T00:00:01Z".to_string(),
+                })
+                .unwrap();
+            store
+                .append_sidebar_log(&PersistedSidebarLog {
+                    log_id: "log_1".to_string(),
+                    workspace_id: "ws_test".to_string(),
+                    level: "success".to_string(),
+                    source: Some("test".to_string()),
+                    message: "ok".to_string(),
+                    created_at: "2026-06-19T00:00:02Z".to_string(),
+                })
+                .unwrap();
+        }
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            assert_eq!(
+                store.list_sidebar_status("ws_test").unwrap()[0].key,
+                "build"
+            );
+            assert_eq!(
+                store
+                    .load_sidebar_progress("ws_test")
+                    .unwrap()
+                    .unwrap()
+                    .value,
+                0.5
+            );
+            assert_eq!(
+                store.list_sidebar_logs("ws_test", Some(5)).unwrap()[0].message,
+                "ok"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dock_trust_survives_reopen_and_matches_current_hash() {
+        let path = unique_temp_db_path("dock_trust_survives_reopen");
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store
+                .upsert_dock_trust(&PersistedDockTrust {
+                    workspace_id: "ws_test".to_string(),
+                    source: "project_agentmux".to_string(),
+                    config_path: "D:\\repo\\.agentmux\\dock.json".to_string(),
+                    config_hash: "hash_a".to_string(),
+                    trusted_at: "2026-06-19T00:00:00Z".to_string(),
+                    updated_at: "2026-06-19T00:00:00Z".to_string(),
+                })
+                .unwrap();
+            assert!(store
+                .dock_trust_matches(
+                    "ws_test",
+                    "project_agentmux",
+                    "D:\\repo\\.agentmux\\dock.json",
+                    "hash_a"
+                )
+                .unwrap());
+            assert!(!store
+                .dock_trust_matches(
+                    "ws_test",
+                    "project_agentmux",
+                    "D:\\repo\\.agentmux\\dock.json",
+                    "hash_b"
+                )
+                .unwrap());
+        }
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let trust = store
+                .load_dock_trust(
+                    "ws_test",
+                    "project_agentmux",
+                    "D:\\repo\\.agentmux\\dock.json",
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(trust.config_hash, "hash_a");
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn workspace_groups_survive_reopen_and_cleanup_workspace_membership() {
+        let path = unique_temp_db_path("workspace_groups_survive_reopen");
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.save_workspace_bundle(&sample_bundle()).unwrap();
+            store
+                .upsert_workspace_group(&PersistedWorkspaceGroup {
+                    group_id: "grp_agents".to_string(),
+                    name: "Agents".to_string(),
+                    anchor_workspace_id: Some("ws_test".to_string()),
+                    collapsed: true,
+                    pinned: true,
+                    color: Some("#22C55E".to_string()),
+                    icon: Some("A".to_string()),
+                    sort_order: 10,
+                    created_at: "2026-06-19T00:10:00Z".to_string(),
+                    updated_at: "2026-06-19T00:10:00Z".to_string(),
+                })
+                .unwrap();
+            store
+                .upsert_workspace_group(&PersistedWorkspaceGroup {
+                    group_id: "grp_ops".to_string(),
+                    name: "Ops".to_string(),
+                    anchor_workspace_id: None,
+                    collapsed: false,
+                    pinned: true,
+                    color: Some("#38BDF8".to_string()),
+                    icon: Some("O".to_string()),
+                    sort_order: 2,
+                    created_at: "2026-06-19T00:09:00Z".to_string(),
+                    updated_at: "2026-06-19T00:09:00Z".to_string(),
+                })
+                .unwrap();
+            store
+                .upsert_workspace_group_member(&PersistedWorkspaceGroupMember {
+                    group_id: "grp_agents".to_string(),
+                    workspace_id: "ws_test".to_string(),
+                    position: 1,
+                    created_at: "2026-06-19T00:10:01Z".to_string(),
+                    updated_at: "2026-06-19T00:10:01Z".to_string(),
+                })
+                .unwrap();
+        }
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            let groups = store.list_workspace_groups().unwrap();
+            assert_eq!(groups.len(), 2);
+            assert_eq!(groups[0].group_id, "grp_ops");
+            assert_eq!(groups[0].sort_order, 2);
+            assert_eq!(groups[1].group_id, "grp_agents");
+            assert_eq!(groups[1].sort_order, 10);
+            assert_eq!(groups[1].name, "Agents");
+            assert!(groups[1].collapsed);
+            assert!(groups[1].pinned);
+            let members = store
+                .list_workspace_group_members(Some("grp_agents"))
+                .unwrap();
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].workspace_id, "ws_test");
+            assert_eq!(members[0].position, 1);
+
+            assert!(store.delete_workspace("ws_test").unwrap());
+            assert!(store
+                .list_workspace_group_members(Some("grp_agents"))
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                store
+                    .load_workspace_group("grp_agents")
+                    .unwrap()
+                    .unwrap()
+                    .anchor_workspace_id,
+                None
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn sensitive_env_keys_are_detected_and_redacted() {
         let env = vec![
             ("OPENAI_API_KEY".to_string(), "secret".to_string()),
@@ -1457,6 +2317,11 @@ mod tests {
                 active_pane_id: "pane_root".to_string(),
                 project_root: Some("D:\\Workspace\\irae\\agentmux".to_string()),
                 environment_profile_id: None,
+                description: Some("Primary AgentMux workspace".to_string()),
+                icon: Some("A".to_string()),
+                color: Some("#F97316".to_string()),
+                default_wsl_distribution: Some("Ubuntu".to_string()),
+                default_agent_command: Some("claude".to_string()),
                 created_at: "2026-06-18T00:00:00Z".to_string(),
                 updated_at: "2026-06-18T00:01:00Z".to_string(),
             },

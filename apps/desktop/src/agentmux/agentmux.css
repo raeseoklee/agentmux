@@ -44,6 +44,30 @@ body {
   }
 }
 
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Terminal startup overlay: shown only while a freshly-spawned session has
+   produced no output yet. The 500ms delay keeps warm spawns (~350ms to first
+   byte) from ever flashing it; only genuine cold starts — chiefly the first
+   WSL2 VM boot (~5s) — stay blank long enough to reveal it. */
+.agentmux-term-booting {
+  opacity: 0;
+  animation: fadein 160ms ease 500ms forwards;
+}
+
+.agentmux-term-booting-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border-strong, #30363d);
+  border-top-color: var(--accent, #58a6ff);
+  border-radius: 50%;
+  animation: spin 700ms linear infinite;
+}
+
 .agentmux-scroll {
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;

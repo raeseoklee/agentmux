@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmux_backend::{
@@ -14,8 +16,8 @@ use agentmux_ipc::{
     NotificationListParams, NotificationListResult, NotificationSummaryResult, RequestEnvelope,
     ResponseEnvelope, SessionAttachParams, SessionIdParams, SessionListParams, SessionListResult,
     SessionReadRecentParams, SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams,
-    SessionSendTextParams, SessionSpawnParams, SessionSpawnResult, SessionSummaryResult,
-    SessionTerminateParams,
+    SessionSendTextParams, SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams,
+    SessionSpawnResult, SessionSummaryResult, SessionTerminateParams,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -23,6 +25,20 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 fn next_id(prefix: &str) -> String {
     let value = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}_{value:08}")
+}
+
+/// Seed the global id counter so ids minted this run never collide with ids
+/// persisted by a previous run.
+///
+/// `next_id` draws from a single process-wide counter shared by every domain id
+/// (workspace, pane, surface, session, …). It restarts at 1 on each launch, so
+/// without seeding the first new pane/surface/session after a restart reuses an
+/// id already on disk and the store's upsert silently overwrites the existing
+/// row — mixing entities across workspaces and panes. Call this once at startup
+/// with `max_persisted_sequence + 1`. Idempotent and monotonic: it only ever
+/// raises the counter (`fetch_max`), so it is safe to call more than once.
+pub fn seed_next_id(at_least: u64) {
+    NEXT_ID.fetch_max(at_least, Ordering::Relaxed);
 }
 
 fn next_timestamped_id(prefix: &str, sequence: u64) -> String {
@@ -292,6 +308,7 @@ pub enum CoreEvent {
     },
     SessionOutputBatch {
         session_id: SessionId,
+        from_offset: u64,
         bytes: Vec<u8>,
     },
     AgentStateChanged {
@@ -343,6 +360,26 @@ pub struct RuntimeSessionSummary {
     pub backend_native_id: Option<String>,
 }
 
+/// An atomic snapshot of a session's recent output ring plus the absolute byte
+/// offsets it covers. `bytes` are the raw bytes for the half-open absolute range
+/// `[base_offset, end_offset)`; `end_offset` equals the total bytes ever emitted
+/// by the session, which is where a live output stream attaches.
+#[derive(Debug, Clone)]
+pub struct OutputSnapshot {
+    pub base_offset: u64,
+    pub end_offset: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// A contiguous run of session output for the live stream: `bytes` begin at the
+/// absolute offset `from_offset`.
+#[derive(Debug, Clone)]
+pub struct OutputDelta {
+    pub session_id: SessionId,
+    pub from_offset: u64,
+    pub bytes: Vec<u8>,
+}
+
 pub struct TerminalRuntime<B>
 where
     B: SessionBackend,
@@ -351,6 +388,9 @@ where
     sessions: HashMap<SessionId, Session>,
     recent_output: HashMap<SessionId, Vec<u8>>,
     recent_output_limit: usize,
+    // Absolute total bytes ever emitted per session (monotonic; never rebased on
+    // ring rotation). Drives the snapshot/stream offset contract.
+    output_offsets: HashMap<SessionId, u64>,
 }
 
 impl<B> TerminalRuntime<B>
@@ -363,6 +403,7 @@ where
             sessions: HashMap::new(),
             recent_output: HashMap::new(),
             recent_output_limit: 64 * 1024,
+            output_offsets: HashMap::new(),
         }
     }
 
@@ -509,6 +550,39 @@ where
         Some(output[output.len().saturating_sub(count)..].to_vec())
     }
 
+    /// Atomic snapshot of a session's recent output ring plus the absolute byte
+    /// range it covers. Returns `None` if the session is unknown.
+    pub fn snapshot_output(
+        &self,
+        session_id: &SessionId,
+        since_offset: Option<u64>,
+    ) -> Option<OutputSnapshot> {
+        if !self.sessions.contains_key(session_id) {
+            return None;
+        }
+        let end_offset = self.output_offsets.get(session_id).copied().unwrap_or(0);
+        let empty: &[u8] = &[];
+        let ring = self
+            .recent_output
+            .get(session_id)
+            .map(|bytes| bytes.as_slice())
+            .unwrap_or(empty);
+        let ring_base = end_offset.saturating_sub(ring.len() as u64);
+        // Start at `since` when it lies within the retained ring; otherwise
+        // return the whole ring (cold start, or the caller fell behind the
+        // bounded window — signalled to the renderer by base_offset > since).
+        let start = match since_offset {
+            Some(since) if since >= ring_base && since <= end_offset => since,
+            _ => ring_base,
+        };
+        let bytes = ring[(start - ring_base) as usize..].to_vec();
+        Some(OutputSnapshot {
+            base_offset: start,
+            end_offset,
+            bytes,
+        })
+    }
+
     pub fn drain_events(&mut self) -> Vec<CoreEvent> {
         self.backend
             .drain_events()
@@ -539,13 +613,23 @@ where
                 let session_id = SessionId::from_string(session_id);
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     session.last_seen_at = Some(SystemTime::now());
+                    let from_offset = {
+                        let counter = self.output_offsets.entry(session_id.clone()).or_default();
+                        let from_offset = *counter;
+                        *counter += bytes.len() as u64;
+                        from_offset
+                    };
                     append_recent_output(
                         &mut self.recent_output,
                         &session_id,
                         &bytes,
                         self.recent_output_limit,
                     );
-                    Some(CoreEvent::SessionOutputBatch { session_id, bytes })
+                    Some(CoreEvent::SessionOutputBatch {
+                        session_id,
+                        from_offset,
+                        bytes,
+                    })
                 } else {
                     None
                 }
@@ -626,6 +710,10 @@ where
     next_event_id: u64,
     dropped_event_count: usize,
     event_backlog_limit: usize,
+    // Per-session coalesced output deltas tapped for the live byte stream,
+    // drained by the host and pushed to the per-session Channel. Separate from
+    // the byte-less `events` history.
+    pending_output: HashMap<SessionId, OutputDelta>,
 }
 
 impl<B> RuntimeControlPlane<B>
@@ -646,6 +734,7 @@ where
             next_event_id: 1,
             dropped_event_count: 0,
             event_backlog_limit: 1024,
+            pending_output: HashMap::new(),
         }
     }
 
@@ -661,10 +750,48 @@ where
         self.agent_heuristics_enabled = enabled;
     }
 
+    /// Atomic snapshot of a session's recent output ring + absolute offsets, for
+    /// a renderer cold-start that then attaches the stream at `end_offset`.
+    pub fn snapshot_output(
+        &self,
+        session_id: &SessionId,
+        since_offset: Option<u64>,
+    ) -> Option<OutputSnapshot> {
+        self.runtime.snapshot_output(session_id, since_offset)
+    }
+
+    /// Drains the coalesced per-session output deltas accumulated since the last
+    /// call, for the live output stream. Call after `collect_events`.
+    pub fn drain_output_stream(&mut self) -> Vec<OutputDelta> {
+        if self.pending_output.is_empty() {
+            return Vec::new();
+        }
+        self.pending_output
+            .drain()
+            .map(|(_, delta)| delta)
+            .collect()
+    }
+
     pub fn collect_events(&mut self) {
         for event in self.runtime.drain_events() {
             let agent_signals = match &event {
-                CoreEvent::SessionOutputBatch { session_id, bytes } => {
+                CoreEvent::SessionOutputBatch {
+                    session_id,
+                    bytes,
+                    from_offset,
+                } => {
+                    // Tap raw output bytes for the live stream, coalescing
+                    // contiguous batches per session (separate from the
+                    // byte-less EventFrame pushed below).
+                    self.pending_output
+                        .entry(session_id.clone())
+                        .or_insert_with(|| OutputDelta {
+                            session_id: session_id.clone(),
+                            from_offset: *from_offset,
+                            bytes: Vec::new(),
+                        })
+                        .bytes
+                        .extend_from_slice(bytes);
                     let signals = if self.agent_heuristics_enabled {
                         detect_agent_signals_from_input(AgentSignalDetectorInput::with_heuristics(
                             bytes,
@@ -679,8 +806,23 @@ where
                 }
                 _ => Vec::new(),
             };
+            let agent_lifecycle = match &event {
+                CoreEvent::SessionStateChanged { session_id, to, .. } => {
+                    self.agent_team_lifecycle_transition(session_id, to)
+                }
+                _ => None,
+            };
             if let Some(frame) = self.frame_from_core_event(event) {
                 self.push_event(frame);
+            }
+            if let Some((session_id, state, reason)) = agent_lifecycle {
+                let _ = self.apply_agent_state_transition(
+                    session_id,
+                    state,
+                    Some(reason),
+                    "agent_team_lifecycle",
+                    None,
+                );
             }
             for (session_id, signal) in agent_signals {
                 if let Ok(result) = self.apply_agent_state_transition(
@@ -785,6 +927,7 @@ where
             "session.resize" => self.handle_session_resize(&request),
             "session.terminate" => self.handle_session_terminate(&request),
             "session.read_recent" => self.handle_session_read_recent(&request),
+            "session.snapshot" => self.handle_session_snapshot(&request),
             "events.poll" => self.handle_events_poll(&request),
             "events.subscribe" => self.handle_events_subscribe(&request),
             "agent.set_state" => self.handle_agent_set_state(&request),
@@ -831,7 +974,11 @@ where
                 backend_profile: params.backend_profile,
                 command,
                 cwd: params.cwd,
-                env: Vec::new(),
+                env: params
+                    .env
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.value))
+                    .collect(),
                 initial_size: TerminalSize::new(params.columns, params.rows),
                 durability,
             })
@@ -1009,6 +1156,27 @@ where
                 session_id: session_id.to_string(),
                 text,
                 byte_count: output.len(),
+            },
+        ))
+    }
+
+    fn handle_session_snapshot(
+        &mut self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, ControlError> {
+        self.collect_events();
+        let params: SessionSnapshotParams = request.parse_params()?;
+        let session_id = SessionId::from_string(params.session_id);
+        let snapshot = self
+            .snapshot_output(&session_id, params.since_offset)
+            .ok_or_else(|| ControlError::new(ErrorCode::SessionNotFound, "Session not found."))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &SessionSnapshotResult {
+                session_id: session_id.to_string(),
+                base_offset: snapshot.base_offset,
+                end_offset: snapshot.end_offset,
+                bytes_base64: BASE64_STANDARD.encode(&snapshot.bytes),
             },
         ))
     }
@@ -1272,6 +1440,51 @@ where
         Ok(agent_state_result(&record))
     }
 
+    fn agent_team_lifecycle_transition(
+        &self,
+        session_id: &SessionId,
+        session_state: &SessionState,
+    ) -> Option<(SessionId, AgentState, String)> {
+        let record = self.agent_states.get(&session_id.to_string())?;
+        if !agent_state_record_is_agent_team(record) {
+            return None;
+        }
+
+        let (state, reason) = match session_state {
+            SessionState::Exited { code } => match code {
+                Some(code) if *code != 0 => (
+                    AgentState::Failed,
+                    format!("Agent team worker exited with code {code}."),
+                ),
+                Some(_) => (
+                    AgentState::Completed,
+                    "Agent team worker exited successfully.".to_string(),
+                ),
+                None => (
+                    AgentState::Completed,
+                    "Agent team worker exited.".to_string(),
+                ),
+            },
+            SessionState::Failed { code, message } => (
+                AgentState::Failed,
+                format!("Agent team worker failed ({code}): {message}"),
+            ),
+            SessionState::Lost => (
+                AgentState::Failed,
+                "Agent team worker session was lost.".to_string(),
+            ),
+            _ => return None,
+        };
+        if record.state == state {
+            return None;
+        }
+        if record.state == AgentState::Failed && state == AgentState::Completed {
+            return None;
+        }
+
+        Some((session_id.clone(), state, reason))
+    }
+
     fn push_event(&mut self, event: EventFrame) {
         if self.event_history.len() >= self.event_backlog_limit {
             self.event_history.remove(0);
@@ -1401,7 +1614,9 @@ where
                 .to_string();
                 frame
             }
-            CoreEvent::SessionOutputBatch { session_id, bytes } => {
+            CoreEvent::SessionOutputBatch {
+                session_id, bytes, ..
+            } => {
                 let mut frame = EventFrame::new(event_id, "session.output");
                 frame.workspace_id = self
                     .runtime
@@ -1588,6 +1803,14 @@ fn agent_state_label(state: AgentState) -> &'static str {
 
 fn agent_state_requires_attention(state: AgentState) -> bool {
     matches!(state, AgentState::WaitingForInput | AgentState::Failed)
+}
+
+fn agent_state_record_is_agent_team(record: &AgentStateRecord) -> bool {
+    record
+        .telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.activity.as_deref())
+        == Some("agent_team")
 }
 
 fn detect_agent_signals(bytes: &[u8]) -> Vec<DetectedAgentSignal> {
@@ -2216,6 +2439,141 @@ mod tests {
         ));
         let visible: NotificationListResult = serde_json::from_str(ok_json(&visible)).unwrap();
         assert!(visible.notifications.is_empty());
+    }
+
+    #[test]
+    fn control_plane_marks_agent_team_session_completed_on_clean_exit() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+
+        let spawn = control.handle_request(request(
+            "req_spawn_agent_team_complete",
+            "session.spawn",
+            r#"{"workspace_id":"ws_agent_team","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+        ));
+        let session_id = ok_json(&spawn)
+            .split("\"session_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("session id in spawn result")
+            .to_string();
+
+        let state = control.handle_request(request(
+            "req_agent_team_running",
+            "agent.set_state",
+            &format!(
+                r#"{{"session_id":"{session_id}","state":"running","reason":"omo split worker","telemetry":{{"activity":"agent_team","session":"omo:split-window","ctx":"pane_worker"}}}}"#
+            ),
+        ));
+        let state: AgentStateResult = serde_json::from_str(ok_json(&state)).unwrap();
+        assert_eq!(state.state, "running");
+
+        control.runtime.backend.events.push(BackendEvent::Exited {
+            session_id: session_id.clone(),
+            code: Some(0),
+        });
+
+        let events = control.handle_request(request(
+            "req_agent_team_complete_events",
+            "events.poll",
+            r#"{"workspace_id":"ws_agent_team","types":["session.state_changed","agent.state_changed","notification.created"],"max_events":10}"#,
+        ));
+        let events: EventPollResult = serde_json::from_str(ok_json(&events)).unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "session.state_changed"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("\"to\":\"exited\"")
+        }));
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "agent.state_changed"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("\"state\":\"completed\"")
+                && event
+                    .data_json
+                    .contains("\"source\":\"agent_team_lifecycle\"")
+                && event.data_json.contains("\"activity\":\"agent_team\"")
+        }));
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "notification.created"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("agent.completed")
+        }));
+
+        let state = control.handle_request(request(
+            "req_agent_team_complete_state",
+            "agent.get_state",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+        ));
+        let state: AgentStateResult = serde_json::from_str(ok_json(&state)).unwrap();
+        assert_eq!(state.state, "completed");
+        assert!(!state.attention);
+        assert_eq!(
+            state
+                .telemetry
+                .and_then(|telemetry| telemetry.activity)
+                .as_deref(),
+            Some("agent_team")
+        );
+    }
+
+    #[test]
+    fn control_plane_marks_agent_team_session_failed_on_nonzero_exit() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+
+        let spawn = control.handle_request(request(
+            "req_spawn_agent_team_failed",
+            "session.spawn",
+            r#"{"workspace_id":"ws_agent_team_failed","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+        ));
+        let session_id = ok_json(&spawn)
+            .split("\"session_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("session id in spawn result")
+            .to_string();
+
+        let _ = control.handle_request(request(
+            "req_agent_team_running_failed",
+            "agent.set_state",
+            &format!(
+                r#"{{"session_id":"{session_id}","state":"running","reason":"claude-teams split worker","telemetry":{{"activity":"agent_team","session":"claude-teams:split-window"}}}}"#
+            ),
+        ));
+
+        control.runtime.backend.events.push(BackendEvent::Exited {
+            session_id: session_id.clone(),
+            code: Some(2),
+        });
+
+        let events = control.handle_request(request(
+            "req_agent_team_failed_events",
+            "events.poll",
+            r#"{"workspace_id":"ws_agent_team_failed","types":["agent.state_changed","notification.created"],"max_events":10}"#,
+        ));
+        let events: EventPollResult = serde_json::from_str(ok_json(&events)).unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "agent.state_changed"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("\"state\":\"failed\"")
+                && event.data_json.contains("exited with code 2")
+        }));
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "notification.created"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("agent.failed")
+        }));
+
+        let state = control.handle_request(request(
+            "req_agent_team_failed_state",
+            "agent.get_state",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+        ));
+        let state: AgentStateResult = serde_json::from_str(ok_json(&state)).unwrap();
+        assert_eq!(state.state, "failed");
+        assert!(state.attention);
     }
 
     #[test]
