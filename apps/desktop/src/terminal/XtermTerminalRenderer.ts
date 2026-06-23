@@ -1,12 +1,27 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import type { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import type { TerminalRenderer, TerminalSnapshot } from "./TerminalRenderer";
+
+export const XTERM_THEME = {
+  background: "#0e1116",
+  foreground: "#d7dde7",
+  cursor: "#f1cf89",
+  selectionBackground: "#2d5f73"
+} as const;
 
 export class XtermTerminalRenderer implements TerminalRenderer {
   private terminal?: Terminal;
   private fitAddon?: FitAddon;
   private mountedElement?: HTMLElement;
+  // Active WebGL addon, when GPU rendering has been opted into and succeeded.
+  private webglAddon?: WebglAddon;
+  // Disposes the onContextLoss subscription tied to the current webglAddon.
+  private webglContextLossSub?: { dispose(): void };
+  // Guards against overlapping enableWebgl() calls while the addon module is
+  // being lazily imported (import() is async, so two calls could race).
+  private webglEnablePending = false;
 
   mount(element: HTMLElement, initialState: TerminalSnapshot): void {
     this.dispose();
@@ -19,12 +34,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       lineHeight: 1.15,
       rows: initialState.rows,
       cols: initialState.columns,
-      theme: {
-        background: "#0e1116",
-        foreground: "#d7dde7",
-        cursor: "#f1cf89",
-        selectionBackground: "#2d5f73"
-      }
+      theme: XTERM_THEME
     });
     const fitAddon = new FitAddon();
 
@@ -42,6 +52,9 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   }
 
   unmount(): void {
+    // WebGL addon must be disposed BEFORE the terminal: disposing the terminal
+    // first leaves the addon holding a dangling reference / leaked GL context.
+    this.disposeWebglAddon();
     this.terminal?.dispose();
     this.terminal = undefined;
     this.fitAddon = undefined;
@@ -50,6 +63,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
   write(batch: Uint8Array): void {
     this.terminal?.write(batch);
+  }
+
+  reset(): void {
+    this.terminal?.reset();
   }
 
   resize(columns: number, rows: number): void {
@@ -72,6 +89,86 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
   fit(): void {
     this.fitAddon?.fit();
+  }
+
+  /**
+   * Opt-in GPU rendering. Lazily loads the WebGL addon and attaches it to the
+   * terminal. This is intentionally NOT called from mount(): the default
+   * renderer remains the DOM renderer so existing callers are unaffected.
+   *
+   * Safe to call repeatedly (double-enable guarded). If WebGL is unavailable
+   * (no terminal mounted, no GPU/WebGL2 context, or the addon throws) it
+   * silently falls back to the default DOM renderer — the terminal keeps
+   * working, just without hardware acceleration.
+   */
+  enableWebgl(): void {
+    const terminal = this.terminal;
+    if (!terminal) {
+      return;
+    }
+    // Already active, or an enable is mid-flight: do nothing.
+    if (this.webglAddon || this.webglEnablePending) {
+      return;
+    }
+    this.webglEnablePending = true;
+    void import("@xterm/addon-webgl")
+      .then(({ WebglAddon }) => {
+        // The renderer may have been unmounted/disposed (or WebGL disabled)
+        // while the dynamic import was in flight. Bail out without attaching.
+        if (this.terminal !== terminal || !this.webglEnablePending) {
+          return;
+        }
+        try {
+          const addon = new WebglAddon();
+          // If the GPU context is lost (driver reset, tab backgrounded too
+          // long, too many live contexts), dispose the addon and drop back to
+          // the DOM renderer instead of leaving a blank/frozen terminal.
+          this.webglContextLossSub = addon.onContextLoss(() => {
+            this.disposeWebglAddon();
+          });
+          terminal.loadAddon(addon);
+          this.webglAddon = addon;
+        } catch {
+          // WebGL2 unavailable or addon initialization failed — fall back to
+          // the default DOM renderer. Clean up any partial subscription.
+          this.disposeWebglAddon();
+        }
+      })
+      .catch(() => {
+        // Dynamic import itself failed (offline chunk, etc.). Stay on DOM.
+      })
+      .finally(() => {
+        this.webglEnablePending = false;
+      });
+  }
+
+  /**
+   * Disable GPU rendering and return to the DOM renderer. Disposes the WebGL
+   * addon (if any) and clears internal refs so enableWebgl() can re-attach a
+   * fresh addon later. Also cancels an in-flight enableWebgl() import.
+   */
+  disableWebgl(): void {
+    // Cancel a pending enable so the resolved import() does not attach after
+    // the caller asked to disable.
+    this.webglEnablePending = false;
+    this.disposeWebglAddon();
+  }
+
+  /**
+   * Whether GPU rendering is currently active (an addon is loaded). Pending
+   * enables that have not yet resolved report false.
+   */
+  isWebglEnabled(): boolean {
+    return this.webglAddon !== undefined;
+  }
+
+  // Disposes the active WebGL addon and its context-loss subscription, leaving
+  // the terminal on the DOM renderer. Idempotent.
+  private disposeWebglAddon(): void {
+    this.webglContextLossSub?.dispose();
+    this.webglContextLossSub = undefined;
+    this.webglAddon?.dispose();
+    this.webglAddon = undefined;
   }
 
   dispose(): void {
