@@ -22,6 +22,12 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   // Guards against overlapping enableWebgl() calls while the addon module is
   // being lazily imported (import() is async, so two calls could race).
   private webglEnablePending = false;
+  // Monotonic generation, bumped on every disable. A lazy enableWebgl() import()
+  // captures the generation it started in and bails on resolve if a later
+  // disable/enable has superseded it. Without this, a rapid
+  // enable -> disable -> enable can let two in-flight imports each loadAddon(),
+  // leaking a duplicate WebGL context.
+  private webglGeneration = 0;
 
   mount(element: HTMLElement, initialState: TerminalSnapshot): void {
     this.dispose();
@@ -111,11 +117,20 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return;
     }
     this.webglEnablePending = true;
+    // Claim a generation for this enable. Any later disable bumps the counter,
+    // which invalidates this in-flight import when it resolves.
+    const generation = ++this.webglGeneration;
     void import("@xterm/addon-webgl")
       .then(({ WebglAddon }) => {
-        // The renderer may have been unmounted/disposed (or WebGL disabled)
-        // while the dynamic import was in flight. Bail out without attaching.
-        if (this.terminal !== terminal || !this.webglEnablePending) {
+        // Bail if this enable was superseded (disable/re-enable) or the terminal
+        // was swapped/unmounted while the import was in flight, or an addon is
+        // already attached. Any of these means attaching here would leak a
+        // duplicate GL context.
+        if (
+          generation !== this.webglGeneration ||
+          this.terminal !== terminal ||
+          this.webglAddon
+        ) {
           return;
         }
         try {
@@ -138,7 +153,11 @@ export class XtermTerminalRenderer implements TerminalRenderer {
         // Dynamic import itself failed (offline chunk, etc.). Stay on DOM.
       })
       .finally(() => {
-        this.webglEnablePending = false;
+        // Only clear the pending flag if we still own the latest generation; a
+        // superseding enable owns it otherwise.
+        if (generation === this.webglGeneration) {
+          this.webglEnablePending = false;
+        }
       });
   }
 
@@ -148,8 +167,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
    * fresh addon later. Also cancels an in-flight enableWebgl() import.
    */
   disableWebgl(): void {
-    // Cancel a pending enable so the resolved import() does not attach after
-    // the caller asked to disable.
+    // Bump the generation so any in-flight enableWebgl() import() bails on
+    // resolve instead of attaching after the caller asked to disable, then
+    // clear the pending flag and dispose any live addon.
+    this.webglGeneration++;
     this.webglEnablePending = false;
     this.disposeWebglAddon();
   }
