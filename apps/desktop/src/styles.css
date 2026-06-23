@@ -6,6 +6,10 @@
     "Apple SD Gothic Neo", "Malgun Gothic", ui-sans-serif, system-ui, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  /* Grayscale AA instead of Windows subpixel/ClearType — far cleaner for light
+     text on the dark UI (kills the colored fringing that reads as "low-res"). */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 * {

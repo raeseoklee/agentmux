@@ -75,12 +75,24 @@ import {
   IconMoon,
   IconPlus,
   IconSearch,
+  IconBalance,
   IconServer,
   IconShellArrow,
+  IconSidebar,
   IconSplitCols,
   IconSplitRows,
   IconSun,
+  IconWinMaximize,
+  IconWinMinimize,
+  IconWinRestore,
 } from "./icons";
+import {
+  closeWindow,
+  minimizeWindow,
+  toggleMaximizeWindow,
+  watchMaximized,
+} from "./windowControls";
+import { applyZoom, loadZoom, nudgeZoom, resetZoom, ZOOM_STEP } from "./uiZoom";
 
 type Overlay = "palette" | "search" | "settings" | "setup" | null;
 type SettingsTab =
@@ -220,8 +232,12 @@ type BrowserCustomActionPreset =
       percent: number;
     };
 
-const FONT_MONO = "'JetBrains Mono',monospace";
-const FONT_SANS = "'Pretendard Variable'";
+// Unified to Pretendard across the UI chrome (the terminal content keeps its own
+// monospace font in XtermTerminalRenderer). Bundled locally via src/fonts.css —
+// no CDN, robust fallbacks so it degrades gracefully if the face ever fails.
+const FONT_MONO =
+  "'Pretendard Variable',Pretendard,-apple-system,'Segoe UI','Malgun Gothic',system-ui,sans-serif";
+const FONT_SANS = FONT_MONO;
 const DEFAULT_WORKSPACE_PLUS_ACTION = "workspace.new";
 const DEFAULT_SURFACE_TAB_PLUS_ACTION = "terminal.newWsl";
 const DEFAULT_SURFACE_TAB_ACTIONS = ["pane.splitRight", "pane.splitDown"];
@@ -831,6 +847,14 @@ export function AgentmuxTerminalApp() {
   const [query, setQuery] = useState("");
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [fontSize, setFontSize] = useState(12.5);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [windowMaximized, setWindowMaximized] = useState(false);
+  useEffect(() => watchMaximized(setWindowMaximized), []);
+  useEffect(() => {
+    // Apply the persisted zoom, or an adaptive default for this display's DPI
+    // and resolution (FHD/QHD/UHD). Ctrl +/-/0 adjust it; see the keydown below.
+    applyZoom(loadZoom());
+  }, []);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configPath, setConfigPath] = useState("");
   const [projectConfigPath, setProjectConfigPath] = useState<string | null>(
@@ -1232,6 +1256,31 @@ export function AgentmuxTerminalApp() {
     })() ??
     panes.find((pane) => !pane.parentPaneId)?.paneId ??
     null;
+
+  const activeRootIsSplit = rootPaneId
+    ? paneById.get(rootPaneId)?.kind === "split"
+    : false;
+
+  // Balance: reset every split ratio in the active tab's subtree back to 0.5 so
+  // panes return to even sizes after manual drag-resizing.
+  const balanceActivePanes = useCallback(() => {
+    if (!rootPaneId) return;
+    const stack = [rootPaneId];
+    const seen = new Set<string>();
+    while (stack.length) {
+      const id = stack.pop();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const pane = paneById.get(id);
+      if (!pane || pane.kind !== "split") continue;
+      if ((pane.splitRatio ?? 0.5) !== 0.5) {
+        void ctl.resizePane(pane.paneId, 0.5);
+      }
+      for (const child of childrenByParent.get(pane.paneId) ?? []) {
+        stack.push(child.paneId);
+      }
+    }
+  }, [rootPaneId, paneById, childrenByParent, ctl]);
 
   const surfaceForPane = (pane: PaneSummary): SurfaceSummary | undefined =>
     pane.mountedSurfaceId ? surfaceById.get(pane.mountedSurfaceId) : undefined;
@@ -1968,6 +2017,12 @@ export function AgentmuxTerminalApp() {
     },
     [ctl, runTerminalLaunch],
   );
+  const openDurableTerminalInPane = useCallback(
+    async (paneId: string) => {
+      await runTerminalLaunch(() => ctl.spawnDurableTerminalInPane(paneId));
+    },
+    [ctl, runTerminalLaunch],
+  );
   const addTerminal = useCallback(async () => {
     await runTerminalLaunch(() => ctl.spawnDefaultTerminal());
   }, [ctl, runTerminalLaunch]);
@@ -2259,6 +2314,29 @@ export function AgentmuxTerminalApp() {
     color: "var(--fg3)",
   };
   const iconBtnHover: CSSProperties = {
+    background: "var(--s2)",
+    color: "var(--fg1)",
+  };
+  // Frameless-window controls (decorations:false): full-height, flush to the
+  // top-right corner like a native caption.
+  const winCtlBtn: CSSProperties = {
+    width: 46,
+    height: "100%",
+    border: 0,
+    // Override the global `button { border-radius: 6px }` rule — caption
+    // controls are sharp rectangles flush to the window edge; the window's own
+    // rounded top-right corner clips the close button for a native look.
+    borderRadius: 0,
+    margin: 0,
+    padding: 0,
+    background: "transparent",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "var(--fg3)",
+  };
+  const winCtlBtnHover: CSSProperties = {
     background: "var(--s2)",
     color: "var(--fg1)",
   };
@@ -2660,6 +2738,38 @@ export function AgentmuxTerminalApp() {
       }
       if (overlay || isEditableShortcutTarget(event.target)) {
         return;
+      }
+
+      // ⌘/Ctrl+B — toggle the workspace sidebar (VS Code convention).
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey &&
+        !event.shiftKey &&
+        key === "b"
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        setSidebarCollapsed((collapsed) => !collapsed);
+        return;
+      }
+
+      // ⌘/Ctrl +/-/0 — UI zoom (persisted; browser / VS Code convention).
+      if ((event.metaKey || event.ctrlKey) && !event.altKey) {
+        if (key === "=" || key === "+") {
+          event.preventDefault();
+          nudgeZoom(ZOOM_STEP);
+          return;
+        }
+        if (key === "-" || key === "_") {
+          event.preventDefault();
+          nudgeZoom(-ZOOM_STEP);
+          return;
+        }
+        if (key === "0") {
+          event.preventDefault();
+          resetZoom();
+          return;
+        }
       }
 
       const stroke = keyboardEventToStroke(event);
@@ -3083,6 +3193,30 @@ export function AgentmuxTerminalApp() {
                 >
                   <IconPlus size={13} /> WSL 터미널 열기
                 </button>
+                <button
+                  type="button"
+                  disabled={terminalLaunchPending}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void openDurableTerminalInPane(pane.paneId);
+                  }}
+                  title="재시작에도 살아남는 durable WSL 세션 (tmux). 연결이 끊겨도 재접속됩니다."
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    background: "transparent",
+                    color: "var(--fg3)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    padding: "6px 12px",
+                    cursor: terminalLaunchPending ? "wait" : "pointer",
+                    opacity: terminalLaunchPending ? 0.72 : 1,
+                    font: `600 11px/1 ${FONT_SANS}`,
+                  }}
+                >
+                  <IconServer size={12} /> Durable 터미널 (tmux)
+                </button>
               </div>
             )}
           </div>
@@ -3120,6 +3254,20 @@ export function AgentmuxTerminalApp() {
             borderBottom: "1px solid var(--border)",
           }}
         >
+          <Hov
+            tag="button"
+            ariaLabel="사이드바 접기/펼치기"
+            title="사이드바 접기/펼치기 (⌘B)"
+            style={{
+              ...iconBtn,
+              marginRight: 6,
+              color: sidebarCollapsed ? "var(--accent)" : "var(--fg2)",
+            }}
+            hover={iconBtnHover}
+            onClick={() => setSidebarCollapsed((c) => !c)}
+          >
+            <IconSidebar />
+          </Hov>
           <BrandLogo size={17} radius={14} />
           <span
             style={{
@@ -3169,6 +3317,18 @@ export function AgentmuxTerminalApp() {
             {isDark ? <IconMoon /> : <IconSun />}
             {isDark ? "다크" : "라이트"}
           </Hov>
+          {activeRootIsSplit ? (
+            <Hov
+              tag="button"
+              ariaLabel="분할 페인 균등 정렬"
+              title="분할 페인 균등 정렬 — 현재 탭의 분할 비율을 모두 50:50으로"
+              style={{ ...iconBtn, marginRight: 2 }}
+              hover={iconBtnHover}
+              onClick={balanceActivePanes}
+            >
+              <IconBalance />
+            </Hov>
+          ) : null}
           <Hov
             tag="button"
             style={{ ...iconBtn, marginRight: 2 }}
@@ -3197,6 +3357,47 @@ export function AgentmuxTerminalApp() {
           >
             <IconGear />
           </Hov>
+          {/* window controls — frameless caption (decorations:false), flush to
+              the top-right corner */}
+          <div
+            style={{
+              display: "flex",
+              alignSelf: "stretch",
+              marginLeft: 6,
+              marginRight: -10,
+            }}
+          >
+            <Hov
+              tag="button"
+              ariaLabel="최소화"
+              title="최소화"
+              style={winCtlBtn}
+              hover={winCtlBtnHover}
+              onClick={minimizeWindow}
+            >
+              <IconWinMinimize />
+            </Hov>
+            <Hov
+              tag="button"
+              ariaLabel={windowMaximized ? "이전 크기로 복원" : "최대화"}
+              title={windowMaximized ? "이전 크기로 복원" : "최대화"}
+              style={winCtlBtn}
+              hover={winCtlBtnHover}
+              onClick={toggleMaximizeWindow}
+            >
+              {windowMaximized ? <IconWinRestore /> : <IconWinMaximize />}
+            </Hov>
+            <Hov
+              tag="button"
+              ariaLabel="닫기"
+              title="닫기"
+              style={winCtlBtn}
+              hover={{ background: "#e81123", color: "#fff" }}
+              onClick={closeWindow}
+            >
+              <IconClose />
+            </Hov>
+          </div>
         </div>
 
         {/* body */}
@@ -3204,122 +3405,19 @@ export function AgentmuxTerminalApp() {
           {/* sidebar */}
           <div
             style={{
-              width: 236,
+              width: sidebarCollapsed ? 0 : 236,
               flex: "none",
               background: "var(--surface)",
-              borderRight: "1px solid var(--border)",
+              borderRight: sidebarCollapsed ? "none" : "1px solid var(--border)",
               display: "flex",
               flexDirection: "column",
+              overflow: "hidden",
+              transition: "width 160ms ease",
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                padding: "10px 10px 8px",
-              }}
-            >
-              <Hov
-                tag="button"
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  background: "var(--canvas)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 8,
-                  padding: "8px 10px",
-                  cursor: "pointer",
-                  color: "var(--fg4)",
-                }}
-                hover={{ borderColor: "var(--border-strong)" }}
-                onClick={() => {
-                  setOverlay("palette");
-                  setQuery("");
-                }}
-              >
-                <IconSearch size={13} />
-                <span
-                  style={{
-                    font: `400 12px/1 ${FONT_SANS}`,
-                    flex: 1,
-                    textAlign: "left",
-                  }}
-                >
-                  검색…
-                </span>
-                <span
-                  style={{
-                    font: `600 10px/1 ${FONT_MONO}`,
-                    background: "var(--s2)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 4,
-                    padding: "3px 5px",
-                    color: "var(--fg3)",
-                  }}
-                >
-                  ⌘K
-                </span>
-              </Hov>
-              <Hov
-                tag="button"
-                className="agentmux-workspace-plus"
-                ariaLabel="워크스페이스 추가"
-                title="워크스페이스 추가"
-                style={{
-                  width: 34,
-                  height: 34,
-                  flex: "none",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  background: "var(--canvas)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                  color: "var(--fg2)",
-                }}
-                hover={{
-                  borderColor: "var(--border-strong)",
-                  color: "var(--fg1)",
-                }}
-                onClick={() => {
-                  runConfiguredAction(workspacePlusActionId, createWorkspace);
-                }}
-              >
-                <IconPlus />
-              </Hov>
-              <Hov
-                tag="button"
-                className="agentmux-workspace-group-create"
-                ariaLabel="그룹 추가"
-                title="그룹 추가"
-                style={{
-                  width: 34,
-                  height: 34,
-                  flex: "none",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  background: "var(--canvas)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                  color: "var(--fg2)",
-                }}
-                hover={{
-                  borderColor: "var(--border-strong)",
-                  color: "var(--fg1)",
-                }}
-                onClick={() => {
-                  void createWorkspaceGroup();
-                }}
-              >
-                <IconFolder />
-              </Hov>
-            </div>
+            {/* Sidebar search box removed — redundant with the titlebar search
+               button. Workspace add (+) and group-create moved into the filter
+               row below, per the requested layout. */}
             <div
               style={{
                 font: `700 10px/1 ${FONT_SANS}`,
@@ -3332,20 +3430,29 @@ export function AgentmuxTerminalApp() {
               워크스페이스
             </div>
             <div
-              className="agentmux-workspace-filter"
               style={{
                 display: "flex",
                 alignItems: "center",
                 gap: 6,
                 margin: "0 10px 7px",
-                padding: "6px 7px",
-                height: 32,
-                background: "var(--canvas)",
-                border: "1px solid var(--border)",
-                borderRadius: 8,
-                color: "var(--fg4)",
               }}
             >
+              <div
+                className="agentmux-workspace-filter"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 7px",
+                  height: 32,
+                  background: "var(--canvas)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  color: "var(--fg4)",
+                }}
+              >
               <IconSearch size={13} />
               <input
                 className="agentmux-workspace-filter-input"
@@ -3395,6 +3502,63 @@ export function AgentmuxTerminalApp() {
                   <IconClose size={11} />
                 </Hov>
               ) : null}
+              </div>
+              <Hov
+                tag="button"
+                className="agentmux-workspace-plus"
+                ariaLabel="워크스페이스 추가"
+                title="워크스페이스 추가"
+                style={{
+                  width: 32,
+                  height: 32,
+                  flex: "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "var(--canvas)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  color: "var(--fg2)",
+                }}
+                hover={{
+                  borderColor: "var(--border-strong)",
+                  color: "var(--fg1)",
+                }}
+                onClick={() => {
+                  runConfiguredAction(workspacePlusActionId, createWorkspace);
+                }}
+              >
+                <IconPlus />
+              </Hov>
+              <Hov
+                tag="button"
+                className="agentmux-workspace-group-create"
+                ariaLabel="그룹 추가"
+                title="그룹 추가"
+                style={{
+                  width: 32,
+                  height: 32,
+                  flex: "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "var(--canvas)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  color: "var(--fg2)",
+                }}
+                hover={{
+                  borderColor: "var(--border-strong)",
+                  color: "var(--fg1)",
+                }}
+                onClick={() => {
+                  void createWorkspaceGroup();
+                }}
+              >
+                <IconFolder />
+              </Hov>
             </div>
             <div
               className="agentmux-scroll"

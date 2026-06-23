@@ -171,10 +171,38 @@ export function IconWinMaximize({ size = 11 }: IconProps) {
   );
 }
 
+export function IconWinRestore({ size = 11 }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round">
+      <rect x="4" y="8" width="12" height="12" rx="1.5" />
+      <path d="M8 8V4h12v12h-4" />
+    </svg>
+  );
+}
+
 export function IconBubble({ size = 10 }: IconProps) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
       <path d="M4 22V4h11l-1.5 4L15 12H4" />
+    </svg>
+  );
+}
+
+export function IconSidebar({ size = 15 }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M9 4v16" />
+    </svg>
+  );
+}
+
+export function IconBalance({ size = 14 }: IconProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round">
+      <rect x="3" y="5" width="5" height="14" rx="1.2" />
+      <rect x="9.5" y="5" width="5" height="14" rx="1.2" />
+      <rect x="16" y="5" width="5" height="14" rx="1.2" />
     </svg>
   );
 }

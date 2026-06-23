@@ -1,0 +1,16 @@
+/*
+ * Pretendard Variable — bundled locally (not from a CDN) so the desktop app
+ * renders identically offline, with no font-loading flash (FOUT) and no
+ * fallback-to-system-serif when the network is slow or blocked. One variable
+ * file covers the full weight range (45–920).
+ *
+ * License: SIL Open Font License 1.1 — Copyright (c) 2021 Kil Hyung-jin.
+ * https://github.com/orioncactus/pretendard
+ */
+@font-face {
+  font-family: "Pretendard Variable";
+  font-weight: 45 920;
+  font-style: normal;
+  font-display: swap;
+  src: url("./assets/fonts/PretendardVariable.woff2") format("woff2-variations");
+}

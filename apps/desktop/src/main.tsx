@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { AgentmuxTerminalApp } from "./agentmux/AgentmuxTerminalApp";
+import "./fonts.css";
 import "./styles.css";
 
 // The implemented design is the primary product UI. The original backend-wired

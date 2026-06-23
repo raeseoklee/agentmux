@@ -1,8 +1,9 @@
 import { type CSSProperties, useState } from "react";
 import type { ControlClient } from "../control/ControlClient";
 
-const FONT_SANS = "'Pretendard Variable'";
-const FONT_MONO = "'JetBrains Mono',monospace";
+const FONT_SANS =
+  "'Pretendard Variable',Pretendard,-apple-system,'Segoe UI','Malgun Gothic',system-ui,sans-serif";
+const FONT_MONO = FONT_SANS;
 
 const buttonStyle: CSSProperties = {
   background: "var(--s2)",

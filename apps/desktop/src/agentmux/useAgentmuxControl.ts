@@ -125,6 +125,7 @@ export interface AgentmuxControl {
   createWorkspaceInGroup: (groupId: string, name?: string) => Promise<WorkspaceSummary | null>;
   spawnDefaultTerminal: () => Promise<void>;
   spawnDefaultTerminalInPane: (paneId: string) => Promise<void>;
+  spawnDurableTerminalInPane: (paneId: string) => Promise<void>;
   spawnWslTerminal: (distribution: string) => Promise<void>;
   spawnAgent: (command: string[]) => Promise<void>;
   spawnDockControl: (control: DockControl) => Promise<TerminalSession | null>;
@@ -671,6 +672,25 @@ export function useAgentmuxControl(): AgentmuxControl {
           throw new Error(WSL_REQUIRED_MESSAGE);
         }
         return client.spawnWslTerminal(
+          workspaceId,
+          distribution,
+          workspaceProjectRoot(workspaceId),
+          "active_pane",
+          paneId
+        );
+      }),
+    [client, defaultWslDistribution, notifyWslRequired, withActive, workspaceProjectRoot]
+  );
+
+  const spawnDurableTerminalInPane = useCallback(
+    (paneId: string) =>
+      withActive(async (workspaceId) => {
+        const distribution = defaultWslDistribution(workspaceId);
+        if (!distribution) {
+          notifyWslRequired();
+          throw new Error(WSL_REQUIRED_MESSAGE);
+        }
+        return client.spawnDurableWslTerminal(
           workspaceId,
           distribution,
           workspaceProjectRoot(workspaceId),
@@ -1250,6 +1270,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     createWorkspaceInGroup,
     spawnDefaultTerminal,
     spawnDefaultTerminalInPane,
+    spawnDurableTerminalInPane,
     spawnWslTerminal,
     spawnAgent,
     spawnDockControl,

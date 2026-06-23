@@ -610,6 +610,13 @@ export interface ControlClient {
     placement?: TerminalPlacement,
     paneId?: string | null,
   ): Promise<TerminalSession>;
+  spawnDurableWslTerminal(
+    workspaceId: string,
+    distribution: string | null,
+    cwd: string | null,
+    placement?: TerminalPlacement,
+    paneId?: string | null,
+  ): Promise<TerminalSession>;
   spawnDockTerminal(
     workspaceId: string,
     control: DockControl,
@@ -1610,6 +1617,39 @@ class TauriControlClient implements ControlClient {
     return {
       sessionId: result.session_id,
       backendKind: "wsl-direct",
+      state: "running",
+    };
+  }
+
+  // Same login-shell as spawnWslTerminal, but on the durable WSL-tmux backend so
+  // the session survives app restarts (and is reattached, not respawned).
+  async spawnDurableWslTerminal(
+    workspaceId: string,
+    distribution: string | null,
+    cwd: string | null,
+    placement?: TerminalPlacement,
+    paneId?: string | null,
+  ): Promise<TerminalSession> {
+    const result = await this.call<{ session_id: string }>("session.spawn", {
+      workspace_id: workspaceId,
+      backend: "wsl-tmux-control",
+      backend_profile: distribution,
+      command: [
+        "sh",
+        "-c",
+        'login_shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; exec "${login_shell:-${SHELL:-/bin/bash}}" -l',
+      ],
+      cwd,
+      columns: 120,
+      rows: 30,
+      durability: "durable",
+      placement: placement ?? null,
+      pane_id: paneId ?? null,
+    });
+
+    return {
+      sessionId: result.session_id,
+      backendKind: "wsl-tmux-control",
       state: "running",
     };
   }
@@ -3177,6 +3217,27 @@ class BrowserPreviewControlClient implements ControlClient {
     );
   }
 
+  async spawnDurableWslTerminal(
+    workspaceId: string,
+    distribution: string | null,
+    cwd: string | null,
+    placement: TerminalPlacement = "active_pane",
+    paneId?: string | null,
+  ): Promise<TerminalSession> {
+    return this.createPreviewTerminal(
+      workspaceId,
+      "wsl-tmux-control",
+      "wsl-tmux-control",
+      [
+        "\r\n$ wsl " + (distribution ?? "default") + " " + (cwd ?? "~") + "  (durable · tmux)",
+        "\r\nagentmux durable WSL desktop preview",
+        "\r\n",
+      ].join(""),
+      placement,
+      paneId,
+    );
+  }
+
   async spawnDockTerminal(
     workspaceId: string,
     control: DockControl,
@@ -4319,6 +4380,18 @@ class ServerControlClient extends BrowserPreviewControlClient {
       paneId,
       title: distribution ? `WSL ${distribution}` : "WSL",
     });
+  }
+
+  async spawnDurableWslTerminal(
+    workspaceId: string,
+    distribution: string | null,
+    cwd: string | null,
+    placement: TerminalPlacement = "active_pane",
+    paneId?: string | null,
+  ): Promise<TerminalSession> {
+    // Server mode doesn't model durability separately yet — fall back to a
+    // regular WSL terminal so the call still resolves.
+    return this.spawnWslTerminal(workspaceId, distribution, cwd, placement, paneId);
   }
 
   async spawnDockTerminal(
