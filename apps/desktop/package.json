@@ -9,8 +9,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "test:ui": "playwright test",
     "tauri:dev": "tauri dev",
-    "tauri:build": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tools/run-desktop-tauri-build.ps1",
-    "tauri:build:debug": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tools/run-desktop-tauri-build.ps1 -DebugBuild -NoBundle -Ci"
+    "tauri:build": "tauri build"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",
