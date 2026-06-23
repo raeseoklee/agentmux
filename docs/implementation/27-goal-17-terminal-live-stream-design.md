@@ -94,9 +94,11 @@ Resync replays **raw recent bytes**, not a reconstructed VT screen. For a full-s
 |-----|---------|--------|
 | Cold start | LiveTerminal first mount for a session | `snapshot` → write ring → attach at `end_offset` |
 | Gap resync | `from_offset != expected_offset` | re-`snapshot` → reset+replay → resume |
-| Renderer swap | WebGL toggle on/off (visible-only, Goal step #1) | re-`snapshot` into the freshly (re)constructed xterm/renderer → attach at `end_offset` |
+| Renderer remount | LiveTerminal renderer rebuilt (session swap / unmount→remount) | re-`snapshot` into the new xterm/renderer → attach at `end_offset` |
 
-The renderer-swap use is why the handshake must be cheap and idempotent: turning WebGL on for a pane that becomes visible (and off when hidden, to stay under the ~16 WebGL-context cap) tears down and rebuilds the xterm renderer, which must then cold-start from the snapshot exactly like a first mount.
+The renderer-remount use is why the handshake must be cheap and idempotent: whenever the xterm instance is actually rebuilt (e.g. the LiveTerminal mount effect re-runs on a session swap), the new instance must cold-start from the snapshot exactly like a first mount.
+
+**WebGL visible-only toggling is _not_ a remount.** As implemented in step #1 (`apps/desktop/src/agentmux/LiveTerminal.tsx`, `XtermTerminalRenderer.enableWebgl`/`disableWebgl`), enabling/disabling WebGL loads/unloads the addon on the **same** `Terminal` instance; the xterm buffer and the live stream are preserved across the toggle, so **no re-handshake is performed on a WebGL toggle**. A re-handshake is needed only on an actual renderer rebuild. (A future change that fully tears down a hidden pane's xterm instance would turn that teardown into a remount, at which point the cold-start handshake applies — but plain WebGL on/off must stay handshake-free to avoid reset+snapshot churn on every focus change.)
 
 ---
 
@@ -162,7 +164,7 @@ Write **`Uint8Array`** into xterm, never strings. xterm's byte-oriented `write(U
 
 ## 6. WebGL visible-only integration (Goal step #1, referenced)
 
-Step #1 (implemented separately) enables the WebGL renderer **only on visible/active panes**, because the browser caps live WebGL contexts (~16). When a hidden pane becomes active, its renderer is (re)constructed with WebGL and must **cold-start from the snapshot+offset handshake** (§2.3, §2.6) exactly like a first mount; when it hides, WebGL is torn down. This is the third use of the one snapshot primitive (§2.6). This document's contract is what makes that swap correct: the re-attach re-`snapshot`s and resumes at `end_offset` rather than assuming continuity across the renderer rebuild.
+Step #1 (implemented separately) enables the WebGL renderer **only on visible/active panes**, because the browser caps live WebGL contexts (~16). As implemented, activating a pane **loads the WebGL addon onto the existing `Terminal`** and deactivating **unloads it** — the xterm instance is **not** rebuilt, so the buffer and the live stream survive the toggle and **no re-handshake is needed** for a WebGL on/off. The snapshot+offset handshake (§2.3) applies only if/when the renderer is genuinely rebuilt (session swap, or a future teardown of hidden panes' xterm instances). Keeping addon toggles handshake-free avoids needless reset+snapshot churn on every focus change.
 
 ---
 
