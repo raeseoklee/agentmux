@@ -5,7 +5,7 @@ use agentmux_backend::{
     CommandSpec, InputEvent, NamedKey, SessionBackend, SessionHandle, SpawnRequest, TerminalSize,
     TerminationMode,
 };
-use agentmux_backend_wsl::{WslDirectBackend, WslDirectConfig};
+use agentmux_backend_wsl::{PipeBackend, WslDirectBackend, WslDirectConfig};
 
 pub const TMUX_EXE: &str = "tmux";
 pub const TMUX_CONTROL_ARGS: &[&str] = &["-C", "new-session", "-A", "-s"];
@@ -572,7 +572,7 @@ pub struct TmuxControlBackend<B = WslDirectBackend> {
     parsers: HashMap<String, TmuxControlParser>,
 }
 
-impl TmuxControlBackend<WslDirectBackend> {
+impl TmuxControlBackend<WslDirectBackend<PipeBackend>> {
     pub fn new() -> Self {
         Self::with_config(TmuxControlConfig::default())
     }
@@ -582,11 +582,16 @@ impl TmuxControlBackend<WslDirectBackend> {
             Some(distribution) => WslDirectConfig::for_distribution(distribution),
             None => WslDirectConfig::default(),
         };
-        Self::with_transport(WslDirectBackend::with_config(wsl_config))
+        // Pipe transport, NOT ConPTY: tmux control mode dies under a pseudo-console
+        // in a GUI process. Pipes carry the line-based control protocol cleanly.
+        Self::with_transport(WslDirectBackend::with_backend(
+            wsl_config,
+            PipeBackend::new(),
+        ))
     }
 }
 
-impl Default for TmuxControlBackend<WslDirectBackend> {
+impl Default for TmuxControlBackend<WslDirectBackend<PipeBackend>> {
     fn default() -> Self {
         Self::new()
     }
@@ -611,11 +616,14 @@ impl<B> TmuxControlBackend<B> {
     }
 
     pub fn session_name_for_spawn(request: &SpawnRequest) -> String {
-        request
-            .workspace_id
-            .as_deref()
-            .map(durable_session_name)
-            .unwrap_or_else(|| durable_session_name(&request.session_id))
+        // Key the tmux session on the unique agentmux session id, NOT the
+        // workspace id. A workspace-shared name meant every durable pane ran
+        // `new-session -A -s agentmux_<ws>` against the SAME tmux session: the
+        // second pane onward only *attached* (no pane content is replayed in
+        // control mode, so it rendered blank), and the contention killed the
+        // server ("server exited unexpectedly"). One tmux session per pane keeps
+        // them independent and lets each pane's prompt stream immediately.
+        durable_session_name(&request.session_id)
     }
 
     fn target_for_session(&self, session_id: &str) -> BackendResult<String> {
@@ -1063,7 +1071,7 @@ mod tests {
         assert_eq!(handle.backend_kind, BackendKind::WslTmuxControl);
         assert_eq!(
             handle.backend_native_id.as_deref(),
-            Some("agentmux_demo123")
+            Some("agentmux_ses_tmux")
         );
         let spawn = backend.transport().last_spawn.as_ref().unwrap();
         assert_eq!(spawn.backend, Some(BackendKind::WslDirect));
@@ -1076,7 +1084,7 @@ mod tests {
                 "new-session",
                 "-A",
                 "-s",
-                "agentmux_demo123",
+                "agentmux_ses_tmux",
                 "bash -lc 'echo hello'"
             ]
         );
@@ -1153,9 +1161,9 @@ mod tests {
         assert_eq!(
             backend.transport().sent_text,
             vec![
-                "send-keys -t agentmux_demo123 -l hi\n",
-                "send-keys -t agentmux_demo123 Enter\n",
-                "resize-pane -t agentmux_demo123 -x 120 -y 30\n",
+                "send-keys -t agentmux_ses_tmux -l hi\n",
+                "send-keys -t agentmux_ses_tmux Enter\n",
+                "resize-pane -t agentmux_ses_tmux -x 120 -y 30\n",
                 "detach-client\n"
             ]
         );

@@ -54,7 +54,7 @@ fn tmux_control_launches_in_wsl_and_round_trips_output() {
     assert!(handle
         .backend_native_id
         .as_deref()
-        .is_some_and(|id| id.starts_with("agentmux_tmux_smoke_")));
+        .is_some_and(|id| id.starts_with("agentmux_ses_tmux_smoke_")));
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut output = Vec::new();

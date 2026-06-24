@@ -10,6 +10,9 @@ use agentmux_backend::{
 };
 use agentmux_backend_conpty::ConptyBackend;
 
+mod pipe;
+pub use pipe::PipeBackend;
+
 pub const WSL_EXE: &str = "wsl.exe";
 pub const DEFAULT_WSL_CWD: &str = "~";
 pub const DEFAULT_WSL_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);

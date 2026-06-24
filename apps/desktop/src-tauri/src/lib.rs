@@ -18,8 +18,8 @@ use agentmux_backend_conpty::ConptyBackend;
 use agentmux_backend_ssh::SshDirectBackend;
 use agentmux_backend_tmux::TmuxControlBackend;
 use agentmux_backend_wsl::{
-    discover_wsl_distributions as discover_wsl_distributions_from_backend, WslDiagnosticCode,
-    WslDirectBackend, WslDirectConfig, WslDistribution,
+    discover_wsl_distributions as discover_wsl_distributions_from_backend, PipeBackend,
+    WslDiagnosticCode, WslDirectBackend, WslDirectConfig, WslDistribution,
 };
 use agentmux_browser::{
     BrowserAutomation, BrowserAutomationError, BrowserAutomationErrorCode, BrowserCommand,
@@ -99,7 +99,7 @@ type DesktopRuntimeControl = RuntimeControlPlane<DesktopBackendRouter>;
 pub struct DesktopBackendRouter {
     conpty: ConptyBackend,
     wsl_direct: WslDirectBackend,
-    tmux_control: TmuxControlBackend,
+    tmux_control: TmuxControlBackend<WslDirectBackend<PipeBackend>>,
     ssh: SshDirectBackend,
     routes: HashMap<String, BackendTraitKind>,
 }

@@ -1634,10 +1634,15 @@ class TauriControlClient implements ControlClient {
       workspace_id: workspaceId,
       backend: "wsl-tmux-control",
       backend_profile: distribution,
+      // Non-nested command substitution: the tmux backend runs this through an
+      // extra `/bin/sh -c "sh -c '…'"` layer, where the original nested
+      // "$(getent passwd "$(id -un)" …)" was fragile and the pane died on
+      // launch (server "exited unexpectedly"). Splitting into separate
+      // assignments keeps the login-shell detection but survives the re-quoting.
       command: [
         "sh",
         "-c",
-        'login_shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; exec "${login_shell:-${SHELL:-/bin/bash}}" -l',
+        'u=$(id -un); s=$(getent passwd "$u" 2>/dev/null | cut -d: -f7); exec "${s:-${SHELL:-/bin/bash}}" -l',
       ],
       cwd,
       columns: 120,

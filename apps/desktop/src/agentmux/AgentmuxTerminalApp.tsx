@@ -4674,7 +4674,7 @@ export function AgentmuxTerminalApp() {
             }}
           />
           <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>
-            {activeWorkspace?.projectRoot ?? ""}
+            {sidebarState?.cwd ?? activeWorkspace?.projectRoot ?? ""}
           </span>
           <div style={{ flex: 1 }} />
           <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>
