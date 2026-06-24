@@ -62,7 +62,6 @@ import {
   type ThemeTokens,
 } from "./theme";
 import {
-  BrandLogo,
   IconBranch,
   IconBubble,
   IconChevronDown,
@@ -3289,16 +3288,14 @@ export function AgentmuxTerminalApp() {
               pointerEvents: "none",
             }}
           >
-            <BrandLogo size={17} radius={14} />
             <span
               style={{
                 font: `700 13px/1 ${FONT_MONO}`,
                 letterSpacing: "-0.02em",
                 color: "var(--fg1)",
-                marginLeft: 9,
               }}
             >
-              agentmux
+              AgentMux
             </span>
             <span style={{ color: "var(--fg4)", fontSize: 12, margin: "0 8px" }}>
               ›
