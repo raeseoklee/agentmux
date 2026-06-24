@@ -213,6 +213,10 @@ pub struct OutputStreamFrame {
     pub bytes_base64: String,
 }
 
+const OUTPUT_STREAM_IDLE_PUMP_MS: u64 = 12;
+const OUTPUT_STREAM_HOT_PUMP_MS: u64 = 3;
+const OUTPUT_STREAM_HOT_WINDOW_MS: u64 = 160;
+
 pub struct DesktopControlState {
     control: Mutex<DesktopRuntimeControl>,
     store: Mutex<SqliteStore>,
@@ -226,6 +230,7 @@ pub struct DesktopControlState {
     // Subscriptions are keyed independently so a late unsubscribe from an old
     // remount cannot remove the current renderer's channel.
     output_channels: Mutex<HashMap<String, HashMap<String, Channel<OutputStreamFrame>>>>,
+    output_pump_hot_until: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -337,6 +342,7 @@ impl DesktopControlState {
             control_token: token,
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
             output_channels: Mutex::new(HashMap::new()),
+            output_pump_hot_until: Mutex::new(None),
         };
         // Durable-session recovery is deliberately NOT run here: it probes
         // wsl.exe/tmux and can block for seconds. The desktop host runs it on a
@@ -362,6 +368,7 @@ impl DesktopControlState {
             control_token: token,
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
             output_channels: Mutex::new(HashMap::new()),
+            output_pump_hot_until: Mutex::new(None),
         };
         Ok(state)
     }
@@ -409,6 +416,32 @@ impl DesktopControlState {
         }
     }
 
+    fn mark_output_pump_hot(&self) {
+        if let Ok(mut hot_until) = self.output_pump_hot_until.lock() {
+            *hot_until =
+                Some(Instant::now() + Duration::from_millis(OUTPUT_STREAM_HOT_WINDOW_MS));
+        }
+    }
+
+    pub fn output_stream_pump_delay(&self, had_output: bool) -> Duration {
+        if had_output {
+            self.mark_output_pump_hot();
+            return Duration::from_millis(OUTPUT_STREAM_HOT_PUMP_MS);
+        }
+        let Ok(mut hot_until) = self.output_pump_hot_until.lock() else {
+            return Duration::from_millis(OUTPUT_STREAM_IDLE_PUMP_MS);
+        };
+        let Some(deadline) = *hot_until else {
+            return Duration::from_millis(OUTPUT_STREAM_IDLE_PUMP_MS);
+        };
+        if deadline > Instant::now() {
+            Duration::from_millis(OUTPUT_STREAM_HOT_PUMP_MS)
+        } else {
+            *hot_until = None;
+            Duration::from_millis(OUTPUT_STREAM_IDLE_PUMP_MS)
+        }
+    }
+
     /// Fast path for interactive terminal input from the desktop WebView. This
     /// avoids building a full control-plane JSON envelope for every keystroke.
     pub fn send_text_direct(&self, session_id: &str, text: String) -> Result<(), DesktopHostError> {
@@ -422,6 +455,8 @@ impl DesktopControlState {
             .send_text(&SessionId::from_string(session_id), text)
             .map_err(|error| DesktopHostError::StateUnavailable(error.to_string()))?;
         control.collect_events();
+        drop(control);
+        self.mark_output_pump_hot();
         Ok(())
     }
 
@@ -430,14 +465,15 @@ impl DesktopControlState {
     /// short timer by the host's background pump, so a stream-first renderer
     /// needs no output polling. Channels that fail to send (renderer gone) are
     /// dropped.
-    pub fn pump_output_stream(&self) {
+    pub fn pump_output_stream(&self) -> bool {
         let (deltas, cwd_updates) = {
             let Ok(mut control) = self.control.lock() else {
-                return;
+                return false;
             };
             control.collect_events();
             (control.drain_output_stream(), control.drain_cwd_updates())
         };
+        let had_activity = !deltas.is_empty() || !cwd_updates.is_empty();
         // Persist live cwd updates (OSC 7) so the footer git status tracks the
         // directory the shell has cd'd into. Best-effort; skip on contention.
         if !cwd_updates.is_empty() {
@@ -449,10 +485,10 @@ impl DesktopControlState {
             }
         }
         if deltas.is_empty() {
-            return;
+            return had_activity;
         }
         let Ok(channels) = self.output_channels.lock() else {
-            return;
+            return had_activity;
         };
         let mut closed: Vec<(String, String)> = Vec::new();
         for delta in &deltas {
@@ -487,6 +523,7 @@ impl DesktopControlState {
                 }
             }
         }
+        had_activity
     }
 
     pub fn recovery_snapshot(&self) -> Result<RecoverySnapshot, DesktopHostError> {

@@ -122,11 +122,12 @@ fn main() {
     // idle shutdown). Best-effort; opt out with AGENTMUX_DISABLE_WSL_PREWARM.
     std::thread::spawn(run_wsl_prewarm_keepalive);
     // Background pump: drains coalesced terminal output and pushes it to each
-    // session's Tauri channel (~12ms), so the renderer streams instead of polling.
+    // session's Tauri channel. It stays light while idle, then briefly tightens
+    // after input/output so interactive echo does not wait on the idle tick.
     let pump_state = state.clone();
     std::thread::spawn(move || loop {
-        pump_state.pump_output_stream();
-        std::thread::sleep(std::time::Duration::from_millis(12));
+        let had_output = pump_state.pump_output_stream();
+        std::thread::sleep(pump_state.output_stream_pump_delay(had_output));
     });
     let notification_state = state.clone();
     tauri::Builder::default()
