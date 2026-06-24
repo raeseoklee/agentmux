@@ -384,13 +384,23 @@ impl DesktopControlState {
     /// needs no output polling. Channels that fail to send (renderer gone) are
     /// dropped.
     pub fn pump_output_stream(&self) {
-        let deltas = {
+        let (deltas, cwd_updates) = {
             let Ok(mut control) = self.control.lock() else {
                 return;
             };
             control.collect_events();
-            control.drain_output_stream()
+            (control.drain_output_stream(), control.drain_cwd_updates())
         };
+        // Persist live cwd updates (OSC 7) so the footer git status tracks the
+        // directory the shell has cd'd into. Best-effort; skip on contention.
+        if !cwd_updates.is_empty() {
+            if let Ok(mut store) = self.store.lock() {
+                let now = timestamp();
+                for (session_id, cwd) in &cwd_updates {
+                    let _ = store.update_session_cwd(session_id, Some(cwd), &now);
+                }
+            }
+        }
         if deltas.is_empty() {
             return;
         }
@@ -9285,6 +9295,11 @@ fn git_status_for_cwd(cwd: Option<&str>) -> (Option<String>, Option<String>) {
     let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
         return (None, None);
     };
+    // OSC 7 from a WSL shell reports a Linux path; native git needs a Windows
+    // path, so translate /mnt/<drive>/… → <DRIVE>:\… (the common project-on-D:
+    // case). Other paths pass through unchanged.
+    let cwd = translate_wsl_path(cwd);
+    let cwd = cwd.as_str();
     let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|value| {
         if value == "HEAD" {
             "detached".to_string()
@@ -9294,6 +9309,29 @@ fn git_status_for_cwd(cwd: Option<&str>) -> (Option<String>, Option<String>) {
     });
     let hash = git_output(cwd, &["rev-parse", "--short", "HEAD"]);
     (branch, hash)
+}
+
+/// Translate a WSL `/mnt/<drive>/…` path into a Windows path (`D:\…`) so native
+/// git can resolve it. Paths that aren't under /mnt (pure WSL-filesystem paths)
+/// and already-Windows paths are returned unchanged.
+fn translate_wsl_path(path: &str) -> String {
+    let Some(rest) = path.strip_prefix("/mnt/") else {
+        return path.to_string();
+    };
+    let mut chars = rest.chars();
+    let Some(drive) = chars.next() else {
+        return path.to_string();
+    };
+    let after = chars.as_str();
+    if !drive.is_ascii_alphabetic() || !(after.is_empty() || after.starts_with('/')) {
+        return path.to_string();
+    }
+    let win_rest = if after.is_empty() {
+        "\\".to_string()
+    } else {
+        after.replace('/', "\\")
+    };
+    format!("{}:{}", drive.to_ascii_uppercase(), win_rest)
 }
 
 fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
@@ -9623,6 +9661,24 @@ mod tests {
     fn desktop_control_state_is_shareable() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DesktopControlState>();
+    }
+
+    #[test]
+    fn translate_wsl_path_maps_mnt_to_windows_drive() {
+        assert_eq!(
+            translate_wsl_path("/mnt/d/workspace/agentmux"),
+            "D:\\workspace\\agentmux"
+        );
+        assert_eq!(translate_wsl_path("/mnt/c"), "C:\\");
+        // Non-/mnt and already-Windows paths pass through unchanged.
+        assert_eq!(
+            translate_wsl_path("/home/irae/project"),
+            "/home/irae/project"
+        );
+        assert_eq!(
+            translate_wsl_path("D:\\already\\windows"),
+            "D:\\already\\windows"
+        );
     }
 
     #[test]

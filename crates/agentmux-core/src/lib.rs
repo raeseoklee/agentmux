@@ -311,6 +311,10 @@ pub enum CoreEvent {
         from_offset: u64,
         bytes: Vec<u8>,
     },
+    SessionCwdChanged {
+        session_id: SessionId,
+        cwd: String,
+    },
     AgentStateChanged {
         session_id: SessionId,
         state: AgentState,
@@ -501,6 +505,18 @@ where
         mode: TerminationMode,
     ) -> BackendResult<()> {
         self.backend.terminate(session_id.as_str(), mode)
+    }
+
+    /// Update the in-memory working directory for a session (driven by OSC 7).
+    /// Returns true when the session exists and the cwd actually changed.
+    pub fn set_session_cwd(&mut self, session_id: &SessionId, cwd: &str) -> bool {
+        match self.sessions.get_mut(session_id) {
+            Some(session) if session.cwd.as_deref() != Some(cwd) => {
+                session.cwd = Some(cwd.to_string());
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn session_summary(&self, session_id: &SessionId) -> Option<RuntimeSessionSummary> {
@@ -714,6 +730,10 @@ where
     // drained by the host and pushed to the per-session Channel. Separate from
     // the byte-less `events` history.
     pending_output: HashMap<SessionId, OutputDelta>,
+    // Per-session working-directory updates detected from OSC 7 in terminal
+    // output, drained by the host and persisted so the footer git status tracks
+    // the directory the shell has cd'd into. Last write per session wins.
+    pending_cwd: HashMap<SessionId, String>,
 }
 
 impl<B> RuntimeControlPlane<B>
@@ -735,6 +755,7 @@ where
             dropped_event_count: 0,
             event_backlog_limit: 1024,
             pending_output: HashMap::new(),
+            pending_cwd: HashMap::new(),
         }
     }
 
@@ -769,6 +790,19 @@ where
         self.pending_output
             .drain()
             .map(|(_, delta)| delta)
+            .collect()
+    }
+
+    /// Drains the per-session working-directory updates detected from OSC 7
+    /// since the last call. Call after `collect_events`; the host persists each
+    /// `(session_id, cwd)` so the footer git status follows the live directory.
+    pub fn drain_cwd_updates(&mut self) -> Vec<(String, String)> {
+        if self.pending_cwd.is_empty() {
+            return Vec::new();
+        }
+        self.pending_cwd
+            .drain()
+            .map(|(session_id, cwd)| (session_id.to_string(), cwd))
             .collect()
     }
 
@@ -812,8 +846,26 @@ where
                 }
                 _ => None,
             };
+            // Live cwd tracking: tap output for OSC 7 so the footer git follows
+            // the directory the shell cd'd into.
+            let cwd_update = match &event {
+                CoreEvent::SessionOutputBatch {
+                    session_id, bytes, ..
+                } => parse_osc7_cwd(bytes).map(|cwd| (session_id.clone(), cwd)),
+                _ => None,
+            };
             if let Some(frame) = self.frame_from_core_event(event) {
                 self.push_event(frame);
+            }
+            if let Some((session_id, cwd)) = cwd_update {
+                if self.runtime.set_session_cwd(&session_id, &cwd) {
+                    self.pending_cwd.insert(session_id.clone(), cwd.clone());
+                    if let Some(frame) =
+                        self.frame_from_core_event(CoreEvent::SessionCwdChanged { session_id, cwd })
+                    {
+                        self.push_event(frame);
+                    }
+                }
             }
             if let Some((session_id, state, reason)) = agent_lifecycle {
                 let _ = self.apply_agent_state_transition(
@@ -1651,6 +1703,16 @@ where
                 .to_string();
                 frame
             }
+            CoreEvent::SessionCwdChanged { session_id, cwd } => {
+                let mut frame = EventFrame::new(event_id, "session.cwd_changed");
+                frame.workspace_id = self
+                    .runtime
+                    .session_summary(&session_id)
+                    .map(|summary| summary.workspace_id.to_string());
+                frame.session_id = Some(session_id.to_string());
+                frame.data_json = serde_json::json!({ "cwd": cwd }).to_string();
+                frame
+            }
             CoreEvent::NotificationCreated { notification } => {
                 let mut frame = EventFrame::new(event_id, "notification.created");
                 frame.workspace_id = notification.workspace_id.as_ref().map(ToString::to_string);
@@ -1961,6 +2023,48 @@ fn event_timestamp() -> String {
     format!("{}.{:03}Z", duration.as_secs(), duration.subsec_millis())
 }
 
+/// Parse the working directory from the LAST OSC 7 sequence in `bytes`, if any.
+/// OSC 7 is `ESC ] 7 ; file://<host><abs-path> ST`, where ST is BEL (0x07) or
+/// `ESC \`. Returns the percent-decoded absolute path (host component stripped).
+/// Taking the last occurrence means the most recent `cd` in a batch wins.
+fn parse_osc7_cwd(bytes: &[u8]) -> Option<String> {
+    const PREFIX: &[u8] = b"\x1b]7;";
+    let start = bytes.windows(PREFIX.len()).rposition(|w| w == PREFIX)? + PREFIX.len();
+    let rest = &bytes[start..];
+    let end = rest
+        .iter()
+        .position(|&b| b == 0x07)
+        .or_else(|| rest.windows(2).position(|w| w == [0x1b, 0x5c]))?;
+    let text = std::str::from_utf8(&rest[..end]).ok()?;
+    let after_scheme = text.strip_prefix("file://").unwrap_or(text);
+    // Drop the host component (everything up to the first '/' of the path).
+    let path_start = after_scheme.find('/')?;
+    let decoded = percent_decode(&after_scheme[path_start..]);
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+/// Minimal percent-decoder for OSC 7 file-URI paths (e.g. `%20` → space). Leaves
+/// malformed escapes untouched.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn append_recent_output(
     recent_output: &mut HashMap<SessionId, Vec<u8>>,
     session_id: &SessionId,
@@ -2136,6 +2240,31 @@ mod tests {
         AttachRequest, BackendError, BackendKind as BackendTraitKind, SessionHandle,
     };
     use agentmux_ipc::ResponseOutcome;
+
+    #[test]
+    fn parse_osc7_cwd_extracts_bel_terminated_path() {
+        let bytes = b"prompt\x1b]7;file://wsl-host/mnt/d/workspace/agentmux\x07$ ";
+        assert_eq!(
+            parse_osc7_cwd(bytes),
+            Some("/mnt/d/workspace/agentmux".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_osc7_cwd_handles_st_terminator_and_percent_decoding() {
+        let bytes = b"\x1b]7;file://host/home/irae/my%20project\x1b\\";
+        assert_eq!(
+            parse_osc7_cwd(bytes),
+            Some("/home/irae/my project".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_osc7_cwd_takes_last_occurrence_and_ignores_non_osc7() {
+        assert_eq!(parse_osc7_cwd(b"just plain output, no escape"), None);
+        let bytes = b"\x1b]7;file://h/a\x07middle\x1b]7;file://h/b\x07";
+        assert_eq!(parse_osc7_cwd(bytes), Some("/b".to_string()));
+    }
 
     #[test]
     fn generated_ids_have_stable_prefixes() {

@@ -641,6 +641,25 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Update a session's current working directory. Driven by live cwd
+    /// tracking (OSC 7) so the footer git status follows the directory the
+    /// terminal has actually `cd`'d into.
+    pub fn update_session_cwd(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "UPDATE sessions
+             SET cwd = ?2,
+                 updated_at = ?3
+             WHERE session_id = ?1",
+            params![session_id, cwd, updated_at],
+        )?;
+        Ok(())
+    }
+
     /// Delete a session row. Used by startup recovery to drop a dead ephemeral
     /// session that has been superseded by a freshly respawned one.
     pub fn delete_session(&mut self, session_id: &str) -> StoreResult<()> {

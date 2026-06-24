@@ -3278,33 +3278,45 @@ export function AgentmuxTerminalApp() {
           >
             <IconSidebar />
           </Hov>
-          <BrandLogo size={17} radius={14} />
-          <span
+          {/* Non-interactive breadcrumb cluster — pointer-events:none lets
+             clicks fall through to the parent drag region so the titlebar
+             center drags the window. */}
+          <div
+            data-tauri-drag-region
             style={{
-              font: `700 13px/1 ${FONT_MONO}`,
-              letterSpacing: "-0.02em",
-              color: "var(--fg1)",
-              marginLeft: 9,
+              display: "flex",
+              alignItems: "center",
+              pointerEvents: "none",
             }}
           >
-            agentmux
-          </span>
-          <span style={{ color: "var(--fg4)", fontSize: 12, margin: "0 8px" }}>
-            ›
-          </span>
-          <span style={{ color: "var(--fg3)", display: "flex" }}>
-            <IconFolder />
-          </span>
-          <span
-            style={{
-              font: `600 12.5px/1 ${FONT_SANS}`,
-              color: "var(--fg2)",
-              marginLeft: 7,
-            }}
-          >
-            {activeWorkspace?.name ?? "—"}
-          </span>
-          <div style={{ flex: 1, height: "100%" }} />
+            <BrandLogo size={17} radius={14} />
+            <span
+              style={{
+                font: `700 13px/1 ${FONT_MONO}`,
+                letterSpacing: "-0.02em",
+                color: "var(--fg1)",
+                marginLeft: 9,
+              }}
+            >
+              agentmux
+            </span>
+            <span style={{ color: "var(--fg4)", fontSize: 12, margin: "0 8px" }}>
+              ›
+            </span>
+            <span style={{ color: "var(--fg3)", display: "flex" }}>
+              <IconFolder />
+            </span>
+            <span
+              style={{
+                font: `600 12.5px/1 ${FONT_SANS}`,
+                color: "var(--fg2)",
+                marginLeft: 7,
+              }}
+            >
+              {activeWorkspace?.name ?? "—"}
+            </span>
+          </div>
+          <div data-tauri-drag-region style={{ flex: 1, height: "100%" }} />
           <Hov
             tag="button"
             style={{
