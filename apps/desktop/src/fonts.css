@@ -14,3 +14,18 @@
   font-display: swap;
   src: url("./assets/fonts/PretendardVariable.woff2") format("woff2-variations");
 }
+
+/*
+ * D2Coding Nerd Font (ligature build) — the terminal font. Bundled locally so
+ * Nerd glyphs (powerline arrows, git/branch icons, devicons) and CJK render in
+ * xterm offline. License: SIL OFL 1.1 (D2Coding) + MIT (Nerd Fonts patch).
+ */
+@font-face {
+  font-family: "D2Coding Nerd";
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+  src:
+    url("./assets/fonts/D2CodingNerd.woff2") format("woff2"),
+    url("./assets/fonts/D2CodingNerd.woff") format("woff");
+}

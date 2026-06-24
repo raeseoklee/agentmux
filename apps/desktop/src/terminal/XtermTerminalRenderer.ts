@@ -11,6 +11,12 @@ export const XTERM_THEME = {
   selectionBackground: "#2d5f73"
 } as const;
 
+// Bundled D2Coding Nerd Font first (powerline/devicons + CJK), then platform
+// monospace fallbacks. Declared in src/fonts.css.
+const TERMINAL_FONT_FAMILY =
+  '"D2Coding Nerd", "Cascadia Mono", Consolas, "Liberation Mono", monospace';
+const TERMINAL_FONT_SIZE = 13;
+
 export class XtermTerminalRenderer implements TerminalRenderer {
   private terminal?: Terminal;
   private fitAddon?: FitAddon;
@@ -35,8 +41,8 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const terminal = new Terminal({
       convertEol: true,
       cursorBlink: true,
-      fontFamily: '"Cascadia Mono", Consolas, "Liberation Mono", monospace',
-      fontSize: 13,
+      fontFamily: TERMINAL_FONT_FAMILY,
+      fontSize: TERMINAL_FONT_SIZE,
       lineHeight: 1.15,
       rows: initialState.rows,
       cols: initialState.columns,
@@ -55,6 +61,33 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.terminal = terminal;
     this.fitAddon = fitAddon;
     this.mountedElement = element;
+
+    // The Nerd font (@font-face) loads lazily, so xterm's first glyph
+    // measurement can use fallback metrics — leaving icons/powerline glyphs
+    // blank or misaligned. Once the face is ready, re-measure: drop the WebGL
+    // texture atlas, re-apply the family to force a glyph re-measure, refit.
+    this.ensureFontThenRemeasure(terminal);
+  }
+
+  private ensureFontThenRemeasure(terminal: Terminal): void {
+    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
+    if (!fonts?.load) {
+      return;
+    }
+    void fonts
+      .load(`${TERMINAL_FONT_SIZE}px "D2Coding Nerd"`)
+      .then(() => {
+        if (this.terminal !== terminal) {
+          return;
+        }
+        this.webglAddon?.clearTextureAtlas();
+        terminal.options.fontFamily = TERMINAL_FONT_FAMILY;
+        this.fitAddon?.fit();
+        terminal.refresh(0, terminal.rows - 1);
+      })
+      .catch(() => {
+        /* font failed to load — keep the monospace fallback */
+      });
   }
 
   unmount(): void {
