@@ -15,7 +15,7 @@ import { XtermTerminalRenderer } from "./terminal/XtermTerminalRenderer";
 
 const encoder = new TextEncoder();
 const DEFAULT_PROJECT_ROOT = "D:\\Workspace\\irae\\agentmux";
-const DEFAULT_WORKSPACE_NAME = "Local project";
+const DEFAULT_WORKSPACE_NAME = "Workspace 1";
 
 interface BrowserPaneState {
   url: string;

@@ -7,7 +7,7 @@ test("design boots with a live workspace", async ({ page }) => {
       (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
         .__AGENTMUX_PREVIEW_READY__ === true,
   );
-  await expect(page.getByText("Local project").first()).toBeVisible();
+  await expect(page.getByText("Workspace 1").first()).toBeVisible();
   await expect(
     page.getByRole("button", { name: /검색/ }).first(),
   ).toBeVisible();
@@ -161,11 +161,11 @@ test("workspace add creates one uniquely named workspace without duplicating the
   await expect(
     page
       .locator(".agentmux-workspace-card")
-      .filter({ hasText: "Local project" }),
+      .filter({ hasText: "Workspace 1" }),
   ).toHaveCount(1);
   await expect(
     page.getByRole("textbox", { name: "워크스페이스 이름" }),
-  ).toHaveValue("Workspace 1");
+  ).toHaveValue("Workspace 2");
 });
 
 test("new workspace enters inline rename after creation", async ({ page }) => {
@@ -181,7 +181,7 @@ test("new workspace enters inline rename after creation", async ({ page }) => {
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
 
   const nameInput = page.getByRole("textbox", { name: "워크스페이스 이름" });
-  await expect(nameInput).toHaveValue("Workspace 1");
+  await expect(nameInput).toHaveValue("Workspace 2");
   await nameInput.fill("Second workspace");
   await nameInput.press("Enter");
 
@@ -264,7 +264,7 @@ test("workspace groups can be created edited collapsed and extended", async ({
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
   await expect(
     page.locator(".agentmux-workspace-inline-name-input"),
-  ).toHaveValue("Workspace 1");
+  ).toHaveValue("Workspace 2");
 });
 
 test("selected workspaces can be grouped and added to an existing group", async ({
@@ -322,7 +322,9 @@ test("workspace sidebar filter narrows groups and workspaces", async ({
   await page.locator(".agentmux-workspace-inline-name-input").press("Enter");
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(3);
 
-  await page.locator(".agentmux-workspace-select").first().check();
+  // Group the LAST ungrouped card ("Workspace 3") so the grouped name stays
+  // distinct from the ungrouped "Workspace 1" card the filter assertions target.
+  await page.locator(".agentmux-workspace-select").last().check();
   page.once("dialog", async (dialog) => {
     await dialog.accept("Agents");
   });
@@ -395,7 +397,7 @@ test("workspace groups and members can be reordered from the sidebar", async ({
 
   await alpha.locator(".agentmux-workspace-member-move-down").first().click();
   await expect(alpha.locator(".agentmux-workspace-card").first()).toContainText(
-    "Workspace 1",
+    "Workspace 2",
   );
 });
 
@@ -443,7 +445,7 @@ test("workspace groups and members can be drag reordered from the sidebar", asyn
       targetPosition: { x: 16, y: 4 },
     });
   await expect(alpha.locator(".agentmux-workspace-card").first()).toContainText(
-    "Workspace 1",
+    "Workspace 2",
   );
 });
 
@@ -509,7 +511,7 @@ test("workspace context menu warns before closing a group anchor", async ({
     .filter({ hasText: "Anchors" });
   const anchorCard = group
     .locator(".agentmux-workspace-card")
-    .filter({ hasText: "Local project" });
+    .filter({ hasText: "Workspace 1" });
   await expect(anchorCard).toHaveCount(1);
 
   await page.locator(".agentmux-workspace-plus").click();
@@ -544,7 +546,7 @@ test("workspace close warns before terminating open terminal sessions", async ({
 
   const workspaceCard = page
     .locator(".agentmux-workspace-card")
-    .filter({ hasText: "Local project" });
+    .filter({ hasText: "Workspace 1" });
   await expect(workspaceCard).toHaveCount(1);
 
   await page.locator(".agentmux-new-terminal-tab").click();

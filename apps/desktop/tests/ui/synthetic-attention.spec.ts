@@ -4,7 +4,7 @@ test("synthetic attention appears in workspace, pane, and notification UI", asyn
   await page.goto("/#console");
   await page.waitForFunction(() => window.__AGENTMUX_PREVIEW_READY__ === true);
 
-  await expect(page.getByRole("button", { name: /Local project/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Workspace 1/ })).toBeVisible();
   await page.getByRole("button", { name: "Native shell" }).click();
   await expect(page.getByRole("application")).toBeVisible();
 
@@ -35,7 +35,7 @@ test("browser surface can be created and driven from the pane UI", async ({ page
   await page.goto("/#console");
   await page.waitForFunction(() => window.__AGENTMUX_PREVIEW_READY__ === true);
 
-  await expect(page.getByRole("button", { name: /Local project/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Workspace 1/ })).toBeVisible();
   await page.getByRole("button", { name: "Browser" }).click();
 
   await expect(page.getByRole("article", { name: "Browser pane" })).toBeVisible();

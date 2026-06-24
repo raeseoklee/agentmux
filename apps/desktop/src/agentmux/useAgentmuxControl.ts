@@ -21,7 +21,7 @@ import {
 } from "../control/ControlClient";
 
 const DEFAULT_PROJECT_ROOT = "D:\\Workspace\\irae\\agentmux";
-const DEFAULT_WORKSPACE_NAME = "Local project";
+const DEFAULT_WORKSPACE_NAME = "Workspace 1";
 const POLL_INTERVAL_MS = 1200;
 const LAST_ACTIVE_WORKSPACE_STORAGE_KEY = "agentmux.ui.lastActiveWorkspaceId.v1";
 const LOCAL_NOTIFICATION_PREFIX = "local_";
