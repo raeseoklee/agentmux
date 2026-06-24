@@ -686,13 +686,17 @@ export interface OutputSnapshot {
   bytes: Uint8Array;
 }
 
+const EMPTY_BYTES = new Uint8Array(0);
+
 function base64ToBytes(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+  // PR-6: an empty (or absent) payload is the steady-state no-output snapshot;
+  // skip decoding entirely. Otherwise decode natively via atob + a single
+  // Uint8Array.from pass instead of a per-character assignment loop.
+  if (!base64) {
+    return EMPTY_BYTES;
   }
-  return bytes;
+  const binary = atob(base64);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
 interface AgentmuxServerBootstrap {

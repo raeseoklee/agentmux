@@ -1222,13 +1222,23 @@ where
         let snapshot = self
             .snapshot_output(&session_id, params.since_offset)
             .ok_or_else(|| ControlError::new(ErrorCode::SessionNotFound, "Session not found."))?;
+        // PR-6: when the delta poll asked for everything at or after `since` and
+        // there is no new output, `bytes` is empty. Skip the Base64 encode (it
+        // would only produce ""), keeping the steady, no-output snapshot poll
+        // free of any encoding on the hot path. The empty string is wire-
+        // compatible: clients already treat it as "no bytes".
+        let bytes_base64 = if snapshot.bytes.is_empty() {
+            String::new()
+        } else {
+            BASE64_STANDARD.encode(&snapshot.bytes)
+        };
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &SessionSnapshotResult {
                 session_id: session_id.to_string(),
                 base_offset: snapshot.base_offset,
                 end_offset: snapshot.end_offset,
-                bytes_base64: BASE64_STANDARD.encode(&snapshot.bytes),
+                bytes_base64,
             },
         ))
     }
@@ -2381,6 +2391,62 @@ mod tests {
         ));
         let recent_json = ok_json(&recent);
         assert!(recent_json.contains("\"text\":\"ok\""));
+    }
+
+    #[test]
+    fn session_snapshot_skips_base64_when_no_new_output() {
+        // PR-6: a steady (no new output) delta poll must not perform any Base64
+        // encoding. After consuming all output, a snapshot at `end_offset`
+        // returns an empty `bytes_base64` and `base_offset == end_offset`.
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+
+        let spawn = control.handle_request(request(
+            "req_spawn_snap",
+            "session.spawn",
+            r#"{"workspace_id":"ws_snap","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+        ));
+        let session_id = ok_json(&spawn)
+            .split("\"session_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("session id in spawn result")
+            .to_string();
+
+        // Produce two bytes ("ok") of output via the fake backend.
+        let send = control.handle_request(request(
+            "req_send_snap",
+            "session.send_text",
+            &format!(r#"{{"session_id":"{session_id}","text":"hello"}}"#),
+        ));
+        assert!(ok_json(&send).contains("\"ok\":true"));
+
+        // Cold-start snapshot: consumes all output, non-empty payload.
+        let first = control.handle_request(request(
+            "req_snap_cold",
+            "session.snapshot",
+            &format!(r#"{{"session_id":"{session_id}","since_offset":null}}"#),
+        ));
+        let first: SessionSnapshotResult = serde_json::from_str(ok_json(&first)).unwrap();
+        assert_eq!(first.base_offset, 0);
+        assert_eq!(first.end_offset, 2);
+        assert!(!first.bytes_base64.is_empty());
+
+        // Delta snapshot at the consumed offset: no new output, so the encode is
+        // skipped and the payload is empty (wire-compatible with "no bytes").
+        let steady = control.handle_request(request(
+            "req_snap_steady",
+            "session.snapshot",
+            &format!(
+                r#"{{"session_id":"{session_id}","since_offset":{}}}"#,
+                first.end_offset
+            ),
+        ));
+        let steady: SessionSnapshotResult = serde_json::from_str(ok_json(&steady)).unwrap();
+        assert_eq!(steady.base_offset, first.end_offset);
+        assert_eq!(steady.end_offset, first.end_offset);
+        assert!(steady.bytes_base64.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type AgentState,
+  type AgentTelemetry,
   type BrowserClickTarget,
   type ControlClient,
   createControlClient,
@@ -31,6 +32,197 @@ const WSL_REQUIRED_MESSAGE =
 const TMUX_REQUIRED_NOTIFICATION_ID = `${LOCAL_NOTIFICATION_PREFIX}tmux_required`;
 const TMUX_REQUIRED_MESSAGE =
   "선택된 WSL 배포판에 tmux가 필요합니다. WSL에서 `sudo apt update && sudo apt install -y tmux`를 실행한 뒤 다시 시도하세요.";
+
+// --- cheap structural-equality gates (PR-1) ---------------------------------
+// The 1.2s poll re-fetches the same data on most ticks. Calling a state setter
+// with a fresh-but-equal value still triggers a full re-render of the root
+// component, so each setter is gated behind one of these cheap checks. They are
+// intentionally shallow: they compare the fields the UI actually renders, so a
+// no-op tick produces zero re-renders while real changes still propagate.
+
+function setIfChanged<T>(
+  setter: (updater: (previous: T) => T) => void,
+  next: T,
+  equal: (previous: T, next: T) => boolean
+): void {
+  setter((previous) => (equal(previous, next) ? previous : next));
+}
+
+function telemetryEqual(
+  a: AgentTelemetry | null | undefined,
+  b: AgentTelemetry | null | undefined
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return !a && !b;
+  return (
+    a.activity === b.activity &&
+    a.session === b.session &&
+    a.cost === b.cost &&
+    a.tokens === b.tokens &&
+    a.cache === b.cache &&
+    a.rate === b.rate &&
+    a.ctx === b.ctx
+  );
+}
+
+function agentStateEqual(a: AgentState, b: AgentState): boolean {
+  return (
+    a.sessionId === b.sessionId &&
+    a.workspaceId === b.workspaceId &&
+    a.state === b.state &&
+    a.attention === b.attention &&
+    a.reason === b.reason &&
+    a.updatedAt === b.updatedAt &&
+    telemetryEqual(a.telemetry, b.telemetry)
+  );
+}
+
+function agentStatesEqual(a: AgentState[], b: AgentState[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (!agentStateEqual(a[index], b[index])) return false;
+  }
+  return true;
+}
+
+function notificationsEqual(
+  a: NotificationSummary[],
+  b: NotificationSummary[]
+): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (
+      left.notificationId !== right.notificationId ||
+      left.dismissed !== right.dismissed ||
+      left.severity !== right.severity ||
+      left.title !== right.title ||
+      left.message !== right.message
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function profilesEqual(a: SshProfile[], b: SshProfile[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (
+      left.profileId !== right.profileId ||
+      left.name !== right.name ||
+      left.host !== right.host ||
+      left.user !== right.user ||
+      left.port !== right.port
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sameIdList(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false;
+  }
+  return true;
+}
+
+function detailEqual(
+  a: WorkspaceDetail | null,
+  b: WorkspaceDetail | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.workspace.workspaceId !== b.workspace.workspaceId) return false;
+  if (a.workspace.activePaneId !== b.workspace.activePaneId) return false;
+  if (a.workspace.rootPaneId !== b.workspace.rootPaneId) return false;
+  if (a.panes.length !== b.panes.length) return false;
+  if (a.surfaces.length !== b.surfaces.length) return false;
+  if (a.sessions.length !== b.sessions.length) return false;
+  for (let index = 0; index < a.panes.length; index += 1) {
+    const left = a.panes[index];
+    const right = b.panes[index];
+    if (
+      left.paneId !== right.paneId ||
+      left.mountedSurfaceId !== right.mountedSurfaceId ||
+      left.splitRatio !== right.splitRatio ||
+      left.splitAxis !== right.splitAxis ||
+      left.parentPaneId !== right.parentPaneId ||
+      left.kind !== right.kind
+    ) {
+      return false;
+    }
+  }
+  for (let index = 0; index < a.surfaces.length; index += 1) {
+    const left = a.surfaces[index];
+    const right = b.surfaces[index];
+    if (
+      left.surfaceId !== right.surfaceId ||
+      left.sessionId !== right.sessionId ||
+      left.title !== right.title ||
+      left.surfaceType !== right.surfaceType
+    ) {
+      return false;
+    }
+  }
+  for (let index = 0; index < a.sessions.length; index += 1) {
+    const left = a.sessions[index];
+    const right = b.sessions[index];
+    if (
+      left.sessionId !== right.sessionId ||
+      left.state !== right.state ||
+      left.backendKind !== right.backendKind
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sidebarStateEqual(
+  a: SidebarState | null,
+  b: SidebarState | null
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (
+    a.workspaceId !== b.workspaceId ||
+    a.cwd !== b.cwd ||
+    a.gitBranch !== b.gitBranch ||
+    a.gitHash !== b.gitHash
+  ) {
+    return false;
+  }
+  if (!sameIdList(a.ports, b.ports)) return false;
+  if (a.statuses.length !== b.statuses.length) return false;
+  for (let index = 0; index < a.statuses.length; index += 1) {
+    const left = a.statuses[index];
+    const right = b.statuses[index];
+    if (
+      left.key !== right.key ||
+      left.label !== right.label ||
+      left.priority !== right.priority ||
+      left.updatedAt !== right.updatedAt
+    ) {
+      return false;
+    }
+  }
+  if ((a.progress?.value ?? null) !== (b.progress?.value ?? null)) return false;
+  if ((a.progress?.label ?? null) !== (b.progress?.label ?? null)) return false;
+  if (a.logs.length !== b.logs.length) return false;
+  for (let index = 0; index < a.logs.length; index += 1) {
+    if (a.logs[index].logId !== b.logs[index].logId) return false;
+  }
+  return true;
+}
 
 function nextWorkspaceName(workspaces: WorkspaceSummary[]): string {
   const usedNames = new Set(workspaces.map((workspace) => workspace.name));
@@ -240,10 +432,13 @@ export function useAgentmuxControl(): AgentmuxControl {
           !notification.dismissed
       );
       const remoteIds = new Set(remoteNotifications.map((notification) => notification.notificationId));
-      return [
+      const merged = [
         ...locals.filter((notification) => !remoteIds.has(notification.notificationId)),
         ...remoteNotifications
       ];
+      // Keep the same reference when nothing changed so a no-op poll tick does
+      // not trigger a re-render through the notifications dependency.
+      return notificationsEqual(current, merged) ? current : merged;
     });
   }, []);
 
@@ -280,8 +475,11 @@ export function useAgentmuxControl(): AgentmuxControl {
     async (workspaceId: string) => {
       const next = await client.getWorkspace(workspaceId);
       if (activeRef.current === workspaceId) {
-        detailRef.current = next;
-        setDetail(next);
+        setDetail((previous) => {
+          const resolved = detailEqual(previous, next) ? previous : next;
+          detailRef.current = resolved;
+          return resolved;
+        });
       }
       return next;
     },
@@ -294,21 +492,24 @@ export function useAgentmuxControl(): AgentmuxControl {
       return;
     }
     try {
-      const [, nextAttention, nextStates, nextNotifications, nextProfiles, nextSidebarState] =
+      // PR-5: profiles and workspace groups change only on explicit user
+      // mutation; they are hydrated once and reloaded by their mutators, so the
+      // periodic poll no longer fetches them (per-tick IPC drops 7 -> 4).
+      const [, nextAttention, nextStates, nextNotifications, nextSidebarState] =
         await Promise.all([
           loadDetail(workspaceId),
           client.listAgentAttention(null),
           client.listAgentStates(null),
           client.listNotifications({ workspaceId: null, severity: null, includeDismissed: false }),
-          client.listProfiles(),
           client.getSidebarState(workspaceId)
         ]);
-      setWorkspaceGroups(await client.listWorkspaceGroups());
-      setAttention(nextAttention);
-      setAgentStates(nextStates);
+      // PR-1: gate each setter behind a cheap equality check so a tick that
+      // returns identical data produces zero re-renders. loadDetail and
+      // mergeNotifications already self-gate above.
+      setIfChanged(setAttention, nextAttention, agentStatesEqual);
+      setIfChanged(setAgentStates, nextStates, agentStatesEqual);
       mergeNotifications(nextNotifications);
-      setProfiles(nextProfiles);
-      setSidebarState(nextSidebarState);
+      setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Control plane request failed.");
@@ -324,7 +525,8 @@ export function useAgentmuxControl(): AgentmuxControl {
       return;
     }
     try {
-      setSidebarState(await client.getSidebarState(workspaceId));
+      const next = await client.getSidebarState(workspaceId);
+      setIfChanged(setSidebarState, next, sidebarStateEqual);
     } catch {
       /* leave the previous sidebar state in place on transient failures */
     }
@@ -426,6 +628,25 @@ export function useAgentmuxControl(): AgentmuxControl {
     const timer = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
   }, [activeWorkspaceId, refresh]);
+
+  // PR-5: hydrate SSH profiles once on mount. They are no longer fetched by the
+  // periodic poll; profile mutations (create/update/delete) keep them current.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const listed = await client.listProfiles();
+        if (!cancelled) {
+          setIfChanged(setProfiles, listed, profilesEqual);
+        }
+      } catch {
+        /* profiles are non-critical; the next mutation will repopulate them */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client]);
 
   const reloadWorkspaces = useCallback(async () => {
     const listed = await client.listWorkspaces();

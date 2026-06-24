@@ -4,6 +4,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -365,6 +366,103 @@ function surfaceTabActionIcon(actionId: string): ReactNode {
   }
   return <IconPlus size={13} />;
 }
+
+// --- module-level style constants (PR-2 / PR-3) -----------------------------
+// These inline style objects reference only CSS variables (resolved at paint
+// from the themed root vars) or static literals, so they never depend on
+// component state. Hoisting them to module scope keeps their references stable
+// across renders, so style props no longer churn every poll tick.
+const ICON_BTN_STYLE: CSSProperties = {
+  width: 30,
+  height: 30,
+  borderRadius: 7,
+  border: 0,
+  background: "transparent",
+  cursor: "pointer",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: "var(--fg3)",
+};
+const ICON_BTN_HOVER_STYLE: CSSProperties = {
+  background: "var(--s2)",
+  color: "var(--fg1)",
+};
+// Frameless-window controls (decorations:false): full-height, flush to the
+// top-right corner like a native caption.
+const WIN_CTL_BTN_STYLE: CSSProperties = {
+  width: 46,
+  height: "100%",
+  border: 0,
+  // Override the global `button { border-radius: 6px }` rule — caption controls
+  // are sharp rectangles flush to the window edge; the window's own rounded
+  // top-right corner clips the close button for a native look.
+  borderRadius: 0,
+  margin: 0,
+  padding: 0,
+  background: "transparent",
+  cursor: "pointer",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: "var(--fg3)",
+};
+const WIN_CTL_BTN_HOVER_STYLE: CSSProperties = {
+  background: "var(--s2)",
+  color: "var(--fg1)",
+};
+const GROUP_ACTION_BTN_STYLE: CSSProperties = {
+  width: 22,
+  height: 22,
+  flex: "none",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "transparent",
+  border: "1px solid transparent",
+  borderRadius: 6,
+  color: "var(--fg4)",
+  cursor: "pointer",
+};
+const GROUP_ACTION_HOVER_STYLE: CSSProperties = {
+  background: "var(--s2)",
+  borderColor: "var(--border)",
+  color: "var(--fg1)",
+};
+const GROUP_MENU_ITEM_STYLE: CSSProperties = {
+  width: "100%",
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+  padding: "8px 10px",
+  border: 0,
+  borderRadius: 6,
+  background: "transparent",
+  color: "var(--fg2)",
+  cursor: "pointer",
+  textAlign: "left",
+  font: `600 12px/1 ${FONT_SANS}`,
+};
+const GROUP_MENU_ITEM_HOVER_STYLE: CSSProperties = {
+  background: "var(--s2)",
+  color: "var(--fg1)",
+};
+// PR-2: per-leaf pane caption-button styles, hoisted so PaneView receives the
+// same references each render.
+const PANE_WIN_BTN_STYLE: CSSProperties = {
+  width: 23,
+  height: 23,
+  borderRadius: 5,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: "var(--fg4)",
+  cursor: "pointer",
+};
+const PANE_WIN_BTN_HOVER_STYLE: CSSProperties = {
+  background: "var(--s2)",
+  color: "var(--fg1)",
+};
 
 function surfaceTabActionClassName(actionId: string): string {
   if (actionId === "pane.splitRight") {
@@ -820,6 +918,275 @@ interface AppConfirmDialog extends AppConfirmOptions {
   variant: AppConfirmVariant;
 }
 
+// PR-2: the leaf (terminal/browser/empty) pane renderer, extracted into a
+// `React.memo` component so panes whose inputs are unchanged do not reconcile on
+// every 1.2s poll tick. The recursive split wrapper stays in the parent and
+// renders one <PaneView/> per leaf. All derived data is computed in the parent
+// and passed in; callbacks are the parent's stable useCallback handlers so the
+// memo comparison holds across no-op ticks. Behaviour is identical to the
+// previous inline leaf branch.
+interface PaneViewProps {
+  pane: PaneSummary;
+  surface: SurfaceSummary | undefined;
+  session: TerminalSession | undefined;
+  active: boolean;
+  isBrowser: boolean;
+  telemetry: AgentTelemetry | null;
+  title: string;
+  dot: string;
+  label: string;
+  theme: ThemeTokens;
+  client: ControlClient;
+  terminalInnerMargin: number;
+  terminalLaunchPending: boolean;
+  focusPane: (paneId: string) => void;
+  splitPaneBy: (paneId: string, axis: "horizontal" | "vertical") => void;
+  closePane: (paneId: string) => void;
+  closeSurface: (surfaceId: string) => void;
+  openTerminalInPane: (paneId: string) => void;
+  openDurableTerminalInPane: (paneId: string) => void;
+  onTerminalError: () => void;
+}
+
+const PaneView = memo(function PaneView({
+  pane,
+  surface,
+  session,
+  active,
+  isBrowser,
+  telemetry,
+  title,
+  dot,
+  label,
+  theme,
+  client,
+  terminalInnerMargin,
+  terminalLaunchPending,
+  focusPane,
+  splitPaneBy,
+  closePane,
+  closeSurface,
+  openTerminalInPane,
+  openDurableTerminalInPane,
+  onTerminalError,
+}: PaneViewProps) {
+  return (
+    <div
+      key={pane.paneId}
+      data-agentmux-pane={pane.paneId}
+      data-agentmux-mounted={surface ? "true" : "false"}
+      data-agentmux-active={active ? "true" : "false"}
+      onMouseDown={() => focusPane(pane.paneId)}
+      style={{
+        minHeight: 0,
+        minWidth: 0,
+        flex: "1 1 0",
+        background: "var(--term)",
+        // Active highlight is a 1px accent border — same thickness as the
+        // inactive 1px border, so focus never shifts layout. No extra inset
+        // shadow: that doubled the edge to 2px, which showed through on empty
+        // panes (no terminal content to paint over the inset ring).
+        border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+        borderRadius: 7,
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          height: 32,
+          flex: "none",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "0 9px",
+          background: "var(--surface)",
+          borderBottom: "1px solid var(--border)",
+        }}
+      >
+        <span
+          style={{
+            width: 7,
+            height: 7,
+            borderRadius: "50%",
+            flex: "none",
+            background: dot,
+          }}
+        />
+        <span
+          style={{
+            font: `600 11.5px/1 ${FONT_MONO}`,
+            color: "var(--fg1)",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          }}
+        >
+          {title}
+        </span>
+        {label ? (
+          <span
+            style={{
+              font: `500 9.5px/1 ${FONT_SANS}`,
+              color: dot,
+              background: "var(--s2)",
+              borderRadius: 4,
+              padding: "3px 6px",
+              flex: "none",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {label}
+          </span>
+        ) : null}
+        {session ? (
+          <span
+            style={{
+              font: `500 10px/1 ${FONT_MONO}`,
+              color: "var(--fg3)",
+              background: "var(--s2)",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              padding: "3px 6px",
+              flex: "none",
+            }}
+          >
+            {session.backendKind}
+          </span>
+        ) : null}
+        <div style={{ flex: 1 }} />
+        <div style={{ display: "flex", gap: 1, flex: "none" }}>
+          <Hov
+            tag="span"
+            className="agentmux-pane-split-vertical"
+            style={PANE_WIN_BTN_STYLE}
+            hover={PANE_WIN_BTN_HOVER_STYLE}
+            onClick={(e) => {
+              e.stopPropagation();
+              splitPaneBy(pane.paneId, "vertical");
+            }}
+          >
+            <IconSplitCols size={12} />
+          </Hov>
+          <Hov
+            tag="span"
+            className="agentmux-pane-split-horizontal"
+            style={PANE_WIN_BTN_STYLE}
+            hover={PANE_WIN_BTN_HOVER_STYLE}
+            onClick={(e) => {
+              e.stopPropagation();
+              splitPaneBy(pane.paneId, "horizontal");
+            }}
+          >
+            <IconSplitRows size={12} />
+          </Hov>
+          <Hov
+            tag="span"
+            className="agentmux-pane-close"
+            style={PANE_WIN_BTN_STYLE}
+            hover={PANE_WIN_BTN_HOVER_STYLE}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (pane.parentPaneId) closePane(pane.paneId);
+              else if (surface) closeSurface(surface.surfaceId);
+            }}
+          >
+            <IconClose size={11} />
+          </Hov>
+        </div>
+      </div>
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: "relative" }}>
+          {session && isLiveSession(session) && !isBrowser ? (
+            <LiveTerminal
+              key={session.sessionId}
+              client={client}
+              sessionId={session.sessionId}
+              active={active}
+              innerMargin={terminalInnerMargin}
+              onFocus={() => focusPane(pane.paneId)}
+              onError={onTerminalError}
+            />
+          ) : isBrowser && surface ? (
+            <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
+          ) : (
+            <div
+              style={{
+                height: "100%",
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+                alignItems: "center",
+                justifyContent: "center",
+                color: "var(--fg4)",
+              }}
+            >
+              <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>빈 페인</span>
+              <button
+                type="button"
+                disabled={terminalLaunchPending}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openTerminalInPane(pane.paneId);
+                }}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 7,
+                  background: "var(--accent)",
+                  color: "#fff",
+                  border: 0,
+                  borderRadius: 8,
+                  padding: "8px 14px",
+                  cursor: terminalLaunchPending ? "wait" : "pointer",
+                  opacity: terminalLaunchPending ? 0.72 : 1,
+                  font: `600 12px/1 ${FONT_SANS}`,
+                }}
+              >
+                <IconPlus size={13} /> WSL 터미널 열기
+              </button>
+              <button
+                type="button"
+                disabled={terminalLaunchPending}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openDurableTerminalInPane(pane.paneId);
+                }}
+                title="재시작에도 살아남는 durable WSL 세션 (tmux). 연결이 끊겨도 재접속됩니다."
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  background: "transparent",
+                  color: "var(--fg3)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  cursor: terminalLaunchPending ? "wait" : "pointer",
+                  opacity: terminalLaunchPending ? 0.72 : 1,
+                  font: `600 11px/1 ${FONT_SANS}`,
+                }}
+              >
+                <IconServer size={12} /> Durable 터미널 (tmux)
+              </button>
+            </div>
+          )}
+        </div>
+        {telemetry ? <OmcBar telemetry={telemetry} theme={theme} /> : null}
+      </div>
+    </div>
+  );
+});
+
 export function AgentmuxTerminalApp() {
   const ctl = useAgentmuxControl();
   const {
@@ -1219,7 +1586,12 @@ export function AgentmuxTerminalApp() {
     // Footer git reflects the active pane's session cwd (computed backend-side
     // from the active pane). Refetch it whenever focus moves between panes so
     // the branch/hash tracks the selected pane, not just the periodic poll.
-    void ctl.refreshSidebar();
+    // PR-4: debounce so rapid focus changes coalesce into a single
+    // getSidebarState call instead of one per intermediate pane.
+    const timer = window.setTimeout(() => {
+      void ctl.refreshSidebar();
+    }, 150);
+    return () => window.clearTimeout(timer);
   }, [activePaneId, ctl]);
 
   const paneById = useMemo(
@@ -2021,13 +2393,17 @@ export function AgentmuxTerminalApp() {
     async (paneId: string) => {
       await runTerminalLaunch(() => ctl.spawnDefaultTerminalInPane(paneId));
     },
-    [ctl, runTerminalLaunch],
+    // PR-2: keep a stable identity for the PaneView memo (ctl.* methods and
+    // runTerminalLaunch are themselves stable).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.spawnDefaultTerminalInPane, runTerminalLaunch],
   );
   const openDurableTerminalInPane = useCallback(
     async (paneId: string) => {
       await runTerminalLaunch(() => ctl.spawnDurableTerminalInPane(paneId));
     },
-    [ctl, runTerminalLaunch],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.spawnDurableTerminalInPane, runTerminalLaunch],
   );
   const addTerminal = useCallback(async () => {
     await runTerminalLaunch(() => ctl.spawnDefaultTerminal());
@@ -2243,12 +2619,45 @@ export function AgentmuxTerminalApp() {
     },
     [ctl, resolveBrowserActionSurface],
   );
+  // PR-2: the control-plane methods are individually stable (memoized inside
+  // useAgentmuxControl), but `ctl` itself is a fresh object each render. Depend
+  // on the specific methods so these handlers keep a stable identity and the
+  // PaneView memo holds across no-op poll ticks.
   const splitPaneBy = useCallback(
     async (paneId: string, axis: "horizontal" | "vertical") => {
       await ctl.focusPane(paneId);
       await ctl.splitActivePane(axis);
     },
-    [ctl],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.focusPane, ctl.splitActivePane],
+  );
+  const focusPaneStable = useCallback(
+    (paneId: string) => {
+      void ctl.focusPane(paneId);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.focusPane],
+  );
+  const closePaneStable = useCallback(
+    (paneId: string) => {
+      void ctl.closePane(paneId);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.closePane],
+  );
+  const closeSurfaceStable = useCallback(
+    (surfaceId: string) => {
+      void ctl.closeSurface(surfaceId);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.closeSurface],
+  );
+  const refreshStable = useCallback(
+    () => {
+      void ctl.refresh();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.refresh],
   );
   const closeSurfaceTab = useCallback(
     async (surfaceId: string, _host?: PaneSummary) => {
@@ -2295,93 +2704,34 @@ export function AgentmuxTerminalApp() {
     [activeWorkspace, client, wslDistributions],
   );
 
-  const rootStyle: CSSProperties = {
-    ...buildRootVars(T, accent, fontSize),
-    height: "100vh",
-    width: "100vw",
-    boxSizing: "border-box",
-    background: "var(--canvas)",
-    display: "flex",
-    flexDirection: "column",
-    overflow: "hidden",
-    fontFamily: `${FONT_SANS},Pretendard,-apple-system,'Segoe UI',sans-serif`,
-    color: T.fg1,
-  };
-  const iconBtn: CSSProperties = {
-    width: 30,
-    height: 30,
-    borderRadius: 7,
-    border: 0,
-    background: "transparent",
-    cursor: "pointer",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    color: "var(--fg3)",
-  };
-  const iconBtnHover: CSSProperties = {
-    background: "var(--s2)",
-    color: "var(--fg1)",
-  };
-  // Frameless-window controls (decorations:false): full-height, flush to the
-  // top-right corner like a native caption.
-  const winCtlBtn: CSSProperties = {
-    width: 46,
-    height: "100%",
-    border: 0,
-    // Override the global `button { border-radius: 6px }` rule — caption
-    // controls are sharp rectangles flush to the window edge; the window's own
-    // rounded top-right corner clips the close button for a native look.
-    borderRadius: 0,
-    margin: 0,
-    padding: 0,
-    background: "transparent",
-    cursor: "pointer",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    color: "var(--fg3)",
-  };
-  const winCtlBtnHover: CSSProperties = {
-    background: "var(--s2)",
-    color: "var(--fg1)",
-  };
-  const groupActionBtn: CSSProperties = {
-    width: 22,
-    height: 22,
-    flex: "none",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    background: "transparent",
-    border: "1px solid transparent",
-    borderRadius: 6,
-    color: "var(--fg4)",
-    cursor: "pointer",
-  };
-  const groupActionHover: CSSProperties = {
-    background: "var(--s2)",
-    borderColor: "var(--border)",
-    color: "var(--fg1)",
-  };
-  const groupMenuItemStyle: CSSProperties = {
-    width: "100%",
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "8px 10px",
-    border: 0,
-    borderRadius: 6,
-    background: "transparent",
-    color: "var(--fg2)",
-    cursor: "pointer",
-    textAlign: "left",
-    font: `600 12px/1 ${FONT_SANS}`,
-  };
-  const groupMenuItemHover: CSSProperties = {
-    background: "var(--s2)",
-    color: "var(--fg1)",
-  };
+  // PR-3: the root style only changes when theme/accent/fontSize change, so it
+  // is memoized on those inputs to keep its reference (and the themed CSS vars)
+  // stable across the frequent re-renders driven by the poll loop.
+  const rootStyle = useMemo<CSSProperties>(
+    () => ({
+      ...buildRootVars(T, accent, fontSize),
+      height: "100vh",
+      width: "100vw",
+      boxSizing: "border-box",
+      background: "var(--canvas)",
+      display: "flex",
+      flexDirection: "column",
+      overflow: "hidden",
+      fontFamily: `${FONT_SANS},Pretendard,-apple-system,'Segoe UI',sans-serif`,
+      color: T.fg1,
+    }),
+    [T, accent, fontSize],
+  );
+  // PR-3: alias the hoisted module-level style constants so the JSX below keeps
+  // its existing names while the references stay stable across renders.
+  const iconBtn = ICON_BTN_STYLE;
+  const iconBtnHover = ICON_BTN_HOVER_STYLE;
+  const winCtlBtn = WIN_CTL_BTN_STYLE;
+  const winCtlBtnHover = WIN_CTL_BTN_HOVER_STYLE;
+  const groupActionBtn = GROUP_ACTION_BTN_STYLE;
+  const groupActionHover = GROUP_ACTION_HOVER_STYLE;
+  const groupMenuItemStyle = GROUP_MENU_ITEM_STYLE;
+  const groupMenuItemHover = GROUP_MENU_ITEM_HOVER_STYLE;
 
   // ---- action registry, shortcuts, and command palette ----
   const shortcutBindings = useMemo(
@@ -2998,240 +3348,31 @@ export function AgentmuxTerminalApp() {
     const title = surface?.title ?? "빈 페인";
     const dot = sessionDotColor(T, session, hasAttention);
     const label = sessionLabel(session, hasAttention);
-    const winBtn: CSSProperties = {
-      width: 23,
-      height: 23,
-      borderRadius: 5,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      color: "var(--fg4)",
-      cursor: "pointer",
-    };
-    const winBtnHover: CSSProperties = {
-      background: "var(--s2)",
-      color: "var(--fg1)",
-    };
 
     return (
-      <div
+      <PaneView
         key={pane.paneId}
-        data-agentmux-pane={pane.paneId}
-        data-agentmux-mounted={surface ? "true" : "false"}
-        data-agentmux-active={active ? "true" : "false"}
-        onMouseDown={() => void ctl.focusPane(pane.paneId)}
-        style={{
-          minHeight: 0,
-          minWidth: 0,
-          flex: "1 1 0",
-          background: "var(--term)",
-          // Active highlight is a 1px accent border — same thickness as the
-          // inactive 1px border, so focus never shifts layout. No extra inset
-          // shadow: that doubled the edge to 2px, which showed through on empty
-          // panes (no terminal content to paint over the inset ring).
-          border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
-          borderRadius: 7,
-          display: "flex",
-          flexDirection: "column",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            height: 32,
-            flex: "none",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "0 9px",
-            background: "var(--surface)",
-            borderBottom: "1px solid var(--border)",
-          }}
-        >
-          <span
-            style={{
-              width: 7,
-              height: 7,
-              borderRadius: "50%",
-              flex: "none",
-              background: dot,
-            }}
-          />
-          <span
-            style={{
-              font: `600 11.5px/1 ${FONT_MONO}`,
-              color: "var(--fg1)",
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
-          >
-            {title}
-          </span>
-          {label ? (
-            <span
-              style={{
-                font: `500 9.5px/1 ${FONT_SANS}`,
-                color: dot,
-                background: "var(--s2)",
-                borderRadius: 4,
-                padding: "3px 6px",
-                flex: "none",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {label}
-            </span>
-          ) : null}
-          {session ? (
-            <span
-              style={{
-                font: `500 10px/1 ${FONT_MONO}`,
-                color: "var(--fg3)",
-                background: "var(--s2)",
-                border: "1px solid var(--border)",
-                borderRadius: 4,
-                padding: "3px 6px",
-                flex: "none",
-              }}
-            >
-              {session.backendKind}
-            </span>
-          ) : null}
-          <div style={{ flex: 1 }} />
-          <div style={{ display: "flex", gap: 1, flex: "none" }}>
-            <Hov
-              tag="span"
-              className="agentmux-pane-split-vertical"
-              style={winBtn}
-              hover={winBtnHover}
-              onClick={(e) => {
-                e.stopPropagation();
-                void splitPaneBy(pane.paneId, "vertical");
-              }}
-            >
-              <IconSplitCols size={12} />
-            </Hov>
-            <Hov
-              tag="span"
-              className="agentmux-pane-split-horizontal"
-              style={winBtn}
-              hover={winBtnHover}
-              onClick={(e) => {
-                e.stopPropagation();
-                void splitPaneBy(pane.paneId, "horizontal");
-              }}
-            >
-              <IconSplitRows size={12} />
-            </Hov>
-            <Hov
-              tag="span"
-              className="agentmux-pane-close"
-              style={winBtn}
-              hover={winBtnHover}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (pane.parentPaneId) void ctl.closePane(pane.paneId);
-                else if (surface) void ctl.closeSurface(surface.surfaceId);
-              }}
-            >
-              <IconClose size={11} />
-            </Hov>
-          </div>
-        </div>
-        <div
-          style={{
-            flex: 1,
-            minHeight: 0,
-            minWidth: 0,
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          <div
-            style={{ flex: 1, minHeight: 0, minWidth: 0, position: "relative" }}
-          >
-            {session && isLiveSession(session) && !isBrowser ? (
-              <LiveTerminal
-                key={session.sessionId}
-                client={client}
-                sessionId={session.sessionId}
-                active={active}
-                innerMargin={terminalInnerMargin}
-                onFocus={() => void ctl.focusPane(pane.paneId)}
-                onError={() => void ctl.refresh()}
-              />
-            ) : isBrowser && surface ? (
-              <BrowserSurfacePanel
-                client={client}
-                surfaceId={surface.surfaceId}
-              />
-            ) : (
-              <div
-                style={{
-                  height: "100%",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 10,
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--fg4)",
-                }}
-              >
-                <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>빈 페인</span>
-                <button
-                  type="button"
-                  disabled={terminalLaunchPending}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void openTerminalInPane(pane.paneId);
-                  }}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 7,
-                    background: "var(--accent)",
-                    color: "#fff",
-                    border: 0,
-                    borderRadius: 8,
-                    padding: "8px 14px",
-                    cursor: terminalLaunchPending ? "wait" : "pointer",
-                    opacity: terminalLaunchPending ? 0.72 : 1,
-                    font: `600 12px/1 ${FONT_SANS}`,
-                  }}
-                >
-                  <IconPlus size={13} /> WSL 터미널 열기
-                </button>
-                <button
-                  type="button"
-                  disabled={terminalLaunchPending}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void openDurableTerminalInPane(pane.paneId);
-                  }}
-                  title="재시작에도 살아남는 durable WSL 세션 (tmux). 연결이 끊겨도 재접속됩니다."
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 6,
-                    background: "transparent",
-                    color: "var(--fg3)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 8,
-                    padding: "6px 12px",
-                    cursor: terminalLaunchPending ? "wait" : "pointer",
-                    opacity: terminalLaunchPending ? 0.72 : 1,
-                    font: `600 11px/1 ${FONT_SANS}`,
-                  }}
-                >
-                  <IconServer size={12} /> Durable 터미널 (tmux)
-                </button>
-              </div>
-            )}
-          </div>
-          {telemetry ? <OmcBar telemetry={telemetry} theme={T} /> : null}
-        </div>
-      </div>
+        pane={pane}
+        surface={surface}
+        session={session}
+        active={active}
+        isBrowser={isBrowser}
+        telemetry={telemetry}
+        title={title}
+        dot={dot}
+        label={label}
+        theme={T}
+        client={client}
+        terminalInnerMargin={terminalInnerMargin}
+        terminalLaunchPending={terminalLaunchPending}
+        focusPane={focusPaneStable}
+        splitPaneBy={splitPaneBy}
+        closePane={closePaneStable}
+        closeSurface={closeSurfaceStable}
+        openTerminalInPane={openTerminalInPane}
+        openDurableTerminalInPane={openDurableTerminalInPane}
+        onTerminalError={refreshStable}
+      />
     );
   };
 
