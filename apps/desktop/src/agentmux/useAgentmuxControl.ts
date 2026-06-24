@@ -186,6 +186,7 @@ export interface AgentmuxControl {
   deleteProfile: (profileId: string) => Promise<void>;
   connectProfile: (profile: SshProfile) => Promise<void>;
   refresh: () => Promise<void>;
+  refreshSidebar: () => Promise<void>;
 }
 
 // Bridges the design UI to the real control plane. Under Tauri this drives the
@@ -313,6 +314,21 @@ export function useAgentmuxControl(): AgentmuxControl {
       setError(cause instanceof Error ? cause.message : "Control plane request failed.");
     }
   }, [client, loadDetail, mergeNotifications]);
+
+  // Lightweight refetch of just the sidebar/footer state (git branch+hash for
+  // the active pane's session cwd). Cheap enough to call whenever focus moves
+  // between panes, so the footer git reflects the selected pane.
+  const refreshSidebar = useCallback(async () => {
+    const workspaceId = activeRef.current;
+    if (!workspaceId) {
+      return;
+    }
+    try {
+      setSidebarState(await client.getSidebarState(workspaceId));
+    } catch {
+      /* leave the previous sidebar state in place on transient failures */
+    }
+  }, [client]);
 
   // Hydrate workspace list (create a default workspace when none exist).
   useEffect(() => {
@@ -1309,6 +1325,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     updateProfile,
     deleteProfile,
     connectProfile,
-    refresh
+    refresh,
+    refreshSidebar
   };
 }

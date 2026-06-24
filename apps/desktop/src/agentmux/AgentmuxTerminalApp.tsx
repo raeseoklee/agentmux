@@ -92,7 +92,7 @@ import {
   toggleMaximizeWindow,
   watchMaximized,
 } from "./windowControls";
-import { applyZoom, loadZoom, nudgeZoom, resetZoom, ZOOM_STEP } from "./uiZoom";
+import { initZoom, nudgeZoom, resetZoom, ZOOM_STEP } from "./uiZoom";
 
 type Overlay = "palette" | "search" | "settings" | "setup" | null;
 type SettingsTab =
@@ -851,9 +851,9 @@ export function AgentmuxTerminalApp() {
   const [windowMaximized, setWindowMaximized] = useState(false);
   useEffect(() => watchMaximized(setWindowMaximized), []);
   useEffect(() => {
-    // Apply the persisted zoom, or an adaptive default for this display's DPI
-    // and resolution (FHD/QHD/UHD). Ctrl +/-/0 adjust it; see the keydown below.
-    applyZoom(loadZoom());
+    // Apply the saved zoom or the adaptive default for this display (not
+    // persisted — the default is recomputed each launch). Ctrl +/-/0 adjust it.
+    initZoom();
   }, []);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configPath, setConfigPath] = useState("");
@@ -1215,6 +1215,13 @@ export function AgentmuxTerminalApp() {
   const surfaces = useMemo(() => detail?.surfaces ?? [], [detail]);
   const sessions = useMemo(() => detail?.sessions ?? [], [detail]);
   const activePaneId = detail?.workspace.activePaneId ?? null;
+
+  useEffect(() => {
+    // Footer git reflects the active pane's session cwd (computed backend-side
+    // from the active pane). Refetch it whenever focus moves between panes so
+    // the branch/hash tracks the selected pane, not just the periodic poll.
+    void ctl.refreshSidebar();
+  }, [activePaneId, ctl]);
 
   const paneById = useMemo(
     () => new Map(panes.map((pane) => [pane.paneId, pane])),
@@ -3024,7 +3031,10 @@ export function AgentmuxTerminalApp() {
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
-          boxShadow: active ? "0 0 0 1px var(--accent)" : "none",
+          // Inset (not outset) so the active highlight never extends past the
+          // pane's border-box into the 2px split gap — otherwise the active pane
+          // visually grows by 1px on each side as focus moves between panes.
+          boxShadow: active ? "inset 0 0 0 1px var(--accent)" : "none",
         }}
       >
         <div
@@ -4349,7 +4359,18 @@ export function AgentmuxTerminalApp() {
             >
               {tabSurfaces.map((surface) => {
                 const host = paneHostingSurface(surface.surfaceId);
-                const on = host?.paneId === activePaneId;
+                // A tab stays active while ANY pane in its tab (root-pane tree)
+                // is focused — not only the tab's first/host pane. Compare roots.
+                const tabRoot = host ? rootPaneForPane(host) : undefined;
+                const activePane = activePaneId
+                  ? paneById.get(activePaneId)
+                  : undefined;
+                const activeRoot = activePane
+                  ? rootPaneForPane(activePane)
+                  : undefined;
+                const on = Boolean(
+                  tabRoot && activeRoot && tabRoot.paneId === activeRoot.paneId,
+                );
                 const session = surface.sessionId
                   ? sessionById.get(surface.sessionId)
                   : undefined;
