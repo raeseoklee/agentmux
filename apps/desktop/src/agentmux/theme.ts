@@ -83,9 +83,9 @@ export interface Accent {
 }
 
 export const ACCENTS: Accent[] = [
+  { key: "blue", label: "Azure", hex: "#3B82F6", hover: "#2563EB", soft: "rgba(59,130,246,0.16)" },
   { key: "orange", label: "Coral", hex: "#F0561D", hover: "#D9491A", soft: "rgba(240,86,29,0.16)" },
   { key: "green", label: "Emerald", hex: "#10B981", hover: "#059669", soft: "rgba(16,185,129,0.16)" },
-  { key: "blue", label: "Azure", hex: "#3B82F6", hover: "#2563EB", soft: "rgba(59,130,246,0.16)" },
   { key: "violet", label: "Iris", hex: "#8B5CF6", hover: "#7C3AED", soft: "rgba(139,92,246,0.16)" }
 ];
 

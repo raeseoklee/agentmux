@@ -5288,7 +5288,7 @@ fn default_app_config_format_version() -> String {
 fn default_app_config_appearance() -> AppConfigAppearance {
     AppConfigAppearance {
         theme: "dark".to_string(),
-        accent_key: "orange".to_string(),
+        accent_key: "blue".to_string(),
         font_size: 12.5,
     }
 }

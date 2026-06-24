@@ -3865,7 +3865,7 @@ class BrowserPreviewControlClient implements ControlClient {
       projectConfigLoaded: false,
       appearance: {
         theme: "dark",
-        accentKey: "orange",
+        accentKey: "blue",
         fontSize: 12.5,
       },
       shortcuts: {
@@ -5597,7 +5597,7 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
       accentKey:
         typeof appearance.accent_key === "string"
           ? appearance.accent_key
-          : "orange",
+          : "blue",
       fontSize:
         typeof appearance.font_size === "number" ? appearance.font_size : 12.5,
     },
