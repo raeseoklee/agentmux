@@ -3491,6 +3491,8 @@ export function AgentmuxTerminalApp() {
           ) : null}
           <Hov
             tag="button"
+            ariaLabel="활성 창에서 검색"
+            title="활성 창에서 검색 (⌘P)"
             style={{ ...iconBtn, marginRight: 2 }}
             hover={iconBtnHover}
             onClick={() => setOverlay("search")}
