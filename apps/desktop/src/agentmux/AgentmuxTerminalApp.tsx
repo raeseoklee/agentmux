@@ -840,7 +840,7 @@ export function AgentmuxTerminalApp() {
   } = ctl;
 
   const [theme, setTheme] = useState<ThemeName>("dark");
-  const [accentKey, setAccentKey] = useState("orange");
+  const [accentKey, setAccentKey] = useState("blue");
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("appearance");
   const [query, setQuery] = useState("");
@@ -918,7 +918,7 @@ export function AgentmuxTerminalApp() {
     setAccentKey(
       ACCENTS.some((candidate) => candidate.key === config.appearance.accentKey)
         ? config.appearance.accentKey
-        : "orange",
+        : "blue",
     );
     setFontSize(Math.min(16, Math.max(11, config.appearance.fontSize)));
     setShortcutOverrides(config.shortcuts.bindings);
@@ -3025,15 +3025,15 @@ export function AgentmuxTerminalApp() {
           minWidth: 0,
           flex: "1 1 0",
           background: "var(--term)",
+          // Active highlight is a 1px accent border — same thickness as the
+          // inactive 1px border, so focus never shifts layout. No extra inset
+          // shadow: that doubled the edge to 2px, which showed through on empty
+          // panes (no terminal content to paint over the inset ring).
           border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
           borderRadius: 7,
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
-          // Inset (not outset) so the active highlight never extends past the
-          // pane's border-box into the 2px split gap — otherwise the active pane
-          // visually grows by 1px on each side as focus moves between panes.
-          boxShadow: active ? "inset 0 0 0 1px var(--accent)" : "none",
         }}
       >
         <div
