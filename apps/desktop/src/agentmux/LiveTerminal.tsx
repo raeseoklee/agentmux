@@ -6,9 +6,19 @@ import {
 } from "../terminal/XtermTerminalRenderer";
 
 const encoder = new TextEncoder();
-const POLL_INTERVAL_MS = 120;
-const SNAPSHOT_POLL_MS = 40;
-const INPUT_POLL_DELAYS_MS = [16, 0, 40, 100] as const;
+const SNAPSHOT_HOT_POLL_MS = 32;
+const SNAPSHOT_BOOT_POLL_MS = 80;
+const SNAPSHOT_IDLE_POLL_MS = 250;
+const SNAPSHOT_INACTIVE_POLL_MS = 500;
+const SNAPSHOT_HIDDEN_POLL_MS = 1000;
+const FALLBACK_HOT_POLL_MS = 80;
+const FALLBACK_IDLE_POLL_MS = 350;
+const FALLBACK_INACTIVE_POLL_MS = 700;
+const ACTIVITY_HOT_POLLS = 12;
+
+function documentHidden(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "hidden";
+}
 
 interface LiveTerminalProps {
   client: ControlClient;
@@ -39,6 +49,9 @@ export function LiveTerminal({
 }: LiveTerminalProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
+  const activeRef = useRef(active);
+  const bootingRef = useRef(true);
+  const pollNowRef = useRef<(() => void) | null>(null);
   const margin = Math.min(32, Math.max(0, Math.round(innerMargin)));
   // True until this session's first output byte is rendered. The component is
   // keyed by sessionId upstream, so this resets for every session. It drives a
@@ -53,8 +66,16 @@ export function LiveTerminal({
     }
     // Backstop: never leave the overlay up forever if a session legitimately
     // produces no output. Well clear of the worst-case cold WSL boot.
-    const bootingBackstop = window.setTimeout(() => setBooting(false), 20000);
+    bootingRef.current = true;
+    const bootingBackstop = window.setTimeout(() => {
+      bootingRef.current = false;
+      setBooting(false);
+    }, 20000);
     const markOutput = () => {
+      if (!bootingRef.current) {
+        return;
+      }
+      bootingRef.current = false;
       window.clearTimeout(bootingBackstop);
       setBooting(false);
     };
@@ -89,7 +110,17 @@ export function LiveTerminal({
           .catch(() => onError?.());
       }, 80);
     });
-    const resizeObserver = new ResizeObserver(() => renderer.fit());
+    let fitFrame: number | null = null;
+    const requestFit = () => {
+      if (fitFrame !== null) {
+        return;
+      }
+      fitFrame = window.requestAnimationFrame(() => {
+        fitFrame = null;
+        renderer.fit();
+      });
+    };
+    const resizeObserver = new ResizeObserver(requestFit);
     resizeObserver.observe(host);
 
     const teardownShared = () => {
@@ -97,6 +128,9 @@ export function LiveTerminal({
       window.clearTimeout(bootingBackstop);
       if (resizeTimer !== null) {
         window.clearTimeout(resizeTimer);
+      }
+      if (fitFrame !== null) {
+        window.cancelAnimationFrame(fitFrame);
       }
       unsubscribeResize();
       resizeObserver.disconnect();
@@ -114,6 +148,44 @@ export function LiveTerminal({
       let expected = 0;
       let polling = false;
       let queued = false;
+      let hotPollsRemaining = ACTIVITY_HOT_POLLS;
+      let snapshotTimer: number | null = null;
+
+      const clearSnapshotTimer = () => {
+        if (snapshotTimer !== null) {
+          window.clearTimeout(snapshotTimer);
+          snapshotTimer = null;
+        }
+      };
+
+      const snapshotDelay = (hadOutput: boolean) => {
+        if (documentHidden()) {
+          return SNAPSHOT_HIDDEN_POLL_MS;
+        }
+        if (hadOutput) {
+          hotPollsRemaining = ACTIVITY_HOT_POLLS;
+          return SNAPSHOT_HOT_POLL_MS;
+        }
+        if (hotPollsRemaining > 0) {
+          hotPollsRemaining -= 1;
+          return SNAPSHOT_HOT_POLL_MS;
+        }
+        if (bootingRef.current && activeRef.current) {
+          return SNAPSHOT_BOOT_POLL_MS;
+        }
+        return activeRef.current ? SNAPSHOT_IDLE_POLL_MS : SNAPSHOT_INACTIVE_POLL_MS;
+      };
+
+      const scheduleSnapshotPoll = (delayMs: number) => {
+        clearSnapshotTimer();
+        if (!alive) {
+          return;
+        }
+        snapshotTimer = window.setTimeout(() => {
+          snapshotTimer = null;
+          void pollSnapshot();
+        }, delayMs);
+      };
 
       const pollSnapshot = async () => {
         if (polling) {
@@ -121,6 +193,7 @@ export function LiveTerminal({
           return;
         }
         polling = true;
+        let hadOutput = false;
         try {
           do {
             queued = false;
@@ -136,6 +209,7 @@ export function LiveTerminal({
             }
             if (snap.bytes.length > 0) {
               renderer.write(snap.bytes);
+              hadOutput = true;
               markOutput();
             }
             expected = snap.endOffset;
@@ -147,31 +221,41 @@ export function LiveTerminal({
           // would be a refresh storm that never lets the terminal settle.
         } finally {
           polling = false;
-          if (alive && queued) {
-            void pollSnapshot();
+          if (!alive) {
+            return;
           }
+          if (queued) {
+            void pollSnapshot();
+            return;
+          }
+          scheduleSnapshotPoll(snapshotDelay(hadOutput));
         }
       };
+
+      const requestSnapshotPoll = () => {
+        hotPollsRemaining = ACTIVITY_HOT_POLLS;
+        clearSnapshotTimer();
+        void pollSnapshot();
+      };
+      pollNowRef.current = requestSnapshotPoll;
 
       const unsubscribeInput = renderer.onData((data) => {
         client
           .sendText(sessionId, data)
           .then(() => {
             // Poll promptly so the echo appears without waiting for the tick.
-            queued = true;
-            void pollSnapshot();
+            requestSnapshotPoll();
           })
           .catch(() => onError?.());
       });
 
       void pollSnapshot();
-      const timer = window.setInterval(
-        () => void pollSnapshot(),
-        SNAPSHOT_POLL_MS,
-      );
 
       return () => {
-        window.clearInterval(timer);
+        clearSnapshotTimer();
+        if (pollNowRef.current === requestSnapshotPoll) {
+          pollNowRef.current = null;
+        }
         unsubscribeInput();
         teardownShared();
       };
@@ -181,7 +265,41 @@ export function LiveTerminal({
     let renderedText = "";
     let pollInFlight = false;
     let pollQueued = false;
-    const pendingPollTimers = new Set<number>();
+    let hotPollsRemaining = ACTIVITY_HOT_POLLS;
+    let fallbackTimer: number | null = null;
+
+    const clearFallbackTimer = () => {
+      if (fallbackTimer !== null) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
+    const fallbackDelay = (hadOutput: boolean) => {
+      if (documentHidden()) {
+        return SNAPSHOT_HIDDEN_POLL_MS;
+      }
+      if (hadOutput) {
+        hotPollsRemaining = ACTIVITY_HOT_POLLS;
+        return FALLBACK_HOT_POLL_MS;
+      }
+      if (hotPollsRemaining > 0) {
+        hotPollsRemaining -= 1;
+        return FALLBACK_HOT_POLL_MS;
+      }
+      return activeRef.current ? FALLBACK_IDLE_POLL_MS : FALLBACK_INACTIVE_POLL_MS;
+    };
+
+    const scheduleFallbackPoll = (delayMs: number) => {
+      clearFallbackTimer();
+      if (!alive) {
+        return;
+      }
+      fallbackTimer = window.setTimeout(() => {
+        fallbackTimer = null;
+        void poll();
+      }, delayMs);
+    };
 
     const poll = async () => {
       if (pollInFlight) {
@@ -189,6 +307,7 @@ export function LiveTerminal({
         return;
       }
       pollInFlight = true;
+      let hadOutput = false;
       try {
         do {
           pollQueued = false;
@@ -207,6 +326,7 @@ export function LiveTerminal({
             renderer.reset();
             if (text.length > 0) {
               renderer.write(encoder.encode(text));
+              hadOutput = true;
             }
             continue;
           }
@@ -214,52 +334,46 @@ export function LiveTerminal({
           renderedText = text;
           if (next.length > 0) {
             renderer.write(encoder.encode(next));
+            hadOutput = true;
           }
         } while (alive && pollQueued);
       } catch {
         onError?.();
       } finally {
         pollInFlight = false;
-        if (alive && pollQueued) {
-          void poll();
+        if (!alive) {
+          return;
         }
+        if (pollQueued) {
+          void poll();
+          return;
+        }
+        scheduleFallbackPoll(fallbackDelay(hadOutput));
       }
     };
 
-    const schedulePoll = (delayMs: number) => {
-      if (!alive) {
-        return;
-      }
-      if (delayMs <= 0) {
-        void poll();
-        return;
-      }
-      const timer = window.setTimeout(() => {
-        pendingPollTimers.delete(timer);
-        void poll();
-      }, delayMs);
-      pendingPollTimers.add(timer);
+    const requestFallbackPoll = () => {
+      hotPollsRemaining = ACTIVITY_HOT_POLLS;
+      clearFallbackTimer();
+      void poll();
     };
+    pollNowRef.current = requestFallbackPoll;
 
     const unsubscribeInput = renderer.onData((data) => {
-      schedulePoll(INPUT_POLL_DELAYS_MS[0]);
+      requestFallbackPoll();
       client
         .sendText(sessionId, data)
-        .then(() => {
-          INPUT_POLL_DELAYS_MS.slice(1).forEach(schedulePoll);
-        })
+        .then(requestFallbackPoll)
         .catch(() => onError?.());
     });
 
     void poll();
-    const timer = window.setInterval(() => void poll(), POLL_INTERVAL_MS);
 
     return () => {
-      window.clearInterval(timer);
-      pendingPollTimers.forEach((pendingTimer) =>
-        window.clearTimeout(pendingTimer),
-      );
-      pendingPollTimers.clear();
+      clearFallbackTimer();
+      if (pollNowRef.current === requestFallbackPoll) {
+        pollNowRef.current = null;
+      }
       unsubscribeInput();
       teardownShared();
     };
@@ -267,8 +381,10 @@ export function LiveTerminal({
   }, [client, sessionId]);
 
   useEffect(() => {
+    activeRef.current = active;
     if (active) {
       rendererRef.current?.focus();
+      pollNowRef.current?.();
     }
   }, [active]);
 

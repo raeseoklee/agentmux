@@ -6,9 +6,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentmux_backend::{
     AttachRequest, BackendError, BackendEvent, BackendKind as BackendTraitKind, BackendResult,
@@ -93,6 +93,16 @@ const TEXT_BOX_MIN_LINES: u8 = 2;
 const TEXT_BOX_MAX_LINES: u8 = 12;
 const TERMINAL_INNER_MARGIN_MIN: u8 = 0;
 const TERMINAL_INNER_MARGIN_MAX: u8 = 32;
+const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Clone)]
+struct GitStatusCacheEntry {
+    captured_at: Instant,
+    branch: Option<String>,
+    hash: Option<String>,
+}
+
+static GIT_STATUS_CACHE: OnceLock<Mutex<HashMap<String, GitStatusCacheEntry>>> = OnceLock::new();
 
 type DesktopRuntimeControl = RuntimeControlPlane<DesktopBackendRouter>;
 
@@ -9300,6 +9310,9 @@ fn git_status_for_cwd(cwd: Option<&str>) -> (Option<String>, Option<String>) {
     // case). Other paths pass through unchanged.
     let cwd = translate_wsl_path(cwd);
     let cwd = cwd.as_str();
+    if let Some(cached) = cached_git_status(cwd) {
+        return cached;
+    }
     let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|value| {
         if value == "HEAD" {
             "detached".to_string()
@@ -9308,7 +9321,37 @@ fn git_status_for_cwd(cwd: Option<&str>) -> (Option<String>, Option<String>) {
         }
     });
     let hash = git_output(cwd, &["rev-parse", "--short", "HEAD"]);
+    store_git_status(cwd, branch.clone(), hash.clone());
     (branch, hash)
+}
+
+fn git_status_cache() -> &'static Mutex<HashMap<String, GitStatusCacheEntry>> {
+    GIT_STATUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_git_status(cwd: &str) -> Option<(Option<String>, Option<String>)> {
+    let Ok(cache) = git_status_cache().lock() else {
+        return None;
+    };
+    let entry = cache.get(cwd)?;
+    if entry.captured_at.elapsed() > GIT_STATUS_CACHE_TTL {
+        return None;
+    }
+    Some((entry.branch.clone(), entry.hash.clone()))
+}
+
+fn store_git_status(cwd: &str, branch: Option<String>, hash: Option<String>) {
+    let Ok(mut cache) = git_status_cache().lock() else {
+        return;
+    };
+    cache.insert(
+        cwd.to_string(),
+        GitStatusCacheEntry {
+            captured_at: Instant::now(),
+            branch,
+            hash,
+        },
+    );
 }
 
 /// Translate a WSL `/mnt/<drive>/…` path into a Windows path (`D:\…`) so native

@@ -23,7 +23,9 @@ import {
 
 const DEFAULT_PROJECT_ROOT = "D:\\Workspace\\irae\\agentmux";
 const DEFAULT_WORKSPACE_NAME = "Workspace 1";
-const POLL_INTERVAL_MS = 1200;
+const SIGNAL_POLL_INTERVAL_MS = 1500;
+const DETAIL_POLL_INTERVAL_MS = 5000;
+const SIDEBAR_POLL_INTERVAL_MS = 5000;
 const LAST_ACTIVE_WORKSPACE_STORAGE_KEY = "agentmux.ui.lastActiveWorkspaceId.v1";
 const LOCAL_NOTIFICATION_PREFIX = "local_";
 const WSL_REQUIRED_NOTIFICATION_ID = `${LOCAL_NOTIFICATION_PREFIX}wsl_required`;
@@ -403,6 +405,9 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const activeRef = useRef<string | null>(null);
   const detailRef = useRef<WorkspaceDetail | null>(null);
+  const lastDetailRefreshAtRef = useRef(0);
+  const lastSidebarRefreshAtRef = useRef(0);
+  const signalRefreshInFlightRef = useRef(false);
   activeRef.current = activeWorkspaceId;
 
   const pushLocalNotification = useCallback(
@@ -475,6 +480,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     async (workspaceId: string) => {
       const next = await client.getWorkspace(workspaceId);
       if (activeRef.current === workspaceId) {
+        lastDetailRefreshAtRef.current = Date.now();
         setDetail((previous) => {
           const resolved = detailEqual(previous, next) ? previous : next;
           detailRef.current = resolved;
@@ -509,10 +515,49 @@ export function useAgentmuxControl(): AgentmuxControl {
       setIfChanged(setAttention, nextAttention, agentStatesEqual);
       setIfChanged(setAgentStates, nextStates, agentStatesEqual);
       mergeNotifications(nextNotifications);
+      lastSidebarRefreshAtRef.current = Date.now();
       setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Control plane request failed.");
+    }
+  }, [client, loadDetail, mergeNotifications]);
+
+  const refreshSignals = useCallback(async () => {
+    const workspaceId = activeRef.current;
+    if (!workspaceId || signalRefreshInFlightRef.current) {
+      return;
+    }
+    signalRefreshInFlightRef.current = true;
+    try {
+      const now = Date.now();
+      const shouldLoadDetail =
+        now - lastDetailRefreshAtRef.current >= DETAIL_POLL_INTERVAL_MS;
+      const shouldLoadSidebar =
+        now - lastSidebarRefreshAtRef.current >= SIDEBAR_POLL_INTERVAL_MS;
+      const [nextDetail, nextAttention, nextStates, nextNotifications, nextSidebarState] =
+        await Promise.all([
+          shouldLoadDetail ? loadDetail(workspaceId) : Promise.resolve(null),
+          client.listAgentAttention(null),
+          client.listAgentStates(null),
+          client.listNotifications({ workspaceId: null, severity: null, includeDismissed: false }),
+          shouldLoadSidebar ? client.getSidebarState(workspaceId) : Promise.resolve(null)
+        ]);
+      if (nextDetail) {
+        lastDetailRefreshAtRef.current = now;
+      }
+      setIfChanged(setAttention, nextAttention, agentStatesEqual);
+      setIfChanged(setAgentStates, nextStates, agentStatesEqual);
+      mergeNotifications(nextNotifications);
+      if (nextSidebarState) {
+        lastSidebarRefreshAtRef.current = now;
+        setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
+      }
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Control plane request failed.");
+    } finally {
+      signalRefreshInFlightRef.current = false;
     }
   }, [client, loadDetail, mergeNotifications]);
 
@@ -526,6 +571,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     }
     try {
       const next = await client.getSidebarState(workspaceId);
+      lastSidebarRefreshAtRef.current = Date.now();
       setIfChanged(setSidebarState, next, sidebarStateEqual);
     } catch {
       /* leave the previous sidebar state in place on transient failures */
@@ -625,9 +671,9 @@ export function useAgentmuxControl(): AgentmuxControl {
       return;
     }
     void refresh();
-    const timer = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    const timer = window.setInterval(() => void refreshSignals(), SIGNAL_POLL_INTERVAL_MS);
     return () => window.clearInterval(timer);
-  }, [activeWorkspaceId, refresh]);
+  }, [activeWorkspaceId, refresh, refreshSignals]);
 
   // PR-5: hydrate SSH profiles once on mount. They are no longer fetched by the
   // periodic poll; profile mutations (create/update/delete) keep them current.
@@ -665,6 +711,8 @@ export function useAgentmuxControl(): AgentmuxControl {
     async (workspaceId: string) => {
       setActiveWorkspaceId(workspaceId);
       activeRef.current = workspaceId;
+      lastDetailRefreshAtRef.current = 0;
+      lastSidebarRefreshAtRef.current = 0;
       persistLastActiveWorkspaceId(workspaceId);
       await loadDetail(workspaceId);
     },
@@ -699,7 +747,9 @@ export function useAgentmuxControl(): AgentmuxControl {
       await reloadWorkspaces();
       if (activeRef.current === workspaceId) {
         await loadDetail(workspaceId);
-        setSidebarState(await client.getSidebarState(workspaceId));
+        const nextSidebarState = await client.getSidebarState(workspaceId);
+        lastSidebarRefreshAtRef.current = Date.now();
+        setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
       }
     },
     [client, loadDetail, reloadWorkspaces]
@@ -712,6 +762,8 @@ export function useAgentmuxControl(): AgentmuxControl {
       const next = listed[0]?.workspaceId ?? null;
       setActiveWorkspaceId(next);
       activeRef.current = next;
+      lastDetailRefreshAtRef.current = 0;
+      lastSidebarRefreshAtRef.current = 0;
       persistLastActiveWorkspaceId(next);
       if (next) {
         await loadDetail(next);
