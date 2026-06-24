@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { ControlClient } from "../control/ControlClient";
+import type { ControlClient, OutputSnapshot } from "../control/ControlClient";
 import {
   XtermTerminalRenderer,
   XTERM_THEME,
@@ -15,9 +15,70 @@ const FALLBACK_HOT_POLL_MS = 80;
 const FALLBACK_IDLE_POLL_MS = 350;
 const FALLBACK_INACTIVE_POLL_MS = 700;
 const ACTIVITY_HOT_POLLS = 12;
+const MAX_PENDING_STREAM_FRAMES = 256;
+const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
+
+interface OutputStreamFrame {
+  fromOffset: number;
+  bytes: Uint8Array;
+}
+
+type OutputTransportMode =
+  | "tauri-channel"
+  | "snapshot-poll"
+  | "read-recent-poll";
+
+interface TerminalTransportDiagnostics {
+  mode: OutputTransportMode;
+  sessionId: string;
+  frames: number;
+  bytes: number;
+  resyncs: number;
+  updatedAt: string;
+}
+
+function terminalDiagnostics() {
+  return window as Window & {
+    __AGENTMUX_TERMINAL_TRANSPORT__?: Record<string, TerminalTransportDiagnostics>;
+  };
+}
+
+function recordTransport(
+  sessionId: string,
+  mode: OutputTransportMode,
+  patch?: Partial<Omit<TerminalTransportDiagnostics, "mode" | "sessionId" | "updatedAt">>,
+) {
+  const target = terminalDiagnostics();
+  const registry = target.__AGENTMUX_TERMINAL_TRANSPORT__ ?? {};
+  const previous = registry[sessionId] ?? {
+    mode,
+    sessionId,
+    frames: 0,
+    bytes: 0,
+    resyncs: 0,
+    updatedAt: new Date().toISOString(),
+  };
+  registry[sessionId] = {
+    ...previous,
+    mode,
+    sessionId,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  target.__AGENTMUX_TERMINAL_TRANSPORT__ = registry;
+}
 
 function documentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
+}
+
+function tauriOutputChannelAvailable(): boolean {
+  const tauri = (
+    window as Window & {
+      __TAURI__?: { core?: { Channel?: unknown } };
+    }
+  ).__TAURI__;
+  return Boolean(tauri?.core?.Channel);
 }
 
 interface LiveTerminalProps {
@@ -33,12 +94,11 @@ interface LiveTerminalProps {
 // instances can render simultaneously (one per mosaic pane) — each owns its own
 // renderer and output loop.
 //
-// With a real Tauri host the renderer streams RAW BYTES: it polls
-// `session.snapshot` with the absolute offset it has consumed and writes only
-// the new delta straight into xterm. Because the bytes are the live VT stream
-// (not a re-sliced text buffer), full-screen cursor-addressed TUIs — vim, htop,
-// Claude Code — render faithfully. On the preview/server clients (no snapshot)
-// it falls back to polling `readRecent`.
+// With a real Tauri host the renderer streams RAW BYTES through a per-session
+// Tauri Channel after one cold-start `session.snapshot`. Because the bytes are
+// the live VT stream (not a re-sliced text buffer), full-screen cursor-addressed
+// TUIs such as vim, htop, and Claude Code render faithfully. On preview/server
+// clients it falls back through snapshot polling, then `readRecent` polling.
 export function LiveTerminal({
   client,
   sessionId,
@@ -140,8 +200,190 @@ export function LiveTerminal({
       }
     };
 
-    // --- raw-byte snapshot polling (real Tauri host) ---
+    // --- live byte stream (real Tauri host) ---
+    if (
+      typeof client.snapshot === "function" &&
+      typeof client.subscribeOutput === "function" &&
+      tauriOutputChannelAvailable()
+    ) {
+      recordTransport(sessionId, "tauri-channel");
+      console.info("[agentmux] terminal output transport: tauri-channel", {
+        sessionId,
+      });
+      let expected = 0;
+      let streamReady = false;
+      let resyncInFlight = false;
+      let resyncQueued = false;
+      let pendingFrames: OutputStreamFrame[] = [];
+      let pendingFrameBytes = 0;
+      let resyncRetryTimer: number | null = null;
+      let unsubscribeOutput: (() => void) | null = null;
+
+      const clearResyncRetry = () => {
+        if (resyncRetryTimer !== null) {
+          window.clearTimeout(resyncRetryTimer);
+          resyncRetryTimer = null;
+        }
+      };
+
+      const queueFrame = (fromOffset: number, bytes: Uint8Array) => {
+        if (bytes.length === 0) {
+          return;
+        }
+        pendingFrames.push({ fromOffset, bytes });
+        pendingFrameBytes += bytes.length;
+        if (
+          pendingFrames.length > MAX_PENDING_STREAM_FRAMES ||
+          pendingFrameBytes > MAX_PENDING_STREAM_BYTES
+        ) {
+          pendingFrames = [];
+          pendingFrameBytes = 0;
+          resyncQueued = true;
+        }
+      };
+
+      const writeSnapshot = (snap: OutputSnapshot) => {
+        const diagnostics =
+          terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+        recordTransport(sessionId, "tauri-channel", {
+          resyncs: (diagnostics?.resyncs ?? 0) + 1,
+        });
+        renderer.reset();
+        if (snap.bytes.length > 0) {
+          renderer.write(snap.bytes);
+          markOutput();
+        }
+        expected = snap.endOffset;
+        streamReady = true;
+      };
+
+      async function resync() {
+        if (resyncInFlight) {
+          resyncQueued = true;
+          return;
+        }
+        resyncInFlight = true;
+        clearResyncRetry();
+        try {
+          const snap = await client.snapshot!(sessionId);
+          if (!alive) {
+            return;
+          }
+          writeSnapshot(snap);
+        } catch {
+          if (alive) {
+            scheduleResync(activeRef.current ? SNAPSHOT_BOOT_POLL_MS : SNAPSHOT_INACTIVE_POLL_MS);
+          }
+          return;
+        } finally {
+          resyncInFlight = false;
+        }
+        if (!alive) {
+          return;
+        }
+        flushPendingFrames();
+        if (resyncQueued) {
+          resyncQueued = false;
+          scheduleResync(0);
+        }
+      }
+
+      const scheduleResync = (delayMs: number) => {
+        clearResyncRetry();
+        if (!alive) {
+          return;
+        }
+        if (delayMs <= 0) {
+          void resync();
+          return;
+        }
+        resyncRetryTimer = window.setTimeout(() => {
+          resyncRetryTimer = null;
+          void resync();
+        }, delayMs);
+      };
+
+      const applyFrame = (fromOffset: number, bytes: Uint8Array) => {
+        if (!alive || bytes.length === 0) {
+          return;
+        }
+        if (!streamReady || resyncInFlight) {
+          queueFrame(fromOffset, bytes);
+          return;
+        }
+
+        const frameEnd = fromOffset + bytes.length;
+        if (frameEnd <= expected) {
+          return;
+        }
+        if (fromOffset > expected) {
+          queueFrame(fromOffset, bytes);
+          scheduleResync(0);
+          return;
+        }
+
+        const duplicateBytes = Math.max(0, expected - fromOffset);
+        const next = duplicateBytes > 0 ? bytes.subarray(duplicateBytes) : bytes;
+        if (next.length > 0) {
+          renderer.write(next);
+          markOutput();
+          const diagnostics =
+            terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+          recordTransport(sessionId, "tauri-channel", {
+            frames: (diagnostics?.frames ?? 0) + 1,
+            bytes: (diagnostics?.bytes ?? 0) + next.length,
+          });
+        }
+        expected = frameEnd;
+      };
+
+      function flushPendingFrames() {
+        if (pendingFrames.length === 0) {
+          return;
+        }
+        const frames = pendingFrames;
+        pendingFrames = [];
+        pendingFrameBytes = 0;
+        frames.sort((left, right) => left.fromOffset - right.fromOffset);
+        for (const frame of frames) {
+          applyFrame(frame.fromOffset, frame.bytes);
+        }
+      }
+
+      const unsubscribeInput = renderer.onData((data) => {
+        client.sendText(sessionId, data).catch(() => onError?.());
+      });
+
+      void client
+        .subscribeOutput(sessionId, applyFrame)
+        .then((unsubscribe) => {
+          if (!alive) {
+            unsubscribe();
+            return;
+          }
+          unsubscribeOutput = unsubscribe;
+          scheduleResync(0);
+        })
+        .catch(() => {
+          if (alive) {
+            onError?.();
+          }
+        });
+
+      return () => {
+        clearResyncRetry();
+        unsubscribeInput();
+        unsubscribeOutput?.();
+        teardownShared();
+      };
+    }
+
+    // --- raw-byte snapshot polling fallback (Tauri without Channel) ---
     if (typeof client.snapshot === "function") {
+      recordTransport(sessionId, "snapshot-poll");
+      console.info("[agentmux] terminal output transport: snapshot-poll", {
+        sessionId,
+      });
       // Absolute offset already written into xterm. Each poll asks for bytes at
       // or after it and writes the delta. A returned base_offset greater than
       // `expected` means the bounded ring rotated past us — reset and resync.
@@ -211,6 +453,12 @@ export function LiveTerminal({
               renderer.write(snap.bytes);
               hadOutput = true;
               markOutput();
+              const diagnostics =
+                terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+              recordTransport(sessionId, "snapshot-poll", {
+                frames: (diagnostics?.frames ?? 0) + 1,
+                bytes: (diagnostics?.bytes ?? 0) + snap.bytes.length,
+              });
             }
             expected = snap.endOffset;
           } while (alive && queued);
@@ -262,6 +510,10 @@ export function LiveTerminal({
     }
 
     // --- readRecent polling fallback (preview / server clients) ---
+    recordTransport(sessionId, "read-recent-poll");
+    console.info("[agentmux] terminal output transport: read-recent-poll", {
+      sessionId,
+    });
     let renderedText = "";
     let pollInFlight = false;
     let pollQueued = false;
@@ -327,6 +579,12 @@ export function LiveTerminal({
             if (text.length > 0) {
               renderer.write(encoder.encode(text));
               hadOutput = true;
+              const diagnostics =
+                terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+              recordTransport(sessionId, "read-recent-poll", {
+                frames: (diagnostics?.frames ?? 0) + 1,
+                bytes: (diagnostics?.bytes ?? 0) + text.length,
+              });
             }
             continue;
           }
@@ -335,6 +593,12 @@ export function LiveTerminal({
           if (next.length > 0) {
             renderer.write(encoder.encode(next));
             hadOutput = true;
+            const diagnostics =
+              terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+            recordTransport(sessionId, "read-recent-poll", {
+              frames: (diagnostics?.frames ?? 0) + 1,
+              bytes: (diagnostics?.bytes ?? 0) + next.length,
+            });
           }
         } while (alive && pollQueued);
       } catch {

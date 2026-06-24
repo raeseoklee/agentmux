@@ -699,6 +699,10 @@ function base64ToBytes(base64: string): Uint8Array {
   return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
+function outputSubscriptionId(): string {
+  return `out_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
 interface AgentmuxServerBootstrap {
   baseUrl?: string;
   mode?: string;
@@ -1787,15 +1791,20 @@ class TauriControlClient implements ControlClient {
     channel.onmessage = (frame) => {
       onFrame(frame.fromOffset, base64ToBytes(frame.bytesBase64));
     };
+    const subscriptionId = outputSubscriptionId();
     // Await registration so the host holds the channel before the renderer
     // takes its cold-start snapshot: output produced after this resolves is
     // streamed, not dropped by the pump for an unregistered session.
     await this.invoke("session_subscribe_output", {
       session_id: sessionId,
+      subscription_id: subscriptionId,
       on_event: channel,
     });
     return () => {
-      void this.invoke("session_unsubscribe_output", { session_id: sessionId });
+      void this.invoke("session_unsubscribe_output", {
+        session_id: sessionId,
+        subscription_id: subscriptionId,
+      });
     };
   }
 
@@ -1807,6 +1816,19 @@ class TauriControlClient implements ControlClient {
   }
 
   async sendText(sessionId: string, text: string): Promise<void> {
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      await this.invoke("session_send_text_direct", {
+        session_id: sessionId,
+        text,
+      });
+      return;
+    } catch {
+      // Older hosts or transient command failures fall back to the generic
+      // control plane. The direct path is a latency optimization only.
+    }
     await this.call("session.send_text", {
       session_id: sessionId,
       text,

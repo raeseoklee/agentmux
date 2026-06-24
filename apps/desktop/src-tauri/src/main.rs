@@ -51,17 +51,39 @@ fn agentmux_control_token(state: tauri::State<'_, Arc<DesktopControlState>>) -> 
 fn session_subscribe_output(
     state: tauri::State<'_, Arc<DesktopControlState>>,
     session_id: String,
+    subscription_id: String,
     on_event: tauri::ipc::Channel<OutputStreamFrame>,
 ) {
-    state.inner().register_output_channel(session_id, on_event);
+    #[cfg(debug_assertions)]
+    eprintln!("agentmux: terminal output stream subscribed session={session_id} subscription={subscription_id}");
+    state
+        .inner()
+        .register_output_channel(session_id, subscription_id, on_event);
 }
 
 #[tauri::command(rename_all = "snake_case")]
 fn session_unsubscribe_output(
     state: tauri::State<'_, Arc<DesktopControlState>>,
     session_id: String,
+    subscription_id: String,
 ) {
-    state.inner().unregister_output_channel(&session_id);
+    #[cfg(debug_assertions)]
+    eprintln!("agentmux: terminal output stream unsubscribed session={session_id} subscription={subscription_id}");
+    state
+        .inner()
+        .unregister_output_channel(&session_id, &subscription_id);
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn session_send_text_direct(
+    state: tauri::State<'_, Arc<DesktopControlState>>,
+    session_id: String,
+    text: String,
+) -> Result<(), String> {
+    state
+        .inner()
+        .send_text_direct(&session_id, text)
+        .map_err(|error| error.to_string())
 }
 
 fn main() {
@@ -122,7 +144,8 @@ fn main() {
             agentmux_control,
             agentmux_control_token,
             session_subscribe_output,
-            session_unsubscribe_output
+            session_unsubscribe_output,
+            session_send_text_direct
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AgentMux desktop app");

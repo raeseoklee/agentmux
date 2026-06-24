@@ -27,7 +27,9 @@ use agentmux_browser::{
     BrowserDownloadInfo, BrowserErrorEvent, BrowserFrameInfo, BrowserHistoryEntry,
     BrowserStorageEntry, BrowserSurface, CdpBrowserAutomation, InMemoryBrowserAutomation,
 };
-use agentmux_core::{PaneId, RuntimeControlPlane, SurfaceId, TerminalRuntime, WorkspaceId};
+use agentmux_core::{
+    PaneId, RuntimeControlPlane, SessionId, SurfaceId, TerminalRuntime, WorkspaceId,
+};
 use agentmux_ipc::{
     AckResult, ActionListParams, ActionListResult, ActionRunParams, ActionRunResult,
     ActionSummaryResult, AgentAttentionListResult, AgentListAttentionParams, AgentStateResult,
@@ -221,7 +223,9 @@ pub struct DesktopControlState {
     control_token: String,
     desktop_notifications: Mutex<DesktopNotificationState>,
     // Per-session live-output Tauri channels for the stream-first renderer.
-    output_channels: Mutex<HashMap<String, Channel<OutputStreamFrame>>>,
+    // Subscriptions are keyed independently so a late unsubscribe from an old
+    // remount cannot remove the current renderer's channel.
+    output_channels: Mutex<HashMap<String, HashMap<String, Channel<OutputStreamFrame>>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,20 +376,53 @@ impl DesktopControlState {
         }
     }
 
-    /// Registers a per-session live-output channel for the stream-first renderer.
-    /// Replaces any existing channel for the session (e.g. on renderer remount).
-    pub fn register_output_channel(&self, session_id: String, channel: Channel<OutputStreamFrame>) {
+    /// Registers a live-output channel for one renderer subscription.
+    /// Multiple subscriptions can coexist for a session during remount races.
+    pub fn register_output_channel(
+        &self,
+        session_id: String,
+        subscription_id: String,
+        channel: Channel<OutputStreamFrame>,
+    ) {
         if let Ok(mut channels) = self.output_channels.lock() {
-            channels.insert(session_id, channel);
+            channels
+                .entry(session_id)
+                .or_default()
+                .insert(subscription_id, channel);
         }
     }
 
     /// Removes a session's live-output channel (renderer unmounted / session
     /// closed). Idempotent.
-    pub fn unregister_output_channel(&self, session_id: &str) {
+    pub fn unregister_output_channel(&self, session_id: &str, subscription_id: &str) {
         if let Ok(mut channels) = self.output_channels.lock() {
-            channels.remove(session_id);
+            let should_remove_session = channels
+                .get_mut(session_id)
+                .map(|session_channels| {
+                    session_channels.remove(subscription_id);
+                    session_channels.is_empty()
+                })
+                .unwrap_or(false);
+            if should_remove_session {
+                channels.remove(session_id);
+            }
         }
+    }
+
+    /// Fast path for interactive terminal input from the desktop WebView. This
+    /// avoids building a full control-plane JSON envelope for every keystroke.
+    pub fn send_text_direct(&self, session_id: &str, text: String) -> Result<(), DesktopHostError> {
+        let Ok(mut control) = self.control.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop control state is unavailable".to_string(),
+            ));
+        };
+        control
+            .runtime_mut()
+            .send_text(&SessionId::from_string(session_id), text)
+            .map_err(|error| DesktopHostError::StateUnavailable(error.to_string()))?;
+        control.collect_events();
+        Ok(())
     }
 
     /// Drains coalesced terminal-output deltas from the control plane and pushes
@@ -417,25 +454,36 @@ impl DesktopControlState {
         let Ok(channels) = self.output_channels.lock() else {
             return;
         };
-        let mut closed: Vec<String> = Vec::new();
+        let mut closed: Vec<(String, String)> = Vec::new();
         for delta in &deltas {
             let session_id = delta.session_id.to_string();
-            let Some(channel) = channels.get(&session_id) else {
+            let Some(session_channels) = channels.get(&session_id) else {
                 continue;
             };
             let frame = OutputStreamFrame {
                 from_offset: delta.from_offset,
                 bytes_base64: BASE64_STANDARD.encode(&delta.bytes),
             };
-            if channel.send(frame).is_err() {
-                closed.push(session_id);
+            for (subscription_id, channel) in session_channels {
+                if channel.send(frame.clone()).is_err() {
+                    closed.push((session_id.clone(), subscription_id.clone()));
+                }
             }
         }
         drop(channels);
         if !closed.is_empty() {
             if let Ok(mut channels) = self.output_channels.lock() {
-                for session_id in closed {
-                    channels.remove(&session_id);
+                for (session_id, subscription_id) in closed {
+                    let should_remove_session = channels
+                        .get_mut(&session_id)
+                        .map(|session_channels| {
+                            session_channels.remove(&subscription_id);
+                            session_channels.is_empty()
+                        })
+                        .unwrap_or(false);
+                    if should_remove_session {
+                        channels.remove(&session_id);
+                    }
                 }
             }
         }
