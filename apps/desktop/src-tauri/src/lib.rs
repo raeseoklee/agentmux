@@ -1460,6 +1460,7 @@ impl DesktopControlState {
                 icon: None,
                 color: None,
                 default_wsl_distribution: None,
+                default_terminal_profile: None,
                 default_agent_command: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1574,6 +1575,8 @@ impl DesktopControlState {
         bundle.workspace.color = clean_optional_text(params.color);
         bundle.workspace.default_wsl_distribution =
             clean_optional_text(params.default_wsl_distribution);
+        bundle.workspace.default_terminal_profile =
+            clean_optional_text(params.default_terminal_profile);
         bundle.workspace.default_agent_command = clean_optional_text(params.default_agent_command);
         bundle.workspace.updated_at = timestamp();
 
@@ -8012,6 +8015,7 @@ fn workspace_bundle_from_spawn(
             icon: None,
             color: None,
             default_wsl_distribution: None,
+            default_terminal_profile: None,
             default_agent_command: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -9192,6 +9196,7 @@ fn workspace_summary(workspace: &PersistedWorkspace) -> WorkspaceSummaryResult {
         icon: workspace.icon.clone(),
         color: workspace.color.clone(),
         default_wsl_distribution: workspace.default_wsl_distribution.clone(),
+        default_terminal_profile: workspace.default_terminal_profile.clone(),
         default_agent_command: workspace.default_agent_command.clone(),
     }
 }
@@ -11324,7 +11329,7 @@ mod tests {
                 "req_workspace_update",
                 "workspace.update",
                 format!(
-                    r##"{{"workspace_id":"{workspace_id}","name":"Project Alpha","project_root":"D:\\work\\alpha","environment_profile_id":"Ubuntu","description":"demo project","icon":"PA","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_agent_command":"codex --resume"}}"##
+                    r##"{{"workspace_id":"{workspace_id}","name":"Project Alpha","project_root":"D:\\work\\alpha","environment_profile_id":"Ubuntu","description":"demo project","icon":"PA","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_terminal_profile":"powershell","default_agent_command":"codex --resume"}}"##
                 ),
                 DESKTOP_CONTROL_TOKEN,
             ),
@@ -11336,6 +11341,7 @@ mod tests {
         assert_eq!(updated["icon"], "PA");
         assert_eq!(updated["color"], "#22C55E");
         assert_eq!(updated["default_wsl_distribution"], "Ubuntu");
+        assert_eq!(updated["default_terminal_profile"], "powershell");
         assert_eq!(updated["default_agent_command"], "codex --resume");
 
         let diagnostics = agentmux_control(
@@ -12731,6 +12737,7 @@ mod tests {
                 icon: None,
                 color: None,
                 default_wsl_distribution: None,
+                default_terminal_profile: None,
                 default_agent_command: None,
                 created_at: "before".to_string(),
                 updated_at: "before".to_string(),
@@ -13401,6 +13408,7 @@ mod tests {
                 icon: None,
                 color: None,
                 default_wsl_distribution: None,
+                default_terminal_profile: None,
                 default_agent_command: None,
                 created_at: "2026-06-18T00:00:00Z".to_string(),
                 updated_at: "2026-06-18T00:00:00Z".to_string(),

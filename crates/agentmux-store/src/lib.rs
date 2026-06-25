@@ -159,6 +159,10 @@ ALTER TABLE workspaces ADD COLUMN default_wsl_distribution TEXT;
 ALTER TABLE workspaces ADD COLUMN default_agent_command TEXT;
 "#;
 
+pub const WORKSPACE_TERMINAL_PROFILE_SCHEMA: &str = r#"
+ALTER TABLE workspaces ADD COLUMN default_terminal_profile TEXT;
+"#;
+
 pub const WORKSPACE_GROUPS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS workspace_groups (
   group_id TEXT PRIMARY KEY,
@@ -237,6 +241,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "dock_trusts_schema",
         sql: DOCK_TRUSTS_SCHEMA,
     },
+    Migration {
+        version: 9,
+        name: "workspace_terminal_profile_column",
+        sql: WORKSPACE_TERMINAL_PROFILE_SCHEMA,
+    },
 ];
 
 pub const REDACTED_VALUE: &str = "redacted";
@@ -286,6 +295,7 @@ pub struct PersistedWorkspace {
     pub icon: Option<String>,
     pub color: Option<String>,
     pub default_wsl_distribution: Option<String>,
+    pub default_terminal_profile: Option<String>,
     pub default_agent_command: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -538,7 +548,7 @@ impl SqliteStore {
         let mut statement = self.connection.prepare(
             "SELECT workspace_id, name, root_pane_id, active_pane_id, project_root,
                     environment_profile_id, description, icon, color,
-                    default_wsl_distribution, default_agent_command,
+                    default_wsl_distribution, default_terminal_profile, default_agent_command,
                     created_at, updated_at
              FROM workspaces
              ORDER BY updated_at DESC, workspace_id ASC",
@@ -583,7 +593,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT workspace_id, name, root_pane_id, active_pane_id, project_root,
                         environment_profile_id, description, icon, color,
-                        default_wsl_distribution, default_agent_command,
+                        default_wsl_distribution, default_terminal_profile, default_agent_command,
                         created_at, updated_at
                  FROM workspaces
                  WHERE workspace_id = ?1",
@@ -1526,9 +1536,9 @@ fn upsert_workspace(connection: &Connection, workspace: &PersistedWorkspace) -> 
         "INSERT INTO workspaces (
             workspace_id, name, root_pane_id, active_pane_id, project_root,
             environment_profile_id, description, icon, color,
-            default_wsl_distribution, default_agent_command, created_at, updated_at
+            default_wsl_distribution, default_terminal_profile, default_agent_command, created_at, updated_at
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(workspace_id) DO UPDATE SET
             name = excluded.name,
             root_pane_id = excluded.root_pane_id,
@@ -1539,6 +1549,7 @@ fn upsert_workspace(connection: &Connection, workspace: &PersistedWorkspace) -> 
             icon = excluded.icon,
             color = excluded.color,
             default_wsl_distribution = excluded.default_wsl_distribution,
+            default_terminal_profile = excluded.default_terminal_profile,
             default_agent_command = excluded.default_agent_command,
             updated_at = excluded.updated_at",
         params![
@@ -1552,6 +1563,7 @@ fn upsert_workspace(connection: &Connection, workspace: &PersistedWorkspace) -> 
             workspace.icon,
             workspace.color,
             workspace.default_wsl_distribution,
+            workspace.default_terminal_profile,
             workspace.default_agent_command,
             workspace.created_at,
             workspace.updated_at
@@ -1681,9 +1693,10 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedWork
         icon: row.get(7)?,
         color: row.get(8)?,
         default_wsl_distribution: row.get(9)?,
-        default_agent_command: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        default_terminal_profile: row.get(10)?,
+        default_agent_command: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -1870,7 +1883,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
     }
 
     #[test]
@@ -1879,6 +1892,14 @@ mod tests {
         assert!(MIGRATIONS[7]
             .sql
             .contains("CREATE TABLE IF NOT EXISTS dock_trusts"));
+    }
+
+    #[test]
+    fn workspace_terminal_profile_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[8].version, 9);
+        assert!(MIGRATIONS[8]
+            .sql
+            .contains("ADD COLUMN default_terminal_profile"));
     }
 
     #[test]
@@ -1906,6 +1927,10 @@ mod tests {
             assert_eq!(
                 bundle.workspace.default_wsl_distribution.as_deref(),
                 Some("Ubuntu")
+            );
+            assert_eq!(
+                bundle.workspace.default_terminal_profile.as_deref(),
+                Some("powershell")
             );
             assert_eq!(
                 bundle.workspace.default_agent_command.as_deref(),
@@ -2340,6 +2365,7 @@ mod tests {
                 icon: Some("A".to_string()),
                 color: Some("#F97316".to_string()),
                 default_wsl_distribution: Some("Ubuntu".to_string()),
+                default_terminal_profile: Some("powershell".to_string()),
                 default_agent_command: Some("claude".to_string()),
                 created_at: "2026-06-18T00:00:00Z".to_string(),
                 updated_at: "2026-06-18T00:01:00Z".to_string(),

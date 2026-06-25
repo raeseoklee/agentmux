@@ -295,6 +295,7 @@ pub struct WorkspaceUpdateParams {
     pub icon: Option<String>,
     pub color: Option<String>,
     pub default_wsl_distribution: Option<String>,
+    pub default_terminal_profile: Option<String>,
     pub default_agent_command: Option<String>,
 }
 
@@ -749,6 +750,7 @@ pub struct WorkspaceSummaryResult {
     pub icon: Option<String>,
     pub color: Option<String>,
     pub default_wsl_distribution: Option<String>,
+    pub default_terminal_profile: Option<String>,
     pub default_agent_command: Option<String>,
 }
 
@@ -2293,7 +2295,7 @@ mod tests {
         let request = RequestEnvelope::new(
             "req_workspace_update",
             "workspace.update",
-            r##"{"workspace_id":"ws_1","name":"AgentMux","project_root":"D:\\Workspace\\irae\\agentmux","environment_profile_id":"Ubuntu","description":"demo","icon":"AM","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_agent_command":"codex --resume"}"##,
+            r##"{"workspace_id":"ws_1","name":"AgentMux","project_root":"D:\\Workspace\\irae\\agentmux","environment_profile_id":"Ubuntu","description":"demo","icon":"AM","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_terminal_profile":"powershell","default_agent_command":"codex --resume"}"##,
             "token",
         );
         let params: WorkspaceUpdateParams = request.parse_params().unwrap();
@@ -2304,6 +2306,10 @@ mod tests {
         assert_eq!(
             params.default_agent_command.as_deref(),
             Some("codex --resume")
+        );
+        assert_eq!(
+            params.default_terminal_profile.as_deref(),
+            Some("powershell")
         );
     }
 

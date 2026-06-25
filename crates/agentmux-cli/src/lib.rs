@@ -7077,6 +7077,7 @@ fn load_server_state(state: &mut ServerState) -> Result<serde_json::Value, CliEr
                     "icon": null,
                     "color": null,
                     "default_wsl_distribution": state.options.backend_profile.clone(),
+                    "default_terminal_profile": null,
                     "default_agent_command": null
                 }]),
                 Some(workspace_id),
@@ -15816,6 +15817,7 @@ HKEY_CURRENT_USER\Environment
                 icon: None,
                 color: None,
                 default_wsl_distribution: None,
+                default_terminal_profile: None,
                 default_agent_command: None,
             },
             panes: vec![
@@ -15907,6 +15909,7 @@ HKEY_CURRENT_USER\Environment
                 icon: None,
                 color: None,
                 default_wsl_distribution: None,
+                default_terminal_profile: None,
                 default_agent_command: None,
             },
             panes: Vec::new(),

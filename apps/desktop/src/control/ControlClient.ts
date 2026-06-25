@@ -85,6 +85,8 @@ export interface SidebarState {
   logs: SidebarLogEntry[];
 }
 
+export type TerminalProfile = "wsl" | "powershell" | "cmd";
+
 export interface WorkspaceSummary {
   workspaceId: string;
   name: string;
@@ -96,6 +98,7 @@ export interface WorkspaceSummary {
   icon?: string | null;
   color?: string | null;
   defaultWslDistribution?: string | null;
+  defaultTerminalProfile?: TerminalProfile | null;
   defaultAgentCommand?: string | null;
 }
 
@@ -146,6 +149,7 @@ export interface WorkspaceUpdateInput {
   icon?: string | null;
   color?: string | null;
   defaultWslDistribution?: string | null;
+  defaultTerminalProfile?: TerminalProfile | null;
   defaultAgentCommand?: string | null;
 }
 
@@ -602,6 +606,7 @@ export interface ControlClient {
     command: string[],
     placement?: TerminalPlacement,
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession>;
   spawnWslTerminal(
     workspaceId: string,
@@ -817,6 +822,7 @@ class TauriControlClient implements ControlClient {
       icon: input.icon ?? null,
       color: input.color ?? null,
       default_wsl_distribution: input.defaultWslDistribution ?? null,
+      default_terminal_profile: input.defaultTerminalProfile ?? null,
       default_agent_command: input.defaultAgentCommand ?? null,
     });
     return mapWorkspace(result);
@@ -1586,12 +1592,13 @@ class TauriControlClient implements ControlClient {
     command: string[],
     placement?: TerminalPlacement,
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession> {
     const result = await this.call<{ session_id: string }>("session.spawn", {
       workspace_id: workspaceId,
       backend: "conpty",
       command,
-      cwd: null,
+      cwd: cwd ?? null,
       columns: 120,
       rows: 30,
       durability: "ephemeral",
@@ -1752,12 +1759,29 @@ class TauriControlClient implements ControlClient {
       placement: placement ?? null,
       pane_id: paneId ?? null,
     });
+    await this.setAgentRunningState(result.session_id, command);
 
     return {
       sessionId: result.session_id,
       backendKind: "wsl-tmux-control",
       state: "running",
     };
+  }
+
+  private async setAgentRunningState(
+    sessionId: string,
+    command: string[],
+  ): Promise<void> {
+    const label = command.join(" ").trim() || "agent";
+    await this.call("agent.set_state", {
+      session_id: sessionId,
+      state: "running",
+      reason: `Agent started: ${label}`,
+      telemetry: {
+        activity: "agent",
+        session: label,
+      },
+    });
   }
 
   async readRecent(sessionId: string, maxBytes: number): Promise<string> {
@@ -2097,6 +2121,7 @@ class BrowserPreviewControlClient implements ControlClient {
       icon: null,
       color: null,
       defaultWslDistribution: null,
+      defaultTerminalProfile: null,
       defaultAgentCommand: null,
     };
     this.workspaces.push(workspace);
@@ -2158,6 +2183,7 @@ class BrowserPreviewControlClient implements ControlClient {
     workspace.icon = input.icon ?? null;
     workspace.color = input.color ?? null;
     workspace.defaultWslDistribution = input.defaultWslDistribution ?? null;
+    workspace.defaultTerminalProfile = input.defaultTerminalProfile ?? null;
     workspace.defaultAgentCommand = input.defaultAgentCommand ?? null;
     return workspace;
   }
@@ -3243,13 +3269,19 @@ class BrowserPreviewControlClient implements ControlClient {
     command: string[],
     placement: TerminalPlacement = "active_pane",
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession> {
     const commandText = command.join(" ");
     return this.createPreviewTerminal(
       workspaceId,
       "conpty",
       "conpty",
-      ["\r\n$ " + commandText, "\r\nagentmux desktop preview", "\r\n"].join(""),
+      [
+        "\r\n$ " + commandText,
+        cwd ? "\r\ncwd: " + cwd : "",
+        "\r\nagentmux desktop preview",
+        "\r\n",
+      ].join(""),
       placement,
       paneId,
     );
@@ -3350,8 +3382,8 @@ class BrowserPreviewControlClient implements ControlClient {
     placement: TerminalPlacement = "active_pane",
     paneId?: string | null,
   ): Promise<TerminalSession> {
-    const label = command.join(" ") || "agent";
-    return this.createPreviewTerminal(
+    const label = command.join(" ").trim() || "agent";
+    const session = await this.createPreviewTerminal(
       workspaceId,
       "wsl-tmux-control",
       "wsl-tmux-control",
@@ -3367,6 +3399,17 @@ class BrowserPreviewControlClient implements ControlClient {
       placement,
       paneId,
     );
+    this.applySyntheticAgentState({
+      workspaceId,
+      sessionId: session.sessionId,
+      state: "running",
+      reason: `Agent started: ${label}`,
+      telemetry: {
+        activity: "agent",
+        session: label,
+      },
+    });
+    return session;
   }
 
   async readRecent(sessionId: string, _maxBytes: number): Promise<string> {
@@ -4176,6 +4219,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
       icon: null,
       color: null,
       defaultWslDistribution: this.serverDefaults.backend_profile ?? null,
+      defaultTerminalProfile: null,
       defaultAgentCommand: null,
     };
     this.serverWorkspaces.set(workspaceId, workspace);
@@ -4221,6 +4265,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
     workspace.color = input.color ?? null;
     workspace.defaultWslDistribution =
       input.defaultWslDistribution ?? workspace.defaultWslDistribution ?? null;
+    workspace.defaultTerminalProfile = input.defaultTerminalProfile ?? null;
     workspace.defaultAgentCommand = input.defaultAgentCommand ?? null;
     return { ...workspace };
   }
@@ -4410,13 +4455,14 @@ class ServerControlClient extends BrowserPreviewControlClient {
     command: string[],
     placement: TerminalPlacement = "active_pane",
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession> {
     return this.spawnServerTerminal({
       workspaceId,
       backend: "conpty",
       backendProfile: null,
       command,
-      cwd: null,
+      cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
       paneId,
       title: command.join(" ") || "ConPTY",
@@ -5048,6 +5094,7 @@ interface WorkspaceSummaryWire {
   icon?: string | null;
   color?: string | null;
   default_wsl_distribution?: string | null;
+  default_terminal_profile?: TerminalProfile | null;
   default_agent_command?: string | null;
 }
 
@@ -5352,8 +5399,17 @@ function mapWorkspace(value: WorkspaceSummaryWire): WorkspaceSummary {
     icon: value.icon,
     color: value.color,
     defaultWslDistribution: value.default_wsl_distribution,
+    defaultTerminalProfile: normalizeTerminalProfile(value.default_terminal_profile),
     defaultAgentCommand: value.default_agent_command,
   };
+}
+
+function normalizeTerminalProfile(
+  value: TerminalProfile | string | null | undefined,
+): TerminalProfile | null {
+  return value === "wsl" || value === "powershell" || value === "cmd"
+    ? value
+    : null;
 }
 
 function mapWorkspaceGroup(value: WorkspaceGroupWire): WorkspaceGroup {

@@ -28,6 +28,7 @@ import type {
   SshProfileInput,
   SurfaceSummary,
   TerminalSession,
+  TerminalProfile,
   TmuxDiagnostics,
   AppConfig,
   AppConfigScope,
@@ -802,6 +803,7 @@ function searchableWorkspaceText(workspace: WorkspaceSummary): string {
     workspace.icon,
     workspace.color,
     workspace.defaultWslDistribution,
+    workspace.defaultTerminalProfile,
     workspace.defaultAgentCommand,
   ]);
 }
@@ -1153,7 +1155,7 @@ const PaneView = memo(function PaneView({
                   font: `600 12px/1 ${FONT_SANS}`,
                 }}
               >
-                <IconPlus size={13} /> WSL 터미널 열기
+                <IconPlus size={13} /> Open terminal
               </button>
               <button
                 type="button"
@@ -2807,8 +2809,8 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.newWsl",
         group: "terminal",
-        title: "새 WSL 터미널",
-        keywords: ["terminal", "wsl", "shell"],
+        title: "New terminal",
+        keywords: ["terminal", "wsl", "powershell", "cmd", "shell"],
         run: () => {
           void addTerminal();
           closeOverlay();
@@ -2817,8 +2819,8 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.openInActivePane",
         group: "terminal",
-        title: "현재 페인에 WSL 터미널 열기",
-        keywords: ["terminal", "wsl", "pane"],
+        title: "Open terminal in current pane",
+        keywords: ["terminal", "wsl", "powershell", "cmd", "pane"],
         disabled: activePaneId === null,
         run: () => {
           if (activePaneId) {
@@ -6897,6 +6899,7 @@ function SetupModal(props: SetupModalProps) {
       icon: activeWorkspace.icon ?? null,
       color: activeWorkspace.color ?? null,
       defaultWslDistribution: selectedDistribution.trim() || null,
+      defaultTerminalProfile: activeWorkspace.defaultTerminalProfile ?? "wsl",
       defaultAgentCommand: activeWorkspace.defaultAgentCommand ?? null,
     });
     setSaveMessage("Setup saved.");
@@ -7366,6 +7369,7 @@ function SettingsModal(props: SettingsModalProps) {
     icon: activeWorkspace?.icon ?? "",
     color: activeWorkspace?.color ?? ACCENTS[0].hex,
     defaultWslDistribution: activeWorkspace?.defaultWslDistribution ?? "",
+    defaultTerminalProfile: activeWorkspace?.defaultTerminalProfile ?? "wsl",
     defaultAgentCommand: activeWorkspace?.defaultAgentCommand ?? "",
   });
 
@@ -7378,6 +7382,7 @@ function SettingsModal(props: SettingsModalProps) {
       icon: activeWorkspace?.icon ?? "",
       color: activeWorkspace?.color ?? ACCENTS[0].hex,
       defaultWslDistribution: activeWorkspace?.defaultWslDistribution ?? "",
+      defaultTerminalProfile: activeWorkspace?.defaultTerminalProfile ?? "wsl",
       defaultAgentCommand: activeWorkspace?.defaultAgentCommand ?? "",
     });
   }, [activeWorkspace]);
@@ -7399,6 +7404,7 @@ function SettingsModal(props: SettingsModalProps) {
       color: workspaceDraft.color?.trim() || null,
       defaultWslDistribution:
         workspaceDraft.defaultWslDistribution?.trim() || null,
+      defaultTerminalProfile: workspaceDraft.defaultTerminalProfile ?? "wsl",
       defaultAgentCommand: workspaceDraft.defaultAgentCommand?.trim() || null,
     });
   };
@@ -7965,11 +7971,30 @@ function SettingsModal(props: SettingsModalProps) {
                   <div
                     style={{
                       display: "grid",
-                      gridTemplateColumns: "1fr 1fr",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
                       gap: 14,
                       marginBottom: 18,
                     }}
                   >
+                    <label>
+                      <span style={fieldLabel}>Default terminal</span>
+                      <select
+                        className="agentmux-workspace-terminal-profile-select"
+                        aria-label="Default terminal profile"
+                        value={workspaceDraft.defaultTerminalProfile ?? "wsl"}
+                        onChange={(event) =>
+                          updateWorkspaceDraft({
+                            defaultTerminalProfile: event.currentTarget
+                              .value as TerminalProfile,
+                          })
+                        }
+                        style={fieldInput}
+                      >
+                        <option value="wsl">WSL</option>
+                        <option value="powershell">PowerShell</option>
+                        <option value="cmd">Command Prompt</option>
+                      </select>
+                    </label>
                     <label>
                       <span style={fieldLabel}>Default WSL</span>
                       <select

@@ -850,7 +850,7 @@ where
             };
             let agent_lifecycle = match &event {
                 CoreEvent::SessionStateChanged { session_id, to, .. } => {
-                    self.agent_team_lifecycle_transition(session_id, to)
+                    self.agent_lifecycle_transition(session_id, to)
                 }
                 _ => None,
             };
@@ -875,12 +875,12 @@ where
                     }
                 }
             }
-            if let Some((session_id, state, reason)) = agent_lifecycle {
+            if let Some((session_id, state, reason, source)) = agent_lifecycle {
                 let _ = self.apply_agent_state_transition(
                     session_id,
                     state,
                     Some(reason),
-                    "agent_team_lifecycle",
+                    source,
                     None,
                 );
             }
@@ -1534,39 +1534,44 @@ where
         Ok(agent_state_result(&record))
     }
 
-    fn agent_team_lifecycle_transition(
+    fn agent_lifecycle_transition(
         &self,
         session_id: &SessionId,
         session_state: &SessionState,
-    ) -> Option<(SessionId, AgentState, String)> {
+    ) -> Option<(SessionId, AgentState, String, &'static str)> {
         let record = self.agent_states.get(&session_id.to_string())?;
-        if !agent_state_record_is_agent_team(record) {
+        let activity = agent_state_record_activity(record)?;
+        if !matches!(activity, "agent" | "agent_team") {
             return None;
         }
+        let subject = if activity == "agent_team" {
+            "Agent team worker"
+        } else {
+            "Agent"
+        };
+        let source = if activity == "agent_team" {
+            "agent_team_lifecycle"
+        } else {
+            "agent_lifecycle"
+        };
 
         let (state, reason) = match session_state {
             SessionState::Exited { code } => match code {
                 Some(code) if *code != 0 => (
                     AgentState::Failed,
-                    format!("Agent team worker exited with code {code}."),
+                    format!("{subject} exited with code {code}."),
                 ),
                 Some(_) => (
                     AgentState::Completed,
-                    "Agent team worker exited successfully.".to_string(),
+                    format!("{subject} exited successfully."),
                 ),
-                None => (
-                    AgentState::Completed,
-                    "Agent team worker exited.".to_string(),
-                ),
+                None => (AgentState::Completed, format!("{subject} exited.")),
             },
             SessionState::Failed { code, message } => (
                 AgentState::Failed,
-                format!("Agent team worker failed ({code}): {message}"),
+                format!("{subject} failed ({code}): {message}"),
             ),
-            SessionState::Lost => (
-                AgentState::Failed,
-                "Agent team worker session was lost.".to_string(),
-            ),
+            SessionState::Lost => (AgentState::Failed, format!("{subject} session was lost.")),
             _ => return None,
         };
         if record.state == state {
@@ -1576,7 +1581,7 @@ where
             return None;
         }
 
-        Some((session_id.clone(), state, reason))
+        Some((session_id.clone(), state, reason, source))
     }
 
     fn push_event(&mut self, event: EventFrame) {
@@ -1909,12 +1914,11 @@ fn agent_state_requires_attention(state: AgentState) -> bool {
     matches!(state, AgentState::WaitingForInput | AgentState::Failed)
 }
 
-fn agent_state_record_is_agent_team(record: &AgentStateRecord) -> bool {
+fn agent_state_record_activity(record: &AgentStateRecord) -> Option<&str> {
     record
         .telemetry
         .as_ref()
         .and_then(|telemetry| telemetry.activity.as_deref())
-        == Some("agent_team")
 }
 
 fn detect_agent_signals(bytes: &[u8]) -> Vec<DetectedAgentSignal> {
@@ -2795,6 +2799,136 @@ mod tests {
 
         let state = control.handle_request(request(
             "req_agent_team_failed_state",
+            "agent.get_state",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+        ));
+        let state: AgentStateResult = serde_json::from_str(ok_json(&state)).unwrap();
+        assert_eq!(state.state, "failed");
+        assert!(state.attention);
+    }
+
+    #[test]
+    fn control_plane_marks_agent_session_completed_on_clean_exit() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+
+        let spawn = control.handle_request(request(
+            "req_spawn_agent_complete",
+            "session.spawn",
+            r#"{"workspace_id":"ws_agent_complete","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+        ));
+        let session_id = ok_json(&spawn)
+            .split("\"session_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("session id in spawn result")
+            .to_string();
+
+        let state = control.handle_request(request(
+            "req_agent_running",
+            "agent.set_state",
+            &format!(
+                r#"{{"session_id":"{session_id}","state":"running","reason":"Agent started: claude","telemetry":{{"activity":"agent","session":"claude"}}}}"#
+            ),
+        ));
+        let state: AgentStateResult = serde_json::from_str(ok_json(&state)).unwrap();
+        assert_eq!(state.state, "running");
+
+        control.runtime.backend.events.push(BackendEvent::Exited {
+            session_id: session_id.clone(),
+            code: Some(0),
+        });
+
+        let events = control.handle_request(request(
+            "req_agent_complete_events",
+            "events.poll",
+            r#"{"workspace_id":"ws_agent_complete","types":["session.state_changed","agent.state_changed","notification.created"],"max_events":10}"#,
+        ));
+        let events: EventPollResult = serde_json::from_str(ok_json(&events)).unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "agent.state_changed"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("\"state\":\"completed\"")
+                && event.data_json.contains("\"source\":\"agent_lifecycle\"")
+                && event.data_json.contains("\"activity\":\"agent\"")
+                && event.data_json.contains("exited successfully")
+        }));
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "notification.created"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("agent.completed")
+        }));
+
+        let state = control.handle_request(request(
+            "req_agent_complete_state",
+            "agent.get_state",
+            &format!(r#"{{"session_id":"{session_id}"}}"#),
+        ));
+        let state: AgentStateResult = serde_json::from_str(ok_json(&state)).unwrap();
+        assert_eq!(state.state, "completed");
+        assert!(!state.attention);
+        assert_eq!(
+            state
+                .telemetry
+                .and_then(|telemetry| telemetry.activity)
+                .as_deref(),
+            Some("agent")
+        );
+    }
+
+    #[test]
+    fn control_plane_marks_agent_session_failed_on_nonzero_exit() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+
+        let spawn = control.handle_request(request(
+            "req_spawn_agent_failed",
+            "session.spawn",
+            r#"{"workspace_id":"ws_agent_failed","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+        ));
+        let session_id = ok_json(&spawn)
+            .split("\"session_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("session id in spawn result")
+            .to_string();
+
+        let _ = control.handle_request(request(
+            "req_agent_running_failed",
+            "agent.set_state",
+            &format!(
+                r#"{{"session_id":"{session_id}","state":"running","reason":"Agent started: claude","telemetry":{{"activity":"agent","session":"claude"}}}}"#
+            ),
+        ));
+
+        control.runtime.backend.events.push(BackendEvent::Exited {
+            session_id: session_id.clone(),
+            code: Some(3),
+        });
+
+        let events = control.handle_request(request(
+            "req_agent_failed_events",
+            "events.poll",
+            r#"{"workspace_id":"ws_agent_failed","types":["agent.state_changed","notification.created"],"max_events":10}"#,
+        ));
+        let events: EventPollResult = serde_json::from_str(ok_json(&events)).unwrap();
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "agent.state_changed"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("\"state\":\"failed\"")
+                && event.data_json.contains("\"source\":\"agent_lifecycle\"")
+                && event.data_json.contains("exited with code 3")
+        }));
+        assert!(events.events.iter().any(|event| {
+            event.event_type == "notification.created"
+                && event.session_id.as_deref() == Some(&session_id)
+                && event.data_json.contains("agent.failed")
+        }));
+
+        let state = control.handle_request(request(
+            "req_agent_failed_state",
             "agent.get_state",
             &format!(r#"{{"session_id":"{session_id}"}}"#),
         ));

@@ -12,6 +12,7 @@ import {
   type SshProfileInput,
   type SurfaceSummary,
   type TerminalSession,
+  type TerminalProfile,
   type WorkspaceDetail,
   type WorkspaceGroup,
   type WorkspaceGroupCreateInput,
@@ -21,8 +22,7 @@ import {
   type WslDistribution
 } from "../control/ControlClient";
 
-const DEFAULT_PROJECT_ROOT = "D:\\Workspace\\irae\\agentmux";
-const DEFAULT_WORKSPACE_NAME = "Workspace 1";
+const DEFAULT_PROJECT_ROOT: string | null = null;
 const SIGNAL_POLL_INTERVAL_MS = 1500;
 const DETAIL_POLL_INTERVAL_MS = 5000;
 const SIDEBAR_POLL_INTERVAL_MS = 5000;
@@ -34,6 +34,12 @@ const WSL_REQUIRED_MESSAGE =
 const TMUX_REQUIRED_NOTIFICATION_ID = `${LOCAL_NOTIFICATION_PREFIX}tmux_required`;
 const TMUX_REQUIRED_MESSAGE =
   "선택된 WSL 배포판에 tmux가 필요합니다. WSL에서 `sudo apt update && sudo apt install -y tmux`를 실행한 뒤 다시 시도하세요.";
+
+const DEFAULT_TERMINAL_PROFILE: TerminalProfile = "wsl";
+const NATIVE_TERMINAL_COMMANDS: Record<Exclude<TerminalProfile, "wsl">, string[]> = {
+  powershell: ["powershell.exe", "-NoLogo"],
+  cmd: ["cmd.exe", "/d", "/q"]
+};
 
 // --- cheap structural-equality gates (PR-1) ---------------------------------
 // The 1.2s poll re-fetches the same data on most ticks. Calling a state setter
@@ -236,10 +242,13 @@ function nextWorkspaceName(workspaces: WorkspaceSummary[]): string {
   }
 }
 
-function resolveDockCwd(cwd: string | null | undefined, workspaceRoot: string): string {
+function resolveDockCwd(
+  cwd: string | null | undefined,
+  workspaceRoot: string | null | undefined
+): string | null {
   const value = cwd?.trim();
   if (!value || value === ".") {
-    return workspaceRoot;
+    return workspaceRoot?.trim() || null;
   }
   if (
     value.startsWith("/") ||
@@ -247,6 +256,9 @@ function resolveDockCwd(cwd: string | null | undefined, workspaceRoot: string): 
     /^[A-Za-z]:[\\/]/.test(value) ||
     value.startsWith("\\\\")
   ) {
+    return value;
+  }
+  if (!workspaceRoot?.trim()) {
     return value;
   }
   if (workspaceRoot.startsWith("/") || workspaceRoot.startsWith("~")) {
@@ -578,7 +590,9 @@ export function useAgentmuxControl(): AgentmuxControl {
     }
   }, [client]);
 
-  // Hydrate workspace list (create a default workspace when none exist).
+  // Hydrate workspace list. An empty store should remain empty until the user
+  // explicitly creates a workspace; otherwise legacy "LocalProject"/default
+  // workspaces keep coming back after the user removes them.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -587,24 +601,22 @@ export function useAgentmuxControl(): AgentmuxControl {
         if (cancelled) {
           return;
         }
-        const shouldCreateStartupTerminal = list.length === 0 && shouldAutoLaunchStartupTerminal();
         const lastActiveWorkspaceId = readLastActiveWorkspaceId();
-        let initial =
+        const initial =
           (lastActiveWorkspaceId
             ? list.find((workspace) => workspace.workspaceId === lastActiveWorkspaceId)
             : undefined) ?? list[0];
         if (!initial) {
-          initial = await client.createWorkspace(DEFAULT_WORKSPACE_NAME, DEFAULT_PROJECT_ROOT);
-          if (cancelled) {
-            return;
-          }
-          list = await client.listWorkspaces();
-          if (cancelled) {
-            return;
-          }
-          if (!list.some((workspace) => workspace.workspaceId === initial.workspaceId)) {
-            list = [initial, ...list];
-          }
+          setWorkspaces(list);
+          setWorkspaceGroups(await client.listWorkspaceGroups());
+          setActiveWorkspaceId(null);
+          activeRef.current = null;
+          persistLastActiveWorkspaceId(null);
+          detailRef.current = null;
+          setDetail(null);
+          setSidebarState(null);
+          setReady(true);
+          return;
         }
         setWorkspaces(list);
         setWorkspaceGroups(await client.listWorkspaceGroups());
@@ -612,8 +624,11 @@ export function useAgentmuxControl(): AgentmuxControl {
         activeRef.current = initial.workspaceId;
         persistLastActiveWorkspaceId(initial.workspaceId);
         await loadDetail(initial.workspaceId);
-        if (shouldCreateStartupTerminal) {
-          setStartupLaunchWorkspaceId(initial.workspaceId);
+        if (list.length > 0 && shouldAutoLaunchStartupTerminal()) {
+          const detail = detailRef.current;
+          if (detail?.workspace.workspaceId === initial.workspaceId && detail.surfaces.length === 0) {
+            setStartupLaunchWorkspaceId(initial.workspaceId);
+          }
         }
         setReady(true);
       } catch (cause) {
@@ -934,9 +949,22 @@ export function useAgentmuxControl(): AgentmuxControl {
     [workspaces, wslDistributions]
   );
 
-  const spawnDefaultTerminal = useCallback(
-    () =>
-      withActive(async (workspaceId) => {
+  const defaultTerminalProfile = useCallback(
+    (workspaceId: string): TerminalProfile => {
+      const workspace = workspaces.find((candidate) => candidate.workspaceId === workspaceId);
+      return workspace?.defaultTerminalProfile ?? DEFAULT_TERMINAL_PROFILE;
+    },
+    [workspaces]
+  );
+
+  const spawnTerminalForWorkspace = useCallback(
+    async (
+      workspaceId: string,
+      placement: "new_tab" | "active_pane",
+      paneId?: string | null
+    ) => {
+      const profile = defaultTerminalProfile(workspaceId);
+      if (profile === "wsl") {
         const distribution = defaultWslDistribution(workspaceId);
         if (!distribution) {
           notifyWslRequired();
@@ -946,29 +974,42 @@ export function useAgentmuxControl(): AgentmuxControl {
           workspaceId,
           distribution,
           workspaceProjectRoot(workspaceId),
-          "new_tab"
+          placement,
+          paneId
         );
+      }
+
+      return client.spawnNativeTerminal(
+        workspaceId,
+        NATIVE_TERMINAL_COMMANDS[profile],
+        placement,
+        paneId,
+        workspaceProjectRoot(workspaceId)
+      );
+    },
+    [
+      client,
+      defaultTerminalProfile,
+      defaultWslDistribution,
+      notifyWslRequired,
+      workspaceProjectRoot
+    ]
+  );
+
+  const spawnDefaultTerminal = useCallback(
+    () =>
+      withActive(async (workspaceId) => {
+        return spawnTerminalForWorkspace(workspaceId, "new_tab");
       }),
-    [client, defaultWslDistribution, notifyWslRequired, withActive, workspaceProjectRoot]
+    [spawnTerminalForWorkspace, withActive]
   );
 
   const spawnDefaultTerminalInPane = useCallback(
     (paneId: string) =>
       withActive(async (workspaceId) => {
-        const distribution = defaultWslDistribution(workspaceId);
-        if (!distribution) {
-          notifyWslRequired();
-          throw new Error(WSL_REQUIRED_MESSAGE);
-        }
-        return client.spawnWslTerminal(
-          workspaceId,
-          distribution,
-          workspaceProjectRoot(workspaceId),
-          "active_pane",
-          paneId
-        );
+        return spawnTerminalForWorkspace(workspaceId, "active_pane", paneId);
       }),
-    [client, defaultWslDistribution, notifyWslRequired, withActive, workspaceProjectRoot]
+    [spawnTerminalForWorkspace, withActive]
   );
 
   const spawnDurableTerminalInPane = useCallback(
@@ -1023,17 +1064,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     let cancelled = false;
     (async () => {
       try {
-        const distribution = defaultWslDistribution(startupLaunchWorkspaceId);
-        if (!distribution) {
-          notifyWslRequired();
-          return;
-        }
-        await client.spawnWslTerminal(
-          startupLaunchWorkspaceId,
-          distribution,
-          workspaceProjectRoot(startupLaunchWorkspaceId),
-          "new_tab"
-        );
+        await spawnTerminalForWorkspace(startupLaunchWorkspaceId, "new_tab");
         if (!cancelled) {
           await loadDetail(startupLaunchWorkspaceId);
           setError(null);
@@ -1053,13 +1084,10 @@ export function useAgentmuxControl(): AgentmuxControl {
       cancelled = true;
     };
   }, [
-    client,
-    defaultWslDistribution,
     loadDetail,
-    notifyWslRequired,
     ready,
+    spawnTerminalForWorkspace,
     startupLaunchWorkspaceId,
-    workspaceProjectRoot,
     wslChecked
   ]);
 
