@@ -1,0 +1,22 @@
+
+7-Zip 22.01 (x64) : Copyright (c) 1999-2022 Igor Pavlov : 2022-07-15
+
+Scanning the drive for archives:
+1 file, 21132197 bytes (21 MiB)
+
+Extracting archive: D:\Workspace\irae\agentmux\docs\implementation\evidence\20260625-202721-IRAE-DESKTOP-installer-build-smoke\AgentMux_0.1.0_x64-setup.exe
+--
+Path = D:\Workspace\irae\agentmux\docs\implementation\evidence\20260625-202721-IRAE-DESKTOP-installer-build-smoke\AgentMux_0.1.0_x64-setup.exe
+Type = Nsis
+Physical Size = 21132197
+Method = LZMA:23
+Solid = +
+Headers Size = 75862
+Embedded Stub Size = 52736
+SubType = NSIS-3 Unicode BadCmd=13
+
+Everything is Ok
+
+Files: 17
+Size:       42819242
+Compressed: 21132197

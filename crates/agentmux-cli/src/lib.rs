@@ -7721,21 +7721,49 @@ fn desktop_ui_file_path(relative_path: &str) -> Option<PathBuf> {
 }
 
 fn desktop_ui_dist_dir() -> Option<PathBuf> {
+    desktop_ui_dist_dir_candidates()
+        .into_iter()
+        .find(|path| path.join("index.html").is_file())
+}
+
+fn desktop_ui_dist_dir_candidates() -> Vec<PathBuf> {
+    let current_dir = std::env::current_dir().ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    desktop_ui_dist_dir_candidates_from(current_dir.as_deref(), exe_dir.as_deref())
+}
+
+fn desktop_ui_dist_dir_candidates_from(
+    current_dir: Option<&Path>,
+    exe_dir: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(current_dir) = std::env::current_dir() {
+
+    if let Ok(override_dir) = std::env::var("AGENTMUX_DESKTOP_UI_DIST") {
+        push_unique_path(&mut candidates, PathBuf::from(override_dir));
+    }
+
+    if let Some(current_dir) = current_dir {
         candidates.push(current_dir.join("apps").join("desktop").join("dist"));
         candidates.push(current_dir.join("dist"));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            candidates.push(exe_dir.join("apps").join("desktop").join("dist"));
-            candidates.push(exe_dir.join("..").join("apps").join("desktop").join("dist"));
-            candidates.push(exe_dir.join("dist"));
-        }
+    if let Some(exe_dir) = exe_dir {
+        candidates.push(exe_dir.join("dist"));
+        candidates.push(exe_dir.join("resources").join("dist"));
+        candidates.push(exe_dir.join("apps").join("desktop").join("dist"));
+        candidates.push(exe_dir.join("..").join("dist"));
+        candidates.push(exe_dir.join("..").join("resources").join("dist"));
+        candidates.push(exe_dir.join("..").join("apps").join("desktop").join("dist"));
     }
+
     candidates
-        .into_iter()
-        .find(|path| path.join("index.html").is_file())
+}
+
+fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    if !candidates.iter().any(|candidate| candidate == &path) {
+        candidates.push(path);
+    }
 }
 
 fn inject_server_bootstrap(mut html: String, options: &ServerOptions) -> String {
@@ -14336,6 +14364,22 @@ mod tests {
         assert!(html.contains("window.__AGENTMUX_SERVER__"));
         assert!(html.contains("\"token\""));
         assert!(html.contains(&options.auth_token));
+    }
+
+    #[test]
+    fn desktop_ui_dist_candidates_include_packaged_resource_locations() {
+        let candidates = desktop_ui_dist_dir_candidates_from(
+            Some(Path::new(r"D:\Workspace\irae\agentmux")),
+            Some(Path::new(r"C:\Users\irae\AppData\Local\AgentMux")),
+        );
+
+        assert!(candidates.contains(&PathBuf::from(r"C:\Users\irae\AppData\Local\AgentMux\dist")));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Users\irae\AppData\Local\AgentMux\resources\dist"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"D:\Workspace\irae\agentmux\apps\desktop\dist"
+        )));
     }
 
     #[test]

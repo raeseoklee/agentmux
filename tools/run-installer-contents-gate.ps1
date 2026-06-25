@@ -38,6 +38,16 @@ function ConvertTo-RelativePath {
   return $full
 }
 
+function ConvertTo-NormalizedArchivePath {
+  param([string]$Path)
+
+  if ([string]::IsNullOrWhiteSpace($Path)) {
+    return ""
+  }
+
+  return $Path.Trim().TrimStart("\", "/").Replace("\", "/")
+}
+
 function Get-FileSnapshot {
   param([string]$Path)
 
@@ -173,20 +183,27 @@ $archivePaths = @(
     ForEach-Object { $_.Groups[1].Value.Trim() } |
     Where-Object { $_ -and $_ -notmatch "setup\.exe$" }
 )
+$normalizedArchivePaths = @($archivePaths | ForEach-Object { ConvertTo-NormalizedArchivePath $_ })
+$desktopUiArchiveIndex = @(
+  $normalizedArchivePaths |
+    Where-Object { $_ -eq "dist/index.html" -or $_ -eq "resources/dist/index.html" } |
+    Select-Object -First 1
+)
+$desktopUiArchiveAssets = @(
+  $normalizedArchivePaths |
+    Where-Object { $_ -match "^(resources/)?dist/assets/.+" }
+)
 
 $runtimeDir = Join-Path $OutputDir "runtime\installer-extract"
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 $extract = Invoke-Capture `
-  -Name "installer-extract-sidecars" `
+  -Name "installer-extract-contents" `
   -FilePath $sevenZip.Source `
   -ArgumentList @(
     "x",
     "-y",
     "-o$runtimeDir",
-    $installer.path,
-    "agentmux-desktop-host.exe",
-    "agentmux.exe",
-    "cmux.exe"
+    $installer.path
   )
 if ($extract.exit_code -ne 0) {
   throw "7z extraction failed with exit code $($extract.exit_code). See $(Join-Path $OutputDir $extract.stderr)"
@@ -222,6 +239,38 @@ foreach ($name in @("agentmux-desktop-host.exe", "agentmux.exe", "cmux.exe")) {
     expected_source = $source
     hash_matches_source = $hashMatchesSource
   }
+}
+
+$desktopUiDistCandidates = @(
+  (Join-Path $runtimeDir "dist"),
+  (Join-Path $runtimeDir "resources\dist")
+)
+$desktopUiDistRoot = @(
+  $desktopUiDistCandidates |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_ "index.html") } |
+    Select-Object -First 1
+)
+$desktopUiIndex = if ($desktopUiDistRoot.Count -gt 0) {
+  Get-FileSnapshot (Join-Path $desktopUiDistRoot[0] "index.html")
+} else {
+  Get-FileSnapshot (Join-Path $runtimeDir "dist\index.html")
+}
+$desktopUiAssetCount = 0
+if ($desktopUiDistRoot.Count -gt 0) {
+  $assetDir = Join-Path $desktopUiDistRoot[0] "assets"
+  if (Test-Path -LiteralPath $assetDir) {
+    $desktopUiAssetCount = @(
+      Get-ChildItem -LiteralPath $assetDir -File -Recurse -ErrorAction SilentlyContinue
+    ).Count
+  }
+}
+$desktopUiChecks = [ordered]@{
+  archive_index_present = ($desktopUiArchiveIndex.Count -gt 0)
+  archive_index_path = if ($desktopUiArchiveIndex.Count -gt 0) { $desktopUiArchiveIndex[0] } else { $null }
+  archive_asset_count = $desktopUiArchiveAssets.Count
+  extracted_dist_root = if ($desktopUiDistRoot.Count -gt 0) { ConvertTo-RelativePath $desktopUiDistRoot[0] } else { $null }
+  extracted_index = $desktopUiIndex
+  extracted_asset_count = $desktopUiAssetCount
 }
 
 $failedChecks = @()
@@ -272,6 +321,18 @@ foreach ($check in $fileChecks) {
     $failedChecks += "extracted $($check.name) does not match the prepared sidecar source"
   }
 }
+if (-not $desktopUiChecks.archive_index_present) {
+  $failedChecks += "installer archive does not list the desktop UI dist/index.html"
+}
+if ($desktopUiChecks.archive_asset_count -eq 0) {
+  $failedChecks += "installer archive does not list desktop UI dist/assets files"
+}
+if (-not $desktopUiChecks.extracted_index.exists) {
+  $failedChecks += "installer archive could not extract the desktop UI dist/index.html"
+}
+if ($desktopUiChecks.extracted_asset_count -eq 0) {
+  $failedChecks += "installer archive did not extract desktop UI asset files"
+}
 
 $passed = $failedChecks.Count -eq 0
 $summary = [ordered]@{
@@ -285,6 +346,7 @@ $summary = [ordered]@{
   script_checks = $scriptChecks
   archive_paths = $archivePaths
   file_checks = $fileChecks
+  desktop_ui_checks = $desktopUiChecks
   failed_checks = $failedChecks
   listing_stdout = $listing.stdout
   listing_stderr = $listing.stderr
@@ -307,6 +369,9 @@ the prepared Tauri sidecar inputs.
 - Installer: $($installer.relative_path)
 - agentmux.exe in archive: $((@($fileChecks | Where-Object { $_.name -eq "agentmux.exe" })[0]).archive_present)
 - cmux.exe in archive: $((@($fileChecks | Where-Object { $_.name -eq "cmux.exe" })[0]).archive_present)
+- Desktop UI index in archive: $($desktopUiChecks.archive_index_present)
+- Desktop UI extracted root: $($desktopUiChecks.extracted_dist_root)
+- Desktop UI extracted asset count: $($desktopUiChecks.extracted_asset_count)
 - PATH hook included: $($scriptChecks.hook_included)
 - PATH hook writes user PATH: $($scriptChecks.path_write_present)
 "@

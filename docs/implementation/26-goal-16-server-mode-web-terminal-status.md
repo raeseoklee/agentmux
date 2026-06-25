@@ -33,6 +33,9 @@ web-accessible server while keeping the product Windows desktop-first.
 - The server-backed control client maps terminal operations to the local HTTP
   API while maintaining browser-side workspace/pane/surface layout state for
   the shared UI.
+- Packaged Windows server mode now includes the shared desktop UI bundle in the
+  NSIS artifact and validates that the extracted `agentmux.exe server` can serve
+  the same UI without relying on the source-tree `apps/desktop/dist` directory.
 - Added `tools/run-server-mode-smoke.ps1` and `npm run server:smoke`.
   The smoke now builds the desktop UI bundle and asserts that `/` contains the
   desktop server bootstrap rather than the retired standalone web-terminal UI.
@@ -147,13 +150,27 @@ verification_20260622_151247_e11395
 verification_20260622_151256_b0a3f3
 ```
 
+Packaged server-mode release gate checks passed on 2026-06-25:
+
+```text
+npm run installer:build-smoke
+npm run installer:contents-gate
+cx session verify --verify "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-server-mode-smoke.ps1 -SkipBuild -Port 18777 -AgentMuxExe <extracted-agentmux.exe>" --json
+cx session verify --verify ".\.toolchains\cargo\bin\rustup.exe run stable-x86_64-pc-windows-msvc cargo test -p agentmux-cli server_" --json
+```
+
+Evidence:
+
+```text
+docs/implementation/evidence/20260625-202721-IRAE-DESKTOP-installer-build-smoke
+docs/implementation/evidence/20260625-203112-IRAE-DESKTOP-installer-contents-gate
+verification_20260625_113139_efbaef
+verification_20260625_113214_5df752
+```
+
 ## Remaining Polish
 
 - Keep stream-first output and backpressure gates current as the terminal path
   evolves.
-- Package or embed the desktop UI bundle with installed `agentmux.exe` so server
-  mode does not require a source-tree `apps/desktop/dist` directory.
-- Add packaged-app docs for discovering `agentmux.exe` and starting server mode
-  from the installed Windows application directory.
-- Add WSL-backed smoke coverage when a known distribution is available on the
-  verification machine.
+- Keep manual installed/uninstalled lifecycle evidence current for release
+  candidates, especially `-RequireCli` and `-RequireUserPath` checks.

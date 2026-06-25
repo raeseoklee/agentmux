@@ -1,7 +1,8 @@
 param(
   [int]$Port = 18765,
   [switch]$SkipBuild,
-  [string]$AgentMuxExe = ""
+  [string]$AgentMuxExe = "",
+  [string]$ServerWorkingDirectory = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +44,11 @@ function Resolve-Npm {
 
 if ([string]::IsNullOrWhiteSpace($AgentMuxExe)) {
   $AgentMuxExe = Join-Path $RepoRoot "target\debug\agentmux.exe"
+  if ([string]::IsNullOrWhiteSpace($ServerWorkingDirectory)) {
+    $ServerWorkingDirectory = $RepoRoot.Path
+  }
+} elseif ([string]::IsNullOrWhiteSpace($ServerWorkingDirectory)) {
+  $ServerWorkingDirectory = Split-Path -Parent ([System.IO.Path]::GetFullPath($AgentMuxExe))
 }
 
 if (-not $SkipBuild) {
@@ -56,6 +62,9 @@ if (-not $SkipBuild) {
 if (-not (Test-Path $AgentMuxExe)) {
   throw "agentmux.exe was not found at $AgentMuxExe"
 }
+if (-not (Test-Path -LiteralPath $ServerWorkingDirectory)) {
+  throw "server working directory was not found at $ServerWorkingDirectory"
+}
 
 $stdout = Join-Path $RepoRoot ".codexus\server-smoke.stdout.log"
 $stderr = Join-Path $RepoRoot ".codexus\server-smoke.stderr.log"
@@ -64,6 +73,7 @@ Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
 $proc = Start-Process `
   -FilePath $AgentMuxExe `
   -ArgumentList @("server", "--port", "$Port", "--backend", "conpty", "--json", "--", "cmd.exe", "/d", "/q") `
+  -WorkingDirectory $ServerWorkingDirectory `
   -PassThru `
   -WindowStyle Hidden `
   -RedirectStandardOutput $stdout `
@@ -226,6 +236,8 @@ try {
     spawnStatus = $spawn.StatusCode
     sessionId = $sessionId
     recentContainsEcho = $true
+    agentMuxExe = ([System.IO.Path]::GetFullPath($AgentMuxExe))
+    serverWorkingDirectory = ([System.IO.Path]::GetFullPath($ServerWorkingDirectory))
     url = "$baseUrl/"
   } | ConvertTo-Json -Compress
 } finally {

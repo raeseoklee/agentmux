@@ -48,6 +48,7 @@ Date: 2026-06-18
 25. [24-goal-14-tmux-compat-status.md](./24-goal-14-tmux-compat-status.md)
 26. [25-goal-15-workspace-groups-status.md](./25-goal-15-workspace-groups-status.md)
 27. [26-goal-16-server-mode-web-terminal-status.md](./26-goal-16-server-mode-web-terminal-status.md)
+28. [28-goal-18-p2-installed-server-mode-release-gate.md](./28-goal-18-p2-installed-server-mode-release-gate.md)
 
 ## 구현 원칙
 

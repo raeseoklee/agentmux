@@ -33,6 +33,9 @@
       "binaries/agentmux",
       "binaries/cmux"
     ],
+    "resources": {
+      "../dist": "dist"
+    },
     "windows": {
       "nsis": {
         "installerHooks": "nsis-hooks.nsh"
