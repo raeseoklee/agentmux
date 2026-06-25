@@ -36,6 +36,14 @@ web-accessible server while keeping the product Windows desktop-first.
 - Added `tools/run-server-mode-smoke.ps1` and `npm run server:smoke`.
   The smoke now builds the desktop UI bundle and asserts that `/` contains the
   desktop server bootstrap rather than the retired standalone web-terminal UI.
+- Added a per-process local server auth token:
+  - the token is emitted in `--json` output and injected into
+    `window.__AGENTMUX_SERVER__` for the shared desktop UI.
+  - `/api/*` requests require `X-AgentMux-Server-Token`.
+  - `/api/session/<session-id>/stream` WebSocket connections require the token
+    query parameter.
+  - `tools/run-server-mode-smoke.ps1` verifies that unauthenticated `/api/state`
+    returns 401 before using the token for the rest of the smoke.
 
 ## CLI Examples
 
@@ -83,8 +91,10 @@ POST /api/session/<session-id>/terminate
 
 - Loopback is the default and recommended server binding.
 - Remote binding is intentionally explicit through `--allow-remote`.
-- This slice does not add browser authentication tokens yet. Remote binding
-  should remain a development-only path until token auth is added.
+- Local browser auth tokens are now required for JSON APIs and terminal-stream
+  WebSockets.
+- Non-loopback remote binding should still be treated as an advanced/developer
+  path until packaged UX and operator documentation make token handling clear.
 
 ## WSL Behavior
 
@@ -139,9 +149,8 @@ verification_20260622_151256_b0a3f3
 
 ## Remaining Polish
 
-- Replace polling output with a streaming channel or WebSocket.
-- Add local browser auth token support before treating remote binding as safe
-  for regular use.
+- Keep stream-first output and backpressure gates current as the terminal path
+  evolves.
 - Package or embed the desktop UI bundle with installed `agentmux.exe` so server
   mode does not require a source-tree `apps/desktop/dist` directory.
 - Add packaged-app docs for discovering `agentmux.exe` and starting server mode

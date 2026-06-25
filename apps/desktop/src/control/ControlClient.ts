@@ -722,6 +722,7 @@ function outputSubscriptionId(): string {
 interface AgentmuxServerBootstrap {
   baseUrl?: string;
   mode?: string;
+  token?: string | null;
   defaults?: {
     workspace_id?: string | null;
     backend?: string | null;
@@ -743,6 +744,7 @@ declare global {
     __AGENTMUX_SERVER__?: AgentmuxServerBootstrap;
     __AGENTMUX_PREVIEW__?: BrowserPreviewApi;
     __AGENTMUX_PREVIEW_READY__?: boolean;
+    __AGENTMUX_PREVIEW_SEED_WORKSPACE__?: boolean;
     __AGENTMUX_PREVIEW_WSL_DISTRIBUTIONS__?: WslDistribution[];
     __AGENTMUX_PREVIEW_TMUX_AVAILABLE__?: boolean;
   }
@@ -2090,6 +2092,12 @@ class BrowserPreviewControlClient implements ControlClient {
       },
     };
     window.__AGENTMUX_PREVIEW__ = previewApi;
+    if (window.__AGENTMUX_PREVIEW_SEED_WORKSPACE__ === true) {
+      void this.createWorkspace(
+        "Workspace 1",
+        "D:\\Workspace\\agentmux-preview",
+      );
+    }
     window.__AGENTMUX_PREVIEW_READY__ = true;
     window.addEventListener("agentmux:synthetic-agent-state", (event) => {
       if (window.__AGENTMUX_PREVIEW__ !== previewApi) {
@@ -4181,6 +4189,7 @@ interface ServerStateResult {
 
 class ServerControlClient extends BrowserPreviewControlClient {
   private readonly serverBaseUrl: string;
+  private readonly serverToken: string | null;
   private readonly serverDefaults: NonNullable<AgentmuxServerBootstrap["defaults"]>;
   private readonly serverWorkspaces = new Map<string, WorkspaceSummary>();
   private readonly serverPanes = new Map<string, PaneSummary[]>();
@@ -4193,6 +4202,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
   constructor(bootstrap: AgentmuxServerBootstrap) {
     super();
     this.serverBaseUrl = (bootstrap.baseUrl ?? "").replace(/\/+$/, "");
+    this.serverToken = bootstrap.token?.trim() || null;
     this.serverDefaults = bootstrap.defaults ?? {};
   }
 
@@ -5016,6 +5026,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
     if (options.body) {
       headers.set("Content-Type", "application/json");
     }
+    if (this.serverToken) {
+      headers.set("X-AgentMux-Server-Token", this.serverToken);
+    }
     const response = await fetch(`${this.serverBaseUrl}${path}`, {
       ...options,
       headers,
@@ -5039,6 +5052,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
       `${window.location.protocol}//${window.location.host}`;
     const url = new URL(path, base);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    if (this.serverToken) {
+      url.searchParams.set("token", this.serverToken);
+    }
     return url.toString();
   }
 

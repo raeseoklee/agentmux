@@ -3492,6 +3492,7 @@ export function AgentmuxTerminalApp() {
           <div data-tauri-drag-region style={{ flex: 1, height: "100%" }} />
           <Hov
             tag="button"
+            className="agentmux-theme-toggle"
             style={{
               height: 30,
               borderRadius: 7,

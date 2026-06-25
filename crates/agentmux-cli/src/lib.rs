@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentmux_backend::SessionBackend;
 use agentmux_backend_conpty::ConptyBackend;
@@ -789,6 +789,7 @@ struct ServerOptions {
     host: String,
     port: u16,
     allow_remote: bool,
+    auth_token: String,
     workspace_id: Option<String>,
     backend: Option<String>,
     backend_profile: Option<String>,
@@ -4955,6 +4956,7 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
         host,
         port,
         allow_remote,
+        auth_token: generate_server_auth_token(),
         workspace_id,
         backend,
         backend_profile,
@@ -4964,6 +4966,31 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
         rows,
         max_recent_bytes,
     })
+}
+
+fn generate_server_auth_token() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        return format!("srv_{}", bytes_to_hex(&bytes));
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    let stack_marker = &nanos as *const u128 as usize;
+    format!("srv_{nanos:x}_{pid:x}_{stack_marker:x}")
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    text
 }
 
 fn parse_server_mode(value: &str) -> Result<ServerMode, CliError> {
@@ -6573,6 +6600,7 @@ where
                 "backend": state.options.backend.clone(),
                 "backend_profile": state.options.backend_profile.clone(),
                 "allow_remote": state.options.allow_remote,
+                "auth_token": state.options.auth_token.clone(),
                 "control_pipe": state.options.invoke.pipe_name.clone(),
             }),
             output,
@@ -6698,6 +6726,17 @@ fn handle_server_websocket(
         Some((path, query)) => (path.to_string(), Some(query.to_string())),
         None => (target, None),
     };
+    let authorized = {
+        let state = state
+            .lock()
+            .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?;
+        query_param(query.as_deref(), "token")
+            .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token))
+    };
+    if !authorized {
+        let _ = socket.close(None);
+        return Ok(());
+    }
     let Some(session_id) = session_id_from_path(&path, "/stream") else {
         let _ = socket.close(None);
         return Ok(());
@@ -6906,6 +6945,7 @@ struct HttpRequest {
     method: String,
     path: String,
     query: Option<String>,
+    headers: HashMap<String, String>,
     body: String,
 }
 
@@ -6987,16 +7027,27 @@ fn parse_http_request(raw: &str) -> Result<HttpRequest, CliError> {
         Some((path, query)) => (path.to_string(), Some(query.to_string())),
         None => (target.to_string(), None),
     };
+    let mut headers = HashMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
 
     Ok(HttpRequest {
         method,
         path,
         query,
+        headers,
         body: body.to_string(),
     })
 }
 
 fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpResponse {
+    if server_request_requires_auth(request) && !server_request_authorized(request, state) {
+        return api_error_response(401, "Unauthorized.");
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => server_desktop_index_response(&state.options),
         ("GET", "/api/state") => server_state_response(state),
@@ -7036,6 +7087,31 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
             api_error_response(404, "Not found.")
         }
     }
+}
+
+fn server_request_requires_auth(request: &HttpRequest) -> bool {
+    request.path.starts_with("/api/")
+}
+
+fn server_request_authorized(request: &HttpRequest, state: &ServerState) -> bool {
+    request
+        .headers
+        .get("x-agentmux-server-token")
+        .is_some_and(|token| constant_time_eq(token, &state.options.auth_token))
+        || query_param(request.query.as_deref(), "token")
+            .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token))
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 fn server_state_response(state: &mut ServerState) -> HttpResponse {
@@ -7666,6 +7742,7 @@ fn inject_server_bootstrap(mut html: String, options: &ServerOptions) -> String 
     let bootstrap = serde_json::to_string(&serde_json::json!({
         "baseUrl": "",
         "mode": options.mode.as_str(),
+        "token": options.auth_token.clone(),
         "defaults": server_defaults_json(options),
     }))
     .unwrap_or_else(|_| "{}".to_string());
@@ -7716,6 +7793,7 @@ fn http_reason(status_code: u16) -> &'static str {
         200 => "OK",
         204 => "No Content",
         304 => "Not Modified",
+        401 => "Unauthorized",
         400 => "Bad Request",
         404 => "Not Found",
         503 => "Service Unavailable",
@@ -7740,6 +7818,7 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Resul
 fn server_index_html(options: &ServerOptions) -> String {
     let bootstrap = serde_json::to_string(&serde_json::json!({
         "mode": options.mode.as_str(),
+        "token": options.auth_token.clone(),
         "defaults": server_defaults_json(options),
     }))
     .unwrap_or_else(|_| "{}".to_string());
@@ -14161,10 +14240,102 @@ mod tests {
         assert!(!options.allow_remote);
         assert_eq!(options.workspace_id.as_deref(), Some("ws_1"));
         assert_eq!(options.backend.as_deref(), Some("conpty"));
+        assert!(options.auth_token.starts_with("srv_"));
+        assert!(options.auth_token.len() >= 35);
         assert_eq!(
             options.command,
             vec!["powershell.exe".to_string(), "-NoLogo".to_string()]
         );
+    }
+
+    #[test]
+    fn server_auth_token_is_not_reused_between_option_parses() {
+        let first = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let second = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+
+        assert!(first.auth_token.starts_with("srv_"));
+        assert!(second.auth_token.starts_with("srv_"));
+        assert_ne!(first.auth_token, second.auth_token);
+    }
+
+    #[test]
+    fn server_api_requests_require_local_auth_token() {
+        let options = parse_server_options(&[
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        let state = ServerState::new(options);
+        let unauthenticated = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/state".to_string(),
+            query: None,
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        assert!(server_request_requires_auth(&unauthenticated));
+        assert!(!server_request_authorized(&unauthenticated, &state));
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-agentmux-server-token".to_string(),
+            state.options.auth_token.clone(),
+        );
+        let header_authenticated = HttpRequest {
+            headers,
+            ..unauthenticated
+        };
+        assert!(server_request_authorized(&header_authenticated, &state));
+
+        let query_authenticated = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api/session/sess_1/stream".to_string(),
+            query: Some(format!("token={}", state.options.auth_token)),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        assert!(server_request_requires_auth(&query_authenticated));
+        assert!(server_request_authorized(&query_authenticated, &state));
+
+        let public_asset = HttpRequest {
+            method: "GET".to_string(),
+            path: "/assets/index.js".to_string(),
+            query: None,
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        assert!(!server_request_requires_auth(&public_asset));
+    }
+
+    #[test]
+    fn server_http_parser_preserves_headers_for_auth() {
+        let request = parse_http_request(
+            "GET /api/state HTTP/1.1\r\nHost: localhost\r\nX-AgentMux-Server-Token: srv_token\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers
+                .get("x-agentmux-server-token")
+                .map(String::as_str),
+            Some("srv_token")
+        );
+    }
+
+    #[test]
+    fn server_desktop_bootstrap_embeds_auth_token() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let html = inject_server_bootstrap(
+            "<!doctype html><html><head></head><body></body></html>".to_string(),
+            &options,
+        );
+
+        assert!(html.contains("window.__AGENTMUX_SERVER__"));
+        assert!(html.contains("\"token\""));
+        assert!(html.contains(&options.auth_token));
     }
 
     #[test]

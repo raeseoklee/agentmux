@@ -93,10 +93,25 @@ try {
   if ($assetMatches.Count -eq 0) {
     throw "server desktop UI response did not reference built assets."
   }
+  $tokenMatch = [regex]::Match($root.Content, '"token"\s*:\s*"(?<token>[^"]+)"')
+  if (-not $tokenMatch.Success) {
+    throw "server desktop UI bootstrap did not include a local auth token."
+  }
+  $apiHeaders = @{ "X-AgentMux-Server-Token" = $tokenMatch.Groups["token"].Value }
   $assetPath = $assetMatches[0].Groups["asset"].Value
   $asset = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl$assetPath" -TimeoutSec 5
 
-  $state = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/api/state" -TimeoutSec 5
+  $unauthorized = $null
+  try {
+    $unauthorized = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/api/state" -TimeoutSec 5
+  } catch {
+    $unauthorized = $_.Exception.Response
+  }
+  if (-not $unauthorized -or [int]$unauthorized.StatusCode -ne 401) {
+    throw "server API did not reject an unauthenticated request."
+  }
+
+  $state = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/api/state" -Headers $apiHeaders -TimeoutSec 5
   $expectedWslDistributions = @()
   if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
     $expectedWslOutput = (& wsl.exe --list --quiet 2>$null) -join "`n"
@@ -108,7 +123,7 @@ try {
   $wslSessionId = $null
   $wslRecentContainsEcho = $null
   if ($expectedWslDistributions.Count -gt 0) {
-    $wsl = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/api/wsl/distributions" -TimeoutSec 5
+    $wsl = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/api/wsl/distributions" -Headers $apiHeaders -TimeoutSec 5
     $wslDistributions = (($wsl.Content | ConvertFrom-Json).result.distributions)
     $wslDistributionCount = $wslDistributions.Count
     if ($wslDistributionCount -eq 0) {
@@ -126,6 +141,7 @@ try {
       -UseBasicParsing `
       -Method Post `
       -Uri "$baseUrl/api/spawn" `
+      -Headers $apiHeaders `
       -ContentType "application/json" `
       -Body $wslSpawnBody `
       -TimeoutSec 20
@@ -134,6 +150,7 @@ try {
     $wslRecent = Invoke-WebRequest `
       -UseBasicParsing `
       -Uri "$baseUrl/api/session/$wslSessionId/recent?max_bytes=65536" `
+      -Headers $apiHeaders `
       -TimeoutSec 5
     $wslRecentText = ($wslRecent.Content | ConvertFrom-Json).result.text
     if ($wslRecentText -notlike "*agentmux-wsl-smoke*") {
@@ -145,6 +162,7 @@ try {
         -UseBasicParsing `
         -Method Post `
         -Uri "$baseUrl/api/session/$wslSessionId/terminate" `
+        -Headers $apiHeaders `
         -ContentType "application/json" `
         -Body "{}" `
         -TimeoutSec 5
@@ -161,6 +179,7 @@ try {
     -UseBasicParsing `
     -Method Post `
     -Uri "$baseUrl/api/spawn" `
+    -Headers $apiHeaders `
     -ContentType "application/json" `
     -Body $spawnBody `
     -TimeoutSec 5
@@ -171,6 +190,7 @@ try {
     -UseBasicParsing `
     -Method Post `
     -Uri "$baseUrl/api/session/$sessionId/send" `
+    -Headers $apiHeaders `
     -ContentType "application/json" `
     -Body $sendBody `
     -TimeoutSec 5
@@ -179,6 +199,7 @@ try {
   $recent = Invoke-WebRequest `
     -UseBasicParsing `
     -Uri "$baseUrl/api/session/$sessionId/recent?max_bytes=65536" `
+    -Headers $apiHeaders `
     -TimeoutSec 5
   $recentText = ($recent.Content | ConvertFrom-Json).result.text
   if ($recentText -notlike "*agentmux-web*") {
@@ -189,6 +210,7 @@ try {
     -UseBasicParsing `
     -Method Post `
     -Uri "$baseUrl/api/session/$sessionId/terminate" `
+    -Headers $apiHeaders `
     -ContentType "application/json" `
     -Body "{}" `
     -TimeoutSec 5
@@ -197,6 +219,7 @@ try {
     rootStatus = $root.StatusCode
     assetStatus = $asset.StatusCode
     stateStatus = $state.StatusCode
+    unauthenticatedApiStatus = [int]$unauthorized.StatusCode
     wslDistributionCount = $wslDistributionCount
     wslSessionId = $wslSessionId
     wslRecentContainsEcho = $wslRecentContainsEcho

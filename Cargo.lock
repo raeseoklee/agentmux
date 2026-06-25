@@ -156,6 +156,7 @@ dependencies = [
  "agentmux-backend-wsl",
  "agentmux-core",
  "agentmux-ipc",
+ "getrandom 0.2.17",
  "serde",
  "serde_json",
  "tungstenite",

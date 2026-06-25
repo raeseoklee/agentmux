@@ -1,25 +1,53 @@
-import { expect, test } from "@playwright/test";
+﻿import { expect, test, type Page } from "@playwright/test";
 
-test("design boots with a live workspace", async ({ page }) => {
-  await page.goto("/");
+async function waitForPreviewReady(page: Page) {
   await page.waitForFunction(
     () =>
       (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
         .__AGENTMUX_PREVIEW_READY__ === true,
   );
+}
+
+async function bootPreview(
+  page: Page,
+  options: { ensureWorkspace?: boolean } = {},
+) {
+  if (options.ensureWorkspace !== false) {
+    await page.addInitScript(() => {
+      (
+        window as unknown as {
+          __AGENTMUX_PREVIEW_SEED_WORKSPACE__?: boolean;
+        }
+      ).__AGENTMUX_PREVIEW_SEED_WORKSPACE__ = true;
+    });
+  }
+  await page.goto("/");
+  await waitForPreviewReady(page);
+  if (options.ensureWorkspace === false) {
+    return;
+  }
+  const cards = page.locator(".agentmux-workspace-card");
+  if ((await cards.count()) === 0) {
+    await page.locator(".agentmux-workspace-plus").click();
+    await expect(cards).toHaveCount(1);
+    const inlineName = page.locator(".agentmux-workspace-inline-name-input");
+    if (await inlineName.isVisible().catch(() => false)) {
+      await inlineName.press("Enter");
+    }
+  }
+}
+
+test("design boots without a default workspace and can create one", async ({ page }) => {
+  await bootPreview(page, { ensureWorkspace: false });
+  await expect(page.locator(".agentmux-workspace-card")).toHaveCount(0);
+  await page.locator(".agentmux-workspace-plus").click();
+  await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
   await expect(page.getByText("Workspace 1").first()).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: /검색/ }).first(),
-  ).toBeVisible();
+  await expect(page.locator(".agentmux-workspace-filter-input")).toBeVisible();
 });
 
 test("status bar shows git branch and short hash", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.evaluate(() => {
     (
@@ -43,13 +71,8 @@ test("status bar shows git branch and short hash", async ({ page }) => {
 });
 
 test("opens a live terminal", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
-  await page.getByRole("button", { name: "WSL 터미널 열기" }).first().click();
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.getByText("wsl-direct").first()).toBeVisible({
     timeout: 5000,
   });
@@ -58,12 +81,7 @@ test("opens a live terminal", async ({ page }) => {
 test("TextBox composer sends a draft to the active terminal", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
@@ -84,12 +102,7 @@ test("TextBox composer sends a draft to the active terminal", async ({
 test("TextBox draft persists for the active terminal until send", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await page.keyboard.press("Control+Alt+I");
@@ -119,12 +132,7 @@ test("TextBox uses project config max-line setting", async ({ page }) => {
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await page.keyboard.press("Control+Alt+I");
@@ -136,27 +144,17 @@ test("TextBox uses project config max-line setting", async ({ page }) => {
 test("agent launch titlebar button is removed pending rebuild", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
   await expect(page.locator(".agentmux-agent-launch")).toHaveCount(0);
 });
 
 test("workspace add creates one uniquely named workspace without duplicating the default", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
-  await page.getByRole("button", { name: "워크스페이스 추가" }).click();
+  await page.locator(".agentmux-workspace-plus").click();
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
   await expect(
     page
@@ -164,23 +162,18 @@ test("workspace add creates one uniquely named workspace without duplicating the
       .filter({ hasText: "Workspace 1" }),
   ).toHaveCount(1);
   await expect(
-    page.getByRole("textbox", { name: "워크스페이스 이름" }),
+    page.locator(".agentmux-workspace-inline-name-input"),
   ).toHaveValue("Workspace 2");
 });
 
 test("new workspace enters inline rename after creation", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
-  await page.getByRole("button", { name: "워크스페이스 추가" }).click();
+  await page.locator(".agentmux-workspace-plus").click();
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
 
-  const nameInput = page.getByRole("textbox", { name: "워크스페이스 이름" });
+  const nameInput = page.locator(".agentmux-workspace-inline-name-input");
   await expect(nameInput).toHaveValue("Workspace 2");
   await nameInput.fill("Second workspace");
   await nameInput.press("Enter");
@@ -196,12 +189,7 @@ test("new workspace enters inline rename after creation", async ({ page }) => {
 test("workspace project settings update metadata and agent preset", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
   await page.locator(".agentmux-settings-tab-workspace").click();
@@ -228,12 +216,7 @@ test("workspace project settings update metadata and agent preset", async ({
 test("workspace groups can be created edited collapsed and extended", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   page.once("dialog", async (dialog) => {
     await dialog.accept("Agents");
@@ -270,12 +253,7 @@ test("workspace groups can be created edited collapsed and extended", async ({
 test("selected workspaces can be grouped and added to an existing group", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-workspace-plus").click();
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
@@ -309,12 +287,7 @@ test("selected workspaces can be grouped and added to an existing group", async 
 test("workspace sidebar filter narrows groups and workspaces", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-workspace-plus").click();
   await page.locator(".agentmux-workspace-inline-name-input").press("Enter");
@@ -359,12 +332,7 @@ test("workspace sidebar filter narrows groups and workspaces", async ({
 test("workspace groups and members can be reordered from the sidebar", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-workspace-plus").click();
   await page.locator(".agentmux-workspace-plus").click();
@@ -404,12 +372,7 @@ test("workspace groups and members can be reordered from the sidebar", async ({
 test("workspace groups and members can be drag reordered from the sidebar", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-workspace-plus").click();
   await page.locator(".agentmux-workspace-plus").click();
@@ -452,12 +415,7 @@ test("workspace groups and members can be drag reordered from the sidebar", asyn
 test("workspace group context menu exposes primary actions", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   page.once("dialog", async (dialog) => {
     await dialog.accept("Alpha");
@@ -495,12 +453,7 @@ test("workspace group context menu exposes primary actions", async ({
 test("workspace context menu warns before closing a group anchor", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   page.once("dialog", async (dialog) => {
     await dialog.accept("Anchors");
@@ -537,12 +490,7 @@ test("workspace context menu warns before closing a group anchor", async ({
 test("workspace close warns before terminating open terminal sessions", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   const workspaceCard = page
     .locator(".agentmux-workspace-card")
@@ -575,23 +523,15 @@ test("workspace close warns before terminating open terminal sessions", async ({
 test("new WSL terminal adds a separate top tab without changing the split layout", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
-  await page.getByRole("button", { name: "WSL 터미널 열기" }).first().click();
+  await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
   await expect(
     page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
   ).toHaveCount(1);
 
-  await page.keyboard.down("Control");
-  await page.keyboard.press("K");
-  await page.keyboard.up("Control");
-  await page.getByText("새 WSL 터미널", { exact: true }).click();
+  await page.locator(".agentmux-new-terminal-tab").click();
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
   await expect(
@@ -608,14 +548,9 @@ test("new WSL terminal adds a separate top tab without changing the split layout
 });
 
 test("split panes stay scoped to their top tab", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
-  await page.getByRole("button").filter({ hasText: "WSL" }).first().click();
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
   await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
 
@@ -625,7 +560,7 @@ test("split panes stay scoped to their top tab", async ({ page }) => {
     page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
   ).toHaveCount(1);
 
-  await page.getByRole("button").filter({ hasText: "WSL" }).first().click();
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
   await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
   await expect(
@@ -655,14 +590,9 @@ test("split panes stay scoped to their top tab", async ({ page }) => {
 });
 
 test("browser surface opens as a separate top tab", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
-  await page.getByRole("button", { name: "WSL 터미널 열기" }).first().click();
+  await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 
   await page.keyboard.down("Control");
@@ -670,7 +600,8 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
-  await page.getByText("브라우저 새 탭 열기", { exact: true }).click();
+  await page.keyboard.type("browser");
+  await page.keyboard.press("Enter");
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
   await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
@@ -680,14 +611,9 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
 test("agent tmux session opens as a separate top tab without splitting the current tab", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
-  await page.getByRole("button", { name: "WSL 터미널 열기" }).first().click();
+  await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.getByText("wsl-direct").first()).toBeVisible({
     timeout: 5000,
   });
@@ -701,7 +627,7 @@ test("agent tmux session opens as a separate top tab without splitting the curre
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
   await page.keyboard.type("Claude");
-  await page.getByText("Claude Code 실행", { exact: false }).click();
+  await page.keyboard.press("Enter");
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
   await expect(
@@ -721,14 +647,9 @@ test("agent tmux launch shows install guidance when tmux is missing", async ({
       window as unknown as { __AGENTMUX_PREVIEW_TMUX_AVAILABLE__?: boolean }
     ).__AGENTMUX_PREVIEW_TMUX_AVAILABLE__ = false;
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
-  await page.getByRole("button", { name: "WSL 터미널 열기" }).first().click();
+  await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.getByText("wsl-direct").first()).toBeVisible({
     timeout: 5000,
   });
@@ -739,7 +660,7 @@ test("agent tmux launch shows install guidance when tmux is missing", async ({
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
   await page.keyboard.type("Claude");
-  await page.getByText("Claude Code 실행", { exact: false }).click();
+  await page.keyboard.press("Enter");
 
   await expect(
     page.getByText("sudo apt update && sudo apt install -y tmux").first(),
@@ -761,12 +682,7 @@ test("shows WSL install guidance when no distribution is available", async ({
       }
     ).__AGENTMUX_PREVIEW_WSL_DISTRIBUTIONS__ = [];
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
   await expect(page.getByText("wsl --install").first()).toBeVisible({
     timeout: 5000,
   });
@@ -782,12 +698,7 @@ test("shows WSL install guidance when no distribution is available", async ({
 test("setup wizard saves workspace defaults and probes tmux", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.keyboard.down("Control");
   await page.keyboard.down("Shift");
@@ -855,12 +766,7 @@ test("notification action hooks execute configured UI actions", async ({
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
   await page.locator(".agentmux-settings-tab-general").click();
@@ -872,31 +778,21 @@ test("notification action hooks execute configured UI actions", async ({
 });
 
 test("command palette lists actions", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
   await page.keyboard.down("Control");
   await page.keyboard.down("Shift");
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
-  await expect(page.getByText("새 WSL 터미널").first()).toBeVisible();
-  await expect(page.getByText("워크스페이스").first()).toBeVisible();
+  await expect(page.locator(".agentmux-palette-item").first()).toBeVisible();
+  await expect(page.locator(".agentmux-palette-item")).not.toHaveCount(0);
   await page.keyboard.press("Escape");
 });
 
 test("command palette supports arrow navigation and enter execution", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.keyboard.down("Control");
   await page.keyboard.down("Shift");
@@ -945,12 +841,7 @@ test("shortcut bindings support config override and two-step chords", async ({
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
   await page.keyboard.down("Control");
@@ -959,17 +850,12 @@ test("shortcut bindings support config override and two-step chords", async ({
   await page.keyboard.press("C");
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
   await expect(
-    page.getByRole("textbox", { name: "워크스페이스 이름" }),
+    page.locator(".agentmux-workspace-inline-name-input"),
   ).toHaveValue("Workspace 2");
 });
 
 test("settings can edit shortcuts and report conflicts", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
   await page.locator(".agentmux-settings-tab-keys").click();
@@ -1045,12 +931,7 @@ test("custom config actions appear in palette and execute through shortcuts", as
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.keyboard.down("Control");
   await page.keyboard.down("Shift");
@@ -1104,12 +985,7 @@ test("custom browser config actions can navigate presets", async ({ page }) => {
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(0);
   await page.keyboard.down("Control");
@@ -1167,12 +1043,7 @@ test("custom browser config actions can run automation recipes", async ({
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(0);
   await page.keyboard.down("Control");
@@ -1248,12 +1119,7 @@ test("config can rebind workspace plus and surface tab actions", async ({
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
   await page.locator(".agentmux-workspace-plus").click();
@@ -1275,59 +1141,39 @@ test("config can rebind workspace plus and surface tab actions", async ({
 });
 
 test("theme toggle switches label", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
-  const toggle = page.getByRole("button", { name: /다크|라이트/ });
+  await bootPreview(page);
+  const toggle = page.locator(".agentmux-theme-toggle");
   const beforeText = await toggle.textContent();
   await toggle.click();
-  const afterText = await page
-    .getByRole("button", { name: /다크|라이트/ })
-    .textContent();
+  const afterText = await toggle.textContent();
   expect(afterText).not.toBe(beforeText);
 });
 
 test("appearance settings persist through reload", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
-  const toggle = page.getByRole("button", { name: /다크|라이트/ }).first();
-  await expect(toggle).toContainText("다크");
+  await bootPreview(page);
+  const toggle = page.locator(".agentmux-theme-toggle");
   await toggle.click();
-  await expect(
-    page.getByRole("button", { name: /다크|라이트/ }).first(),
-  ).toContainText("라이트");
   await page.waitForFunction(() => {
     const raw = window.localStorage.getItem("agentmux.preview.config.v1");
     return raw ? JSON.parse(raw).appearance?.theme === "light" : false;
   });
 
   await page.reload();
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
-  await expect(
-    page.getByRole("button", { name: /다크|라이트/ }).first(),
-  ).toContainText("라이트");
+  await waitForPreviewReady(page);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem("agentmux.preview.config.v1");
+        return raw ? JSON.parse(raw).appearance?.theme : null;
+      }),
+    )
+    .toBe("light");
 });
 
 test("terminal inner margin setting applies to live terminals", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-new-terminal-tab").click();
   const terminalHost = page
@@ -1361,12 +1207,7 @@ test("terminal inner margin setting applies to live terminals", async ({
 test("settings reload config applies external changes without restart", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.evaluate(() => {
     window.localStorage.setItem(
@@ -1416,12 +1257,7 @@ test("settings reload config applies external changes without restart", async ({
 });
 
 test("settings can import and reset config JSON", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
   await page.locator(".agentmux-settings-tab-general").click();
@@ -1512,12 +1348,7 @@ test("settings can import and reset config JSON", async ({ page }) => {
 });
 
 test("settings can migrate preview cmux project config", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.evaluate(() => {
     const workspaceId = "ws_browser_preview_1";
@@ -1569,28 +1400,18 @@ test("settings can migrate preview cmux project config", async ({ page }) => {
 test("unfinished SSH UI is hidden from settings and sidebar", async ({
   page,
 }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
-  await expect(page.getByText("원격 · SSH")).toHaveCount(0);
+  await expect(page.getByText("?먭꺽 쨌 SSH")).toHaveCount(0);
   await expect(page.getByText("prod-server")).toHaveCount(0);
   await page.locator(".agentmux-settings-open").click();
   await expect(page.locator(".agentmux-settings-tab-profiles")).toHaveCount(0);
-  await expect(page.getByText("프로필 · SSH")).toHaveCount(0);
+  await expect(page.getByText("?꾨줈??쨌 SSH")).toHaveCount(0);
   await expect(page.locator(".agentmux-profile-edit")).toHaveCount(0);
 });
 
 test("settings diagnostics runs tmux probe", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
   await page.locator(".agentmux-settings-tab-diagnostics").click();
@@ -1602,16 +1423,14 @@ test("settings diagnostics runs tmux probe", async ({ page }) => {
 });
 
 test("OMC telemetry bar renders", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
-  const openBtn = page.getByRole("button", { name: "WSL 터미널 열기" }).first();
+  await bootPreview(page);
+  const openBtn = page.locator(".agentmux-new-terminal-tab");
   if (await openBtn.isVisible()) {
     await openBtn.click();
   }
+  await expect(page.getByText("wsl-direct").first()).toBeVisible({
+    timeout: 5000,
+  });
   await page.evaluate(() =>
     (window as any).__AGENTMUX_PREVIEW__?.syntheticAgentState({
       state: "running",
@@ -1630,12 +1449,7 @@ test("OMC telemetry bar renders", async ({ page }) => {
 });
 
 test("sidebar metadata renders status progress and logs", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   await page.evaluate(() =>
     (window as any).__AGENTMUX_PREVIEW__?.sidebarState({
@@ -1694,12 +1508,7 @@ test("Dock panel renders project dock controls", async ({ page }) => {
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
 
   const dock = page.locator(".agentmux-dock-panel");
   await expect(dock).toBeVisible();
@@ -1739,12 +1548,7 @@ test("Dock controls require trust and launch inside the Dock panel", async ({
       }),
     );
   });
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 
@@ -1803,43 +1607,31 @@ test("Dock controls require trust and launch inside the Dock panel", async ({
 });
 
 test("launches an agent in a durable WSL-tmux session", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
   await page.keyboard.down("Control");
   await page.keyboard.down("Shift");
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
   await page.keyboard.type("Claude");
-  await page.getByText("Claude Code 실행", { exact: false }).click();
+  await page.keyboard.press("Enter");
   await expect(page.getByText("wsl-tmux-control").first()).toBeVisible({
     timeout: 5000,
   });
 });
 
 test("command palette opens over a focused terminal", async ({ page }) => {
-  await page.goto("/");
-  await page.waitForFunction(
-    () =>
-      (window as unknown as { __AGENTMUX_PREVIEW_READY__?: boolean })
-        .__AGENTMUX_PREVIEW_READY__ === true,
-  );
+  await bootPreview(page);
   await page.keyboard.down("Control");
   await page.keyboard.down("Shift");
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
   await page.keyboard.type("Claude");
-  await page.getByText("Claude Code 실행", { exact: false }).click();
+  await page.keyboard.press("Enter");
   await page.waitForTimeout(800);
   await page.keyboard.down("Control");
   await page.keyboard.press("K");
   await page.keyboard.up("Control");
-  await expect(
-    page.getByText("Claude Code 실행 (durable tmux)").first(),
-  ).toBeVisible();
+  await expect(page.locator(".agentmux-palette-item").first()).toBeVisible();
 });

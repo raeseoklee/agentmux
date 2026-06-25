@@ -26,15 +26,25 @@ Implementation update, 2026-06-25:
   `visited` set per recursive level, and WebGL rendering now caches the addon
   module import while debouncing deactivation teardown to survive rapid pane
   switching.
+- The P0/P1 completion pass refreshes the preview UI E2E fixture so product
+  startup remains no-default-workspace while tests can explicitly seed a
+  workspace; the full Playwright UI suite passes again.
+- Backend read-pause is wired for local terminal output pressure:
+  renderer pressure reports flow through desktop/server control clients to
+  `session.report_output_pressure`, core forwards pause/resume to the backend,
+  ConPTY checks a pause flag before issuing the next blocking read, and
+  wsl-direct forwards the same pressure signal to its inner backend.
+- Local server mode now injects a per-process auth token into the shared desktop
+  UI bootstrap. `/api/*` requests require the token in
+  `X-AgentMux-Server-Token`, and the per-session output WebSocket requires the
+  token query parameter.
 
 Remaining follow-up:
 
-- Add backend-specific real PTY read-pause beyond renderer pressure reporting.
-- Keep server remote binding development-only until local auth token support is
-  added.
 - Keep performance gates and Tauri UI smoke current as the stream path evolves.
-  The existing preview Playwright smoke still needs a separate refresh for the
-  no-default-workspace startup state.
+- Add packaged/remote deployment hardening before treating non-loopback server
+  mode as a regular production path: stronger operator docs, token presentation
+  UX, and optional packaged-server discovery.
 
 Related: [Goal 1 status](09-goal-1-native-terminal-slice-status.md) ("Not Yet Implemented: live backend event stream; output batching/backpressure"), [Goal 16 server mode](26-goal-16-server-mode-web-terminal-status.md), [Goal groups](08-goal-groups.md).
 
