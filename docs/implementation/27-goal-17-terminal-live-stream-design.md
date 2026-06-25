@@ -21,6 +21,11 @@ Implementation update, 2026-06-25:
   descriptor source-list splitting, byte-level agent-signal prefiltering plus
   heuristic scan throttling, read-only runtime pre-dispatch `collect_events`
   reduction, and an amortized `VecDeque` recent-output ring.
+- The next 2026-06-25 follow-up implements PR-11 and PR-12 from the desktop
+  performance SRS: `renderPane` now uses DFS backtracking instead of cloning the
+  `visited` set per recursive level, and WebGL rendering now caches the addon
+  module import while debouncing deactivation teardown to survive rapid pane
+  switching.
 
 Remaining follow-up:
 
@@ -28,7 +33,8 @@ Remaining follow-up:
 - Keep server remote binding development-only until local auth token support is
   added.
 - Keep performance gates and Tauri UI smoke current as the stream path evolves.
-- Continue PR-11/PR-12 polish from the desktop performance SRS.
+  The existing preview Playwright smoke still needs a separate refresh for the
+  no-default-workspace startup state.
 
 Related: [Goal 1 status](09-goal-1-native-terminal-slice-status.md) ("Not Yet Implemented: live backend event stream; output batching/backpressure"), [Goal 16 server mode](26-goal-16-server-mode-web-terminal-status.md), [Goal groups](08-goal-groups.md).
 

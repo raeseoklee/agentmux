@@ -28,6 +28,19 @@ const TERMINAL_FONT_FAMILY = [
   "monospace"
 ].join(", ");
 const TERMINAL_FONT_SIZE = 13;
+type WebglAddonModule = typeof import("@xterm/addon-webgl");
+
+let webglAddonModulePromise: Promise<WebglAddonModule> | undefined;
+
+function loadWebglAddonModule(): Promise<WebglAddonModule> {
+  if (!webglAddonModulePromise) {
+    webglAddonModulePromise = import("@xterm/addon-webgl").catch((error) => {
+      webglAddonModulePromise = undefined;
+      throw error;
+    });
+  }
+  return webglAddonModulePromise;
+}
 
 export class XtermTerminalRenderer implements TerminalRenderer {
   private terminal?: Terminal;
@@ -182,7 +195,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const generation = ++this.webglGeneration;
     void (this.fontReadyPromise ?? Promise.resolve())
       .catch(() => {})
-      .then(() => import("@xterm/addon-webgl"))
+      .then(() => loadWebglAddonModule())
       .then(({ WebglAddon }) => {
         // Bail if this enable was superseded (disable/re-enable) or the terminal
         // was swapped/unmounted while the import was in flight, or an addon is

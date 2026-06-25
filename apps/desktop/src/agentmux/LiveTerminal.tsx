@@ -24,6 +24,7 @@ const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
 const MAX_RENDER_QUEUE_BYTES = 2 * 1024 * 1024;
 const MAX_RENDER_BATCH_BYTES = 64 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
+const WEBGL_DISABLE_DEBOUNCE_MS = 250;
 
 function terminalWebglEnabled(): boolean {
   try {
@@ -127,6 +128,7 @@ export function LiveTerminal({
   const activeRef = useRef(active);
   const bootingRef = useRef(true);
   const pollNowRef = useRef<(() => void) | null>(null);
+  const webglDisableTimerRef = useRef<number | null>(null);
   const margin = Math.min(32, Math.max(0, Math.round(innerMargin)));
   // True until this session's first output byte is rendered. The component is
   // keyed by sessionId upstream, so this resets for every session. It drives a
@@ -861,13 +863,26 @@ export function LiveTerminal({
     if (!renderer) {
       return;
     }
+    const clearWebglDisableTimer = () => {
+      if (webglDisableTimerRef.current !== null) {
+        window.clearTimeout(webglDisableTimerRef.current);
+        webglDisableTimerRef.current = null;
+      }
+    };
     if (active && terminalWebglEnabled()) {
+      clearWebglDisableTimer();
       renderer.enableWebgl();
     } else {
-      renderer.disableWebgl();
+      clearWebglDisableTimer();
+      webglDisableTimerRef.current = window.setTimeout(() => {
+        webglDisableTimerRef.current = null;
+        if (rendererRef.current === renderer) {
+          renderer.disableWebgl();
+        }
+      }, WEBGL_DISABLE_DEBOUNCE_MS);
     }
     return () => {
-      renderer.disableWebgl();
+      clearWebglDisableTimer();
     };
   }, [active, sessionId, client]);
 

@@ -3306,10 +3306,10 @@ export function AgentmuxTerminalApp() {
         </div>
       );
     }
-    const nextVisited = new Set(visited);
-    nextVisited.add(paneId);
+    visited.add(paneId);
     const pane = paneById.get(paneId);
-    if (!pane) return null;
+    try {
+      if (!pane) return null;
 
     if (pane.kind === "split") {
       const children = (childrenByParent.get(pane.paneId) ?? []).filter(
@@ -3339,7 +3339,7 @@ export function AgentmuxTerminalApp() {
                 display: "flex",
               }}
             >
-              {renderPane(first.paneId, nextVisited)}
+              {renderPane(first.paneId, visited)}
             </div>
           ) : null}
           {first && second ? (
@@ -3357,7 +3357,7 @@ export function AgentmuxTerminalApp() {
                 display: "flex",
               }}
             >
-              {renderPane(second.paneId, nextVisited)}
+              {renderPane(second.paneId, visited)}
             </div>
           ) : null}
         </div>
@@ -3381,7 +3381,7 @@ export function AgentmuxTerminalApp() {
     const dot = sessionDotColor(T, session, hasAttention);
     const label = sessionLabel(session, hasAttention);
 
-    return (
+      return (
       <PaneView
         key={pane.paneId}
         pane={pane}
@@ -3406,6 +3406,9 @@ export function AgentmuxTerminalApp() {
         onTerminalError={refreshStable}
       />
     );
+    } finally {
+      visited.delete(paneId);
+    }
   };
 
   return (

@@ -5,7 +5,7 @@ Conforms to ISO/IEC/IEEE 29148:2018 (Requirements engineering — Software requi
 | Field | Value |
 |-------|-------|
 | Document ID | SRS-PERF-001 |
-| Status | Implemented baseline; PR-11/PR-12 follow-up remains |
+| Status | Implemented baseline; PR-7 through PR-12 complete |
 | Scope | AgentMux desktop application (Tauri host + React/xterm UI + Rust control plane hot paths) |
 | Related | [ieee-29148-system-design.md](./ieee-29148-system-design.md), [implementation/17-goal-9-performance-diagnostics-status.md](./implementation/17-goal-9-performance-diagnostics-status.md), [implementation/04-ui-terminal-rendering.md](./implementation/04-ui-terminal-rendering.md) |
 
@@ -18,7 +18,14 @@ Implementation note, 2026-06-25:
   construction, byte-level agent-signal scan prefilters with per-session
   heuristic throttling, read-only runtime pre-dispatch event-collection
   reduction, and an amortized `VecDeque` recent-output ring.
-- PR-11 and PR-12 remain polish items.
+- The next follow-up implements PR-11 and PR-12: DFS backtracking for
+  `renderPane` cycle detection, cached WebGL addon module loading, and debounced
+  WebGL teardown on pane deactivation.
+- Verification note: `npm run desktop:build` and `git diff --check` pass for
+  PR-11/PR-12. A targeted Playwright split-pane smoke currently times out before
+  it reaches pane rendering because the preview test suite still assumes a
+  default workspace exists; that fixture needs a separate no-default-workspace
+  update.
 
 ### 1.1 Purpose
 
