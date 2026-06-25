@@ -6660,6 +6660,11 @@ fn is_websocket_upgrade(stream: &TcpStream) -> Result<bool, CliError> {
         && head.contains("\r\nsec-websocket-key:"))
 }
 
+// The accept_hdr handshake callback must return tungstenite's
+// Result<Response, ErrorResponse>; that Err variant (an http::Response) is
+// large and imposed by the upstream API, so the large-Err lint can't be
+// resolved by boxing here.
+#[allow(clippy::result_large_err)]
 fn handle_server_websocket(
     stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
