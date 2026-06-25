@@ -1,0 +1,104 @@
+﻿{
+    "generated_at":  "2026-06-25T11:47:25.7214253Z",
+    "script":  "tools/run-installer-lifecycle-gate.ps1",
+    "expected_phase":  "installed",
+    "require_cli":  true,
+    "require_user_path":  true,
+    "result":  "passed",
+    "requirements":  [
+                         "installer artifact is present",
+                         "AgentMux registry entry is present",
+                         "installed AgentMux executable is present",
+                         "uninstall command is present",
+                         "installed agentmux.exe CLI is present",
+                         "installed cmux.exe CLI is present",
+                         "AgentMux install directory is present on the user PATH"
+                     ],
+    "phase_checks":  {
+                         "installer_found":  true,
+                         "registry_entry_present":  true,
+                         "installed_executable_present":  true,
+                         "installed_agentmux_cli_present":  true,
+                         "installed_cmux_cli_present":  true,
+                         "install_directory_on_user_path":  true,
+                         "uninstall_command_present":  true,
+                         "shortcuts_present":  true
+                     },
+    "installer":  {
+                      "status":  "found",
+                      "source":  "parameter",
+                      "file":  {
+                                   "path":  "D:\\Workspace\\irae\\agentmux\\target\\release\\bundle\\nsis\\AgentMux_0.1.0_x64-setup.exe",
+                                   "relative_path":  "target/release/bundle/nsis/AgentMux_0.1.0_x64-setup.exe",
+                                   "exists":  true,
+                                   "bytes":  21132197,
+                                   "sha256":  "72774DD4C4ECCB75EC1BA92CE94B15191514F079B0D497B8932858A8162E2B55",
+                                   "last_write_time":  "2026-06-25T11:30:59.7138707Z"
+                               }
+                  },
+    "installed_state":  {
+                            "registry_entries":  [
+                                                     {
+                                                         "display_name":  "AgentMux",
+                                                         "display_version":  "0.1.0",
+                                                         "publisher":  "agentmux",
+                                                         "install_location":  "\"C:\\Users\\irae\\AppData\\Local\\AgentMux\"",
+                                                         "display_icon":  "\"C:\\Users\\irae\\AppData\\Local\\AgentMux\\agentmux-desktop-host.exe\"",
+                                                         "uninstall_string":  "\"C:\\Users\\irae\\AppData\\Local\\AgentMux\\uninstall.exe\"",
+                                                         "quiet_uninstall_string":  null,
+                                                         "registry_source":  "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*"
+                                                     }
+                                                 ],
+                            "install_locations":  [
+                                                      "C:\\Users\\irae\\AppData\\Local\\AgentMux"
+                                                  ],
+                            "user_path":  {
+                                              "value":  "C:\\Users\\irae\\scoop\\shims;C:\\Users\\irae\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Users\\irae\\AppData\\Local\\Programs\\Fiddler;C:\\Users\\irae\\AppData\\Local\\Yarn\\bin;C:\\Users\\irae\\.dotnet\\tools;C:\\Program Files\\JetBrains\\IntelliJ IDEA 2024.2.3\\bin;;C:\\ProgramData\\mingw64\\mingw64\\bin;C:\\Users\\irae\\.azure-kubectl;C:\\Users\\irae\\.azure-kubelogin;C:\\Users\\irae\\AppData\\Roaming\\npm;C:\\Users\\irae\\AppData\\Local\\Programs\\Ollama;C:\\Users\\irae\\AppData\\Local\\Programs\\cursor\\resources\\app\\bin;C:\\Users\\irae\\AppData\\Local\\Programs\\Antigravity\\bin;C:\\Users\\irae\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe;;C:\\Users\\irae\\AppData\\Local\\AgentMux",
+                                              "install_directory_on_user_path":  true
+                                          },
+                            "executable_candidates":  [
+                                                          {
+                                                              "path":  "C:\\Users\\irae\\AppData\\Local\\AgentMux\\agentmux-desktop-host.exe",
+                                                              "relative_path":  "C:\\Users\\irae\\AppData\\Local\\AgentMux\\agentmux-desktop-host.exe",
+                                                              "exists":  true,
+                                                              "bytes":  24732672,
+                                                              "sha256":  "0A376C7846AFDFCD092153BD418EC65F5A39506B688A0FCB00B5B6002B38EB65",
+                                                              "last_write_time":  "2026-06-25T11:30:34.0000000Z"
+                                                          }
+                                                      ],
+                            "agentmux_cli_candidates":  [
+                                                            {
+                                                                "path":  "C:\\Users\\irae\\AppData\\Local\\AgentMux\\agentmux.exe",
+                                                                "relative_path":  "C:\\Users\\irae\\AppData\\Local\\AgentMux\\agentmux.exe",
+                                                                "exists":  true,
+                                                                "bytes":  4161536,
+                                                                "sha256":  "9E9A7C96E6C6DF82F033234AD1E73525997E7814BB9D9A2FD6E3D239768EC46E",
+                                                                "last_write_time":  "2026-06-25T11:28:12.0000000Z"
+                                                            }
+                                                        ],
+                            "cmux_cli_candidates":  [
+                                                        {
+                                                            "path":  "C:\\Users\\irae\\AppData\\Local\\AgentMux\\cmux.exe",
+                                                            "relative_path":  "C:\\Users\\irae\\AppData\\Local\\AgentMux\\cmux.exe",
+                                                            "exists":  true,
+                                                            "bytes":  4161536,
+                                                            "sha256":  "B9C88BF45A7AB01548FD19D67F96F92DD281698B57401C31110BB57A8E7878E7",
+                                                            "last_write_time":  "2026-06-25T11:28:12.0000000Z"
+                                                        }
+                                                    ],
+                            "shortcuts":  [
+                                              {
+                                                  "path":  "C:\\Users\\irae\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\AgentMux.lnk",
+                                                  "relative_path":  "C:\\Users\\irae\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\AgentMux.lnk",
+                                                  "bytes":  1280,
+                                                  "last_write_time":  "2026-06-25T11:47:03.3399867Z"
+                                              },
+                                              {
+                                                  "path":  "C:\\Users\\irae\\Desktop\\AgentMux.lnk",
+                                                  "relative_path":  "C:\\Users\\irae\\Desktop\\AgentMux.lnk",
+                                                  "bytes":  1272,
+                                                  "last_write_time":  "2026-06-25T11:47:03.3620748Z"
+                                              }
+                                          ]
+                        }
+}

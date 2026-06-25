@@ -49,6 +49,7 @@ Date: 2026-06-18
 26. [25-goal-15-workspace-groups-status.md](./25-goal-15-workspace-groups-status.md)
 27. [26-goal-16-server-mode-web-terminal-status.md](./26-goal-16-server-mode-web-terminal-status.md)
 28. [28-goal-18-p2-installed-server-mode-release-gate.md](./28-goal-18-p2-installed-server-mode-release-gate.md)
+29. [29-installed-lifecycle-e2e-release-closure.md](./29-installed-lifecycle-e2e-release-closure.md)
 
 ## 구현 원칙
 

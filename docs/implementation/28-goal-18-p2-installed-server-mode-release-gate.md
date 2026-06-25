@@ -81,10 +81,10 @@ Additional local checks:
 PowerShell parser checks for tools/run-installer-contents-gate.ps1 and tools/run-server-mode-smoke.ps1
 ```
 
-## Remaining Separate Gates
+## Subsequent Gate Closure
 
-- Manual installed/uninstalled lifecycle evidence with
-  `npm run installer:lifecycle-gate -- installed -RequireCli -RequireUserPath`
-  remains a separate release-candidate signoff.
-- End-to-end interactive UI review from a freshly installed app remains a manual
-  usability check, not a blocker for this packaged server-mode gate.
+- Installed/uninstalled lifecycle evidence and installed desktop/CLI smoke are
+  now recorded in
+  [29-installed-lifecycle-e2e-release-closure.md](./29-installed-lifecycle-e2e-release-closure.md).
+- End-to-end interactive UI review from a freshly installed app remains an
+  exploratory usability check, not a blocker for this packaged server-mode gate.

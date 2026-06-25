@@ -258,6 +258,9 @@ the installed executable, an uninstall command, and Start Menu shortcut
 presence. Use `npm run installer:lifecycle-gate -- installed -RequireCli -RequireUserPath`
 for final signoff so installed `agentmux.exe` and `cmux.exe` sidecars plus
 install-directory user PATH registration are also required.
+The 2026-06-25 release closure captured a real NSIS install, installed desktop
+smoke, installed CLI server smoke, and silent uninstall gate in
+`29-installed-lifecycle-e2e-release-closure.md`.
 
 Release candidate must not have:
 

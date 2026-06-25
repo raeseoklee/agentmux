@@ -1,6 +1,7 @@
 param(
   [string]$OutputDir = "",
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+  [string]$CliExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -170,6 +171,22 @@ function Resolve-CargoExecutable {
 }
 
 function Resolve-CliExecutable {
+  param([string]$RequestedPath, [string]$InstalledDesktopExe)
+
+  if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+    if (-not (Test-Path -LiteralPath $RequestedPath)) {
+      throw "Requested agentmux CLI executable was not found at $RequestedPath"
+    }
+    return [System.IO.Path]::GetFullPath($RequestedPath)
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($InstalledDesktopExe)) {
+    $installedCli = Join-Path (Split-Path -Parent $InstalledDesktopExe) "agentmux.exe"
+    if (Test-Path -LiteralPath $installedCli) {
+      return $installedCli
+    }
+  }
+
   $debug = Join-Path $root "target\debug\agentmux.exe"
   if (Test-Path -LiteralPath $debug) {
     return $debug
@@ -258,9 +275,9 @@ if (-not $SkipBuild) {
   }
 }
 
-$cliExe = Resolve-CliExecutable
 $install = Find-AgentMuxInstall
 $desktopExe = $install.executable
+$cliExe = Resolve-CliExecutable -RequestedPath $CliExe -InstalledDesktopExe $desktopExe
 
 $runtimeDir = Join-Path $OutputDir "runtime"
 New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
