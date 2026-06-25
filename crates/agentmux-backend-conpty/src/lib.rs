@@ -163,6 +163,8 @@ mod platform {
     };
 
     const STILL_ACTIVE: u32 = 259;
+    const ERROR_HANDLE_EOF_CODE: u32 = 38;
+    const ERROR_BROKEN_PIPE_CODE: u32 = 109;
 
     #[derive(Default)]
     pub struct ConptyBackend {
@@ -598,13 +600,13 @@ mod platform {
                     )
                 };
 
-                if ok == 0 || bytes_read == 0 {
-                    let message = if ok == 0 {
-                        let error = unsafe { GetLastError() };
-                        format!("ReadFile(output) ended. GetLastError={error}.")
-                    } else {
-                        "ReadFile(output) returned zero bytes.".to_string()
-                    };
+                if ok == 0 {
+                    let error = unsafe { GetLastError() };
+                    if matches!(error, ERROR_HANDLE_EOF_CODE | ERROR_BROKEN_PIPE_CODE) {
+                        break;
+                    }
+
+                    let message = format!("ReadFile(output) ended. GetLastError={error}.");
 
                     if let Ok(mut events) = events.lock() {
                         events.push(BackendEvent::Error {
@@ -612,6 +614,10 @@ mod platform {
                             error: BackendError::new("output_read_ended", message),
                         });
                     }
+                    break;
+                }
+
+                if bytes_read == 0 {
                     break;
                 }
 

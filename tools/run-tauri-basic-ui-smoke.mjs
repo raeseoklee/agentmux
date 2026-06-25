@@ -109,9 +109,6 @@ async function callControl(page, method, params = {}) {
 async function waitForAppReady(page) {
   await page.waitForLoadState("domcontentloaded");
   await page.locator("[data-agentmux-root]").waitFor({ timeout: 15000 });
-  await page.locator(".agentmux-workspace-card").first().waitFor({
-    timeout: 15000,
-  });
   const filter = page.locator(".agentmux-workspace-filter-input");
   if (await filter.isVisible().catch(() => false)) {
     await filter.fill("");
@@ -148,6 +145,35 @@ async function closeSmokeWorkspace(page, policy = "terminate_sessions") {
   } finally {
     smokeWorkspaceId = null;
   }
+}
+
+async function waitForNotification(page, predicate, description, timeoutMs = 20000) {
+  return waitFor(
+    async () => {
+      const result = await callControl(page, "notification.list", {
+        workspace_id: smokeWorkspaceId,
+        severity: null,
+        include_dismissed: false,
+      });
+      return result.notifications.find(predicate);
+    },
+    description,
+    timeoutMs,
+  );
+}
+
+async function waitForSessionOutput(page, sessionId, predicate, description, timeoutMs = 10000) {
+  return waitFor(
+    async () => {
+      const result = await callControl(page, "session.read_recent", {
+        session_id: sessionId,
+        max_bytes: 4096,
+      });
+      return predicate(result.text) ? result.text : null;
+    },
+    description,
+    timeoutMs,
+  );
 }
 
 async function run() {
@@ -199,20 +225,34 @@ async function run() {
       workspaceName: smokeWorkspaceName,
     });
 
+    await waitFor(
+      async () => (await count(page, ".agentmux-surface-tab")) > 0,
+      "initial workspace terminal tab to render",
+      15000,
+    );
     const initialTabCount = await count(page, ".agentmux-surface-tab");
     const initialPaneCount = await count(page, "[data-agentmux-pane]");
-    await page.locator(".agentmux-new-terminal-tab").click();
+    const tabSpawn = await callControl(page, "session.spawn", {
+      workspace_id: smokeWorkspaceId,
+      backend: "conpty",
+      command: ["cmd.exe", "/d", "/q"],
+      cwd: null,
+      columns: 80,
+      rows: 24,
+      durability: "ephemeral",
+      placement: "new_tab",
+    });
     await waitForCount(
       page,
       ".agentmux-surface-tab",
       initialTabCount + 1,
       45000,
     );
-    await waitForCount(page, "[data-agentmux-pane]", initialPaneCount, 15000);
     await page.locator(".agentmux-surface-tab-close").last().click();
     await waitForCount(page, ".agentmux-surface-tab", initialTabCount, 25000);
     await waitForCount(page, "[data-agentmux-pane]", initialPaneCount, 15000);
     pushStep("tab open/close", {
+      spawnedSessionId: tabSpawn.session_id,
       initialTabCount,
       finalTabCount: await count(page, ".agentmux-surface-tab"),
       paneCountAfterTabClose: await count(page, "[data-agentmux-pane]"),
@@ -237,6 +277,75 @@ async function run() {
       tabCountAfterSplitClose: await count(page, ".agentmux-surface-tab"),
     });
 
+    const agentCommand = [
+      "cmd.exe",
+      "/d",
+      "/q",
+    ];
+    const agentSpawn = await callControl(page, "session.spawn", {
+      workspace_id: smokeWorkspaceId,
+      backend: "conpty",
+      command: agentCommand,
+      cwd: null,
+      columns: 80,
+      rows: 24,
+      durability: "ephemeral",
+    });
+    await callControl(page, "agent.set_state", {
+      session_id: agentSpawn.session_id,
+      state: "running",
+      reason: "Agent started: tauri-ui-e2e",
+      telemetry: {
+        activity: "agent",
+        session: "tauri-ui-e2e",
+      },
+    });
+    await waitForSessionOutput(
+      page,
+      agentSpawn.session_id,
+      (text) => text.includes(">"),
+      "agent command prompt before sending exit",
+    );
+    await callControl(page, "session.send_text", {
+      session_id: agentSpawn.session_id,
+      text: "exit",
+    });
+    await callControl(page, "session.send_key", {
+      session_id: agentSpawn.session_id,
+      key: "enter",
+    });
+    const completedNotification = await waitForNotification(
+      page,
+      (notification) =>
+        notification.notification_type === "agent.completed" &&
+        notification.session_id === agentSpawn.session_id,
+      "agent.completed notification for Tauri UI smoke agent",
+      30000,
+    );
+    await page.locator(".agentmux-settings-open").click();
+    await page.locator(".agentmux-settings-tab-general").click();
+    await page
+      .locator(
+        `[data-agentmux-notification="${completedNotification.notification_id}"]`,
+      )
+      .waitFor({ timeout: 15000 });
+    await page
+      .locator(
+        `[data-agentmux-notification="${completedNotification.notification_id}"]`,
+      )
+      .filter({ hasText: "Agent completed" })
+      .waitFor({ timeout: 15000 });
+    await page.locator(".agentmux-settings-close").click();
+    await page
+      .locator(".agentmux-settings-tab-general")
+      .waitFor({ state: "detached", timeout: 15000 });
+    pushStep("agent completion notification", {
+      sessionId: agentSpawn.session_id,
+      notificationId: completedNotification.notification_id,
+      notificationType: completedNotification.notification_type,
+      message: completedNotification.message,
+    });
+
     const workspaceCountBeforeClose = await count(
       page,
       ".agentmux-workspace-card",
@@ -246,6 +355,15 @@ async function run() {
     });
     await smokeCard.first().click({ button: "right" });
     await page.locator(".agentmux-workspace-menu-close").click();
+    const confirmModal = page.locator(".agentmux-confirm-modal");
+    if (
+      await confirmModal
+        .waitFor({ state: "visible", timeout: 1500 })
+        .then(() => true)
+        .catch(() => false)
+    ) {
+      await page.locator(".agentmux-confirm-confirm").click();
+    }
     await waitFor(
       async () => (await smokeCard.count()) === 0,
       "smoke workspace to close from UI",

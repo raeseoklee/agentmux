@@ -7569,6 +7569,7 @@ function SettingsModal(props: SettingsModalProps) {
         >
           <Hov
             tag="span"
+            className="agentmux-settings-close"
             style={{
               position: "absolute",
               top: 16,
@@ -8833,6 +8834,9 @@ function SettingsModal(props: SettingsModalProps) {
                   {notifications.map((n) => (
                     <div
                       key={n.notificationId}
+                      data-agentmux-notification={n.notificationId}
+                      data-agentmux-notification-type={n.notificationType}
+                      data-agentmux-notification-severity={n.severity}
                       style={{
                         display: "flex",
                         alignItems: "center",
