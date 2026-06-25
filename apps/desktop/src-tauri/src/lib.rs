@@ -722,9 +722,11 @@ impl DesktopControlState {
             );
         };
 
-        control.collect_events();
-        if let Some(error) = self.persist_agent_snapshots(&control, &id) {
-            return error;
+        if runtime_request_needs_pre_dispatch_collect(&request.method) {
+            control.collect_events();
+            if let Some(error) = self.persist_agent_snapshots(&control, &id) {
+                return error;
+            }
         }
         let response = control.handle_request(request);
         control.collect_events();
@@ -9201,6 +9203,21 @@ fn workspace_summary(workspace: &PersistedWorkspace) -> WorkspaceSummaryResult {
     }
 }
 
+fn runtime_request_needs_pre_dispatch_collect(method: &str) -> bool {
+    !matches!(
+        method,
+        "session.list"
+            | "session.get"
+            | "session.read_recent"
+            | "session.snapshot"
+            | "events.poll"
+            | "events.subscribe"
+            | "agent.get_state"
+            | "agent.list_attention"
+            | "notification.list"
+    )
+}
+
 fn clean_optional_text(value: Option<String>) -> Option<String> {
     value
         .map(|text| text.trim().to_string())
@@ -9959,6 +9976,21 @@ mod tests {
     fn desktop_control_state_is_shareable() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DesktopControlState>();
+    }
+
+    #[test]
+    fn read_only_runtime_requests_skip_pre_dispatch_collect() {
+        assert!(!runtime_request_needs_pre_dispatch_collect(
+            "session.snapshot"
+        ));
+        assert!(!runtime_request_needs_pre_dispatch_collect("session.get"));
+        assert!(!runtime_request_needs_pre_dispatch_collect(
+            "notification.list"
+        ));
+        assert!(runtime_request_needs_pre_dispatch_collect(
+            "session.send_text"
+        ));
+        assert!(runtime_request_needs_pre_dispatch_collect("session.spawn"));
     }
 
     #[test]

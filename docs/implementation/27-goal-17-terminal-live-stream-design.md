@@ -1,8 +1,40 @@
-# Goal 17 — Terminal Live Byte Stream (Design + Spike)
+# Goal 17 — Terminal Live Byte Stream
 
-Status: Design + spike; pending implementation decision
+Status: Implemented baseline; follow-up hardening remains
+
+Implementation update, 2026-06-25:
+
+- `session.snapshot` is implemented as a separate raw-byte/base64 snapshot API,
+  leaving `session.read_recent` as the lossy-text compatibility path for CLI and
+  fallback clients.
+- Desktop Tauri uses a per-session output stream via `tauri::ipc::Channel`,
+  with raw output bytes base64-encoded at the host boundary and decoded to
+  `Uint8Array` before xterm ingestion.
+- Server mode exposes the same output-stream contract through a per-session
+  WebSocket at `/api/session/<session-id>/stream`.
+- `LiveTerminal` is stream-first when a stream transport is available, with
+  snapshot polling and legacy `readRecent` polling retained only as fallback
+  paths.
+- Host diagnostics now expose output-stream counters, renderer queued bytes,
+  and renderer backpressure reports.
+- The 2026-06-25 performance follow-up implements PR-7 through PR-10: action
+  descriptor source-list splitting, byte-level agent-signal prefiltering plus
+  heuristic scan throttling, read-only runtime pre-dispatch `collect_events`
+  reduction, and an amortized `VecDeque` recent-output ring.
+
+Remaining follow-up:
+
+- Add backend-specific real PTY read-pause beyond renderer pressure reporting.
+- Keep server remote binding development-only until local auth token support is
+  added.
+- Keep performance gates and Tauri UI smoke current as the stream path evolves.
+- Continue PR-11/PR-12 polish from the desktop performance SRS.
 
 Related: [Goal 1 status](09-goal-1-native-terminal-slice-status.md) ("Not Yet Implemented: live backend event stream; output batching/backpressure"), [Goal 16 server mode](26-goal-16-server-mode-web-terminal-status.md), [Goal groups](08-goal-groups.md).
+
+Current reading note: sections below preserve the original design rationale.
+When they describe future work or pending choices, prefer the implementation
+update above and the decision summary in section 9 for the current state.
 
 This document specifies — implementation-ready, before any code is written — the replacement of the terminal output **polling** model with a **live byte stream**. The design below is converged with the user; it is to be specified precisely, not re-litigated. Step #1 (WebGL renderer, visible-only) is being implemented separately and is referenced where it intersects this work.
 
@@ -181,25 +213,30 @@ The point of defining the abstraction once is that the core emits an ordered off
 
 ## 8. Phased rollout / sequencing + rough effort sizing
 
-| # | Step | Layer | Rough size |
-|---|------|-------|------------|
-| 1 | WebGL renderer, **visible-only** (in progress, separate) | UI | — (separate) |
-| 2 | **Offset snapshot API** — absolute counter + `snapshot(base,end,bytes)` | core + ipc | S–M (per-session `u64` counter in `TerminalRuntime`; one new/extended result struct + fixture) |
-| 3 | **Channel encoding spike** (§3.3 A/B) | host + UI | S (manual measurement, no production code committed until decided) |
-| 4 | **Stream-first LiveTerminal** — subscribe via Channel, write bytes, drop poll loop | UI + host | M (replace poll loop with `onmessage`; keep input/resize sends) |
-| 5 | **Bounded queue + coalescing** (Phase 1 backpressure) | host | M |
-| 6 | **Server WS** sink for `session.output` | server (Goal 16) | M–L |
+| # | Step | Layer | Current status |
+|---|------|-------|----------------|
+| 1 | WebGL renderer, **visible-only** | UI | Implemented |
+| 2 | **Offset snapshot API** — absolute counter + `snapshot(base,end,bytes)` | core + ipc | Implemented |
+| 3 | **Channel encoding** | host + UI | Base64 chosen and implemented |
+| 4 | **Stream-first LiveTerminal** — subscribe via Channel/WS, write bytes | UI + host | Implemented with fallback polling retained |
+| 5 | **Bounded queue + coalescing** (Phase 1 backpressure) | host | Implemented baseline; renderer pressure diagnostics remain additive |
+| 6 | **Server WS** sink for `session.output` | server (Goal 16) | Implemented baseline |
 
 Sequencing rationale: the snapshot API (2) is the prerequisite for both the stream renderer (4) and the WebGL swap (1); the spike (3) gates the wire format before (4) is written; backpressure (5) hardens (4); the WS sink (6) reuses the same abstraction last.
 
 ---
 
-## 9. Open decisions for the user
+## 9. Decisions
 
-1. **IPC shape for snapshot** — (a) add a **new** method `session.snapshot` returning `{ base_offset, end_offset, bytes }`, **or** (b) extend the existing `SessionReadRecentResult` (`crates/agentmux-ipc/src/lib.rs:836-841`) to add `base_offset` / `end_offset` (and a raw/base64 bytes field) alongside the current lossy `text`. A new method keeps `read_recent` untouched for the CLI; extending reuses one struct but mixes the lossy-text and raw-bytes contracts. → **DECISION (user, 2026-06-23): option (a) — add a new `session.snapshot` method, leaving `read_recent` untouched.**
-2. **Frame encoding** — base64 string (recommended default) vs `number[]`; **pending the §3.3 spike**.
-3. **Where the bytes live** — a **separate `session.output` stream channel** (recommended) vs stuffing bytes into `EventFrame.data_json`. Recommend **separate**: today `CoreEvent::SessionOutputBatch` deliberately keeps only `byte_count` in the event (`crates/agentmux-core/src/lib.rs:1468-1480`); routing bulk terminal bytes through the bounded event history (`events.poll`/`events.subscribe`) would pollute that history, blow its memory bound, and entangle terminal backpressure with event backpressure. Keep terminal bytes on their own channel; keep `session.output` **events** as the lightweight `byte_count` signal they already are.
-4. **Where the absolute offset counter lives** — recommend the **core `TerminalRuntime`, per session**, incremented in the same place the ring is appended (`append_recent_output` / the `BackendEvent::Output` arm at `crates/agentmux-core/src/lib.rs:538-548`), so `end_offset` and the ring stay consistent under one lock.
+1. **IPC shape for snapshot** — implemented as a new `session.snapshot` method,
+   leaving `session.read_recent` untouched for compatibility.
+2. **Frame encoding** — base64 string, decoded to `Uint8Array` in the renderer.
+3. **Where the bytes live** — separate `session.output` stream channels rather
+   than `EventFrame.data_json`; event history keeps only lightweight byte-count
+   signals.
+4. **Where the absolute offset counter lives** — core `TerminalRuntime`, per
+   session, incremented with each `BackendEvent::Output` before the recent ring
+   is updated.
 
 Secondary note for (1)/(3): the IPC `ErrorCode` enum (`crates/agentmux-ipc/src/lib.rs:104-119`) has **no** `Gone` / `OutOfRange` / `ResourceExhausted` variant. A "renderer fell behind the ring" condition (§2.4) is handled entirely renderer-side by reset+restart-from-`base_offset` and needs no new error code; if a server-mode error is ever required, reuse `Conflict` or `InvalidRequest`, or add a variant deliberately (enum is a wire contract with fixtures).
 

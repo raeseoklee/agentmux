@@ -5,11 +5,20 @@ Conforms to ISO/IEC/IEEE 29148:2018 (Requirements engineering — Software requi
 | Field | Value |
 |-------|-------|
 | Document ID | SRS-PERF-001 |
-| Status | Draft |
+| Status | Implemented baseline; PR-11/PR-12 follow-up remains |
 | Scope | AgentMux desktop application (Tauri host + React/xterm UI + Rust control plane hot paths) |
 | Related | [ieee-29148-system-design.md](./ieee-29148-system-design.md), [implementation/17-goal-9-performance-diagnostics-status.md](./implementation/17-goal-9-performance-diagnostics-status.md), [implementation/04-ui-terminal-rendering.md](./implementation/04-ui-terminal-rendering.md) |
 
 ## 1. Introduction
+
+Implementation note, 2026-06-25:
+
+- PR-1 through PR-6 were already present in the desktop and core code paths.
+- This follow-up implements PR-7 through PR-10: split action descriptor
+  construction, byte-level agent-signal scan prefilters with per-session
+  heuristic throttling, read-only runtime pre-dispatch event-collection
+  reduction, and an amortized `VecDeque` recent-output ring.
+- PR-11 and PR-12 remain polish items.
 
 ### 1.1 Purpose
 

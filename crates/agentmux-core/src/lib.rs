@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -224,6 +225,7 @@ impl<'a> AgentSignalDetectorInput<'a> {
         }
     }
 
+    #[cfg(test)]
     fn with_heuristics(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
@@ -387,6 +389,51 @@ pub struct OutputDelta {
 
 const OUTPUT_FLOW_CONTROL_PAUSE_BYTES: u64 = 1024 * 1024;
 const OUTPUT_FLOW_CONTROL_RESUME_BYTES: u64 = 256 * 1024;
+const AGENT_HEURISTIC_SCAN_INTERVAL_BYTES: u64 = 8 * 1024;
+
+#[derive(Debug, Clone, Default)]
+struct RecentOutputBuffer {
+    bytes: VecDeque<u8>,
+}
+
+impl RecentOutputBuffer {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn append_limited(&mut self, bytes: &[u8], limit: usize) {
+        if limit == 0 {
+            self.bytes.clear();
+            return;
+        }
+
+        if bytes.len() >= limit {
+            self.bytes.clear();
+            self.bytes
+                .extend(bytes[bytes.len() - limit..].iter().copied());
+            return;
+        }
+
+        self.bytes.extend(bytes.iter().copied());
+        let overflow = self.bytes.len().saturating_sub(limit);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+        }
+    }
+
+    fn tail(&self, max_bytes: usize) -> Vec<u8> {
+        let count = max_bytes.min(self.bytes.len());
+        self.bytes
+            .iter()
+            .skip(self.bytes.len().saturating_sub(count))
+            .copied()
+            .collect()
+    }
+
+    fn from_index(&self, index: usize) -> Vec<u8> {
+        self.bytes.iter().skip(index).copied().collect()
+    }
+}
 
 pub struct TerminalRuntime<B>
 where
@@ -394,7 +441,7 @@ where
 {
     backend: B,
     sessions: HashMap<SessionId, Session>,
-    recent_output: HashMap<SessionId, Vec<u8>>,
+    recent_output: HashMap<SessionId, RecentOutputBuffer>,
     recent_output_limit: usize,
     // Absolute total bytes ever emitted per session (monotonic; never rebased on
     // ring rotation). Drives the snapshot/stream offset contract.
@@ -570,8 +617,7 @@ where
         let Some(output) = self.recent_output.get(session_id) else {
             return Some(Vec::new());
         };
-        let count = max_bytes.min(output.len());
-        Some(output[output.len().saturating_sub(count)..].to_vec())
+        Some(output.tail(max_bytes))
     }
 
     /// Atomic snapshot of a session's recent output ring plus the absolute byte
@@ -585,13 +631,9 @@ where
             return None;
         }
         let end_offset = self.output_offsets.get(session_id).copied().unwrap_or(0);
-        let empty: &[u8] = &[];
-        let ring = self
-            .recent_output
-            .get(session_id)
-            .map(|bytes| bytes.as_slice())
-            .unwrap_or(empty);
-        let ring_base = end_offset.saturating_sub(ring.len() as u64);
+        let ring = self.recent_output.get(session_id);
+        let ring_len = ring.map(RecentOutputBuffer::len).unwrap_or(0);
+        let ring_base = end_offset.saturating_sub(ring_len as u64);
         // Start at `since` when it lies within the retained ring; otherwise
         // return the whole ring (cold start, or the caller fell behind the
         // bounded window — signalled to the renderer by base_offset > since).
@@ -599,7 +641,9 @@ where
             Some(since) if since >= ring_base && since <= end_offset => since,
             _ => ring_base,
         };
-        let bytes = ring[(start - ring_base) as usize..].to_vec();
+        let bytes = ring
+            .map(|ring| ring.from_index((start - ring_base) as usize))
+            .unwrap_or_default();
         Some(OutputSnapshot {
             base_offset: start,
             end_offset,
@@ -729,6 +773,7 @@ where
     notifications: Vec<NotificationRecord>,
     next_notification_id: u64,
     notification_limit: usize,
+    agent_heuristic_next_scan_offset: HashMap<SessionId, u64>,
     events: Vec<EventFrame>,
     event_history: Vec<EventFrame>,
     next_event_id: u64,
@@ -757,6 +802,7 @@ where
             notifications: Vec::new(),
             next_notification_id: 1,
             notification_limit: 256,
+            agent_heuristic_next_scan_offset: HashMap::new(),
             events: Vec::new(),
             event_history: Vec::new(),
             next_event_id: 1,
@@ -777,6 +823,30 @@ where
 
     pub fn set_agent_heuristics_enabled(&mut self, enabled: bool) {
         self.agent_heuristics_enabled = enabled;
+    }
+
+    fn agent_heuristic_scan_allowed(
+        &mut self,
+        session_id: &SessionId,
+        from_offset: u64,
+        byte_len: usize,
+    ) -> bool {
+        let next_allowed = self
+            .agent_heuristic_next_scan_offset
+            .get(session_id)
+            .copied()
+            .unwrap_or(0);
+        if from_offset < next_allowed {
+            return false;
+        }
+
+        self.agent_heuristic_next_scan_offset.insert(
+            session_id.clone(),
+            from_offset
+                .saturating_add(byte_len as u64)
+                .saturating_add(AGENT_HEURISTIC_SCAN_INTERVAL_BYTES),
+        );
+        true
     }
 
     /// Atomic snapshot of a session's recent output ring + absolute offsets, for
@@ -834,13 +904,14 @@ where
                         })
                         .bytes
                         .extend_from_slice(bytes);
-                    let signals = if self.agent_heuristics_enabled {
-                        detect_agent_signals_from_input(AgentSignalDetectorInput::with_heuristics(
-                            bytes,
-                        ))
-                    } else {
-                        detect_agent_signals(bytes)
-                    };
+                    let mut signals = detect_agent_signals(bytes);
+                    if signals.is_empty()
+                        && self.agent_heuristics_enabled
+                        && contains_heuristic_agent_signal_marker(bytes)
+                        && self.agent_heuristic_scan_allowed(session_id, *from_offset, bytes.len())
+                    {
+                        signals.extend(detect_heuristic_agent_signals(bytes));
+                    }
                     signals
                         .into_iter()
                         .map(|signal| (session_id.clone(), signal))
@@ -1928,12 +1999,48 @@ fn detect_agent_signals(bytes: &[u8]) -> Vec<DetectedAgentSignal> {
 fn detect_agent_signals_from_input(
     input: AgentSignalDetectorInput<'_>,
 ) -> Vec<DetectedAgentSignal> {
-    let text = String::from_utf8_lossy(input.bytes);
-    let mut signals = detect_explicit_agent_signals(&text);
-    if signals.is_empty() && input.heuristic.is_some_and(|heuristic| heuristic.enabled) {
-        signals.extend(detect_heuristic_output_signals(&text));
+    let mut decoded: Option<Cow<'_, str>> = None;
+    let mut signals = Vec::new();
+
+    if contains_explicit_agent_signal_marker(input.bytes) {
+        let text = decoded.get_or_insert_with(|| String::from_utf8_lossy(input.bytes));
+        signals.extend(detect_explicit_agent_signals(text.as_ref()));
+    }
+
+    if signals.is_empty()
+        && input.heuristic.is_some_and(|heuristic| heuristic.enabled)
+        && contains_heuristic_agent_signal_marker(input.bytes)
+    {
+        let text = decoded.get_or_insert_with(|| String::from_utf8_lossy(input.bytes));
+        signals.extend(detect_heuristic_output_signals(text.as_ref()));
     }
     signals
+}
+
+fn detect_heuristic_agent_signals(bytes: &[u8]) -> Vec<DetectedAgentSignal> {
+    if !contains_heuristic_agent_signal_marker(bytes) {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(bytes);
+    detect_heuristic_output_signals(&text)
+}
+
+fn contains_explicit_agent_signal_marker(bytes: &[u8]) -> bool {
+    bytes.contains(&b':') || bytes.contains(&0x1b)
+}
+
+fn contains_heuristic_agent_signal_marker(bytes: &[u8]) -> bool {
+    contains_ascii_case_insensitive(bytes, b"input")
+        || contains_ascii_case_insensitive(bytes, b"approval")
+}
+
+fn contains_ascii_case_insensitive(bytes: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && bytes.windows(needle.len()).any(|window| {
+            window.iter().zip(needle.iter()).all(|(actual, expected)| {
+                actual.to_ascii_lowercase() == expected.to_ascii_lowercase()
+            })
+        })
 }
 
 fn detect_explicit_agent_signals(text: &str) -> Vec<DetectedAgentSignal> {
@@ -2112,7 +2219,7 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn append_recent_output(
-    recent_output: &mut HashMap<SessionId, Vec<u8>>,
+    recent_output: &mut HashMap<SessionId, RecentOutputBuffer>,
     session_id: &SessionId,
     bytes: &[u8],
     limit: usize,
@@ -2122,12 +2229,7 @@ fn append_recent_output(
     }
 
     let buffer = recent_output.entry(session_id.clone()).or_default();
-    buffer.extend_from_slice(bytes);
-
-    if buffer.len() > limit {
-        let overflow = buffer.len() - limit;
-        buffer.drain(..overflow);
-    }
+    buffer.append_limited(bytes, limit);
 }
 
 fn parse_durability(value: Option<&str>) -> Result<Durability, ControlError> {
@@ -2972,6 +3074,17 @@ mod tests {
     }
 
     #[test]
+    fn detector_rejects_unmarked_output_before_signal_scan() {
+        assert!(detect_agent_signals(b"plain terminal output without control markers").is_empty());
+        assert!(
+            detect_agent_signals_from_input(AgentSignalDetectorInput::with_heuristics(
+                b"plain terminal output without control markers"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn detector_keeps_heuristic_input_opt_in_and_separate() {
         assert!(detect_agent_signals(b"approval required before continuing").is_empty());
 
@@ -3000,6 +3113,22 @@ mod tests {
                 source: "shell_marker",
             }]
         );
+    }
+
+    #[test]
+    fn heuristic_agent_scan_is_rate_limited_per_session() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+        let session_id = SessionId::from_string("ses_rate_limited");
+
+        assert!(control.agent_heuristic_scan_allowed(&session_id, 0, 32));
+        assert!(!control.agent_heuristic_scan_allowed(&session_id, 64, 32));
+        assert!(control.agent_heuristic_scan_allowed(
+            &session_id,
+            AGENT_HEURISTIC_SCAN_INTERVAL_BYTES + 64,
+            32
+        ));
     }
 
     #[test]

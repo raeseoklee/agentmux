@@ -2754,7 +2754,73 @@ export function AgentmuxTerminalApp() {
       void ctl.spawnAgent(parts);
     }
     closeOverlay();
-  }, [closeOverlay, ctl]);
+  }, [closeOverlay, ctl.spawnAgent]);
+
+  // PR-7: keep source-list-derived command descriptors separate from the core
+  // command list so workspace/WSL/custom maps do not rebuild on unrelated UI
+  // state changes.
+  const customActionDescriptors = useMemo<ActionDescriptor[]>(
+    () =>
+      customActions.map<ActionDescriptor>((customAction) => ({
+        id: customAction.id,
+        group: groupForCustomAction(customAction),
+        title: customAction.title,
+        keywords: [
+          customAction.target,
+          ...customAction.command,
+          ...customAction.keywords,
+        ],
+        run: () => {
+          switch (customAction.target) {
+            case "agent":
+              void ctl.spawnAgent(customAction.command);
+              break;
+            case "wsl-terminal":
+              void ctl.spawnDefaultTerminal();
+              break;
+            case "browser":
+              void runBrowserCustomAction(customAction.command);
+              break;
+          }
+          closeOverlay();
+        },
+      })),
+    [
+      closeOverlay,
+      customActions,
+      ctl.spawnAgent,
+      ctl.spawnDefaultTerminal,
+      runBrowserCustomAction,
+    ],
+  );
+  const workspaceActionDescriptors = useMemo<ActionDescriptor[]>(
+    () =>
+      workspaces.map<ActionDescriptor>((ws) => ({
+        id: `workspace.select.${ws.workspaceId}`,
+        group: "workspace",
+        title: `이동: ${ws.name}`,
+        keywords: [ws.projectRoot ?? "", ws.name],
+        run: () => {
+          void ctl.selectWorkspace(ws.workspaceId);
+          closeOverlay();
+        },
+      })),
+    [closeOverlay, ctl.selectWorkspace, workspaces],
+  );
+  const wslActionDescriptors = useMemo<ActionDescriptor[]>(
+    () =>
+      wslDistributions.map<ActionDescriptor>((distribution) => ({
+        id: `wsl.open.${distribution.name}`,
+        group: "remote",
+        title: `WSL 셸: ${distribution.name}`,
+        keywords: [distribution.name, distribution.isDefault ? "default" : ""],
+        run: () => {
+          void ctl.spawnWslTerminal(distribution.name);
+          closeOverlay();
+        },
+      })),
+    [closeOverlay, ctl.spawnWslTerminal, wslDistributions],
+  );
   const actions = useMemo<ActionDescriptor[]>(
     () => [
       {
@@ -2894,40 +2960,8 @@ export function AgentmuxTerminalApp() {
           closeOverlay();
         },
       },
-      ...customActions.map<ActionDescriptor>((customAction) => ({
-        id: customAction.id,
-        group: groupForCustomAction(customAction),
-        title: customAction.title,
-        keywords: [
-          customAction.target,
-          ...customAction.command,
-          ...customAction.keywords,
-        ],
-        run: () => {
-          switch (customAction.target) {
-            case "agent":
-              void ctl.spawnAgent(customAction.command);
-              break;
-            case "wsl-terminal":
-              void ctl.spawnDefaultTerminal();
-              break;
-            case "browser":
-              void runBrowserCustomAction(customAction.command);
-              break;
-          }
-          closeOverlay();
-        },
-      })),
-      ...workspaces.map<ActionDescriptor>((ws) => ({
-        id: `workspace.select.${ws.workspaceId}`,
-        group: "workspace",
-        title: `이동: ${ws.name}`,
-        keywords: [ws.projectRoot ?? "", ws.name],
-        run: () => {
-          void ctl.selectWorkspace(ws.workspaceId);
-          closeOverlay();
-        },
-      })),
+      ...customActionDescriptors,
+      ...workspaceActionDescriptors,
       {
         id: "view.toggleTheme",
         group: "view",
@@ -2959,16 +2993,7 @@ export function AgentmuxTerminalApp() {
         keywords: ["find", "search"],
         run: () => setOverlay("search"),
       },
-      ...wslDistributions.map<ActionDescriptor>((distribution) => ({
-        id: `wsl.open.${distribution.name}`,
-        group: "remote",
-        title: `WSL 셸: ${distribution.name}`,
-        keywords: [distribution.name, distribution.isDefault ? "default" : ""],
-        run: () => {
-          void ctl.spawnWslTerminal(distribution.name);
-          closeOverlay();
-        },
-      })),
+      ...wslActionDescriptors,
     ],
     [
       activePaneId,
@@ -2976,16 +3001,16 @@ export function AgentmuxTerminalApp() {
       addTerminal,
       closeOverlay,
       createWorkspace,
-      customActions,
-      ctl,
+      ctl.createBrowserSurface,
+      ctl.spawnAgent,
+      customActionDescriptors,
       isDark,
       openTerminalInPane,
       openTextBoxComposer,
       promptCustomAgent,
-      runBrowserCustomAction,
       splitPaneBy,
-      workspaces,
-      wslDistributions,
+      workspaceActionDescriptors,
+      wslActionDescriptors,
     ],
   );
   const actionsById = useMemo(
