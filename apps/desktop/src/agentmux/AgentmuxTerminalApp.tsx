@@ -344,7 +344,8 @@ function isLiveSession(session: TerminalSession | undefined): boolean {
     !!session &&
     (session.state === "running" ||
       session.state === "starting" ||
-      session.state === "recovering")
+      session.state === "recovering" ||
+      session.state === "preview")
   );
 }
 
@@ -3096,12 +3097,17 @@ export function AgentmuxTerminalApp() {
         return;
       }
 
+      const stroke = keyboardEventToStroke(event);
+
       // ⌘/Ctrl+B — toggle the workspace sidebar (VS Code convention).
       if (
         (event.metaKey || event.ctrlKey) &&
         !event.altKey &&
         !event.shiftKey &&
-        key === "b"
+        key === "b" &&
+        (!stroke ||
+          (!shortcutIndex.chordPrefix.has(stroke) &&
+            !shortcutIndex.single.has(stroke)))
       ) {
         event.preventDefault();
         event.stopPropagation();
@@ -3128,7 +3134,6 @@ export function AgentmuxTerminalApp() {
         }
       }
 
-      const stroke = keyboardEventToStroke(event);
       if (!stroke) {
         return;
       }

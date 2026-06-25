@@ -2078,7 +2078,7 @@ class BrowserPreviewControlClient implements ControlClient {
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
-    return [...this.workspaces];
+    return this.workspaces.map((workspace) => ({ ...workspace }));
   }
 
   async createWorkspace(
@@ -2111,7 +2111,7 @@ class BrowserPreviewControlClient implements ControlClient {
         mountedSurfaceId: null,
       },
     ]);
-    return workspace;
+    return { ...workspace };
   }
 
   async getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
@@ -2123,17 +2123,17 @@ class BrowserPreviewControlClient implements ControlClient {
       terminalSurfaces.map((surface) => surface.sessionId).filter(Boolean),
     );
     return {
-      workspace,
-      panes: [...(this.panes.get(workspaceId) ?? [])],
+      workspace: { ...workspace },
+      panes: (this.panes.get(workspaceId) ?? []).map((pane) => ({ ...pane })),
       surfaces: [
         ...terminalSurfaces,
         ...this.browserSurfaces.filter(
           (surface) => surface.workspaceId === workspaceId,
         ),
-      ],
-      sessions: [...this.sessions.values()].filter((session) =>
-        sessionIds.has(session.sessionId),
-      ),
+      ].map((surface) => ({ ...surface })),
+      sessions: [...this.sessions.values()]
+        .filter((session) => sessionIds.has(session.sessionId))
+        .map((session) => ({ ...session })),
     };
   }
 

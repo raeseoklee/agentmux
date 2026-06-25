@@ -960,7 +960,7 @@ test("shortcut bindings support config override and two-step chords", async ({
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(2);
   await expect(
     page.getByRole("textbox", { name: "워크스페이스 이름" }),
-  ).toHaveValue("Workspace 1");
+  ).toHaveValue("Workspace 2");
 });
 
 test("settings can edit shortcuts and report conflicts", async ({ page }) => {
