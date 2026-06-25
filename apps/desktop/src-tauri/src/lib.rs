@@ -52,27 +52,28 @@ use agentmux_ipc::{
     BrowserScrollParams, BrowserSelectParams, BrowserStorageEntryResult, BrowserStorageResult,
     BrowserSurfaceParams, BrowserTypeParams, BrowserWaitForSelectorParams,
     BrowserWaitForSelectorResult, BrowserZoomParams, ControlError, ControlPipeConnection,
-    DiagnosticsBackendHealthResult, DiagnosticsExportResult, DiagnosticsQueuePressureResult,
-    DockConfigResult, DockControlResult, DockGetParams, DockTrustParams, EnvVarParam, ErrorCode,
-    EventSubscribeParams, EventSubscribeResult, NotificationClearParams, NotificationClearResult,
-    NotificationCreateParams, NotificationDismissParams, NotificationListParams,
-    NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
-    PaneMountSurfaceParams, PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult,
-    PaneUnmountSurfaceParams, ProfileCreateParams, ProfileIdParams, ProfileListResult,
-    ProfileSummaryResult, ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult,
-    RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionIdParams, SessionSpawnParams,
-    SessionSpawnResult, SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams,
-    SidebarLogListResult, SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams,
-    SidebarStateResult, SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult,
-    SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
-    SurfaceSummaryResult, SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult,
-    TmuxDiagnosticsParams, TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult,
-    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
-    WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
-    WorkspaceGroupMemberParams, WorkspaceGroupMemberResult, WorkspaceGroupResult,
-    WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams,
-    WorkspaceSummaryResult, WorkspaceUpdateParams, WslDistributionListResult,
-    WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
+    DiagnosticsBackendHealthResult, DiagnosticsExportResult, DiagnosticsOutputStreamResult,
+    DiagnosticsQueuePressureResult, DockConfigResult, DockControlResult, DockGetParams,
+    DockTrustParams, EnvVarParam, ErrorCode, EventSubscribeParams, EventSubscribeResult,
+    NotificationClearParams, NotificationClearResult, NotificationCreateParams,
+    NotificationDismissParams, NotificationListParams, NotificationListResult,
+    NotificationSummaryResult, PaneCloseParams, PaneFocusParams, PaneMountSurfaceParams,
+    PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, PaneUnmountSurfaceParams,
+    ProfileCreateParams, ProfileIdParams, ProfileListResult, ProfileSummaryResult,
+    ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult, RequestEnvelope,
+    ResponseEnvelope, ResponseOutcome, SessionIdParams, SessionSpawnParams, SessionSpawnResult,
+    SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams, SidebarLogListResult,
+    SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams, SidebarStateResult,
+    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult, SidebarStatusSetParams,
+    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams, SurfaceSummaryResult,
+    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, TmuxDiagnosticsParams,
+    TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult, WorkspaceCreateParams,
+    WorkspaceDetailResult, WorkspaceGroupCreateParams, WorkspaceGroupIdParams,
+    WorkspaceGroupListParams, WorkspaceGroupListResult, WorkspaceGroupMemberParams,
+    WorkspaceGroupMemberResult, WorkspaceGroupResult, WorkspaceGroupUpdateParams,
+    WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
+    WorkspaceUpdateParams, WslDistributionListResult, WslDistributionResult,
+    DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
 };
 use agentmux_store::{
     PersistedAgentState, PersistedDockTrust, PersistedNotification, PersistedPane,
@@ -216,6 +217,28 @@ pub struct OutputStreamFrame {
 const OUTPUT_STREAM_IDLE_PUMP_MS: u64 = 12;
 const OUTPUT_STREAM_HOT_PUMP_MS: u64 = 3;
 const OUTPUT_STREAM_HOT_WINDOW_MS: u64 = 160;
+const OUTPUT_FLOW_CONTROL_PAUSE_BYTES: u64 = 1024 * 1024;
+const OUTPUT_FLOW_CONTROL_RESUME_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Debug, Default)]
+struct OutputStreamMetrics {
+    frames_sent: u64,
+    bytes_sent: u64,
+    send_failures: u64,
+    closed_channels: u64,
+    pump_runs: u64,
+    pump_active_runs: u64,
+    pump_idle_runs: u64,
+    last_frame_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OutputPressureRecord {
+    queued_bytes: u64,
+    max_queued_bytes: u64,
+    backpressure_events: u64,
+    write_in_flight: bool,
+}
 
 pub struct DesktopControlState {
     control: Mutex<DesktopRuntimeControl>,
@@ -231,6 +254,8 @@ pub struct DesktopControlState {
     // remount cannot remove the current renderer's channel.
     output_channels: Mutex<HashMap<String, HashMap<String, Channel<OutputStreamFrame>>>>,
     output_pump_hot_until: Mutex<Option<Instant>>,
+    output_stream_metrics: Mutex<OutputStreamMetrics>,
+    output_pressure: Mutex<HashMap<String, OutputPressureRecord>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -343,6 +368,8 @@ impl DesktopControlState {
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
             output_channels: Mutex::new(HashMap::new()),
             output_pump_hot_until: Mutex::new(None),
+            output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
+            output_pressure: Mutex::new(HashMap::new()),
         };
         // Durable-session recovery is deliberately NOT run here: it probes
         // wsl.exe/tmux and can block for seconds. The desktop host runs it on a
@@ -369,6 +396,8 @@ impl DesktopControlState {
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
             output_channels: Mutex::new(HashMap::new()),
             output_pump_hot_until: Mutex::new(None),
+            output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
+            output_pressure: Mutex::new(HashMap::new()),
         };
         Ok(state)
     }
@@ -414,12 +443,44 @@ impl DesktopControlState {
                 channels.remove(session_id);
             }
         }
+        if let Ok(mut pressure) = self.output_pressure.lock() {
+            pressure.remove(session_id);
+        }
+    }
+
+    pub fn report_output_pressure(
+        &self,
+        session_id: String,
+        queued_bytes: u64,
+        max_queued_bytes: u64,
+        backpressure_events: u64,
+        write_in_flight: bool,
+    ) {
+        if let Ok(mut pressure) = self.output_pressure.lock() {
+            pressure.insert(
+                session_id.clone(),
+                OutputPressureRecord {
+                    queued_bytes,
+                    max_queued_bytes,
+                    backpressure_events,
+                    write_in_flight,
+                },
+            );
+        }
+        let pause = write_in_flight && queued_bytes >= OUTPUT_FLOW_CONTROL_PAUSE_BYTES;
+        let resume = !write_in_flight || queued_bytes <= OUTPUT_FLOW_CONTROL_RESUME_BYTES;
+        if pause || resume {
+            if let Ok(mut control) = self.control.lock() {
+                let _ = control
+                    .runtime_mut()
+                    .set_output_paused(&SessionId::from_string(&session_id), pause && !resume);
+            }
+        }
     }
 
     fn mark_output_pump_hot(&self) {
         if let Ok(mut hot_until) = self.output_pump_hot_until.lock() {
-            *hot_until =
-                Some(Instant::now() + Duration::from_millis(OUTPUT_STREAM_HOT_WINDOW_MS));
+            *hot_until = Some(Instant::now() + Duration::from_millis(OUTPUT_STREAM_HOT_WINDOW_MS));
         }
     }
 
@@ -439,6 +500,90 @@ impl DesktopControlState {
         } else {
             *hot_until = None;
             Duration::from_millis(OUTPUT_STREAM_IDLE_PUMP_MS)
+        }
+    }
+
+    fn record_output_pump_metrics(
+        &self,
+        had_activity: bool,
+        frames_sent: u64,
+        bytes_sent: u64,
+        send_failures: u64,
+        closed_channels: u64,
+    ) {
+        if let Ok(mut metrics) = self.output_stream_metrics.lock() {
+            metrics.pump_runs = metrics.pump_runs.saturating_add(1);
+            if had_activity {
+                metrics.pump_active_runs = metrics.pump_active_runs.saturating_add(1);
+            } else {
+                metrics.pump_idle_runs = metrics.pump_idle_runs.saturating_add(1);
+            }
+            metrics.frames_sent = metrics.frames_sent.saturating_add(frames_sent);
+            metrics.bytes_sent = metrics.bytes_sent.saturating_add(bytes_sent);
+            metrics.send_failures = metrics.send_failures.saturating_add(send_failures);
+            metrics.closed_channels = metrics.closed_channels.saturating_add(closed_channels);
+            if frames_sent > 0 {
+                metrics.last_frame_at = Some(timestamp());
+            }
+        }
+    }
+
+    fn output_stream_diagnostics(&self) -> DiagnosticsOutputStreamResult {
+        let (active_sessions, active_subscriptions) = self
+            .output_channels
+            .lock()
+            .map(|channels| {
+                (
+                    channels.len(),
+                    channels
+                        .values()
+                        .map(|session_channels| session_channels.len())
+                        .sum::<usize>(),
+                )
+            })
+            .unwrap_or((0, 0));
+        let metrics = self
+            .output_stream_metrics
+            .lock()
+            .map(|metrics| metrics.clone())
+            .unwrap_or_default();
+        let (
+            renderer_queued_bytes,
+            renderer_max_queued_bytes,
+            renderer_backpressure_events,
+            renderer_write_in_flight_sessions,
+        ) = self
+            .output_pressure
+            .lock()
+            .map(|pressure| {
+                pressure.values().fold(
+                    (0_u64, 0_u64, 0_u64, 0_usize),
+                    |(queued, max_queued, backpressure, in_flight), record| {
+                        (
+                            queued.saturating_add(record.queued_bytes),
+                            max_queued.max(record.max_queued_bytes),
+                            backpressure.saturating_add(record.backpressure_events),
+                            in_flight + usize::from(record.write_in_flight),
+                        )
+                    },
+                )
+            })
+            .unwrap_or((0, 0, 0, 0));
+        DiagnosticsOutputStreamResult {
+            active_sessions,
+            active_subscriptions,
+            frames_sent: metrics.frames_sent,
+            bytes_sent: metrics.bytes_sent,
+            send_failures: metrics.send_failures,
+            closed_channels: metrics.closed_channels,
+            pump_runs: metrics.pump_runs,
+            pump_active_runs: metrics.pump_active_runs,
+            pump_idle_runs: metrics.pump_idle_runs,
+            last_frame_at: metrics.last_frame_at,
+            renderer_queued_bytes,
+            renderer_max_queued_bytes,
+            renderer_backpressure_events,
+            renderer_write_in_flight_sessions,
         }
     }
 
@@ -468,6 +613,7 @@ impl DesktopControlState {
     pub fn pump_output_stream(&self) -> bool {
         let (deltas, cwd_updates) = {
             let Ok(mut control) = self.control.lock() else {
+                self.record_output_pump_metrics(false, 0, 0, 0, 0);
                 return false;
             };
             control.collect_events();
@@ -485,12 +631,17 @@ impl DesktopControlState {
             }
         }
         if deltas.is_empty() {
+            self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
             return had_activity;
         }
         let Ok(channels) = self.output_channels.lock() else {
+            self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
             return had_activity;
         };
         let mut closed: Vec<(String, String)> = Vec::new();
+        let mut frames_sent = 0_u64;
+        let mut bytes_sent = 0_u64;
+        let mut send_failures = 0_u64;
         for delta in &deltas {
             let session_id = delta.session_id.to_string();
             let Some(session_channels) = channels.get(&session_id) else {
@@ -502,11 +653,16 @@ impl DesktopControlState {
             };
             for (subscription_id, channel) in session_channels {
                 if channel.send(frame.clone()).is_err() {
+                    send_failures = send_failures.saturating_add(1);
                     closed.push((session_id.clone(), subscription_id.clone()));
+                } else {
+                    frames_sent = frames_sent.saturating_add(1);
+                    bytes_sent = bytes_sent.saturating_add(delta.bytes.len() as u64);
                 }
             }
         }
         drop(channels);
+        let closed_channels = closed.len() as u64;
         if !closed.is_empty() {
             if let Ok(mut channels) = self.output_channels.lock() {
                 for (session_id, subscription_id) in closed {
@@ -523,6 +679,13 @@ impl DesktopControlState {
                 }
             }
         }
+        self.record_output_pump_metrics(
+            had_activity,
+            frames_sent,
+            bytes_sent,
+            send_failures,
+            closed_channels,
+        );
         had_activity
     }
 
@@ -4727,6 +4890,7 @@ impl DesktopControlState {
             MAX_BROWSER_FAILURES,
             browser_dropped,
         ));
+        let output_stream = self.output_stream_diagnostics();
 
         Ok(DiagnosticsExportResult {
             generated_at: timestamp(),
@@ -4736,6 +4900,7 @@ impl DesktopControlState {
             notifications,
             backend_health,
             queue_pressure,
+            output_stream,
         })
     }
 
@@ -12234,6 +12399,11 @@ mod tests {
             .any(|queue| queue["queue"] == "desktop.browser_failures"
                 && queue["depth"] == 1
                 && queue["capacity"] == MAX_BROWSER_FAILURES));
+        assert_eq!(export["output_stream"]["active_sessions"], 0);
+        assert_eq!(export["output_stream"]["active_subscriptions"], 0);
+        assert_eq!(export["output_stream"]["frames_sent"], 0);
+        assert_eq!(export["output_stream"]["renderer_queued_bytes"], 0);
+        assert_eq!(export["output_stream"]["renderer_backpressure_events"], 0);
     }
 
     #[test]

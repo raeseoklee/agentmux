@@ -5,6 +5,8 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use agentmux_backend::SessionBackend;
@@ -37,19 +39,21 @@ use agentmux_ipc::{
     NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
     PaneSplitParams, PaneSummaryResult, ProfileListResult, ProfileSummaryResult,
     RecoveryDiagnosticsResult, RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionIdParams,
-    SessionListParams, SessionListResult, SessionReadRecentParams, SessionReadRecentResult,
-    SessionResizeParams, SessionSendKeyParams, SessionSendTextParams, SessionSpawnParams,
-    SessionSpawnResult, SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams,
-    SidebarLogListParams, SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult,
-    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusSetParams,
-    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams, SurfaceSummaryResult,
-    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams,
-    WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
+    SessionListParams, SessionListResult, SessionOutputPressureParams, SessionReadRecentParams,
+    SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams, SessionSendTextParams,
+    SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult,
+    SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams, SidebarLogListParams,
+    SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams,
+    SidebarStatusListResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
+    SurfaceCreateBrowserParams, SurfaceSummaryResult, SystemCapabilitiesResult,
+    SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams, WorkspaceCloseResult,
+    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
     WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
     WorkspaceGroupMemberParams, WorkspaceGroupResult, WorkspaceGroupUpdateParams,
     WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
     DEFAULT_CONTROL_PIPE_NAME,
 };
+use tungstenite::{accept_hdr, Error as WsError, Message as WsMessage};
 
 const AGENTMUX_CONFIG_SCHEMA_JSON: &str =
     include_str!("../../../docs/schemas/agentmux.config.schema.json");
@@ -6379,9 +6383,11 @@ impl LocalServerControl {
             "session.list" => self.handle_list_request(request),
             "session.get"
             | "session.read_recent"
+            | "session.snapshot"
             | "session.send_text"
             | "session.send_key"
             | "session.resize"
+            | "session.report_output_pressure"
             | "session.terminate" => self.handle_session_request(request),
             _ => self
                 .control_mut(self.default_backend)
@@ -6512,6 +6518,9 @@ fn local_server_session_id(request: &RequestEnvelope) -> Result<String, ControlE
         "session.read_recent" => request
             .parse_params::<SessionReadRecentParams>()
             .map(|params| params.session_id),
+        "session.snapshot" => request
+            .parse_params::<SessionSnapshotParams>()
+            .map(|params| params.session_id),
         "session.send_text" => request
             .parse_params::<SessionSendTextParams>()
             .map(|params| params.session_id),
@@ -6520,6 +6529,9 @@ fn local_server_session_id(request: &RequestEnvelope) -> Result<String, ControlE
             .map(|params| params.session_id),
         "session.resize" => request
             .parse_params::<SessionResizeParams>()
+            .map(|params| params.session_id),
+        "session.report_output_pressure" => request
+            .parse_params::<SessionOutputPressureParams>()
             .map(|params| params.session_id),
         "session.terminate" => request
             .parse_params::<SessionTerminateParams>()
@@ -6548,7 +6560,7 @@ where
         })?;
     let local_addr = listener.local_addr()?;
     let url = format_server_url(&options.host, local_addr.port());
-    let mut state = ServerState::new(options);
+    let state = ServerState::new(options);
 
     if state.options.invoke.json {
         write_json_value(
@@ -6587,12 +6599,16 @@ where
         }
     }
 
+    let shared_state = Arc::new(Mutex::new(state));
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                if let Err(error) = handle_server_stream(&mut stream, &mut state) {
-                    eprintln!("agentmux server request failed: {error}");
-                }
+            Ok(stream) => {
+                let state = Arc::clone(&shared_state);
+                thread::spawn(move || {
+                    if let Err(error) = handle_server_stream(stream, state) {
+                        eprintln!("agentmux server request failed: {error}");
+                    }
+                });
             }
             Err(error) => eprintln!("agentmux server accept failed: {error}"),
         }
@@ -6609,17 +6625,275 @@ fn format_server_url(host: &str, port: u16) -> String {
     }
 }
 
-fn handle_server_stream(stream: &mut TcpStream, state: &mut ServerState) -> Result<(), CliError> {
+fn handle_server_stream(
+    mut stream: TcpStream,
+    state: Arc<Mutex<ServerState>>,
+) -> Result<(), CliError> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let request = match read_http_request(stream).and_then(|raw| parse_http_request(&raw)) {
+    if is_websocket_upgrade(&stream)? {
+        return handle_server_websocket(stream, state);
+    }
+
+    let request = match read_http_request(&mut stream).and_then(|raw| parse_http_request(&raw)) {
         Ok(request) => request,
         Err(error) => {
             let response = api_error_response(400, &format!("Bad request: {error}"));
-            return write_http_response(stream, &response);
+            return write_http_response(&mut stream, &response);
         }
     };
-    let response = route_server_request(&request, state);
-    write_http_response(stream, &response)
+    let response = match state.lock() {
+        Ok(mut state) => route_server_request(&request, &mut state),
+        Err(_) => api_error_response(503, "Server state is unavailable."),
+    };
+    write_http_response(&mut stream, &response)
+}
+
+fn is_websocket_upgrade(stream: &TcpStream) -> Result<bool, CliError> {
+    let mut buffer = [0_u8; 4096];
+    let read = stream.peek(&mut buffer)?;
+    if read == 0 {
+        return Ok(false);
+    }
+    let head = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
+    Ok(head.starts_with("get ")
+        && head.contains("\r\nupgrade: websocket")
+        && head.contains("\r\nsec-websocket-key:"))
+}
+
+fn handle_server_websocket(
+    stream: TcpStream,
+    state: Arc<Mutex<ServerState>>,
+) -> Result<(), CliError> {
+    let target = Arc::new(Mutex::new(None::<String>));
+    let captured_target = Arc::clone(&target);
+    let mut socket = accept_hdr(
+        stream,
+        move |request: &tungstenite::handshake::server::Request, response| {
+            if let Ok(mut target) = captured_target.lock() {
+                *target = Some(request.uri().to_string());
+            }
+            Ok(response)
+        },
+    )
+    .map_err(|error| CliError::Control(format!("websocket handshake error: {error}")))?;
+
+    let _ = socket
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_millis(8)));
+    let _ = socket
+        .get_mut()
+        .set_write_timeout(Some(Duration::from_secs(5)));
+
+    let target = target
+        .lock()
+        .ok()
+        .and_then(|target| target.clone())
+        .unwrap_or_else(|| "/".to_string());
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (target, None),
+    };
+    let Some(session_id) = session_id_from_path(&path, "/stream") else {
+        let _ = socket.close(None);
+        return Ok(());
+    };
+    let mut offset = initial_websocket_output_offset(&session_id, query.as_deref(), &state)?;
+
+    loop {
+        match socket.read() {
+            Ok(WsMessage::Text(text)) => {
+                handle_server_websocket_message(&session_id, &text, &state)?;
+            }
+            Ok(WsMessage::Binary(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
+            Ok(WsMessage::Close(_)) => break,
+            Ok(WsMessage::Frame(_)) => {}
+            Err(WsError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(WsError::ConnectionClosed) | Err(WsError::AlreadyClosed) => break,
+            Err(error) => return Err(websocket_error(error)),
+        }
+
+        let had_output =
+            send_server_websocket_output(&session_id, &state, &mut socket, &mut offset)?;
+        thread::sleep(Duration::from_millis(if had_output { 3 } else { 12 }));
+    }
+
+    Ok(())
+}
+
+fn websocket_error(error: WsError) -> CliError {
+    CliError::Control(format!("websocket error: {error}"))
+}
+
+fn initial_websocket_output_offset(
+    session_id: &str,
+    query: Option<&str>,
+    state: &Arc<Mutex<ServerState>>,
+) -> Result<u64, CliError> {
+    if let Some(offset) = query_param(query, "since_offset").and_then(|value| value.parse().ok()) {
+        return Ok(offset);
+    }
+    let params = SessionSnapshotParams {
+        session_id: session_id.to_string(),
+        since_offset: None,
+    };
+    let result = {
+        let mut state = state
+            .lock()
+            .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?;
+        state
+            .invoke("session.snapshot", &params)
+            .and_then(|response| response_result::<SessionSnapshotResult>(&response))?
+    };
+    Ok(result.end_offset)
+}
+
+fn send_server_websocket_output(
+    session_id: &str,
+    state: &Arc<Mutex<ServerState>>,
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    offset: &mut u64,
+) -> Result<bool, CliError> {
+    let params = SessionSnapshotParams {
+        session_id: session_id.to_string(),
+        since_offset: Some(*offset),
+    };
+    let result = {
+        let mut state = state
+            .lock()
+            .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?;
+        state
+            .invoke("session.snapshot", &params)
+            .and_then(|response| response_result::<SessionSnapshotResult>(&response))?
+    };
+    if result.end_offset == *offset && result.bytes_base64.is_empty() {
+        return Ok(false);
+    }
+    let frame_type = if result.base_offset > *offset {
+        "reset"
+    } else {
+        "output"
+    };
+    *offset = result.end_offset;
+    socket
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": frame_type,
+                "session_id": result.session_id,
+                "from_offset": result.base_offset,
+                "end_offset": result.end_offset,
+                "bytes_base64": result.bytes_base64,
+            })
+            .to_string(),
+        ))
+        .map_err(websocket_error)?;
+    Ok(true)
+}
+
+fn handle_server_websocket_message(
+    session_id: &str,
+    text: &str,
+    state: &Arc<Mutex<ServerState>>,
+) -> Result<(), CliError> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| CliError::InvalidArgs(format!("invalid websocket message: {error}")))?;
+    let Some(message_type) = value.get("type").and_then(|value| value.as_str()) else {
+        return Ok(());
+    };
+    let (method, params) = match message_type {
+        "input" => {
+            let Some(text) = value.get("text").and_then(|value| value.as_str()) else {
+                return Ok(());
+            };
+            (
+                "session.send_text",
+                serde_json::to_value(SessionSendTextParams {
+                    session_id: session_id.to_string(),
+                    text: text.to_string(),
+                })
+                .map_err(|error| CliError::Control(error.to_string()))?,
+            )
+        }
+        "key" => {
+            let Some(key) = value.get("key").and_then(|value| value.as_str()) else {
+                return Ok(());
+            };
+            (
+                "session.send_key",
+                serde_json::to_value(SessionSendKeyParams {
+                    session_id: session_id.to_string(),
+                    key: key.to_string(),
+                })
+                .map_err(|error| CliError::Control(error.to_string()))?,
+            )
+        }
+        "resize" => {
+            let columns = value
+                .get("columns")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(120);
+            let rows = value
+                .get("rows")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(30);
+            (
+                "session.resize",
+                serde_json::to_value(SessionResizeParams {
+                    session_id: session_id.to_string(),
+                    columns,
+                    rows,
+                })
+                .map_err(|error| CliError::Control(error.to_string()))?,
+            )
+        }
+        "terminate" => (
+            "session.terminate",
+            serde_json::to_value(SessionTerminateParams {
+                session_id: session_id.to_string(),
+                mode: "soft".to_string(),
+            })
+            .map_err(|error| CliError::Control(error.to_string()))?,
+        ),
+        "pressure" => (
+            "session.report_output_pressure",
+            serde_json::to_value(SessionOutputPressureParams {
+                session_id: session_id.to_string(),
+                queued_bytes: value
+                    .get("queuedBytes")
+                    .or_else(|| value.get("queued_bytes"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                max_queued_bytes: value
+                    .get("maxQueuedBytes")
+                    .or_else(|| value.get("max_queued_bytes"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                backpressure_events: value
+                    .get("backpressureEvents")
+                    .or_else(|| value.get("backpressure_events"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                write_in_flight: value
+                    .get("writeInFlight")
+                    .or_else(|| value.get("write_in_flight"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            })
+            .map_err(|error| CliError::Control(error.to_string()))?,
+        ),
+        _ => return Ok(()),
+    };
+    let mut state = state
+        .lock()
+        .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?;
+    let response = state.invoke(method, &params)?;
+    response_result::<serde_json::Value>(&response)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -6635,7 +6909,7 @@ struct HttpResponse {
     status_code: u16,
     reason: &'static str,
     content_type: &'static str,
-    body: String,
+    body: Vec<u8>,
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<String, CliError> {
@@ -6728,6 +7002,9 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
         ("OPTIONS", _) => empty_response(204),
         _ => {
             if request.method == "GET" {
+                if let Some(session_id) = session_id_from_path(&request.path, "/snapshot") {
+                    return server_snapshot_response(&session_id, request, state);
+                }
                 if let Some(session_id) = session_id_from_path(&request.path, "/recent") {
                     return server_read_recent_response(&session_id, request, state);
                 }
@@ -7012,6 +7289,34 @@ fn server_read_recent_response(
     }
 }
 
+fn server_snapshot_response(
+    session_id: &str,
+    request: &HttpRequest,
+    state: &mut ServerState,
+) -> HttpResponse {
+    let since_offset = query_param(request.query.as_deref(), "since_offset")
+        .and_then(|value| value.parse::<u64>().ok());
+    let params = SessionSnapshotParams {
+        session_id: session_id.to_string(),
+        since_offset,
+    };
+    match state
+        .invoke("session.snapshot", &params)
+        .and_then(|response| response_result::<SessionSnapshotResult>(&response))
+    {
+        Ok(result) => api_json_response(
+            200,
+            serde_json::json!({
+                "session_id": result.session_id,
+                "base_offset": result.base_offset,
+                "end_offset": result.end_offset,
+                "bytes_base64": result.bytes_base64,
+            }),
+        ),
+        Err(error) => api_error_response(503, &server_control_error_message(error, &state.options)),
+    }
+}
+
 fn server_send_text_response(
     session_id: &str,
     request: &HttpRequest,
@@ -7260,7 +7565,7 @@ fn json_response(status_code: u16, body: serde_json::Value) -> HttpResponse {
         status_code,
         reason: http_reason(status_code),
         content_type: "application/json; charset=utf-8",
-        body,
+        body: body.into_bytes(),
     }
 }
 
@@ -7269,7 +7574,7 @@ fn html_response(status_code: u16, body: String) -> HttpResponse {
         status_code,
         reason: http_reason(status_code),
         content_type: "text/html; charset=utf-8",
-        body,
+        body: body.into_bytes(),
     }
 }
 
@@ -7278,11 +7583,11 @@ fn empty_response(status_code: u16) -> HttpResponse {
         status_code,
         reason: http_reason(status_code),
         content_type: "text/plain; charset=utf-8",
-        body: String::new(),
+        body: Vec::new(),
     }
 }
 
-fn text_response(status_code: u16, content_type: &'static str, body: String) -> HttpResponse {
+fn bytes_response(status_code: u16, content_type: &'static str, body: Vec<u8>) -> HttpResponse {
     HttpResponse {
         status_code,
         reason: http_reason(status_code),
@@ -7315,8 +7620,8 @@ fn server_static_asset_response(request_path: &str) -> Option<HttpResponse> {
     if !file_path.is_file() {
         return None;
     }
-    let body = fs::read_to_string(&file_path).ok()?;
-    Some(text_response(200, content_type_for_path(&file_path), body))
+    let body = fs::read(&file_path).ok()?;
+    Some(bytes_response(200, content_type_for_path(&file_path), body))
 }
 
 fn desktop_ui_file_path(relative_path: &str) -> Option<PathBuf> {
@@ -7393,6 +7698,9 @@ fn content_type_for_path(path: &Path) -> &'static str {
         Some("html") => "text/html; charset=utf-8",
         Some("svg") => "image/svg+xml; charset=utf-8",
         Some("txt") => "text/plain; charset=utf-8",
+        Some("ttf") => "font/ttf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
         _ => "application/octet-stream",
     }
 }
@@ -7410,16 +7718,15 @@ fn http_reason(status_code: u16) -> &'static str {
 }
 
 fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<(), CliError> {
-    let body = response.body.as_bytes();
     write!(
         stream,
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
         response.status_code,
         response.reason,
         response.content_type,
-        body.len()
+        response.body.len()
     )?;
-    stream.write_all(body)?;
+    stream.write_all(&response.body)?;
     Ok(())
 }
 
@@ -9751,7 +10058,7 @@ where
         diagnostics.recovery.session_count
     )?;
     writeln!(output, "backend health:")?;
-    for backend in diagnostics.backend_health {
+    for backend in &diagnostics.backend_health {
         writeln!(
             output,
             "{}\t{}\tactive={}\trecovering={}\tfailed={}",
@@ -9763,13 +10070,31 @@ where
         )?;
     }
     writeln!(output, "queue pressure:")?;
-    for queue in diagnostics.queue_pressure {
+    for queue in &diagnostics.queue_pressure {
         writeln!(
             output,
             "{}\t{}\tdepth={}/{}\tdropped={}",
             queue.queue, queue.state, queue.depth, queue.capacity, queue.dropped_count
         )?;
     }
+    writeln!(
+        output,
+        "output stream: sessions={}\tsubscriptions={}\tframes={}\tbytes={}\tfailures={}\tclosed={}\tpumps={}/{}+{}\tlast_frame={}",
+        diagnostics.output_stream.active_sessions,
+        diagnostics.output_stream.active_subscriptions,
+        diagnostics.output_stream.frames_sent,
+        diagnostics.output_stream.bytes_sent,
+        diagnostics.output_stream.send_failures,
+        diagnostics.output_stream.closed_channels,
+        diagnostics.output_stream.pump_runs,
+        diagnostics.output_stream.pump_active_runs,
+        diagnostics.output_stream.pump_idle_runs,
+        diagnostics
+            .output_stream
+            .last_frame_at
+            .as_deref()
+            .unwrap_or("never")
+    )?;
     writeln!(
         output,
         "browser failures: {}",
@@ -13892,8 +14217,36 @@ mod tests {
             Some("sess_1")
         );
         assert_eq!(
+            session_id_from_path("/api/session/sess_1/snapshot", "/snapshot").as_deref(),
+            Some("sess_1")
+        );
+        assert_eq!(
+            session_id_from_path("/api/session/sess_1/stream", "/stream").as_deref(),
+            Some("sess_1")
+        );
+        assert_eq!(
             session_id_from_path("/api/session/sess%201/send", "/send").as_deref(),
             Some("sess 1")
+        );
+        assert_eq!(
+            local_server_session_id(&request(
+                "req_snapshot",
+                "session.snapshot",
+                r#"{"session_id":"sess_1","since_offset":0}"#,
+                SERVER_LOCAL_TOKEN,
+            ))
+            .unwrap(),
+            "sess_1"
+        );
+        assert_eq!(
+            local_server_session_id(&request(
+                "req_pressure",
+                "session.report_output_pressure",
+                r#"{"session_id":"sess_1","queued_bytes":1048576,"max_queued_bytes":1048576,"backpressure_events":1,"write_in_flight":true}"#,
+                SERVER_LOCAL_TOKEN,
+            ))
+            .unwrap(),
+            "sess_1"
         );
     }
 

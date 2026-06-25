@@ -15,9 +15,10 @@ use agentmux_ipc::{
     EventPollResult, EventSubscribeParams, EventSubscribeResult, NotificationDismissParams,
     NotificationListParams, NotificationListResult, NotificationSummaryResult, RequestEnvelope,
     ResponseEnvelope, SessionAttachParams, SessionIdParams, SessionListParams, SessionListResult,
-    SessionReadRecentParams, SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams,
-    SessionSendTextParams, SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams,
-    SessionSpawnResult, SessionSummaryResult, SessionTerminateParams,
+    SessionOutputPressureParams, SessionReadRecentParams, SessionReadRecentResult,
+    SessionResizeParams, SessionSendKeyParams, SessionSendTextParams, SessionSnapshotParams,
+    SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult, SessionSummaryResult,
+    SessionTerminateParams,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -384,6 +385,9 @@ pub struct OutputDelta {
     pub bytes: Vec<u8>,
 }
 
+const OUTPUT_FLOW_CONTROL_PAUSE_BYTES: u64 = 1024 * 1024;
+const OUTPUT_FLOW_CONTROL_RESUME_BYTES: u64 = 256 * 1024;
+
 pub struct TerminalRuntime<B>
 where
     B: SessionBackend,
@@ -497,6 +501,10 @@ where
         size: TerminalSize,
     ) -> BackendResult<()> {
         self.backend.resize(session_id.as_str(), size)
+    }
+
+    pub fn set_output_paused(&mut self, session_id: &SessionId, paused: bool) -> BackendResult<()> {
+        self.backend.set_output_paused(session_id.as_str(), paused)
     }
 
     pub fn terminate_session(
@@ -980,6 +988,9 @@ where
             "session.terminate" => self.handle_session_terminate(&request),
             "session.read_recent" => self.handle_session_read_recent(&request),
             "session.snapshot" => self.handle_session_snapshot(&request),
+            "session.report_output_pressure" => {
+                self.handle_session_report_output_pressure(&request)
+            }
             "events.poll" => self.handle_events_poll(&request),
             "events.subscribe" => self.handle_events_subscribe(&request),
             "agent.set_state" => self.handle_agent_set_state(&request),
@@ -1240,6 +1251,27 @@ where
                 end_offset: snapshot.end_offset,
                 bytes_base64,
             },
+        ))
+    }
+
+    fn handle_session_report_output_pressure(
+        &mut self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, ControlError> {
+        let params: SessionOutputPressureParams = request.parse_params()?;
+        let session_id = SessionId::from_string(params.session_id);
+        let pause =
+            params.write_in_flight && params.queued_bytes >= OUTPUT_FLOW_CONTROL_PAUSE_BYTES;
+        let resume =
+            !params.write_in_flight || params.queued_bytes <= OUTPUT_FLOW_CONTROL_RESUME_BYTES;
+        if pause || resume {
+            self.runtime
+                .set_output_paused(&session_id, pause && !resume)
+                .map_err(control_error_from_backend)?;
+        }
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &AckResult { ok: true },
         ))
     }
 
@@ -3048,6 +3080,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn output_pressure_report_pauses_and_resumes_backend_output() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+
+        let spawn = control.handle_request(request(
+            "req_spawn",
+            "session.spawn",
+            r#"{"workspace_id":"ws_test","backend":"conpty","command":["cmd.exe"],"columns":120,"rows":30,"durability":"ephemeral"}"#,
+        ));
+        let spawn: SessionSpawnResult = serde_json::from_str(ok_json(&spawn)).unwrap();
+        let session_id = spawn.session_id;
+
+        let pause = control.handle_request(request(
+            "req_pressure_pause",
+            "session.report_output_pressure",
+            &format!(
+                r#"{{"session_id":"{session_id}","queued_bytes":1048576,"max_queued_bytes":1048576,"backpressure_events":1,"write_in_flight":true}}"#
+            ),
+        ));
+        assert!(ok_json(&pause).contains("\"ok\":true"));
+
+        let resume = control.handle_request(request(
+            "req_pressure_resume",
+            "session.report_output_pressure",
+            &format!(
+                r#"{{"session_id":"{session_id}","queued_bytes":0,"max_queued_bytes":1048576,"backpressure_events":1,"write_in_flight":false}}"#
+            ),
+        ));
+        assert!(ok_json(&resume).contains("\"ok\":true"));
+
+        assert_eq!(
+            control.runtime.backend.output_pauses,
+            vec![(session_id.clone(), true), (session_id, false)]
+        );
+    }
+
     fn request(id: &str, method: &str, params_json: &str) -> RequestEnvelope {
         RequestEnvelope::new(id, method, params_json, "test-token")
     }
@@ -3062,6 +3132,7 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         events: Vec<BackendEvent>,
+        output_pauses: Vec<(String, bool)>,
     }
 
     impl SessionBackend for FakeBackend {
@@ -3116,6 +3187,11 @@ mod tests {
                 session_id: session_id.to_string(),
                 code: Some(0),
             });
+            Ok(())
+        }
+
+        fn set_output_paused(&mut self, session_id: &str, paused: bool) -> BackendResult<()> {
+            self.output_pauses.push((session_id.to_string(), paused));
             Ok(())
         }
 

@@ -141,8 +141,12 @@ mod platform {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use std::ptr::{null, null_mut};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
     use std::thread;
+    use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -173,6 +177,7 @@ mod platform {
         process_handle: HANDLE,
         _attribute_list: ProcThreadAttributeList,
         exit_reported: bool,
+        output_paused: Arc<AtomicBool>,
     }
 
     // Windows HANDLE/HPCON values are process handles that can be closed from any thread.
@@ -329,7 +334,13 @@ mod platform {
             let environment_ptr = environment.as_mut_ptr().cast();
             let session_id = request.session_id.clone();
             let events = Arc::clone(&self.events);
-            spawn_output_reader(session_id.clone(), output_read, events);
+            let output_paused = Arc::new(AtomicBool::new(false));
+            spawn_output_reader(
+                session_id.clone(),
+                output_read,
+                events,
+                Arc::clone(&output_paused),
+            );
 
             let created = unsafe {
                 CreateProcessW(
@@ -368,6 +379,7 @@ mod platform {
                 process_handle: process_info.hProcess,
                 _attribute_list: attribute_list,
                 exit_reported: false,
+                output_paused,
             };
 
             self.sessions.insert(session_id.clone(), session);
@@ -471,6 +483,15 @@ mod platform {
             }
         }
 
+        fn set_output_paused(&mut self, session_id: &str, paused: bool) -> BackendResult<()> {
+            let session = self
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| BackendError::session_not_found(session_id))?;
+            session.output_paused.store(paused, Ordering::Release);
+            Ok(())
+        }
+
         fn drain_events(&mut self) -> Vec<BackendEvent> {
             self.poll_exits();
             if let Ok(mut events) = self.events.lock() {
@@ -555,6 +576,7 @@ mod platform {
         session_id: String,
         output_read: HANDLE,
         events: Arc<Mutex<Vec<BackendEvent>>>,
+        output_paused: Arc<AtomicBool>,
     ) {
         let output_read_value = output_read as isize;
         thread::spawn(move || {
@@ -562,6 +584,9 @@ mod platform {
             let mut buffer = [0u8; 8192];
 
             loop {
+                while output_paused.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(8));
+                }
                 let mut bytes_read = 0;
                 let ok = unsafe {
                     ReadFile(

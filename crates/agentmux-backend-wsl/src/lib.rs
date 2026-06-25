@@ -672,6 +672,10 @@ where
         self.inner.terminate(session_id, mode)
     }
 
+    fn set_output_paused(&mut self, session_id: &str, paused: bool) -> BackendResult<()> {
+        self.inner.set_output_paused(session_id, paused)
+    }
+
     fn drain_events(&mut self) -> Vec<BackendEvent> {
         self.inner.drain_events()
     }

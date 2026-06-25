@@ -86,6 +86,24 @@ fn session_send_text_direct(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command(rename_all = "snake_case")]
+fn session_report_output_pressure(
+    state: tauri::State<'_, Arc<DesktopControlState>>,
+    session_id: String,
+    queued_bytes: u64,
+    max_queued_bytes: u64,
+    backpressure_events: u64,
+    write_in_flight: bool,
+) {
+    state.inner().report_output_pressure(
+        session_id,
+        queued_bytes,
+        max_queued_bytes,
+        backpressure_events,
+        write_in_flight,
+    );
+}
+
 fn main() {
     let store_path = default_store_path().expect("failed to resolve AgentMux store path");
     let token_path =
@@ -146,7 +164,8 @@ fn main() {
             agentmux_control_token,
             session_subscribe_output,
             session_unsubscribe_output,
-            session_send_text_direct
+            session_send_text_direct,
+            session_report_output_pressure
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AgentMux desktop app");

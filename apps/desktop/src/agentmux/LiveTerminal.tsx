@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import type { ControlClient, OutputSnapshot } from "../control/ControlClient";
+import type {
+  ControlClient,
+  OutputPressureReport,
+  OutputSnapshot,
+} from "../control/ControlClient";
 import {
   XtermTerminalRenderer,
   XTERM_THEME,
@@ -17,6 +21,17 @@ const FALLBACK_INACTIVE_POLL_MS = 700;
 const ACTIVITY_HOT_POLLS = 12;
 const MAX_PENDING_STREAM_FRAMES = 256;
 const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
+const MAX_RENDER_QUEUE_BYTES = 2 * 1024 * 1024;
+const MAX_RENDER_BATCH_BYTES = 64 * 1024;
+const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
+
+function terminalWebglEnabled(): boolean {
+  try {
+    return window.localStorage?.getItem("agentmux.terminal.webgl") === "1";
+  } catch {
+    return false;
+  }
+}
 
 interface OutputStreamFrame {
   fromOffset: number;
@@ -25,6 +40,7 @@ interface OutputStreamFrame {
 
 type OutputTransportMode =
   | "tauri-channel"
+  | "websocket"
   | "snapshot-poll"
   | "read-recent-poll";
 
@@ -34,6 +50,10 @@ interface TerminalTransportDiagnostics {
   frames: number;
   bytes: number;
   resyncs: number;
+  queuedBytes: number;
+  maxQueuedBytes: number;
+  backpressureEvents: number;
+  writeInFlight: boolean;
   updatedAt: string;
 }
 
@@ -56,6 +76,10 @@ function recordTransport(
     frames: 0,
     bytes: 0,
     resyncs: 0,
+    queuedBytes: 0,
+    maxQueuedBytes: 0,
+    backpressureEvents: 0,
+    writeInFlight: false,
     updatedAt: new Date().toISOString(),
   };
   registry[sessionId] = {
@@ -70,15 +94,6 @@ function recordTransport(
 
 function documentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
-}
-
-function tauriOutputChannelAvailable(): boolean {
-  const tauri = (
-    window as Window & {
-      __TAURI__?: { core?: { Channel?: unknown } };
-    }
-  ).__TAURI__;
-  return Boolean(tauri?.core?.Channel);
 }
 
 interface LiveTerminalProps {
@@ -200,14 +215,15 @@ export function LiveTerminal({
       }
     };
 
-    // --- live byte stream (real Tauri host) ---
+    // --- live byte stream (Tauri Channel / server WebSocket) ---
+    const liveOutputMode = client.outputStreamMode?.() ?? null;
     if (
       typeof client.snapshot === "function" &&
       typeof client.subscribeOutput === "function" &&
-      tauriOutputChannelAvailable()
+      liveOutputMode !== null
     ) {
-      recordTransport(sessionId, "tauri-channel");
-      console.info("[agentmux] terminal output transport: tauri-channel", {
+      recordTransport(sessionId, liveOutputMode);
+      console.info(`[agentmux] terminal output transport: ${liveOutputMode}`, {
         sessionId,
       });
       let expected = 0;
@@ -216,6 +232,16 @@ export function LiveTerminal({
       let resyncQueued = false;
       let pendingFrames: OutputStreamFrame[] = [];
       let pendingFrameBytes = 0;
+      let renderQueue: Uint8Array[] = [];
+      let renderQueueBytes = 0;
+      let maxRenderQueueBytes = 0;
+      let renderBackpressureEvents = 0;
+      let renderWriteInFlight = false;
+      let renderFlushFrame: number | null = null;
+      let pendingDiagnosticFrames = 0;
+      let pendingDiagnosticBytes = 0;
+      let diagnosticFlushTimer: number | null = null;
+      let pressureReportTimer: number | null = null;
       let resyncRetryTimer: number | null = null;
       let unsubscribeOutput: (() => void) | null = null;
 
@@ -224,6 +250,179 @@ export function LiveTerminal({
           window.clearTimeout(resyncRetryTimer);
           resyncRetryTimer = null;
         }
+      };
+
+      const clearRenderFlush = () => {
+        if (renderFlushFrame !== null) {
+          window.cancelAnimationFrame(renderFlushFrame);
+          renderFlushFrame = null;
+        }
+      };
+
+      const flushTransportDiagnostics = () => {
+        if (diagnosticFlushTimer !== null) {
+          window.clearTimeout(diagnosticFlushTimer);
+          diagnosticFlushTimer = null;
+        }
+        if (pendingDiagnosticFrames === 0 && pendingDiagnosticBytes === 0) {
+          return;
+        }
+        const diagnostics =
+          terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+        recordTransport(sessionId, liveOutputMode, {
+          frames: (diagnostics?.frames ?? 0) + pendingDiagnosticFrames,
+          bytes: (diagnostics?.bytes ?? 0) + pendingDiagnosticBytes,
+          queuedBytes: renderQueueBytes,
+          maxQueuedBytes: maxRenderQueueBytes,
+          backpressureEvents: renderBackpressureEvents,
+          writeInFlight: renderWriteInFlight,
+        });
+        pendingDiagnosticFrames = 0;
+        pendingDiagnosticBytes = 0;
+      };
+
+      const queueTransportDiagnostics = (byteCount: number) => {
+        pendingDiagnosticFrames += 1;
+        pendingDiagnosticBytes += byteCount;
+        if (diagnosticFlushTimer !== null) {
+          return;
+        }
+        diagnosticFlushTimer = window.setTimeout(
+          flushTransportDiagnostics,
+          TRANSPORT_DIAGNOSTIC_FLUSH_MS,
+        );
+      };
+
+      const clearRenderQueue = () => {
+        renderQueue = [];
+        renderQueueBytes = 0;
+      };
+
+      const currentPressureReport = (): OutputPressureReport => ({
+        queuedBytes: renderQueueBytes,
+        maxQueuedBytes: maxRenderQueueBytes,
+        backpressureEvents: renderBackpressureEvents,
+        writeInFlight: renderWriteInFlight,
+      });
+
+      const flushPressureReport = () => {
+        if (pressureReportTimer !== null) {
+          window.clearTimeout(pressureReportTimer);
+          pressureReportTimer = null;
+        }
+        const report = currentPressureReport();
+        recordTransport(sessionId, liveOutputMode, {
+          queuedBytes: report.queuedBytes,
+          maxQueuedBytes: report.maxQueuedBytes,
+          backpressureEvents: report.backpressureEvents,
+          writeInFlight: report.writeInFlight,
+        });
+        void client.reportOutputPressure?.(sessionId, report).catch(() => {});
+      };
+
+      const queuePressureReport = () => {
+        if (pressureReportTimer !== null) {
+          return;
+        }
+        pressureReportTimer = window.setTimeout(
+          flushPressureReport,
+          TRANSPORT_DIAGNOSTIC_FLUSH_MS,
+        );
+      };
+
+      const takeRenderBatch = () => {
+        const byteCount = Math.min(renderQueueBytes, MAX_RENDER_BATCH_BYTES);
+        if (byteCount <= 0) {
+          return null;
+        }
+        if (renderQueue.length === 1 && renderQueue[0].length <= byteCount) {
+          const [only] = renderQueue;
+          renderQueue = [];
+          renderQueueBytes = 0;
+          return only;
+        }
+
+        const batch = new Uint8Array(byteCount);
+        let copied = 0;
+        while (copied < byteCount && renderQueue.length > 0) {
+          const head = renderQueue[0];
+          const take = Math.min(head.length, byteCount - copied);
+          batch.set(head.subarray(0, take), copied);
+          copied += take;
+          renderQueueBytes -= take;
+          if (take === head.length) {
+            renderQueue.shift();
+          } else {
+            renderQueue[0] = head.subarray(take);
+          }
+        }
+        return batch;
+      };
+
+      const scheduleRenderFlush = () => {
+        if (!alive || renderWriteInFlight || renderFlushFrame !== null) {
+          return;
+        }
+        renderFlushFrame = window.requestAnimationFrame(() => {
+          renderFlushFrame = null;
+          flushRenderQueue();
+        });
+      };
+
+      function flushRenderQueue() {
+        if (!alive || renderWriteInFlight) {
+          return;
+        }
+        if (resyncQueued) {
+          scheduleResync(0);
+          return;
+        }
+        const batch = takeRenderBatch();
+        if (!batch) {
+          return;
+        }
+
+        renderWriteInFlight = true;
+        renderer.write(batch, () => {
+          renderWriteInFlight = false;
+          if (!alive) {
+            return;
+          }
+          markOutput();
+          queueTransportDiagnostics(batch.length);
+          queuePressureReport();
+          if (resyncQueued) {
+            scheduleResync(0);
+            return;
+          }
+          if (renderQueueBytes > 0) {
+            scheduleRenderFlush();
+          }
+        });
+      }
+
+      const enqueueRenderBytes = (bytes: Uint8Array) => {
+        if (bytes.length === 0) {
+          return;
+        }
+        const wasBackpressured = renderWriteInFlight || renderQueueBytes > 0;
+        renderQueue.push(bytes);
+        renderQueueBytes += bytes.length;
+        maxRenderQueueBytes = Math.max(maxRenderQueueBytes, renderQueueBytes);
+        if (wasBackpressured) {
+          renderBackpressureEvents += 1;
+          queuePressureReport();
+        }
+        if (renderQueueBytes > MAX_RENDER_QUEUE_BYTES) {
+          clearRenderQueue();
+          resyncQueued = true;
+          flushPressureReport();
+          if (!renderWriteInFlight) {
+            scheduleResync(0);
+          }
+          return;
+        }
+        scheduleRenderFlush();
       };
 
       const queueFrame = (fromOffset: number, bytes: Uint8Array) => {
@@ -245,23 +444,28 @@ export function LiveTerminal({
       const writeSnapshot = (snap: OutputSnapshot) => {
         const diagnostics =
           terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
-        recordTransport(sessionId, "tauri-channel", {
+        recordTransport(sessionId, liveOutputMode, {
           resyncs: (diagnostics?.resyncs ?? 0) + 1,
         });
         renderer.reset();
+        clearRenderQueue();
         if (snap.bytes.length > 0) {
-          renderer.write(snap.bytes);
-          markOutput();
+          enqueueRenderBytes(snap.bytes);
         }
         expected = snap.endOffset;
         streamReady = true;
       };
 
       async function resync() {
+        if (renderWriteInFlight) {
+          resyncQueued = true;
+          return;
+        }
         if (resyncInFlight) {
           resyncQueued = true;
           return;
         }
+        resyncQueued = false;
         resyncInFlight = true;
         clearResyncRetry();
         try {
@@ -325,14 +529,7 @@ export function LiveTerminal({
         const duplicateBytes = Math.max(0, expected - fromOffset);
         const next = duplicateBytes > 0 ? bytes.subarray(duplicateBytes) : bytes;
         if (next.length > 0) {
-          renderer.write(next);
-          markOutput();
-          const diagnostics =
-            terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
-          recordTransport(sessionId, "tauri-channel", {
-            frames: (diagnostics?.frames ?? 0) + 1,
-            bytes: (diagnostics?.bytes ?? 0) + next.length,
-          });
+          enqueueRenderBytes(next);
         }
         expected = frameEnd;
       };
@@ -372,6 +569,9 @@ export function LiveTerminal({
 
       return () => {
         clearResyncRetry();
+        clearRenderFlush();
+        flushTransportDiagnostics();
+        flushPressureReport();
         unsubscribeInput();
         unsubscribeOutput?.();
         teardownShared();
@@ -652,17 +852,16 @@ export function LiveTerminal({
     }
   }, [active]);
 
-  // Visible-only GPU rendering. WebView2/Chromium caps the number of live WebGL
-  // contexts (~16), so a multiplexer must not hand every pane its own context.
-  // Enable WebGL only while this pane is active, and dispose it on deactivation.
-  // The xterm instance stays mounted, so the buffer and output loop survive the
-  // toggle. enable/disableWebgl no-op if WebGL is unavailable.
+  // WebGL remains opt-in because Chromium's glyph atlas can render private-use
+  // Nerd Font fallback symbols as tofu on some Windows/WebView2 stacks. Keep
+  // the default path glyph-faithful; allow explicit perf testing with
+  // localStorage.agentmux.terminal.webgl = "1".
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer) {
       return;
     }
-    if (active) {
+    if (active && terminalWebglEnabled()) {
       renderer.enableWebgl();
     } else {
       renderer.disableWebgl();

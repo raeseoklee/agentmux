@@ -11,10 +11,22 @@ export const XTERM_THEME = {
   selectionBackground: "#2d5f73"
 } as const;
 
-// Bundled D2Coding Nerd Font first (powerline/devicons + CJK), then platform
-// monospace fallbacks. Declared in src/fonts.css.
-const TERMINAL_FONT_FAMILY =
-  '"D2Coding Nerd", "Cascadia Mono", Consolas, "Liberation Mono", monospace';
+const TERMINAL_PRIMARY_FONT = "D2Coding Nerd";
+const TERMINAL_SYMBOL_FONT = "Symbols Nerd Font Mono";
+const TERMINAL_FONT_FAMILY = [
+  '"CaskaydiaCove Nerd Font Mono"',
+  '"CaskaydiaCove Nerd Font"',
+  '"MesloLGS NF"',
+  '"JetBrainsMono Nerd Font Mono"',
+  '"JetBrainsMono Nerd Font"',
+  '"FiraCode Nerd Font Mono"',
+  '"Symbols Nerd Font Mono"',
+  '"D2Coding Nerd"',
+  '"Cascadia Mono"',
+  "Consolas",
+  '"Liberation Mono"',
+  "monospace"
+].join(", ");
 const TERMINAL_FONT_SIZE = 13;
 
 export class XtermTerminalRenderer implements TerminalRenderer {
@@ -34,6 +46,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   // enable -> disable -> enable can let two in-flight imports each loadAddon(),
   // leaking a duplicate WebGL context.
   private webglGeneration = 0;
+  private fontReadyPromise?: Promise<void>;
 
   mount(element: HTMLElement, initialState: TerminalSnapshot): void {
     this.dispose();
@@ -66,16 +79,25 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // measurement can use fallback metrics — leaving icons/powerline glyphs
     // blank or misaligned. Once the face is ready, re-measure: drop the WebGL
     // texture atlas, re-apply the family to force a glyph re-measure, refit.
-    this.ensureFontThenRemeasure(terminal);
+    this.fontReadyPromise = this.ensureFontsThenRemeasure(terminal);
   }
 
-  private ensureFontThenRemeasure(terminal: Terminal): void {
+  private ensureFontsThenRemeasure(terminal: Terminal): Promise<void> {
     const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
-    if (!fonts?.load) {
-      return;
-    }
-    void fonts
-      .load(`${TERMINAL_FONT_SIZE}px "D2Coding Nerd"`)
+    const fontLoads = fonts?.load
+      ? Promise.allSettled([
+          fonts.load(`${TERMINAL_FONT_SIZE}px "${TERMINAL_PRIMARY_FONT}"`),
+          fonts.load(`${TERMINAL_FONT_SIZE}px "${TERMINAL_SYMBOL_FONT}"`)
+        ]).then(() => {})
+      : Promise.resolve();
+    return fontLoads
+      .catch(() => {})
+      .then(
+        () =>
+          new Promise<void>((resolve) => {
+            window.setTimeout(resolve, 80);
+          })
+      )
       .then(() => {
         if (this.terminal !== terminal) {
           return;
@@ -98,10 +120,15 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.terminal = undefined;
     this.fitAddon = undefined;
     this.mountedElement = undefined;
+    this.fontReadyPromise = undefined;
   }
 
-  write(batch: Uint8Array): void {
-    this.terminal?.write(batch);
+  write(batch: Uint8Array, callback?: () => void): void {
+    if (!this.terminal) {
+      callback?.();
+      return;
+    }
+    this.terminal.write(batch, callback);
   }
 
   reset(): void {
@@ -153,7 +180,9 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // Claim a generation for this enable. Any later disable bumps the counter,
     // which invalidates this in-flight import when it resolves.
     const generation = ++this.webglGeneration;
-    void import("@xterm/addon-webgl")
+    void (this.fontReadyPromise ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => import("@xterm/addon-webgl"))
       .then(({ WebglAddon }) => {
         // Bail if this enable was superseded (disable/re-enable) or the terminal
         // was swapped/unmounted while the import was in flight, or an addon is

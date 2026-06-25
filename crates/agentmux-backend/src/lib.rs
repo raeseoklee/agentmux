@@ -215,6 +215,10 @@ pub trait SessionBackend {
 
     fn terminate(&mut self, session_id: &str, mode: TerminationMode) -> BackendResult<()>;
 
+    fn set_output_paused(&mut self, _session_id: &str, _paused: bool) -> BackendResult<()> {
+        Ok(())
+    }
+
     fn drain_events(&mut self) -> Vec<BackendEvent>;
 }
 

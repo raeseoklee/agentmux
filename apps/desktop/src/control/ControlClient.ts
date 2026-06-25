@@ -640,16 +640,20 @@ export interface ControlClient {
   getSession(sessionId: string): Promise<TerminalSession>;
   readRecent(sessionId: string, maxBytes: number): Promise<string>;
   /**
-   * Optional live-output stream (real Tauri host only). When present, the
-   * renderer cold-starts from `snapshot`, then writes raw bytes pushed through
-   * `subscribeOutput` instead of polling `readRecent`. Absent on the preview and
-   * server clients, where the renderer falls back to polling.
+   * Optional live-output stream. When present, the renderer cold-starts from
+   * `snapshot`, then writes raw bytes pushed through `subscribeOutput` instead
+   * of polling `readRecent`.
    */
   snapshot?(sessionId: string, sinceOffset?: number): Promise<OutputSnapshot>;
+  outputStreamMode?(): "tauri-channel" | "websocket" | null;
   subscribeOutput?(
     sessionId: string,
     onFrame: (fromOffset: number, bytes: Uint8Array) => void,
   ): Promise<() => void>;
+  reportOutputPressure?(
+    sessionId: string,
+    report: OutputPressureReport,
+  ): Promise<void>;
   sendText(sessionId: string, text: string): Promise<void>;
   sendKey(sessionId: string, key: string): Promise<void>;
   resize(sessionId: string, columns: number, rows: number): Promise<void>;
@@ -684,6 +688,13 @@ export interface OutputSnapshot {
   baseOffset: number;
   endOffset: number;
   bytes: Uint8Array;
+}
+
+export interface OutputPressureReport {
+  queuedBytes: number;
+  maxQueuedBytes: number;
+  backpressureEvents: number;
+  writeInFlight: boolean;
 }
 
 const EMPTY_BYTES = new Uint8Array(0);
@@ -1776,6 +1787,10 @@ class TauriControlClient implements ControlClient {
     };
   }
 
+  outputStreamMode(): "tauri-channel" | null {
+    return window.__TAURI__?.core?.Channel ? "tauri-channel" : null;
+  }
+
   async subscribeOutput(
     sessionId: string,
     onFrame: (fromOffset: number, bytes: Uint8Array) => void,
@@ -1806,6 +1821,19 @@ class TauriControlClient implements ControlClient {
         subscription_id: subscriptionId,
       });
     };
+  }
+
+  async reportOutputPressure(
+    sessionId: string,
+    report: OutputPressureReport,
+  ): Promise<void> {
+    await this.invoke("session_report_output_pressure", {
+      session_id: sessionId,
+      queued_bytes: Math.max(0, Math.floor(report.queuedBytes)),
+      max_queued_bytes: Math.max(0, Math.floor(report.maxQueuedBytes)),
+      backpressure_events: Math.max(0, Math.floor(report.backpressureEvents)),
+      write_in_flight: report.writeInFlight,
+    });
   }
 
   async getSession(sessionId: string): Promise<TerminalSession> {
@@ -4115,6 +4143,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
   private readonly serverPanes = new Map<string, PaneSummary[]>();
   private readonly serverSurfaces = new Map<string, SurfaceSummary[]>();
   private readonly serverSessions = new Map<string, TerminalSession>();
+  private readonly serverOutputSockets = new Map<string, WebSocket>();
   private serverWorkspaceCounter = 0;
   private serverPaneCounter = 0;
 
@@ -4490,6 +4519,98 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return result.text ?? "";
   }
 
+  async snapshot(
+    sessionId: string,
+    sinceOffset?: number,
+  ): Promise<OutputSnapshot> {
+    const query =
+      sinceOffset === undefined
+        ? ""
+        : `?since_offset=${encodeURIComponent(String(sinceOffset))}`;
+    const result = await this.serverApi<{
+      base_offset: number;
+      end_offset: number;
+      bytes_base64: string;
+    }>(`/api/session/${encodeURIComponent(sessionId)}/snapshot${query}`);
+    return {
+      baseOffset: result.base_offset,
+      endOffset: result.end_offset,
+      bytes: base64ToBytes(result.bytes_base64),
+    };
+  }
+
+  outputStreamMode(): "websocket" | null {
+    return typeof WebSocket === "undefined" ? null : "websocket";
+  }
+
+  async subscribeOutput(
+    sessionId: string,
+    onFrame: (fromOffset: number, bytes: Uint8Array) => void,
+  ): Promise<() => void> {
+    const socket = new WebSocket(
+      this.serverWebSocketUrl(`/api/session/${encodeURIComponent(sessionId)}/stream`),
+    );
+    let opened = false;
+    socket.onmessage = (event) => {
+      if (typeof event.data !== "string") {
+        return;
+      }
+      let frame: {
+        type?: string;
+        from_offset?: number;
+        bytes_base64?: string;
+      };
+      try {
+        frame = JSON.parse(event.data) as typeof frame;
+      } catch {
+        return;
+      }
+      if (
+        (frame.type === "output" || frame.type === "reset") &&
+        typeof frame.from_offset === "number"
+      ) {
+        onFrame(frame.from_offset, base64ToBytes(frame.bytes_base64 ?? ""));
+      }
+    };
+    await new Promise<void>((resolve, reject) => {
+      socket.onopen = () => {
+        opened = true;
+        this.serverOutputSockets.set(sessionId, socket);
+        resolve();
+      };
+      socket.onerror = () => reject(new Error("Server output WebSocket failed."));
+      socket.onclose = () => {
+        const current = this.serverOutputSockets.get(sessionId);
+        if (current === socket) {
+          this.serverOutputSockets.delete(sessionId);
+        }
+        if (!opened) {
+          reject(new Error("Server output WebSocket closed before opening."));
+        }
+      };
+    });
+    return () => {
+      const current = this.serverOutputSockets.get(sessionId);
+      if (current === socket) {
+        this.serverOutputSockets.delete(sessionId);
+      }
+      socket.close();
+    };
+  }
+
+  async reportOutputPressure(
+    sessionId: string,
+    report: OutputPressureReport,
+  ): Promise<void> {
+    this.sendServerSocketMessage(sessionId, {
+      type: "pressure",
+      queuedBytes: Math.max(0, Math.floor(report.queuedBytes)),
+      maxQueuedBytes: Math.max(0, Math.floor(report.maxQueuedBytes)),
+      backpressureEvents: Math.max(0, Math.floor(report.backpressureEvents)),
+      writeInFlight: report.writeInFlight,
+    });
+  }
+
   async getSession(sessionId: string): Promise<TerminalSession> {
     for (const workspace of await this.listWorkspaces()) {
       const detail = await this.getWorkspace(workspace.workspaceId);
@@ -4506,6 +4627,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
   }
 
   async sendText(sessionId: string, text: string): Promise<void> {
+    if (this.sendServerSocketMessage(sessionId, { type: "input", text })) {
+      return;
+    }
     await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/send`, {
       method: "POST",
       body: JSON.stringify({ text }),
@@ -4513,6 +4637,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
   }
 
   async sendKey(sessionId: string, key: string): Promise<void> {
+    if (this.sendServerSocketMessage(sessionId, { type: "key", key })) {
+      return;
+    }
     await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/key`, {
       method: "POST",
       body: JSON.stringify({ key }),
@@ -4524,6 +4651,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
     columns: number,
     rows: number,
   ): Promise<void> {
+    if (this.sendServerSocketMessage(sessionId, { type: "resize", columns, rows })) {
+      return;
+    }
     await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/resize`, {
       method: "POST",
       body: JSON.stringify({ columns, rows }),
@@ -4855,6 +4985,27 @@ class ServerControlClient extends BrowserPreviewControlClient {
       throw new Error(data.error || response.statusText);
     }
     return data.result as T;
+  }
+
+  private serverWebSocketUrl(path: string): string {
+    const base =
+      this.serverBaseUrl ||
+      `${window.location.protocol}//${window.location.host}`;
+    const url = new URL(path, base);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    return url.toString();
+  }
+
+  private sendServerSocketMessage(
+    sessionId: string,
+    message: Record<string, unknown>,
+  ): boolean {
+    const socket = this.serverOutputSockets.get(sessionId);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    socket.send(JSON.stringify(message));
+    return true;
   }
 }
 

@@ -24,8 +24,26 @@
   font-family: "D2Coding Nerd";
   font-weight: normal;
   font-style: normal;
-  font-display: swap;
+  font-display: block;
   src:
     url("./assets/fonts/D2CodingNerd.woff2") format("woff2"),
     url("./assets/fonts/D2CodingNerd.woff") format("woff");
+}
+
+/*
+ * Symbols Nerd Font Mono — modern Nerd Font v3 symbol fallback. D2Coding Nerd
+ * is kept as the primary terminal face for text/CJK, while this symbols-only
+ * face fills newer private-use glyphs used by prompts such as Starship,
+ * Powerlevel10k, and Claude/agent CLIs.
+ */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+  src: url("./assets/fonts/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  unicode-range:
+    U+E000-F8FF,
+    U+F0000-FFFFD,
+    U+100000-10FFFF;
 }

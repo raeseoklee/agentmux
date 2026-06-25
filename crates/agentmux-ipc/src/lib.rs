@@ -865,6 +865,15 @@ pub struct SessionSnapshotResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionOutputPressureParams {
+    pub session_id: String,
+    pub queued_bytes: u64,
+    pub max_queued_bytes: u64,
+    pub backpressure_events: u64,
+    pub write_in_flight: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EventPollResult {
     pub events: Vec<EventFrame>,
     pub dropped_count: usize,
@@ -1246,6 +1255,24 @@ pub struct DiagnosticsQueuePressureResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DiagnosticsOutputStreamResult {
+    pub active_sessions: usize,
+    pub active_subscriptions: usize,
+    pub frames_sent: u64,
+    pub bytes_sent: u64,
+    pub send_failures: u64,
+    pub closed_channels: u64,
+    pub pump_runs: u64,
+    pub pump_active_runs: u64,
+    pub pump_idle_runs: u64,
+    pub last_frame_at: Option<String>,
+    pub renderer_queued_bytes: u64,
+    pub renderer_max_queued_bytes: u64,
+    pub renderer_backpressure_events: u64,
+    pub renderer_write_in_flight_sessions: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DiagnosticsExportResult {
     pub generated_at: String,
     pub format_version: String,
@@ -1254,6 +1281,7 @@ pub struct DiagnosticsExportResult {
     pub notifications: Vec<NotificationSummaryResult>,
     pub backend_health: Vec<DiagnosticsBackendHealthResult>,
     pub queue_pressure: Vec<DiagnosticsQueuePressureResult>,
+    pub output_stream: DiagnosticsOutputStreamResult,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
