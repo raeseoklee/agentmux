@@ -503,6 +503,11 @@ export interface ControlClient {
     workspaceId: string,
     surfaceId: string,
   ): Promise<WorkspaceDetail>;
+  moveSurfaceToWorkspace(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    surfaceId: string,
+  ): Promise<{ source: WorkspaceDetail; target: WorkspaceDetail }>;
   browserNavigate(
     surfaceId: string,
     url: string,
@@ -1123,6 +1128,25 @@ class TauriControlClient implements ControlClient {
       panes: result.panes.map(mapPane),
       surfaces: result.surfaces.map(mapSurface),
       sessions: result.sessions.map(mapSession),
+    };
+  }
+
+  async moveSurfaceToWorkspace(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    surfaceId: string,
+  ): Promise<{ source: WorkspaceDetail; target: WorkspaceDetail }> {
+    const result = await this.call<{
+      source: WorkspaceDetailWire;
+      target: WorkspaceDetailWire;
+    }>("surface.move_workspace", {
+      source_workspace_id: sourceWorkspaceId,
+      target_workspace_id: targetWorkspaceId,
+      surface_id: surfaceId,
+    });
+    return {
+      source: mapWorkspaceDetail(result.source),
+      target: mapWorkspaceDetail(result.target),
     };
   }
 
@@ -2869,6 +2893,68 @@ class BrowserPreviewControlClient implements ControlClient {
     }
 
     return this.getWorkspace(workspaceId);
+  }
+
+  async moveSurfaceToWorkspace(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    surfaceId: string,
+  ): Promise<{ source: WorkspaceDetail; target: WorkspaceDetail }> {
+    const sourceWorkspace = this.findWorkspace(sourceWorkspaceId);
+    const targetWorkspace = this.findWorkspace(targetWorkspaceId);
+    if (sourceWorkspaceId === targetWorkspaceId) {
+      const detail = await this.getWorkspace(sourceWorkspaceId);
+      return { source: detail, target: detail };
+    }
+
+    const sourcePanes = this.panes.get(sourceWorkspaceId) ?? [];
+    for (const pane of sourcePanes) {
+      if (pane.mountedSurfaceId === surfaceId) {
+        pane.mountedSurfaceId = null;
+      }
+    }
+    const targetPanes = this.panes.get(targetWorkspaceId) ?? [];
+    const targetPaneId = `pane_browser_preview_moved_${++this.terminalCounter}`;
+    targetPanes.push({
+      paneId: targetPaneId,
+      workspaceId: targetWorkspaceId,
+      parentPaneId: null,
+      kind: "leaf",
+      splitAxis: null,
+      splitRatio: null,
+      mountedSurfaceId: surfaceId,
+    });
+    this.panes.set(targetWorkspaceId, targetPanes);
+    targetWorkspace.rootPaneId = targetPaneId;
+    targetWorkspace.activePaneId = targetPaneId;
+    if (sourceWorkspace.rootPaneId && sourceWorkspace.activePaneId) {
+      sourceWorkspace.activePaneId =
+        sourcePanes.find((pane) => pane.kind === "leaf")?.paneId ??
+        sourceWorkspace.activePaneId;
+      sourceWorkspace.rootPaneId =
+        this.findRootPaneId(sourceWorkspaceId, sourceWorkspace.activePaneId) ??
+        sourceWorkspace.rootPaneId;
+    }
+
+    const surface =
+      this.terminalSurfaces.find((candidate) => candidate.surfaceId === surfaceId) ??
+      this.browserSurfaces.find((candidate) => candidate.surfaceId === surfaceId);
+    if (!surface) {
+      throw new Error(`Surface '${surfaceId}' was not found.`);
+    }
+    surface.workspaceId = targetWorkspaceId;
+    if (surface.sessionId) {
+      const session = this.sessions.get(surface.sessionId);
+      if (session) {
+        this.agentStates.get(surface.sessionId) &&
+          (this.agentStates.get(surface.sessionId)!.workspaceId = targetWorkspaceId);
+      }
+    }
+
+    return {
+      source: await this.getWorkspace(sourceWorkspaceId),
+      target: await this.getWorkspace(targetWorkspaceId),
+    };
   }
 
   async browserNavigate(
@@ -4876,6 +4962,56 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return this.getWorkspace(workspaceId);
   }
 
+  async moveSurfaceToWorkspace(
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+    surfaceId: string,
+  ): Promise<{ source: WorkspaceDetail; target: WorkspaceDetail }> {
+    this.findServerWorkspace(sourceWorkspaceId);
+    const targetWorkspace = this.findServerWorkspace(targetWorkspaceId);
+    if (sourceWorkspaceId === targetWorkspaceId) {
+      const detail = await this.getWorkspace(sourceWorkspaceId);
+      return { source: detail, target: detail };
+    }
+    const sourcePanes = this.serverPanes.get(sourceWorkspaceId) ?? [];
+    for (const pane of sourcePanes) {
+      if (pane.mountedSurfaceId === surfaceId) {
+        pane.mountedSurfaceId = null;
+      }
+    }
+    const surfaces = this.serverSurfaces.get(sourceWorkspaceId) ?? [];
+    const surfaceIndex = surfaces.findIndex(
+      (surface) => surface.surfaceId === surfaceId,
+    );
+    if (surfaceIndex < 0) {
+      throw new Error(`Surface '${surfaceId}' was not found.`);
+    }
+    const [surface] = surfaces.splice(surfaceIndex, 1);
+    surface.workspaceId = targetWorkspaceId;
+    this.serverSurfaces.set(sourceWorkspaceId, surfaces);
+    const targetSurfaces = this.serverSurfaces.get(targetWorkspaceId) ?? [];
+    targetSurfaces.push(surface);
+    this.serverSurfaces.set(targetWorkspaceId, targetSurfaces);
+    const targetPanes = this.serverPanes.get(targetWorkspaceId) ?? [];
+    const paneId = `pane_server_moved_${++this.serverPaneCounter}`;
+    targetPanes.push({
+      paneId,
+      workspaceId: targetWorkspaceId,
+      parentPaneId: null,
+      kind: "leaf",
+      splitAxis: null,
+      splitRatio: null,
+      mountedSurfaceId: surfaceId,
+    });
+    this.serverPanes.set(targetWorkspaceId, targetPanes);
+    targetWorkspace.rootPaneId = paneId;
+    targetWorkspace.activePaneId = paneId;
+    return {
+      source: await this.getWorkspace(sourceWorkspaceId),
+      target: await this.getWorkspace(targetWorkspaceId),
+    };
+  }
+
   async createBrowserSurface(): Promise<SurfaceSummary> {
     throw new Error("Browser surfaces are not available in server mode yet.");
   }
@@ -5902,6 +6038,15 @@ function mapWorkspace(value: WorkspaceSummaryWire): WorkspaceSummary {
     defaultWslDistribution: value.default_wsl_distribution,
     defaultTerminalProfile: normalizeTerminalProfile(value.default_terminal_profile),
     defaultAgentCommand: value.default_agent_command,
+  };
+}
+
+function mapWorkspaceDetail(value: WorkspaceDetailWire): WorkspaceDetail {
+  return {
+    workspace: mapWorkspace(value.workspace),
+    panes: value.panes.map(mapPane),
+    surfaces: value.surfaces.map(mapSurface),
+    sessions: value.sessions.map(mapSession),
   };
 }
 

@@ -66,18 +66,18 @@ use agentmux_ipc::{
     SidebarLogListParams, SidebarLogListResult, SidebarLogResult, SidebarProgressResult,
     SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams, SidebarStatusListResult,
     SidebarStatusResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
-    SurfaceCreateBrowserParams, SurfaceSummaryResult, SystemCapabilitiesResult,
-    SystemIdentifyParams, SystemIdentifyResult, TeamMessageListParams, TeamMessageListResult,
-    TeamMessageMarkReadParams, TeamMessageResult, TeamMessageSendParams, TeamTaskBlockParams,
-    TeamTaskClaimParams, TeamTaskCreateParams, TeamTaskDependencyParams, TeamTaskIdParams,
-    TeamTaskListParams, TeamTaskListResult, TeamTaskResult, TmuxDiagnosticsParams,
-    TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult, WorkspaceCreateParams,
-    WorkspaceDetailResult, WorkspaceGroupCreateParams, WorkspaceGroupIdParams,
-    WorkspaceGroupListParams, WorkspaceGroupListResult, WorkspaceGroupMemberParams,
-    WorkspaceGroupMemberResult, WorkspaceGroupResult, WorkspaceGroupUpdateParams,
-    WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
-    WorkspaceUpdateParams, WslDistributionListResult, WslDistributionResult,
-    DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
+    SurfaceCreateBrowserParams, SurfaceMoveWorkspaceParams, SurfaceMoveWorkspaceResult,
+    SurfaceSummaryResult, SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult,
+    TeamMessageListParams, TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult,
+    TeamMessageSendParams, TeamTaskBlockParams, TeamTaskClaimParams, TeamTaskCreateParams,
+    TeamTaskDependencyParams, TeamTaskIdParams, TeamTaskListParams, TeamTaskListResult,
+    TeamTaskResult, TmuxDiagnosticsParams, TmuxDiagnosticsResult, WorkspaceCloseParams,
+    WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
+    WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
+    WorkspaceGroupMemberParams, WorkspaceGroupMemberResult, WorkspaceGroupResult,
+    WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams,
+    WorkspaceSummaryResult, WorkspaceUpdateParams, WslDistributionListResult,
+    WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
 };
 use agentmux_store::{
     PersistedAgentState, PersistedDockTrust, PersistedNotification, PersistedPane,
@@ -1320,6 +1320,7 @@ impl DesktopControlState {
             "pane.unmount_surface" => self.handle_pane_unmount_surface(&request),
             "surface.create_browser" => self.handle_surface_create_browser(&request),
             "surface.close" => self.handle_surface_close(&request),
+            "surface.move_workspace" => self.handle_surface_move_workspace(&request),
             "browser.navigate" => self.handle_browser_navigate(&request),
             "browser.reload" => self.handle_browser_reload(&request),
             "browser.back" => self.handle_browser_back(&request),
@@ -2461,6 +2462,66 @@ impl DesktopControlState {
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &workspace_detail(bundle),
+        ))
+    }
+
+    fn handle_surface_move_workspace(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: SurfaceMoveWorkspaceParams = request.parse_params()?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let mut source = store
+            .load_workspace_bundle(&params.source_workspace_id)?
+            .ok_or_else(|| workspace_not_found(&params.source_workspace_id))?;
+        if params.source_workspace_id == params.target_workspace_id {
+            if !source
+                .surfaces
+                .iter()
+                .any(|surface| surface.surface_id == params.surface_id)
+            {
+                return Err(surface_not_found(&params.surface_id).into());
+            }
+            let detail = workspace_detail(source);
+            return Ok(ResponseEnvelope::ok_typed(
+                request.id.clone(),
+                &SurfaceMoveWorkspaceResult {
+                    source: detail.clone(),
+                    target: detail,
+                },
+            ));
+        }
+
+        let mut target = store
+            .load_workspace_bundle(&params.target_workspace_id)?
+            .ok_or_else(|| workspace_not_found(&params.target_workspace_id))?;
+        let moved_session_ids =
+            move_surface_tab_between_workspaces(&mut source, &mut target, &params.surface_id)?;
+        let mut moved_agent_states = Vec::new();
+        for session_id in &moved_session_ids {
+            if let Some(mut state) = store.load_agent_state(session_id)? {
+                state.workspace_id = params.target_workspace_id.clone();
+                state.updated_at = timestamp();
+                moved_agent_states.push(state);
+            }
+        }
+
+        store.save_workspace_bundle(&target)?;
+        store.save_workspace_bundle(&source)?;
+        for state in &moved_agent_states {
+            store.upsert_agent_state(state)?;
+        }
+
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &SurfaceMoveWorkspaceResult {
+                source: workspace_detail(source),
+                target: workspace_detail(target),
+            },
         ))
     }
 
@@ -5918,6 +5979,7 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "pane.unmount_surface",
         "surface.create_browser",
         "surface.close",
+        "surface.move_workspace",
         "session.spawn",
         "session.attach",
         "session.list",
@@ -8870,6 +8932,7 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "pane.unmount_surface"
             | "surface.create_browser"
             | "surface.close"
+            | "surface.move_workspace"
             | "browser.navigate"
             | "browser.reload"
             | "browser.back"
@@ -9609,6 +9672,148 @@ fn surface_ids_for_close(
         surface_ids.push(surface_id.to_string());
     }
     Ok(surface_ids)
+}
+
+fn move_surface_tab_between_workspaces(
+    source: &mut WorkspaceBundle,
+    target: &mut WorkspaceBundle,
+    surface_id: &str,
+) -> Result<Vec<String>, DesktopHostError> {
+    let now = timestamp();
+    let host_pane_id = source
+        .panes
+        .iter()
+        .find(|pane| pane.mounted_surface_id.as_deref() == Some(surface_id))
+        .map(|pane| pane.pane_id.clone());
+    let root_pane_id = host_pane_id
+        .as_deref()
+        .and_then(|pane_id| root_pane_id_for_pane(source, pane_id));
+    let moved_pane_ids = root_pane_id
+        .as_deref()
+        .map(|pane_id| pane_subtree_ids(source, pane_id))
+        .unwrap_or_default();
+    let moved_pane_id_set = moved_pane_ids.iter().cloned().collect::<HashSet<_>>();
+
+    if !source
+        .surfaces
+        .iter()
+        .any(|surface| surface.surface_id == surface_id)
+    {
+        return Err(surface_not_found(surface_id).into());
+    }
+
+    let mut moved_surface_ids = if moved_pane_id_set.is_empty() {
+        vec![surface_id.to_string()]
+    } else {
+        source
+            .panes
+            .iter()
+            .filter(|pane| moved_pane_id_set.contains(&pane.pane_id))
+            .filter_map(|pane| pane.mounted_surface_id.clone())
+            .collect::<Vec<_>>()
+    };
+    if !moved_surface_ids
+        .iter()
+        .any(|candidate| candidate == surface_id)
+    {
+        moved_surface_ids.push(surface_id.to_string());
+    }
+    moved_surface_ids.sort();
+    moved_surface_ids.dedup();
+    let moved_surface_id_set = moved_surface_ids.iter().cloned().collect::<HashSet<_>>();
+
+    let moved_session_ids = source
+        .surfaces
+        .iter()
+        .filter(|surface| moved_surface_id_set.contains(&surface.surface_id))
+        .filter_map(|surface| surface.session_id.clone())
+        .collect::<Vec<_>>();
+    let moved_session_id_set = moved_session_ids.iter().cloned().collect::<HashSet<_>>();
+
+    let mut moved_panes = source
+        .panes
+        .iter()
+        .filter(|pane| moved_pane_id_set.contains(&pane.pane_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut moved_surfaces = source
+        .surfaces
+        .iter()
+        .filter(|surface| moved_surface_id_set.contains(&surface.surface_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut moved_sessions = source
+        .sessions
+        .iter()
+        .filter(|session| moved_session_id_set.contains(&session.session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if moved_surfaces.is_empty() {
+        return Err(surface_not_found(surface_id).into());
+    }
+
+    source
+        .panes
+        .retain(|pane| !moved_pane_id_set.contains(&pane.pane_id));
+    source
+        .surfaces
+        .retain(|surface| !moved_surface_id_set.contains(&surface.surface_id));
+    source
+        .sessions
+        .retain(|session| !moved_session_id_set.contains(&session.session_id));
+
+    let moved_root_id = if let Some(root_pane_id) = root_pane_id {
+        root_pane_id
+    } else {
+        let pane_id = PaneId::new().to_string();
+        moved_panes.push(PersistedPane {
+            pane_id: pane_id.clone(),
+            workspace_id: target.workspace.workspace_id.clone(),
+            parent_pane_id: None,
+            kind: "leaf".to_string(),
+            split_axis: None,
+            split_ratio: None,
+            mounted_surface_id: Some(surface_id.to_string()),
+            last_focused_at: Some(now.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        });
+        pane_id
+    };
+
+    for pane in &mut moved_panes {
+        pane.workspace_id = target.workspace.workspace_id.clone();
+        if pane.parent_pane_id.as_ref().is_some_and(|parent| {
+            !moved_pane_id_set.contains(parent) || pane.pane_id == moved_root_id
+        }) {
+            pane.parent_pane_id = None;
+        }
+        if pane.pane_id == moved_root_id {
+            pane.parent_pane_id = None;
+        }
+        pane.updated_at = now.clone();
+    }
+    for surface in &mut moved_surfaces {
+        surface.workspace_id = target.workspace.workspace_id.clone();
+        surface.updated_at = now.clone();
+        surface.last_visible_at = Some(now.clone());
+    }
+    for session in &mut moved_sessions {
+        session.workspace_id = target.workspace.workspace_id.clone();
+        session.updated_at = now.clone();
+    }
+
+    target.panes.extend(moved_panes);
+    target.surfaces.extend(moved_surfaces);
+    target.sessions.extend(moved_sessions);
+    target.workspace.root_pane_id = moved_root_id.clone();
+    target.workspace.active_pane_id =
+        first_leaf_id(target, &moved_root_id).unwrap_or(moved_root_id);
+    target.workspace.updated_at = now.clone();
+    normalize_workspace_pane_tree(source);
+    normalize_workspace_pane_tree(target);
+    Ok(moved_session_ids)
 }
 
 fn pane_subtree_ids(bundle: &WorkspaceBundle, pane_id: &str) -> Vec<String> {
@@ -14550,6 +14755,62 @@ mod tests {
             children_of_p1, 2,
             "P1 must keep its 2 split children after a new-tab spawn"
         );
+    }
+
+    #[test]
+    fn move_surface_tab_between_workspaces_preserves_split_subtree() {
+        let mut source = workspace_bundle_with_unmounted_surface();
+        source.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+        let mut target = workspace_bundle_with_unmounted_surface();
+        target.workspace.workspace_id = "ws_target".to_string();
+        target.workspace.name = "Target workspace".to_string();
+        for pane in &mut target.panes {
+            pane.workspace_id = "ws_target".to_string();
+            pane.pane_id = format!("target_{}", pane.pane_id);
+            pane.parent_pane_id = pane
+                .parent_pane_id
+                .as_ref()
+                .map(|parent_id| format!("target_{parent_id}"));
+        }
+        target.workspace.root_pane_id = "target_pane_root".to_string();
+        target.workspace.active_pane_id = "target_pane_left".to_string();
+        target.surfaces.clear();
+        target.sessions.clear();
+
+        let moved_sessions =
+            move_surface_tab_between_workspaces(&mut source, &mut target, "surf_terminal")
+                .expect("move surface tab");
+
+        assert_eq!(moved_sessions, vec!["ses_surface".to_string()]);
+        assert!(source
+            .surfaces
+            .iter()
+            .all(|surface| surface.surface_id != "surf_terminal"));
+        assert!(source
+            .sessions
+            .iter()
+            .all(|session| session.session_id != "ses_surface"));
+        assert_eq!(
+            target
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == "surf_terminal")
+                .unwrap()
+                .workspace_id,
+            "ws_target"
+        );
+        assert_eq!(
+            target
+                .sessions
+                .iter()
+                .find(|session| session.session_id == "ses_surface")
+                .unwrap()
+                .workspace_id,
+            "ws_target"
+        );
+        assert!(target.panes.iter().any(|pane| pane.pane_id == "pane_root"
+            && pane.workspace_id == "ws_target"
+            && pane.parent_pane_id.is_none()));
     }
 
     #[test]

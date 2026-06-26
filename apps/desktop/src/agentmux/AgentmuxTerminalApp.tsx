@@ -262,6 +262,11 @@ const TERMINAL_INNER_MARGIN_MIN = 0;
 const TERMINAL_INNER_MARGIN_MAX = 32;
 const WORKSPACE_GROUP_DRAG_TYPE = "application/x-agentmux-workspace-group";
 const WORKSPACE_MEMBER_DRAG_TYPE = "application/x-agentmux-workspace-member";
+const WORKSPACE_CARD_DRAG_TYPE = "application/x-agentmux-workspace-card";
+const SURFACE_TAB_DRAG_TYPE = "application/x-agentmux-surface-tab";
+const PANE_SURFACE_DRAG_TYPE = "application/x-agentmux-pane-surface";
+const WORKSPACE_ORDER_STORAGE_KEY = "agentmux.workspaceOrder.v1";
+const SURFACE_TAB_ORDER_STORAGE_PREFIX = "agentmux.surfaceTabOrder.v1:";
 
 type DropPlacement = "before" | "after";
 
@@ -272,6 +277,21 @@ interface WorkspaceGroupDragPayload {
 interface WorkspaceMemberDragPayload {
   groupId: string;
   workspaceId: string;
+}
+
+interface WorkspaceCardDragPayload {
+  workspaceId: string;
+}
+
+interface SurfaceTabDragPayload {
+  workspaceId: string;
+  surfaceId: string;
+}
+
+interface PaneSurfaceDragPayload {
+  workspaceId: string;
+  paneId: string;
+  surfaceId: string;
 }
 
 interface AttentionPaneTarget {
@@ -300,6 +320,55 @@ function parseDragPayload<T>(
   } catch {
     return null;
   }
+}
+
+function readStoredOrder(key: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredOrder(key: string, order: string[]): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(order));
+  } catch {
+    // Ordering is a UX preference; storage failures should not block work.
+  }
+}
+
+function applyStoredOrder<T>(
+  items: T[],
+  getId: (item: T) => string,
+  storedOrder: string[],
+): T[] {
+  if (storedOrder.length === 0) return items;
+  const rank = new Map(storedOrder.map((id, index) => [id, index]));
+  return [...items].sort((left, right) => {
+    const leftRank = rank.get(getId(left)) ?? Number.MAX_SAFE_INTEGER;
+    const rightRank = rank.get(getId(right)) ?? Number.MAX_SAFE_INTEGER;
+    return leftRank - rightRank;
+  });
+}
+
+function reorderIds(
+  current: string[],
+  sourceId: string,
+  targetId: string,
+  placement: DropPlacement,
+): string[] {
+  if (sourceId === targetId) return current;
+  const next = current.filter((id) => id !== sourceId);
+  const targetIndex = next.indexOf(targetId);
+  if (targetIndex < 0) return current;
+  next.splice(targetIndex + (placement === "after" ? 1 : 0), 0, sourceId);
+  return next;
 }
 
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"')\]]+/i;
@@ -1003,6 +1072,16 @@ interface PaneViewProps {
     paneId?: string | null,
   ) => void;
   openDurableTerminalInPane: (paneId: string) => void;
+  onPaneDragStart: (
+    event: ReactDragEvent<HTMLElement>,
+    paneId: string,
+    surfaceId?: string | null,
+  ) => void;
+  onPaneDragOver: (event: ReactDragEvent<HTMLElement>) => void;
+  onPaneDrop: (
+    event: ReactDragEvent<HTMLElement>,
+    pane: PaneSummary,
+  ) => void;
   onTerminalError: () => void;
 }
 
@@ -1031,6 +1110,9 @@ const PaneView = memo(function PaneView({
   openTerminalInPane,
   openTerminalProfileMenu,
   openDurableTerminalInPane,
+  onPaneDragStart,
+  onPaneDragOver,
+  onPaneDrop,
   onTerminalError,
 }: PaneViewProps) {
   const restoringAgent = isRestorableAgentPlaceholder(
@@ -1047,6 +1129,8 @@ const PaneView = memo(function PaneView({
       data-agentmux-mounted={surface ? "true" : "false"}
       data-agentmux-active={active ? "true" : "false"}
       data-agentmux-attention={hasAttention ? "true" : "false"}
+      onDragOver={onPaneDragOver}
+      onDrop={(event) => onPaneDrop(event, pane)}
       onMouseDown={() => focusPane(pane.paneId)}
       style={{
         minHeight: 0,
@@ -1080,6 +1164,10 @@ const PaneView = memo(function PaneView({
           background: "var(--surface)",
           borderBottom: "1px solid var(--border)",
         }}
+        draggable={Boolean(surface?.surfaceId)}
+        onDragStart={(event) =>
+          onPaneDragStart(event, pane.paneId, surface?.surfaceId)
+        }
       >
         <span
           style={{
@@ -1390,6 +1478,12 @@ export function AgentmuxTerminalApp() {
   );
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceFilterText, setWorkspaceFilterText] = useState("");
+  const [workspaceOrder, setWorkspaceOrder] = useState<string[]>(() =>
+    readStoredOrder(WORKSPACE_ORDER_STORAGE_KEY),
+  );
+  const [surfaceTabOrderByWorkspace, setSurfaceTabOrderByWorkspace] = useState<
+    Record<string, string[]>
+  >({});
   const [selectedWorkspaceIds, setSelectedWorkspaceIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -1869,7 +1963,7 @@ export function AgentmuxTerminalApp() {
       }
     }
     const tabSurfaceIds = new Set(firstSurfaceByRoot.values());
-    return surfaces.filter((surface) => {
+    const visible = surfaces.filter((surface) => {
       if (surface.surfaceType === "dock-terminal") return false;
       // The representative surface of each root pane (tab) always shows.
       if (tabSurfaceIds.has(surface.surfaceId)) return true;
@@ -1884,7 +1978,17 @@ export function AgentmuxTerminalApp() {
       // unmounted.
       return surface.surfaceType === "browser";
     });
-  }, [panes, rootPaneForPane, surfaces]);
+    const activeOrder = activeWorkspaceId
+      ? (surfaceTabOrderByWorkspace[activeWorkspaceId] ?? [])
+      : [];
+    return applyStoredOrder(visible, (surface) => surface.surfaceId, activeOrder);
+  }, [
+    activeWorkspaceId,
+    panes,
+    rootPaneForPane,
+    surfaces,
+    surfaceTabOrderByWorkspace,
+  ]);
 
   const activeWorkspace = workspaces.find(
     (ws) => ws.workspaceId === activeWorkspaceId,
@@ -1929,6 +2033,32 @@ export function AgentmuxTerminalApp() {
       return next.size === previous.size ? previous : next;
     });
   }, [workspaces]);
+  useEffect(() => {
+    const ids = new Set(workspaces.map((workspace) => workspace.workspaceId));
+    setWorkspaceOrder((previous) => {
+      const next = [
+        ...previous.filter((workspaceId) => ids.has(workspaceId)),
+        ...workspaces
+          .map((workspace) => workspace.workspaceId)
+          .filter((workspaceId) => !previous.includes(workspaceId)),
+      ];
+      if (next.join("\0") !== previous.join("\0")) {
+        writeStoredOrder(WORKSPACE_ORDER_STORAGE_KEY, next);
+        return next;
+      }
+      return previous;
+    });
+  }, [workspaces]);
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+    const key = `${SURFACE_TAB_ORDER_STORAGE_PREFIX}${activeWorkspaceId}`;
+    setSurfaceTabOrderByWorkspace((previous) => ({
+      ...previous,
+      [activeWorkspaceId]: readStoredOrder(key),
+    }));
+  }, [activeWorkspaceId]);
   const workspaceById = useMemo(
     () =>
       new Map(
@@ -1997,10 +2127,14 @@ export function AgentmuxTerminalApp() {
   }, [workspaceGroups]);
   const ungroupedWorkspaces = useMemo(
     () =>
-      workspaces.filter(
-        (workspace) => !groupedWorkspaceIds.has(workspace.workspaceId),
+      applyStoredOrder(
+        workspaces.filter(
+          (workspace) => !groupedWorkspaceIds.has(workspace.workspaceId),
+        ),
+        (workspace) => workspace.workspaceId,
+        workspaceOrder,
       ),
-    [groupedWorkspaceIds, workspaces],
+    [groupedWorkspaceIds, workspaceOrder, workspaces],
   );
   const normalizedWorkspaceFilter = workspaceFilterText.trim().toLowerCase();
   const workspaceFilterActive = normalizedWorkspaceFilter.length > 0;
@@ -2530,6 +2664,231 @@ export function AgentmuxTerminalApp() {
       );
     },
     [reorderWorkspaceInGroup],
+  );
+  const persistWorkspaceOrder = useCallback((next: string[]) => {
+    setWorkspaceOrder(next);
+    writeStoredOrder(WORKSPACE_ORDER_STORAGE_KEY, next);
+  }, []);
+  const beginWorkspaceCardDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>, workspaceId: string) => {
+      event.stopPropagation();
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData(
+        WORKSPACE_CARD_DRAG_TYPE,
+        JSON.stringify({ workspaceId } satisfies WorkspaceCardDragPayload),
+      );
+    },
+    [],
+  );
+  const allowWorkspaceCardDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (
+        event.dataTransfer.types.includes(WORKSPACE_CARD_DRAG_TYPE) ||
+        event.dataTransfer.types.includes(SURFACE_TAB_DRAG_TYPE)
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "move";
+      }
+    },
+    [],
+  );
+  const dropWorkspaceCard = useCallback(
+    (event: ReactDragEvent<HTMLElement>, targetWorkspaceId: string) => {
+      const surfacePayload = parseDragPayload<SurfaceTabDragPayload>(
+        event,
+        SURFACE_TAB_DRAG_TYPE,
+      );
+      if (surfacePayload && surfacePayload.workspaceId !== targetWorkspaceId) {
+        event.preventDefault();
+        event.stopPropagation();
+        void client
+          .moveSurfaceToWorkspace(
+            surfacePayload.workspaceId,
+            targetWorkspaceId,
+            surfacePayload.surfaceId,
+          )
+          .then(() => ctl.selectWorkspace(targetWorkspaceId));
+        return;
+      }
+
+      const workspacePayload = parseDragPayload<WorkspaceCardDragPayload>(
+        event,
+        WORKSPACE_CARD_DRAG_TYPE,
+      );
+      if (!workspacePayload || workspaceFilterActive) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const current = [
+        ...workspaceOrder.filter((workspaceId) =>
+          workspaces.some((workspace) => workspace.workspaceId === workspaceId),
+        ),
+        ...workspaces
+          .map((workspace) => workspace.workspaceId)
+          .filter((workspaceId) => !workspaceOrder.includes(workspaceId)),
+      ];
+      persistWorkspaceOrder(
+        reorderIds(
+          current,
+          workspacePayload.workspaceId,
+          targetWorkspaceId,
+          dropPlacementFromEvent(event),
+        ),
+      );
+    },
+    [
+      client,
+      ctl,
+      persistWorkspaceOrder,
+      workspaceFilterActive,
+      workspaceOrder,
+      workspaces,
+    ],
+  );
+  const persistSurfaceTabOrder = useCallback(
+    (workspaceId: string, next: string[]) => {
+      setSurfaceTabOrderByWorkspace((previous) => ({
+        ...previous,
+        [workspaceId]: next,
+      }));
+      writeStoredOrder(`${SURFACE_TAB_ORDER_STORAGE_PREFIX}${workspaceId}`, next);
+    },
+    [],
+  );
+  const beginSurfaceTabDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>, surface: SurfaceSummary) => {
+      if (!activeWorkspaceId) return;
+      event.stopPropagation();
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData(
+        SURFACE_TAB_DRAG_TYPE,
+        JSON.stringify({
+          workspaceId: activeWorkspaceId,
+          surfaceId: surface.surfaceId,
+        } satisfies SurfaceTabDragPayload),
+      );
+    },
+    [activeWorkspaceId],
+  );
+  const allowSurfaceTabDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (event.dataTransfer.types.includes(SURFACE_TAB_DRAG_TYPE)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "move";
+      }
+    },
+    [],
+  );
+  const dropSurfaceTab = useCallback(
+    (event: ReactDragEvent<HTMLElement>, targetSurfaceId: string) => {
+      if (!activeWorkspaceId) return;
+      const payload = parseDragPayload<SurfaceTabDragPayload>(
+        event,
+        SURFACE_TAB_DRAG_TYPE,
+      );
+      if (!payload) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (payload.workspaceId !== activeWorkspaceId) {
+        void client
+          .moveSurfaceToWorkspace(
+            payload.workspaceId,
+            activeWorkspaceId,
+            payload.surfaceId,
+          )
+          .then(() => ctl.selectWorkspace(activeWorkspaceId));
+        return;
+      }
+      const current = [
+        ...((surfaceTabOrderByWorkspace[activeWorkspaceId] ?? []).filter(
+          (surfaceId) =>
+            tabSurfaces.some((surface) => surface.surfaceId === surfaceId),
+        )),
+        ...tabSurfaces
+          .map((surface) => surface.surfaceId)
+          .filter(
+            (surfaceId) =>
+              !(surfaceTabOrderByWorkspace[activeWorkspaceId] ?? []).includes(
+                surfaceId,
+              ),
+          ),
+      ];
+      persistSurfaceTabOrder(
+        activeWorkspaceId,
+        reorderIds(
+          current,
+          payload.surfaceId,
+          targetSurfaceId,
+          dropPlacementFromEvent(event),
+        ),
+      );
+    },
+    [
+      activeWorkspaceId,
+      client,
+      ctl,
+      persistSurfaceTabOrder,
+      surfaceTabOrderByWorkspace,
+      tabSurfaces,
+    ],
+  );
+  const beginPaneSurfaceDrag = useCallback(
+    (
+      event: ReactDragEvent<HTMLElement>,
+      paneId: string,
+      surfaceId: string | null | undefined,
+    ) => {
+      if (!activeWorkspaceId || !surfaceId) return;
+      event.stopPropagation();
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData(
+        PANE_SURFACE_DRAG_TYPE,
+        JSON.stringify({
+          workspaceId: activeWorkspaceId,
+          paneId,
+          surfaceId,
+        } satisfies PaneSurfaceDragPayload),
+      );
+    },
+    [activeWorkspaceId],
+  );
+  const allowPaneSurfaceDrop = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (event.dataTransfer.types.includes(PANE_SURFACE_DRAG_TYPE)) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "move";
+      }
+    },
+    [],
+  );
+  const dropPaneSurface = useCallback(
+    async (event: ReactDragEvent<HTMLElement>, targetPane: PaneSummary) => {
+      if (!activeWorkspaceId) return;
+      const payload = parseDragPayload<PaneSurfaceDragPayload>(
+        event,
+        PANE_SURFACE_DRAG_TYPE,
+      );
+      if (
+        !payload ||
+        payload.workspaceId !== activeWorkspaceId ||
+        payload.paneId === targetPane.paneId ||
+        targetPane.kind !== "leaf"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const targetSurfaceId = targetPane.mountedSurfaceId ?? null;
+      await ctl.mountSurface(payload.surfaceId, targetPane.paneId);
+      if (targetSurfaceId) {
+        await ctl.mountSurface(targetSurfaceId, payload.paneId);
+      }
+    },
+    [activeWorkspaceId, ctl],
   );
   const setupWarning = notifications.find(
     (notification) =>
@@ -3776,6 +4135,11 @@ export function AgentmuxTerminalApp() {
         openTerminalInPane={openTerminalInPane}
         openTerminalProfileMenu={openTerminalProfileMenu}
         openDurableTerminalInPane={openDurableTerminalInPane}
+        onPaneDragStart={beginPaneSurfaceDrag}
+        onPaneDragOver={allowPaneSurfaceDrop}
+        onPaneDrop={(event, targetPane) => {
+          void dropPaneSurface(event, targetPane);
+        }}
         onTerminalError={refreshStable}
       />
     );
@@ -4463,10 +4827,14 @@ export function AgentmuxTerminalApp() {
                                 ws.workspaceId,
                               )
                             }
-                            onDragOver={allowWorkspaceMemberDrop}
-                            onDrop={(event) =>
-                              dropWorkspaceMember(event, group, ws.workspaceId)
-                            }
+                            onDragOver={(event) => {
+                              allowWorkspaceMemberDrop(event);
+                              allowWorkspaceCardDrop(event);
+                            }}
+                            onDrop={(event) => {
+                              dropWorkspaceMember(event, group, ws.workspaceId);
+                              dropWorkspaceCard(event, ws.workspaceId);
+                            }}
                             onStartRename={() => startWorkspaceRename(ws)}
                             onCommitRename={commitWorkspaceRename}
                             onCancelRename={cancelWorkspaceRename}
@@ -4504,6 +4872,12 @@ export function AgentmuxTerminalApp() {
                   onToggleSelected={() =>
                     toggleWorkspaceSelection(ws.workspaceId)
                   }
+                  draggable={!workspaceFilterActive}
+                  onDragStart={(event) =>
+                    beginWorkspaceCardDrag(event, ws.workspaceId)
+                  }
+                  onDragOver={allowWorkspaceCardDrop}
+                  onDrop={(event) => dropWorkspaceCard(event, ws.workspaceId)}
                   onStartRename={() => startWorkspaceRename(ws)}
                   onCommitRename={commitWorkspaceRename}
                   onCancelRename={cancelWorkspaceRename}
@@ -4956,6 +5330,10 @@ export function AgentmuxTerminalApp() {
                   <Hov
                     key={surface.surfaceId}
                     className="agentmux-surface-tab"
+                    draggable
+                    onDragStart={(event) => beginSurfaceTabDrag(event, surface)}
+                    onDragOver={allowSurfaceTabDrop}
+                    onDrop={(event) => dropSurfaceTab(event, surface.surfaceId)}
                     style={{
                       display: "flex",
                       alignItems: "center",

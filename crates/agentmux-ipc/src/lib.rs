@@ -399,6 +399,19 @@ pub struct SurfaceCloseParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SurfaceMoveWorkspaceParams {
+    pub source_workspace_id: String,
+    pub target_workspace_id: String,
+    pub surface_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SurfaceMoveWorkspaceResult {
+    pub source: WorkspaceDetailResult,
+    pub target: WorkspaceDetailResult,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionIdParams {
     pub session_id: String,
 }
