@@ -2,6 +2,8 @@ name: release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
   workflow_dispatch:
@@ -45,8 +47,12 @@ jobs:
           if ("${{ github.ref_type }}" -eq "tag") {
             $tag = "${{ github.ref_name }}"
             $version = $tag -replace '^v', ''
-          } else {
+          } elseif ("${{ github.event_name }}" -eq "workflow_dispatch") {
             $version = "${{ inputs.version }}"
+            $tag = "v$version"
+          } else {
+            $package = Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json
+            $version = [string]$package.version
             $tag = "v$version"
           }
 
@@ -144,7 +150,7 @@ jobs:
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag $installer $checksum --clobber
-            gh release edit $tag --title "AgentMux $version" --notes-file release-notes.md --latest
+            gh release edit $tag --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
           } else {
             gh release create $tag $installer $checksum --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
           }
