@@ -503,6 +503,105 @@ test("workspace groups and members can be drag reordered from the sidebar", asyn
   );
 });
 
+test("workspace cards can be reordered with explicit controls", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-workspace-plus").click();
+  await page.locator(".agentmux-workspace-plus").click();
+  const cards = page.locator(".agentmux-workspace-card");
+  await expect(cards).toHaveCount(3);
+
+  await cards.nth(2).locator(".agentmux-workspace-member-move-up").click();
+  await expect(cards.nth(1)).toContainText("Workspace 3");
+
+  await cards.nth(1).locator(".agentmux-workspace-member-move-down").click();
+  await expect(cards.nth(2)).toContainText("Workspace 3");
+});
+
+test("surface tabs can be reordered and moved to another workspace", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-workspace-plus").click();
+  const cards = page.locator(".agentmux-workspace-card");
+  await expect(cards).toHaveCount(2);
+  await cards.filter({ hasText: "Workspace 1" }).click();
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  const firstSurfaceId = await tabs
+    .nth(0)
+    .getAttribute("data-agentmux-surface-tab");
+  const secondSurfaceId = await tabs
+    .nth(1)
+    .getAttribute("data-agentmux-surface-tab");
+  expect(firstSurfaceId).toBeTruthy();
+  expect(secondSurfaceId).toBeTruthy();
+
+  await tabs.nth(1).locator(".agentmux-surface-tab-move-left").click();
+  await expect(tabs.nth(0)).toHaveAttribute(
+    "data-agentmux-surface-tab",
+    secondSurfaceId ?? "",
+  );
+
+  await tabs.nth(0).locator(".agentmux-surface-tab-workspace-menu").click();
+  const tabMenu = page.locator(".agentmux-surface-tab-menu");
+  await expect(tabMenu).toBeVisible();
+  await tabMenu
+    .locator(".agentmux-surface-tab-menu-workspace")
+    .filter({ hasText: "Workspace 2" })
+    .click();
+
+  await expect(
+    page.locator('.agentmux-workspace-card[data-agentmux-active="true"]'),
+  ).toContainText("Workspace 2");
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+});
+
+test("split pane surfaces can be swapped with explicit controls", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await expect(
+    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+  ).toHaveCount(1);
+
+  await page.locator(".agentmux-pane-split-horizontal").click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await page.getByRole("button", { name: "Open terminal" }).click();
+  const mountedPanes = page.locator(
+    '[data-agentmux-pane][data-agentmux-mounted="true"]',
+  );
+  await expect(mountedPanes).toHaveCount(2);
+
+  const firstSurfaceId = await mountedPanes
+    .nth(0)
+    .getAttribute("data-agentmux-mounted-surface");
+  const secondSurfaceId = await mountedPanes
+    .nth(1)
+    .getAttribute("data-agentmux-mounted-surface");
+  expect(firstSurfaceId).toBeTruthy();
+  expect(secondSurfaceId).toBeTruthy();
+
+  await mountedPanes.nth(0).locator(".agentmux-pane-surface-move-next").click();
+  await expect(mountedPanes.nth(0)).toHaveAttribute(
+    "data-agentmux-mounted-surface",
+    secondSurfaceId ?? "",
+  );
+  await expect(mountedPanes.nth(1)).toHaveAttribute(
+    "data-agentmux-mounted-surface",
+    firstSurfaceId ?? "",
+  );
+});
+
 test("workspace group context menu exposes primary actions", async ({
   page,
 }) => {

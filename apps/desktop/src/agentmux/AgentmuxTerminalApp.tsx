@@ -371,6 +371,22 @@ function reorderIds(
   return next;
 }
 
+function moveIdByDirection(
+  current: string[],
+  sourceId: string,
+  direction: -1 | 1,
+): string[] {
+  const index = current.indexOf(sourceId);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= current.length) {
+    return current;
+  }
+  const next = [...current];
+  const [moved] = next.splice(index, 1);
+  next.splice(nextIndex, 0, moved);
+  return next;
+}
+
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"')\]]+/i;
 
 function extractFirstUrl(value: string | null | undefined): string | null {
@@ -1082,6 +1098,7 @@ interface PaneViewProps {
     event: ReactDragEvent<HTMLElement>,
     pane: PaneSummary,
   ) => void;
+  onMovePaneSurface: (paneId: string, direction: -1 | 1) => void;
   onTerminalError: () => void;
 }
 
@@ -1113,6 +1130,7 @@ const PaneView = memo(function PaneView({
   onPaneDragStart,
   onPaneDragOver,
   onPaneDrop,
+  onMovePaneSurface,
   onTerminalError,
 }: PaneViewProps) {
   const restoringAgent = isRestorableAgentPlaceholder(
@@ -1127,6 +1145,7 @@ const PaneView = memo(function PaneView({
       key={pane.paneId}
       data-agentmux-pane={pane.paneId}
       data-agentmux-mounted={surface ? "true" : "false"}
+      data-agentmux-mounted-surface={surface?.surfaceId ?? ""}
       data-agentmux-active={active ? "true" : "false"}
       data-agentmux-attention={hasAttention ? "true" : "false"}
       onDragOver={onPaneDragOver}
@@ -1224,6 +1243,48 @@ const PaneView = memo(function PaneView({
         ) : null}
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", gap: 1, flex: "none" }}>
+          <Hov
+            tag="span"
+            className="agentmux-pane-surface-move-prev"
+            ariaLabel="Move pane surface earlier"
+            title="Move pane surface earlier"
+            style={{
+              ...PANE_WIN_BTN_STYLE,
+              opacity: surface ? 1 : 0.35,
+              cursor: surface ? "pointer" : "default",
+            }}
+            hover={surface ? PANE_WIN_BTN_HOVER_STYLE : {}}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (surface) {
+                onMovePaneSurface(pane.paneId, -1);
+              }
+            }}
+          >
+            <span style={{ display: "flex", transform: "rotate(180deg)" }}>
+              <IconChevronRight size={12} />
+            </span>
+          </Hov>
+          <Hov
+            tag="span"
+            className="agentmux-pane-surface-move-next"
+            ariaLabel="Move pane surface later"
+            title="Move pane surface later"
+            style={{
+              ...PANE_WIN_BTN_STYLE,
+              opacity: surface ? 1 : 0.35,
+              cursor: surface ? "pointer" : "default",
+            }}
+            hover={surface ? PANE_WIN_BTN_HOVER_STYLE : {}}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (surface) {
+                onMovePaneSurface(pane.paneId, 1);
+              }
+            }}
+          >
+            <IconChevronRight size={12} />
+          </Hov>
           <Hov
             tag="span"
             className="agentmux-pane-split-vertical"
@@ -1494,6 +1555,11 @@ export function AgentmuxTerminalApp() {
   } | null>(null);
   const [workspaceMenu, setWorkspaceMenu] = useState<{
     workspaceId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [surfaceTabMenu, setSurfaceTabMenu] = useState<{
+    surfaceId: string;
     x: number;
     y: number;
   } | null>(null);
@@ -1876,6 +1942,29 @@ export function AgentmuxTerminalApp() {
   const activeRootIsSplit = rootPaneId
     ? paneById.get(rootPaneId)?.kind === "split"
     : false;
+  const orderedLeafPaneIds = useMemo(() => {
+    if (!rootPaneId) {
+      return panes
+        .filter((pane) => pane.kind === "leaf")
+        .map((pane) => pane.paneId);
+    }
+    const ordered: string[] = [];
+    const visit = (paneId: string, visited = new Set<string>()) => {
+      if (visited.has(paneId)) return;
+      visited.add(paneId);
+      const pane = paneById.get(paneId);
+      if (!pane) return;
+      if (pane.kind !== "split") {
+        ordered.push(pane.paneId);
+        return;
+      }
+      for (const child of childrenByParent.get(pane.paneId) ?? []) {
+        visit(child.paneId, visited);
+      }
+    };
+    visit(rootPaneId);
+    return ordered;
+  }, [childrenByParent, paneById, panes, rootPaneId]);
 
   // Balance: reset every split ratio in the active tab's subtree back to 0.5 so
   // panes return to even sizes after manual drag-resizing.
@@ -2107,6 +2196,15 @@ export function AgentmuxTerminalApp() {
         : null,
     [workspaceMenu, workspaces],
   );
+  const surfaceTabMenuSurface = useMemo(
+    () =>
+      surfaceTabMenu
+        ? (surfaces.find(
+            (surface) => surface.surfaceId === surfaceTabMenu.surfaceId,
+          ) ?? null)
+        : null,
+    [surfaceTabMenu, surfaces],
+  );
   const workspaceAnchorGroups = useMemo(
     () =>
       workspaceMenu
@@ -2195,6 +2293,9 @@ export function AgentmuxTerminalApp() {
   const closeWorkspaceMenu = useCallback(() => {
     setWorkspaceMenu(null);
   }, []);
+  const closeSurfaceTabMenu = useCallback(() => {
+    setSurfaceTabMenu(null);
+  }, []);
   const closeTerminalProfileMenu = useCallback(() => {
     setTerminalProfileMenu(null);
   }, []);
@@ -2205,6 +2306,7 @@ export function AgentmuxTerminalApp() {
       const width = 230;
       const height = 292;
       setWorkspaceMenu(null);
+      setSurfaceTabMenu(null);
       setWorkspaceGroupMenu({
         groupId: group.groupId,
         x: Math.min(event.clientX, Math.max(8, window.innerWidth - width - 8)),
@@ -2223,6 +2325,7 @@ export function AgentmuxTerminalApp() {
       const width = 224;
       const height = 170;
       setWorkspaceGroupMenu(null);
+      setSurfaceTabMenu(null);
       setWorkspaceMenu({
         workspaceId: workspace.workspaceId,
         x: Math.min(event.clientX, Math.max(8, window.innerWidth - width - 8)),
@@ -2234,6 +2337,26 @@ export function AgentmuxTerminalApp() {
     },
     [],
   );
+  const openSurfaceTabMenu = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, surface: SurfaceSummary) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = event.currentTarget.getBoundingClientRect();
+      const width = 250;
+      const height = Math.min(360, 92 + Math.max(1, workspaces.length) * 30);
+      setWorkspaceGroupMenu(null);
+      setWorkspaceMenu(null);
+      setSurfaceTabMenu({
+        surfaceId: surface.surfaceId,
+        x: Math.min(rect.left, Math.max(8, window.innerWidth - width - 8)),
+        y: Math.min(
+          rect.bottom + 4,
+          Math.max(8, window.innerHeight - height - 8),
+        ),
+      });
+    },
+    [workspaces.length],
+  );
   const openTerminalProfileMenu = useCallback(
     (event: ReactMouseEvent<HTMLElement>, paneId?: string | null) => {
       event.preventDefault();
@@ -2243,6 +2366,7 @@ export function AgentmuxTerminalApp() {
       const height = 270;
       setWorkspaceGroupMenu(null);
       setWorkspaceMenu(null);
+      setSurfaceTabMenu(null);
       setTerminalProfileMenu({
         x: Math.min(rect.left, Math.max(8, window.innerWidth - width - 8)),
         y: Math.min(
@@ -2255,19 +2379,25 @@ export function AgentmuxTerminalApp() {
     [],
   );
   useEffect(() => {
-    if (!workspaceGroupMenu && !workspaceMenu && !terminalProfileMenu) {
+    if (
+      !workspaceGroupMenu &&
+      !workspaceMenu &&
+      !surfaceTabMenu &&
+      !terminalProfileMenu
+    ) {
       return;
     }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setWorkspaceGroupMenu(null);
         setWorkspaceMenu(null);
+        setSurfaceTabMenu(null);
         setTerminalProfileMenu(null);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [terminalProfileMenu, workspaceGroupMenu, workspaceMenu]);
+  }, [surfaceTabMenu, terminalProfileMenu, workspaceGroupMenu, workspaceMenu]);
   const toggleWorkspaceGroup = useCallback(
     (group: WorkspaceGroup) => {
       void ctl.updateWorkspaceGroup(group.groupId, {
@@ -2669,6 +2799,50 @@ export function AgentmuxTerminalApp() {
     setWorkspaceOrder(next);
     writeStoredOrder(WORKSPACE_ORDER_STORAGE_KEY, next);
   }, []);
+  const moveUngroupedWorkspace = useCallback(
+    (workspaceId: string, direction: -1 | 1) => {
+      if (workspaceFilterActive) {
+        return;
+      }
+      const visibleIds = visibleUngroupedWorkspaces.map(
+        (workspace) => workspace.workspaceId,
+      );
+      if (!visibleIds.includes(workspaceId)) {
+        return;
+      }
+      const nextVisible = moveIdByDirection(visibleIds, workspaceId, direction);
+      if (nextVisible === visibleIds) {
+        return;
+      }
+      const nextVisibleRank = new Map(
+        nextVisible.map((id, index) => [id, index]),
+      );
+      const current = [
+        ...workspaceOrder.filter((id) =>
+          workspaces.some((workspace) => workspace.workspaceId === id),
+        ),
+        ...workspaces
+          .map((workspace) => workspace.workspaceId)
+          .filter((id) => !workspaceOrder.includes(id)),
+      ];
+      const next = [...current].sort((left, right) => {
+        const leftRank = nextVisibleRank.get(left);
+        const rightRank = nextVisibleRank.get(right);
+        if (leftRank === undefined || rightRank === undefined) {
+          return 0;
+        }
+        return leftRank - rightRank;
+      });
+      persistWorkspaceOrder(next);
+    },
+    [
+      persistWorkspaceOrder,
+      visibleUngroupedWorkspaces,
+      workspaceFilterActive,
+      workspaceOrder,
+      workspaces,
+    ],
+  );
   const beginWorkspaceCardDrag = useCallback(
     (event: ReactDragEvent<HTMLElement>, workspaceId: string) => {
       event.stopPropagation();
@@ -2757,6 +2931,48 @@ export function AgentmuxTerminalApp() {
     },
     [],
   );
+  const currentSurfaceTabOrder = useCallback(
+    (workspaceId: string) => {
+      const storedOrder = surfaceTabOrderByWorkspace[workspaceId] ?? [];
+      return [
+        ...storedOrder.filter((surfaceId) =>
+          tabSurfaces.some((surface) => surface.surfaceId === surfaceId),
+        ),
+        ...tabSurfaces
+          .map((surface) => surface.surfaceId)
+          .filter((surfaceId) => !storedOrder.includes(surfaceId)),
+      ];
+    },
+    [surfaceTabOrderByWorkspace, tabSurfaces],
+  );
+  const moveSurfaceTabByDirection = useCallback(
+    (surfaceId: string, direction: -1 | 1) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const current = currentSurfaceTabOrder(activeWorkspaceId);
+      const next = moveIdByDirection(current, surfaceId, direction);
+      if (next !== current) {
+        persistSurfaceTabOrder(activeWorkspaceId, next);
+      }
+    },
+    [activeWorkspaceId, currentSurfaceTabOrder, persistSurfaceTabOrder],
+  );
+  const moveSurfaceTabToWorkspace = useCallback(
+    async (surfaceId: string, targetWorkspaceId: string) => {
+      if (!activeWorkspaceId || activeWorkspaceId === targetWorkspaceId) {
+        return;
+      }
+      await client.moveSurfaceToWorkspace(
+        activeWorkspaceId,
+        targetWorkspaceId,
+        surfaceId,
+      );
+      closeSurfaceTabMenu();
+      await ctl.selectWorkspace(targetWorkspaceId);
+    },
+    [activeWorkspaceId, client, closeSurfaceTabMenu, ctl],
+  );
   const beginSurfaceTabDrag = useCallback(
     (event: ReactDragEvent<HTMLElement>, surface: SurfaceSummary) => {
       if (!activeWorkspaceId) return;
@@ -2802,20 +3018,7 @@ export function AgentmuxTerminalApp() {
           .then(() => ctl.selectWorkspace(activeWorkspaceId));
         return;
       }
-      const current = [
-        ...((surfaceTabOrderByWorkspace[activeWorkspaceId] ?? []).filter(
-          (surfaceId) =>
-            tabSurfaces.some((surface) => surface.surfaceId === surfaceId),
-        )),
-        ...tabSurfaces
-          .map((surface) => surface.surfaceId)
-          .filter(
-            (surfaceId) =>
-              !(surfaceTabOrderByWorkspace[activeWorkspaceId] ?? []).includes(
-                surfaceId,
-              ),
-          ),
-      ];
+      const current = currentSurfaceTabOrder(activeWorkspaceId);
       persistSurfaceTabOrder(
         activeWorkspaceId,
         reorderIds(
@@ -2829,10 +3032,9 @@ export function AgentmuxTerminalApp() {
     [
       activeWorkspaceId,
       client,
+      currentSurfaceTabOrder,
       ctl,
       persistSurfaceTabOrder,
-      surfaceTabOrderByWorkspace,
-      tabSurfaces,
     ],
   );
   const beginPaneSurfaceDrag = useCallback(
@@ -2889,6 +3091,38 @@ export function AgentmuxTerminalApp() {
       }
     },
     [activeWorkspaceId, ctl],
+  );
+  const swapPaneSurfaceByDirection = useCallback(
+    async (paneId: string, direction: -1 | 1) => {
+      if (!activeWorkspaceId) {
+        return;
+      }
+      const currentIndex = orderedLeafPaneIds.indexOf(paneId);
+      const targetPaneId = orderedLeafPaneIds[currentIndex + direction];
+      if (currentIndex < 0 || !targetPaneId || paneId === targetPaneId) {
+        return;
+      }
+      const sourcePane = paneById.get(paneId);
+      const targetPane = paneById.get(targetPaneId);
+      if (!sourcePane || !targetPane || targetPane.kind !== "leaf") {
+        return;
+      }
+      const sourceSurfaceId = sourcePane.mountedSurfaceId ?? null;
+      const targetSurfaceId = targetPane.mountedSurfaceId ?? null;
+      if (!sourceSurfaceId && !targetSurfaceId) {
+        return;
+      }
+      if (sourceSurfaceId && targetSurfaceId) {
+        await ctl.mountSurface(sourceSurfaceId, targetPaneId);
+        await ctl.mountSurface(targetSurfaceId, paneId);
+      } else if (sourceSurfaceId) {
+        await ctl.mountSurface(sourceSurfaceId, targetPaneId);
+      } else if (targetSurfaceId) {
+        await ctl.mountSurface(targetSurfaceId, paneId);
+      }
+      await ctl.focusPane(targetPaneId);
+    },
+    [activeWorkspaceId, ctl, orderedLeafPaneIds, paneById],
   );
   const setupWarning = notifications.find(
     (notification) =>
@@ -4140,6 +4374,9 @@ export function AgentmuxTerminalApp() {
         onPaneDrop={(event, targetPane) => {
           void dropPaneSurface(event, targetPane);
         }}
+        onMovePaneSurface={(paneId, direction) => {
+          void swapPaneSurfaceByDirection(paneId, direction);
+        }}
         onTerminalError={refreshStable}
       />
     );
@@ -4850,7 +5087,7 @@ export function AgentmuxTerminalApp() {
                   </div>
                 ),
               )}
-              {visibleUngroupedWorkspaces.map((ws) => (
+              {visibleUngroupedWorkspaces.map((ws, index) => (
                 <WorkspaceCard
                   key={ws.workspaceId}
                   ws={ws}
@@ -4871,6 +5108,17 @@ export function AgentmuxTerminalApp() {
                   onDraftNameChange={setWorkspaceNameDraft}
                   onToggleSelected={() =>
                     toggleWorkspaceSelection(ws.workspaceId)
+                  }
+                  onMoveUp={
+                    !workspaceFilterActive && index > 0
+                      ? () => moveUngroupedWorkspace(ws.workspaceId, -1)
+                      : undefined
+                  }
+                  onMoveDown={
+                    !workspaceFilterActive &&
+                    index < visibleUngroupedWorkspaces.length - 1
+                      ? () => moveUngroupedWorkspace(ws.workspaceId, 1)
+                      : undefined
                   }
                   draggable={!workspaceFilterActive}
                   onDragStart={(event) =>
@@ -5285,6 +5533,96 @@ export function AgentmuxTerminalApp() {
               })()
             : null}
 
+          {surfaceTabMenu && surfaceTabMenuSurface
+            ? (() => {
+                const surface = surfaceTabMenuSurface;
+                return (
+                  <>
+                    <div
+                      className="agentmux-surface-tab-menu-backdrop"
+                      onClick={closeSurfaceTabMenu}
+                      style={{ position: "fixed", inset: 0, zIndex: 58 }}
+                    />
+                    <div
+                      className="agentmux-surface-tab-menu"
+                      onClick={(event) => event.stopPropagation()}
+                      onMouseDown={(event) => event.stopPropagation()}
+                      style={{
+                        position: "fixed",
+                        left: surfaceTabMenu.x,
+                        top: surfaceTabMenu.y,
+                        width: 250,
+                        maxHeight: "min(360px, calc(100vh - 16px))",
+                        overflowY: "auto",
+                        zIndex: 59,
+                        background: "var(--surface)",
+                        border: "1px solid var(--border-strong)",
+                        borderRadius: 8,
+                        boxShadow: "0 18px 45px rgba(0,0,0,0.35)",
+                        padding: 6,
+                      }}
+                    >
+                      <div
+                        style={{
+                          padding: "7px 10px 8px",
+                          borderBottom: "1px solid var(--border)",
+                          marginBottom: 4,
+                        }}
+                      >
+                        <div
+                          style={{
+                            font: `700 12px/1 ${FONT_SANS}`,
+                            color: "var(--fg1)",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {surface.title}
+                        </div>
+                        <div
+                          style={{
+                            font: `500 10px/1 ${FONT_MONO}`,
+                            color: "var(--fg4)",
+                            marginTop: 4,
+                          }}
+                        >
+                          Move to workspace
+                        </div>
+                      </div>
+                      {workspaces.map((workspace) => {
+                        const current = workspace.workspaceId === activeWorkspaceId;
+                        return (
+                          <Hov
+                            key={workspace.workspaceId}
+                            tag="button"
+                            className="agentmux-surface-tab-menu-workspace"
+                            style={{
+                              ...groupMenuItemStyle,
+                              opacity: current ? 0.45 : 1,
+                              cursor: current ? "default" : "pointer",
+                            }}
+                            hover={current ? {} : groupMenuItemHover}
+                            onClick={() => {
+                              if (!current) {
+                                void moveSurfaceTabToWorkspace(
+                                  surface.surfaceId,
+                                  workspace.workspaceId,
+                                );
+                              }
+                            }}
+                          >
+                            <IconFolder size={12} />
+                            {workspace.name}
+                          </Hov>
+                        );
+                      })}
+                    </div>
+                  </>
+                );
+              })()
+            : null}
+
           {/* right: tabs + mosaic */}
           <div
             style={{
@@ -5306,7 +5644,7 @@ export function AgentmuxTerminalApp() {
                 overflow: "hidden",
               }}
             >
-              {tabSurfaces.map((surface) => {
+              {tabSurfaces.map((surface, index) => {
                 const host = paneHostingSurface(surface.surfaceId);
                 // A tab stays active while ANY pane in its tab (root-pane tree)
                 // is focused — not only the tab's first/host pane. Compare roots.
@@ -5330,15 +5668,18 @@ export function AgentmuxTerminalApp() {
                   <Hov
                     key={surface.surfaceId}
                     className="agentmux-surface-tab"
+                    data-agentmux-surface-tab={surface.surfaceId}
                     draggable
                     onDragStart={(event) => beginSurfaceTabDrag(event, surface)}
                     onDragOver={allowSurfaceTabDrop}
                     onDrop={(event) => dropSurfaceTab(event, surface.surfaceId)}
+                    onContextMenu={(event) => openSurfaceTabMenu(event, surface)}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       gap: 7,
                       padding: "0 11px 0 13px",
+                      minWidth: 220,
                       maxWidth: 240,
                       borderRight: "1px solid var(--border-subtle)",
                       cursor: "pointer",
@@ -5371,10 +5712,100 @@ export function AgentmuxTerminalApp() {
                         whiteSpace: "nowrap",
                         overflow: "hidden",
                         textOverflow: "ellipsis",
+                        flex: 1,
+                        minWidth: 0,
                       }}
                     >
-                      {surface.title}
-                    </span>
+                        {surface.title}
+                      </span>
+                    <Hov
+                      tag="span"
+                      className="agentmux-surface-tab-move-left"
+                      ariaLabel={`Move ${surface.title} left`}
+                      title="Move tab left"
+                      style={{
+                        width: 17,
+                        height: 17,
+                        borderRadius: 5,
+                        flex: "none",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "var(--fg4)",
+                        opacity: index > 0 ? 1 : 0.35,
+                        cursor: index > 0 ? "pointer" : "default",
+                      }}
+                      hover={
+                        index > 0
+                          ? { background: "var(--s3)", color: "var(--fg1)" }
+                          : {}
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (index > 0) {
+                          moveSurfaceTabByDirection(surface.surfaceId, -1);
+                        }
+                      }}
+                    >
+                      <span style={{ display: "flex", transform: "rotate(180deg)" }}>
+                        <IconChevronRight size={11} />
+                      </span>
+                    </Hov>
+                    <Hov
+                      tag="span"
+                      className="agentmux-surface-tab-move-right"
+                      ariaLabel={`Move ${surface.title} right`}
+                      title="Move tab right"
+                      style={{
+                        width: 17,
+                        height: 17,
+                        borderRadius: 5,
+                        flex: "none",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "var(--fg4)",
+                        opacity: index < tabSurfaces.length - 1 ? 1 : 0.35,
+                        cursor:
+                          index < tabSurfaces.length - 1 ? "pointer" : "default",
+                      }}
+                      hover={
+                        index < tabSurfaces.length - 1
+                          ? { background: "var(--s3)", color: "var(--fg1)" }
+                          : {}
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (index < tabSurfaces.length - 1) {
+                          moveSurfaceTabByDirection(surface.surfaceId, 1);
+                        }
+                      }}
+                    >
+                      <IconChevronRight size={11} />
+                    </Hov>
+                    <Hov
+                      tag="span"
+                      className="agentmux-surface-tab-workspace-menu"
+                      ariaLabel={`Move ${surface.title} to workspace`}
+                      title="Move tab to workspace"
+                      style={{
+                        width: 17,
+                        height: 17,
+                        borderRadius: 5,
+                        flex: "none",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: surfaceTabMenu?.surfaceId === surface.surfaceId
+                          ? "var(--accent)"
+                          : "var(--fg4)",
+                        cursor: "pointer",
+                      }}
+                      hover={{ background: "var(--s3)", color: "var(--fg1)" }}
+                      onClick={(e) => openSurfaceTabMenu(e, surface)}
+                    >
+                      <IconChevronDown size={11} />
+                    </Hov>
                     {att ? (
                       <span
                         style={{
