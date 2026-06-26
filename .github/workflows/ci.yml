@@ -37,6 +37,9 @@ jobs:
         working-directory: apps/desktop
       - run: npm run build
         working-directory: apps/desktop
+      - name: Prepare desktop sidecars
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-desktop-bundle-binaries.ps1
       - run: npm run tauri:build -- --debug --no-bundle --ci
         working-directory: apps/desktop
 

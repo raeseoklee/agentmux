@@ -10490,9 +10490,8 @@ fn team_task_result(task: &PersistedTeamTask, dependencies: &[(String, String)])
         blocked_reason: task.blocked_reason.clone(),
         depends_on: dependencies
             .iter()
-            .filter_map(|(task_id, depends_on)| {
-                (task_id == &task.task_id).then(|| depends_on.clone())
-            })
+            .filter(|(task_id, _)| task_id == &task.task_id)
+            .map(|(_, depends_on)| depends_on.clone())
             .collect(),
         created_at: task.created_at.clone(),
         updated_at: task.updated_at.clone(),

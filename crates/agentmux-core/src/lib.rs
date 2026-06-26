@@ -430,7 +430,7 @@ impl RecentOutputBuffer {
             .collect()
     }
 
-    fn from_index(&self, index: usize) -> Vec<u8> {
+    fn bytes_from_index(&self, index: usize) -> Vec<u8> {
         self.bytes.iter().skip(index).copied().collect()
     }
 }
@@ -657,7 +657,7 @@ where
             _ => ring_base,
         };
         let bytes = ring
-            .map(|ring| ring.from_index((start - ring_base) as usize))
+            .map(|ring| ring.bytes_from_index((start - ring_base) as usize))
             .unwrap_or_default();
         Some(OutputSnapshot {
             base_offset: start,
@@ -2069,9 +2069,10 @@ fn contains_heuristic_agent_signal_marker(bytes: &[u8]) -> bool {
 fn contains_ascii_case_insensitive(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && bytes.windows(needle.len()).any(|window| {
-            window.iter().zip(needle.iter()).all(|(actual, expected)| {
-                actual.to_ascii_lowercase() == expected.to_ascii_lowercase()
-            })
+            window
+                .iter()
+                .zip(needle.iter())
+                .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
         })
 }
 
