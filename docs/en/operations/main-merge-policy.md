@@ -12,10 +12,19 @@ Use this allowlist when promoting documentation:
 
 - `README.md`
 - `docs/README.md`
-- `docs/user/**`
-- `docs/operations/**`
-- `docs/release/versioning.md`
-- `docs/schemas/agentmux.config.schema.json`
+- `docs/en/README.md`
+- `docs/en/features.md`
+- `docs/en/user/**`
+- `docs/en/operations/**`
+- `docs/en/release/versioning.md`
+- `docs/en/schemas/agentmux.config.schema.json`
+
+Localized documents may be included only when they intentionally mirror or
+supplement the published user documentation:
+
+- `docs/ko/README.md`
+- `docs/ko/features.md`
+- `docs/ko/user/**`
 
 Release automation and version tooling may also be merged when needed:
 
@@ -31,11 +40,10 @@ Release automation and version tooling may also be merged when needed:
 
 ## Exclude from main by default
 
-- `docs/implementation/**`
+- `docs/ko/implementation/**`
 - `docs/implementation/evidence/**`
-- `docs/development/**`
-- `docs/ieee-*.md`
-- `docs/features.md`
+- `docs/en/development/**`
+- `docs/en/ieee-*.md`
 - `.codexus/**`
 - `.vs/**`
 - local MCP/config files such as `.mcp.json`
@@ -47,7 +55,7 @@ From a clean working tree:
 ```powershell
 git checkout main
 git pull origin main
-git checkout develop -- README.md docs/README.md docs/user docs/operations docs/release/versioning.md docs/schemas/agentmux.config.schema.json
+git checkout develop -- README.md docs/README.md docs/en/README.md docs/en/features.md docs/en/user docs/en/operations docs/en/release/versioning.md docs/en/schemas/agentmux.config.schema.json docs/ko/README.md
 npm run docs:check
 git status --short
 git commit -m "Publish AgentMux operations documentation"
@@ -66,8 +74,8 @@ npm run version:check
 Remove them in a separate cleanup commit:
 
 ```powershell
-git rm -r docs/implementation docs/development
-git rm docs/features.md docs/ieee-29148-desktop-performance-optimization.md docs/ieee-29148-system-design.md
+git rm -r docs/ko/implementation docs/implementation/evidence docs/en/development
+git rm docs/en/ieee-29148-desktop-performance-optimization.md docs/en/ieee-29148-system-design.md
 git commit -m "Remove development-only docs from main"
 ```
 

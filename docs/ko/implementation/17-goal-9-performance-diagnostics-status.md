@@ -102,36 +102,36 @@ npm run check
 
 A full performance-gate run was recorded on `IRAE-DESKTOP`:
 
-- [manifest.json](./evidence/20260618-220217-IRAE-DESKTOP-performance-gates/manifest.json)
-- [summary](./evidence/20260618-220217-IRAE-DESKTOP-performance-gates/README.md)
-- [reference-profile.json](./evidence/20260618-220217-IRAE-DESKTOP-performance-gates/reference-profile.json)
-- [browser-cdp-smoke.txt](./evidence/20260618-220217-IRAE-DESKTOP-performance-gates/browser-cdp-smoke.txt)
+- [manifest.json](../../implementation/evidence/20260618-220217-IRAE-DESKTOP-performance-gates/manifest.json)
+- [summary](../../implementation/evidence/20260618-220217-IRAE-DESKTOP-performance-gates/README.md)
+- [reference-profile.json](../../implementation/evidence/20260618-220217-IRAE-DESKTOP-performance-gates/reference-profile.json)
+- [browser-cdp-smoke.txt](../../implementation/evidence/20260618-220217-IRAE-DESKTOP-performance-gates/browser-cdp-smoke.txt)
 
 A packaged diagnostics export smoke was recorded on `IRAE-DESKTOP`:
 
-- [summary.json](./evidence/20260618-220709-IRAE-DESKTOP-packaged-diagnostics-smoke/summary.json)
-- [diagnostics-export.json](./evidence/20260618-220709-IRAE-DESKTOP-packaged-diagnostics-smoke/diagnostics-export.json)
-- [summary](./evidence/20260618-220709-IRAE-DESKTOP-packaged-diagnostics-smoke/README.md)
+- [summary.json](../../implementation/evidence/20260618-220709-IRAE-DESKTOP-packaged-diagnostics-smoke/summary.json)
+- [diagnostics-export.json](../../implementation/evidence/20260618-220709-IRAE-DESKTOP-packaged-diagnostics-smoke/diagnostics-export.json)
+- [summary](../../implementation/evidence/20260618-220709-IRAE-DESKTOP-packaged-diagnostics-smoke/README.md)
 
 A desktop build and UI smoke gate was recorded on `IRAE-DESKTOP`:
 
-- [summary.json](./evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/summary.json)
-- [summary](./evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/README.md)
-- [archived dist](./evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/dist/index.html)
-- [ui-smoke.stdout.txt](./evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/ui-smoke.stdout.txt)
+- [summary.json](../../implementation/evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/summary.json)
+- [summary](../../implementation/evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/README.md)
+- [archived dist](../../implementation/evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/dist/index.html)
+- [ui-smoke.stdout.txt](../../implementation/evidence/20260618-223819-IRAE-DESKTOP-desktop-ui-gates/ui-smoke.stdout.txt)
 
 An installer artifact build smoke was recorded on `IRAE-DESKTOP`:
 
-- [summary.json](./evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/summary.json)
-- [summary](./evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/README.md)
-- [installer](./evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/AgentMux_0.1.0_x64-setup.exe)
-- [installer-build.stderr.txt](./evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/installer-build.stderr.txt)
+- [summary.json](../../implementation/evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/summary.json)
+- [summary](../../implementation/evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/README.md)
+- [installer](../../implementation/evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/AgentMux_0.1.0_x64-setup.exe)
+- [installer-build.stderr.txt](../../implementation/evidence/20260618-223659-IRAE-DESKTOP-installer-build-smoke/installer-build.stderr.txt)
 
 A real WSL/tmux launch and reattach smoke was recorded on `IRAE-DESKTOP`:
 
-- [summary.json](./evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/summary.json)
-- [summary](./evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/README.md)
-- [tmux-control-smoke.stdout.txt](./evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/tmux-control-smoke.stdout.txt)
+- [summary.json](../../implementation/evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/summary.json)
+- [summary](../../implementation/evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/README.md)
+- [tmux-control-smoke.stdout.txt](../../implementation/evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/tmux-control-smoke.stdout.txt)
 
 ## Remaining Work
 

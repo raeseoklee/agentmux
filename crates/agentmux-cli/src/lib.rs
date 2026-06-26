@@ -56,7 +56,7 @@ use agentmux_ipc::{
 use tungstenite::{accept_hdr, Error as WsError, Message as WsMessage};
 
 const AGENTMUX_CONFIG_SCHEMA_JSON: &str =
-    include_str!("../../../docs/schemas/agentmux.config.schema.json");
+    include_str!("../../../docs/en/schemas/agentmux.config.schema.json");
 
 pub const COMMAND_FAMILIES: &[&str] = &[
     "system",

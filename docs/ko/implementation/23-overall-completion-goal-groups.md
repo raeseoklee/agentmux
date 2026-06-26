@@ -310,7 +310,7 @@ Current slice:
   diagnostics rows now report global, AgentMux project, and cmux project config
   existence, validity, active-source status, paths, and messages even when a
   broken config file would make normal `config.get` fail.
-- `docs/schemas/agentmux.config.schema.json` publishes a JSON Schema for
+- `docs/en/schemas/agentmux.config.schema.json` publishes a JSON Schema for
   AgentMux global and project config files, and `agentmux config schema`
   exports the same schema to stdout or `--output <path>` without requiring a
   running desktop host.
