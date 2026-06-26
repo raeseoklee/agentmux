@@ -13,6 +13,7 @@ import {
 } from "react";
 import "./agentmux.css";
 import type {
+  AgentState,
   AgentTelemetry,
   AppConfigCustomAction,
   AppConfigDiagnosticEntry,
@@ -27,6 +28,8 @@ import type {
   SshProfile,
   SshProfileInput,
   SurfaceSummary,
+  TeamMessage,
+  TeamTask,
   TerminalSession,
   TerminalProfile,
   TmuxDiagnostics,
@@ -118,6 +121,15 @@ interface PaletteItem {
 interface PaletteGroup {
   label: string;
   items: PaletteItem[];
+}
+
+interface TerminalProfileMenuItem {
+  id: string;
+  profile: TerminalProfile;
+  distribution?: string | null;
+  title: string;
+  description: string;
+  disabled?: boolean;
 }
 
 interface NotificationActionBinding {
@@ -262,6 +274,12 @@ interface WorkspaceMemberDragPayload {
   workspaceId: string;
 }
 
+interface AttentionPaneTarget {
+  state: AgentState;
+  pane: PaneSummary;
+  surface: SurfaceSummary;
+}
+
 function dropPlacementFromEvent(
   event: ReactDragEvent<HTMLElement>,
 ): DropPlacement {
@@ -284,12 +302,19 @@ function parseDragPayload<T>(
   }
 }
 
+const URL_PATTERN = /\bhttps?:\/\/[^\s<>"')\]]+/i;
+
+function extractFirstUrl(value: string | null | undefined): string | null {
+  const match = value?.match(URL_PATTERN);
+  return match?.[0] ?? null;
+}
+
 function sessionDotColor(
   theme: ThemeTokens,
   session: TerminalSession | undefined,
   attention: boolean,
 ): string {
-  if (attention) return theme.warn;
+  if (attention) return "var(--accent)";
   if (!session) return theme.fg4;
   switch (session.state) {
     case "running":
@@ -347,6 +372,28 @@ function isLiveSession(session: TerminalSession | undefined): boolean {
       session.state === "starting" ||
       session.state === "recovering" ||
       session.state === "preview")
+  );
+}
+
+function isRestorableAgentPlaceholder(
+  session: TerminalSession | undefined,
+  agentState: AgentState | null | undefined,
+  isBrowser: boolean,
+): boolean {
+  return Boolean(
+    session &&
+      !isBrowser &&
+      session.state === "disconnected" &&
+      agentState &&
+      !isLiveSession(session),
+  );
+}
+
+function agentRestoreLabel(agentState: AgentState | null | undefined): string {
+  return (
+    agentState?.telemetry?.session?.trim() ||
+    agentState?.telemetry?.activity?.trim() ||
+    "agent"
   );
 }
 
@@ -934,19 +981,27 @@ interface PaneViewProps {
   session: TerminalSession | undefined;
   active: boolean;
   isBrowser: boolean;
+  agentState: AgentState | null;
   telemetry: AgentTelemetry | null;
+  hasAttention: boolean;
+  attentionReason?: string | null;
   title: string;
   dot: string;
   label: string;
   theme: ThemeTokens;
   client: ControlClient;
   terminalInnerMargin: number;
+  fontSize: number;
   terminalLaunchPending: boolean;
   focusPane: (paneId: string) => void;
   splitPaneBy: (paneId: string, axis: "horizontal" | "vertical") => void;
   closePane: (paneId: string) => void;
   closeSurface: (surfaceId: string) => void;
   openTerminalInPane: (paneId: string) => void;
+  openTerminalProfileMenu: (
+    event: ReactMouseEvent<HTMLElement>,
+    paneId?: string | null,
+  ) => void;
   openDurableTerminalInPane: (paneId: string) => void;
   onTerminalError: () => void;
 }
@@ -957,28 +1012,41 @@ const PaneView = memo(function PaneView({
   session,
   active,
   isBrowser,
+  agentState,
   telemetry,
+  hasAttention,
+  attentionReason,
   title,
   dot,
   label,
   theme,
   client,
   terminalInnerMargin,
+  fontSize,
   terminalLaunchPending,
   focusPane,
   splitPaneBy,
   closePane,
   closeSurface,
   openTerminalInPane,
+  openTerminalProfileMenu,
   openDurableTerminalInPane,
   onTerminalError,
 }: PaneViewProps) {
+  const restoringAgent = isRestorableAgentPlaceholder(
+    session,
+    agentState,
+    isBrowser,
+  );
+  const restoringAgentLabel = agentRestoreLabel(agentState);
+
   return (
     <div
       key={pane.paneId}
       data-agentmux-pane={pane.paneId}
       data-agentmux-mounted={surface ? "true" : "false"}
       data-agentmux-active={active ? "true" : "false"}
+      data-agentmux-attention={hasAttention ? "true" : "false"}
       onMouseDown={() => focusPane(pane.paneId)}
       style={{
         minHeight: 0,
@@ -989,8 +1057,13 @@ const PaneView = memo(function PaneView({
         // inactive 1px border, so focus never shifts layout. No extra inset
         // shadow: that doubled the edge to 2px, which showed through on empty
         // panes (no terminal content to paint over the inset ring).
-        border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+        border: `1px solid ${
+          hasAttention ? "var(--accent)" : active ? "var(--accent)" : "var(--border)"
+        }`,
         borderRadius: 7,
+        boxShadow: hasAttention
+          ? "0 0 0 1px rgba(88, 166, 255, 0.58), 0 0 0 4px rgba(88, 166, 255, 0.16)"
+          : "none",
         display: "flex",
         flexDirection: "column",
         overflow: "hidden",
@@ -1030,10 +1103,13 @@ const PaneView = memo(function PaneView({
         </span>
         {label ? (
           <span
+            className={hasAttention ? "attention-pill" : undefined}
+            title={hasAttention ? attentionReason ?? "Agent needs input" : undefined}
             style={{
               font: `500 9.5px/1 ${FONT_SANS}`,
-              color: dot,
-              background: "var(--s2)",
+              color: hasAttention ? "var(--accent)" : dot,
+              background: hasAttention ? "var(--accent-soft)" : "var(--s2)",
+              border: hasAttention ? "1px solid rgba(88, 166, 255, 0.38)" : 0,
               borderRadius: 4,
               padding: "3px 6px",
               flex: "none",
@@ -1116,11 +1192,42 @@ const PaneView = memo(function PaneView({
               sessionId={session.sessionId}
               active={active}
               innerMargin={terminalInnerMargin}
+              fontSize={fontSize}
               onFocus={() => focusPane(pane.paneId)}
               onError={onTerminalError}
             />
           ) : isBrowser && surface ? (
             <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
+          ) : restoringAgent ? (
+            <div
+              style={{
+                height: "100%",
+                display: "flex",
+                flexDirection: "column",
+                gap: 10,
+                alignItems: "center",
+                justifyContent: "center",
+                color: "var(--fg3)",
+                background: "var(--term)",
+              }}
+            >
+              <span className="agentmux-term-booting-spinner" />
+              <span style={{ font: `600 12px/1 ${FONT_SANS}` }}>
+                에이전트 세션 복원 중…
+              </span>
+              <span
+                style={{
+                  font: `600 10px/1 ${FONT_MONO}`,
+                  color: "var(--accent)",
+                  background: "var(--accent-soft)",
+                  border: "1px solid rgba(88, 166, 255, 0.28)",
+                  borderRadius: 4,
+                  padding: "4px 7px",
+                }}
+              >
+                {restoringAgentLabel}
+              </span>
+            </div>
           ) : (
             <div
               style={{
@@ -1156,6 +1263,32 @@ const PaneView = memo(function PaneView({
                 }}
               >
                 <IconPlus size={13} /> Open terminal
+              </button>
+              <button
+                type="button"
+                className="agentmux-pane-terminal-profile-menu-button"
+                disabled={terminalLaunchPending}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openTerminalProfileMenu(e, pane.paneId);
+                }}
+                title="Choose terminal profile"
+                aria-label="Choose terminal profile for pane"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  background: "transparent",
+                  color: "var(--fg3)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: "6px 10px",
+                  cursor: terminalLaunchPending ? "wait" : "pointer",
+                  opacity: terminalLaunchPending ? 0.72 : 1,
+                  font: `600 11px/1 ${FONT_SANS}`,
+                }}
+              >
+                <IconChevronDown size={12} /> Choose shell
               </button>
               <button
                 type="button"
@@ -1200,7 +1333,10 @@ export function AgentmuxTerminalApp() {
     workspaceGroups,
     activeWorkspaceId,
     detail,
+    attention,
     notifications,
+    teamTasks,
+    teamMessages,
     sidebarState,
     wslDistributions,
     profiles,
@@ -1266,6 +1402,11 @@ export function AgentmuxTerminalApp() {
     workspaceId: string;
     x: number;
     y: number;
+  } | null>(null);
+  const [terminalProfileMenu, setTerminalProfileMenu] = useState<{
+    x: number;
+    y: number;
+    paneId?: string | null;
   } | null>(null);
   const [textBoxOpen, setTextBoxOpen] = useState(false);
   const [textBoxDraft, setTextBoxDraft] = useState("");
@@ -1683,6 +1824,25 @@ export function AgentmuxTerminalApp() {
   );
   const paneHostingSurface = (surfaceId: string): PaneSummary | undefined =>
     panes.find((pane) => pane.mountedSurfaceId === surfaceId);
+  const attentionPaneQueue = useMemo<AttentionPaneTarget[]>(() => {
+    const surfaceBySession = new Map(
+      surfaces
+        .filter((surface) => surface.sessionId)
+        .map((surface) => [surface.sessionId ?? "", surface] as const),
+    );
+    return attention
+      .map((state) => {
+        const surface = surfaceBySession.get(state.sessionId);
+        const pane = surface ? paneHostingSurface(surface.surfaceId) : undefined;
+        return surface && pane ? { state, pane, surface } : null;
+      })
+      .filter((target): target is AttentionPaneTarget => Boolean(target))
+      .sort((left, right) => {
+        const leftTime = Date.parse(left.state.updatedAt ?? "") || 0;
+        const rightTime = Date.parse(right.state.updatedAt ?? "") || 0;
+        return leftTime - rightTime;
+      });
+  }, [attention, panes, surfaces]);
   const rootPaneForPane = useCallback(
     (pane: PaneSummary): PaneSummary => {
       let current = pane;
@@ -1737,6 +1897,17 @@ export function AgentmuxTerminalApp() {
     }
     return branch || hash || "no git";
   }, [sidebarState?.gitBranch, sidebarState?.gitHash]);
+  const teamTaskStats = useMemo(() => {
+    const total = teamTasks.length;
+    const completed = teamTasks.filter((task) => task.status === "completed").length;
+    const blocked = teamTasks.filter((task) => task.status === "blocked").length;
+    const claimed = teamTasks.filter((task) => task.status === "claimed").length;
+    return { total, completed, blocked, claimed };
+  }, [teamTasks]);
+  const unreadTeamMessageCount = useMemo(
+    () => teamMessages.filter((message) => !message.readAt).length,
+    [teamMessages],
+  );
   const selectedWorkspaces = useMemo(
     () =>
       workspaces.filter((workspace) =>
@@ -1890,6 +2061,9 @@ export function AgentmuxTerminalApp() {
   const closeWorkspaceMenu = useCallback(() => {
     setWorkspaceMenu(null);
   }, []);
+  const closeTerminalProfileMenu = useCallback(() => {
+    setTerminalProfileMenu(null);
+  }, []);
   const openWorkspaceGroupMenu = useCallback(
     (event: ReactMouseEvent<HTMLElement>, group: WorkspaceGroup) => {
       event.preventDefault();
@@ -1926,19 +2100,40 @@ export function AgentmuxTerminalApp() {
     },
     [],
   );
+  const openTerminalProfileMenu = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, paneId?: string | null) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const rect = event.currentTarget.getBoundingClientRect();
+      const width = 300;
+      const height = 270;
+      setWorkspaceGroupMenu(null);
+      setWorkspaceMenu(null);
+      setTerminalProfileMenu({
+        x: Math.min(rect.left, Math.max(8, window.innerWidth - width - 8)),
+        y: Math.min(
+          rect.bottom + 4,
+          Math.max(8, window.innerHeight - height - 8),
+        ),
+        paneId: paneId ?? null,
+      });
+    },
+    [],
+  );
   useEffect(() => {
-    if (!workspaceGroupMenu && !workspaceMenu) {
+    if (!workspaceGroupMenu && !workspaceMenu && !terminalProfileMenu) {
       return;
     }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         setWorkspaceGroupMenu(null);
         setWorkspaceMenu(null);
+        setTerminalProfileMenu(null);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [workspaceGroupMenu, workspaceMenu]);
+  }, [terminalProfileMenu, workspaceGroupMenu, workspaceMenu]);
   const toggleWorkspaceGroup = useCallback(
     (group: WorkspaceGroup) => {
       void ctl.updateWorkspaceGroup(group.groupId, {
@@ -2411,6 +2606,50 @@ export function AgentmuxTerminalApp() {
   const addTerminal = useCallback(async () => {
     await runTerminalLaunch(() => ctl.spawnDefaultTerminal());
   }, [ctl, runTerminalLaunch]);
+  const openContextLink = useCallback(async () => {
+    const selectedText = window.getSelection()?.toString() ?? "";
+    const url =
+      extractFirstUrl(selectedText) ??
+      notifications
+        .map((notification) =>
+          extractFirstUrl(`${notification.title}\n${notification.message}`),
+        )
+        .find((candidate): candidate is string => Boolean(candidate)) ??
+      teamMessages
+        .map((message) => extractFirstUrl(message.body))
+        .find((candidate): candidate is string => Boolean(candidate)) ??
+      teamTasks
+        .map((task) => extractFirstUrl(`${task.title}\n${task.description ?? ""}`))
+        .find((candidate): candidate is string => Boolean(candidate)) ??
+      attention
+        .map((state) => extractFirstUrl(state.reason))
+        .find((candidate): candidate is string => Boolean(candidate)) ??
+      null;
+    const surface = await ctl.createBrowserSurface("new_tab");
+    if (surface && url) {
+      await ctl.browserNavigate(surface.surfaceId, url);
+    }
+    closeOverlay();
+  }, [attention, closeOverlay, ctl, notifications, teamMessages, teamTasks]);
+  const addTerminalProfile = useCallback(
+    async (item: TerminalProfileMenuItem) => {
+      if (item.disabled) {
+        return;
+      }
+      const targetPaneId = terminalProfileMenu?.paneId ?? null;
+      closeTerminalProfileMenu();
+      await runTerminalLaunch(() =>
+        targetPaneId
+          ? ctl.spawnTerminalProfileInPane(
+              targetPaneId,
+              item.profile,
+              item.distribution ?? null,
+            )
+          : ctl.spawnTerminalProfile(item.profile, item.distribution ?? null),
+      );
+    },
+    [closeTerminalProfileMenu, ctl, runTerminalLaunch, terminalProfileMenu?.paneId],
+  );
   const openTextBoxComposer = useCallback(() => {
     if (!activeTerminalSession) {
       return;
@@ -2641,6 +2880,58 @@ export function AgentmuxTerminalApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [ctl.focusPane],
   );
+  const focusSessionPane = useCallback(
+    (sessionId: string | null | undefined): boolean => {
+      if (!sessionId) {
+        return false;
+      }
+      const surface = surfaces.find(
+        (candidate) => candidate.sessionId === sessionId,
+      );
+      const pane = surface
+        ? panes.find((candidate) => candidate.mountedSurfaceId === surface.surfaceId)
+        : undefined;
+      if (!pane) {
+        return false;
+      }
+      void ctl.focusPane(pane.paneId);
+      setOverlay(null);
+      return true;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.focusPane, panes, surfaces],
+  );
+  const focusAttentionTarget = useCallback(
+    (target: AttentionPaneTarget | undefined): boolean => {
+      if (!target) {
+        return false;
+      }
+      void ctl.focusPane(target.pane.paneId);
+      setOverlay(null);
+      return true;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ctl.focusPane],
+  );
+  const jumpNextAttention = useCallback((): boolean => {
+    if (attentionPaneQueue.length === 0) {
+      return false;
+    }
+    const activeIndex = activePaneId
+      ? attentionPaneQueue.findIndex(
+          (target) => target.pane.paneId === activePaneId,
+        )
+      : -1;
+    const nextTarget =
+      attentionPaneQueue[
+        activeIndex >= 0 ? (activeIndex + 1) % attentionPaneQueue.length : 0
+      ];
+    return focusAttentionTarget(nextTarget);
+  }, [activePaneId, attentionPaneQueue, focusAttentionTarget]);
+  const openNotificationPanel = useCallback(() => {
+    setSettingsTab("general");
+    setOverlay("settings");
+  }, []);
   const closePaneStable = useCallback(
     (paneId: string) => {
       void ctl.closePane(paneId);
@@ -2735,6 +3026,43 @@ export function AgentmuxTerminalApp() {
   const groupActionHover = GROUP_ACTION_HOVER_STYLE;
   const groupMenuItemStyle = GROUP_MENU_ITEM_STYLE;
   const groupMenuItemHover = GROUP_MENU_ITEM_HOVER_STYLE;
+  const terminalProfileMenuItems = useMemo<TerminalProfileMenuItem[]>(() => {
+    const nativeItems: TerminalProfileMenuItem[] = [
+      {
+        id: "powershell",
+        profile: "powershell",
+        title: "Windows PowerShell",
+        description: "powershell.exe -NoLogo",
+      },
+      {
+        id: "cmd",
+        profile: "cmd",
+        title: "Command Prompt",
+        description: "cmd.exe /d /q",
+      },
+    ];
+    const wslItems =
+      wslDistributions.length > 0
+        ? wslDistributions.map<TerminalProfileMenuItem>((distribution) => ({
+            id: `wsl:${distribution.name}`,
+            profile: "wsl",
+            distribution: distribution.name,
+            title: distribution.name,
+            description: distribution.isDefault
+              ? "WSL distribution · default"
+              : "WSL distribution",
+          }))
+        : [
+            {
+              id: "wsl:missing",
+              profile: "wsl" as const,
+              title: "Install WSL",
+              description: "No WSL distribution detected",
+              disabled: true,
+            },
+          ];
+    return [...nativeItems, ...wslItems];
+  }, [wslDistributions]);
 
   // ---- action registry, shortcuts, and command palette ----
   const shortcutBindings = useMemo(
@@ -2873,6 +3201,16 @@ export function AgentmuxTerminalApp() {
         run: promptCustomAgent,
       },
       {
+        id: "agent.jumpNextAttention",
+        group: "agent",
+        title: "Jump to next waiting agent",
+        keywords: ["attention", "waiting", "agent", "jump"],
+        disabled: attentionPaneQueue.length === 0,
+        run: () => {
+          void jumpNextAttention();
+        },
+      },
+      {
         id: "terminal.newWsl",
         group: "terminal",
         title: "New terminal",
@@ -2960,6 +3298,15 @@ export function AgentmuxTerminalApp() {
           closeOverlay();
         },
       },
+      {
+        id: "browser.openContextLink",
+        group: "terminal",
+        title: "Open context link",
+        keywords: ["browser", "url", "link", "context", "docs", "pr"],
+        run: () => {
+          void openContextLink();
+        },
+      },
       ...customActionDescriptors,
       ...workspaceActionDescriptors,
       {
@@ -2978,6 +3325,13 @@ export function AgentmuxTerminalApp() {
         title: "설정 열기",
         keywords: ["settings"],
         run: () => setOverlay("settings"),
+      },
+      {
+        id: "notification.openPanel",
+        group: "view",
+        title: "Open notifications",
+        keywords: ["notification", "attention", "waiting"],
+        run: openNotificationPanel,
       },
       {
         id: "app.setup",
@@ -2999,12 +3353,16 @@ export function AgentmuxTerminalApp() {
       activePaneId,
       activeTerminalSession,
       addTerminal,
+      attentionPaneQueue.length,
       closeOverlay,
       createWorkspace,
       ctl.createBrowserSurface,
       ctl.spawnAgent,
       customActionDescriptors,
       isDark,
+      jumpNextAttention,
+      openContextLink,
+      openNotificationPanel,
       openTerminalInPane,
       openTextBoxComposer,
       promptCustomAgent,
@@ -3373,13 +3731,23 @@ export function AgentmuxTerminalApp() {
       ? attentionBySession.get(session.sessionId)
       : undefined;
     const hasAttention = Boolean(attentionState);
+    const agentState = session
+      ? (agentBySession.get(session.sessionId) ?? null)
+      : null;
+    const restoringAgent = isRestorableAgentPlaceholder(
+      session,
+      agentState,
+      surface?.surfaceType === "browser",
+    );
     const telemetry = session
-      ? (agentBySession.get(session.sessionId)?.telemetry ?? null)
+      ? (agentState?.telemetry ?? null)
       : null;
     const isBrowser = surface?.surfaceType === "browser";
     const title = surface?.title ?? "빈 페인";
-    const dot = sessionDotColor(T, session, hasAttention);
-    const label = sessionLabel(session, hasAttention);
+    const dot = restoringAgent
+      ? "var(--accent)"
+      : sessionDotColor(T, session, hasAttention);
+    const label = restoringAgent ? "복원 중" : sessionLabel(session, hasAttention);
 
       return (
       <PaneView
@@ -3389,19 +3757,24 @@ export function AgentmuxTerminalApp() {
         session={session}
         active={active}
         isBrowser={isBrowser}
+        agentState={agentState}
         telemetry={telemetry}
+        hasAttention={hasAttention}
+        attentionReason={attentionState?.reason ?? null}
         title={title}
         dot={dot}
         label={label}
         theme={T}
         client={client}
         terminalInnerMargin={terminalInnerMargin}
+        fontSize={fontSize}
         terminalLaunchPending={terminalLaunchPending}
         focusPane={focusPaneStable}
         splitPaneBy={splitPaneBy}
         closePane={closePaneStable}
         closeSurface={closeSurfaceStable}
         openTerminalInPane={openTerminalInPane}
+        openTerminalProfileMenu={openTerminalProfileMenu}
         openDurableTerminalInPane={openDurableTerminalInPane}
         onTerminalError={refreshStable}
       />
@@ -4163,6 +4536,20 @@ export function AgentmuxTerminalApp() {
               ) : null}
 
               <SidebarMetadataPanel sidebarState={sidebarState} />
+              <TeamCollaborationPanel
+                tasks={teamTasks}
+                messages={teamMessages}
+                activeSessionId={activeTerminalSession?.sessionId ?? null}
+                onFocusSession={focusSessionPane}
+                onClaimTask={(taskId, sessionId) =>
+                  void ctl.claimTeamTask(taskId, sessionId)
+                }
+                onCompleteTask={(taskId) => void ctl.completeTeamTask(taskId)}
+                onUnblockTask={(taskId) => void ctl.unblockTeamTask(taskId)}
+                onMarkMessageRead={(messageId) =>
+                  void ctl.markTeamMessageRead(messageId)
+                }
+              />
 
               {SSH_UI_ENABLED ? (
                 <>
@@ -4650,7 +5037,7 @@ export function AgentmuxTerminalApp() {
               <Hov
                 className="agentmux-new-terminal-tab"
                 style={{
-                  width: 36,
+                  width: 34,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -4667,6 +5054,36 @@ export function AgentmuxTerminalApp() {
                 }}
               >
                 <IconPlus size={14} />
+              </Hov>
+              <Hov
+                tag="button"
+                className="agentmux-terminal-profile-menu-button"
+                ariaLabel="Choose terminal profile"
+                title="Choose terminal profile"
+                style={{
+                  width: 24,
+                  height: 36,
+                  border: 0,
+                  borderLeft: "1px solid var(--border)",
+                  borderRadius: 0,
+                  background: "transparent",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: terminalLaunchPending ? "wait" : "pointer",
+                  color: terminalProfileMenu ? "var(--accent)" : "var(--fg4)",
+                  opacity: terminalLaunchPending ? 0.55 : 1,
+                  padding: 0,
+                }}
+                hover={{ background: "var(--s2)", color: "var(--fg1)" }}
+                onClick={(event) => {
+                  if (terminalLaunchPending) {
+                    return;
+                  }
+                  openTerminalProfileMenu(event);
+                }}
+              >
+                <IconChevronDown size={11} />
               </Hov>
               <div style={{ flex: 1 }} />
               <div
@@ -4704,6 +5121,129 @@ export function AgentmuxTerminalApp() {
                 ))}
               </div>
             </div>
+
+            {terminalProfileMenu ? (
+              <>
+                <div
+                  className="agentmux-terminal-profile-menu-backdrop"
+                  onClick={closeTerminalProfileMenu}
+                  style={{ position: "fixed", inset: 0, zIndex: 58 }}
+                />
+                <div
+                  className="agentmux-terminal-profile-menu"
+                  onClick={(event) => event.stopPropagation()}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  style={{
+                    position: "fixed",
+                    left: terminalProfileMenu.x,
+                    top: terminalProfileMenu.y,
+                    width: 300,
+                    zIndex: 59,
+                    background: "var(--surface)",
+                    border: "1px solid var(--border-strong)",
+                    borderRadius: 8,
+                    boxShadow: "0 18px 45px rgba(0,0,0,0.35)",
+                    padding: 6,
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: "8px 10px 9px",
+                      borderBottom: "1px solid var(--border)",
+                      marginBottom: 4,
+                    }}
+                  >
+                    <div
+                      style={{
+                        font: `700 12px/1 ${FONT_SANS}`,
+                        color: "var(--fg1)",
+                      }}
+                    >
+                      {terminalProfileMenu.paneId ? "Open in pane" : "New terminal"}
+                    </div>
+                    <div
+                      style={{
+                        font: `500 10px/1 ${FONT_MONO}`,
+                        color: "var(--fg4)",
+                        marginTop: 4,
+                      }}
+                    >
+                      {terminalProfileMenu.paneId
+                        ? "Choose a shell for this split pane"
+                        : "Choose a shell for this tab"}
+                    </div>
+                  </div>
+                  {terminalProfileMenuItems.map((item) => (
+                    <Hov
+                      key={item.id}
+                      tag="button"
+                      className={`agentmux-terminal-profile-menu-item agentmux-terminal-profile-${item.profile}`}
+                      style={{
+                        ...groupMenuItemStyle,
+                        padding: "8px 9px",
+                        opacity: item.disabled ? 0.55 : 1,
+                        cursor: item.disabled ? "default" : "pointer",
+                      }}
+                      hover={item.disabled ? undefined : groupMenuItemHover}
+                      onClick={() => {
+                        void addTerminalProfile(item);
+                      }}
+                    >
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          width: 22,
+                          height: 22,
+                          borderRadius: 5,
+                          flex: "none",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          background:
+                            item.profile === "wsl"
+                              ? "rgba(34,197,94,0.13)"
+                              : "var(--accent-soft)",
+                          color:
+                            item.profile === "wsl" ? "#22C55E" : "var(--accent)",
+                        }}
+                      >
+                        {item.profile === "wsl" ? (
+                          <IconServer size={12} />
+                        ) : (
+                          <IconShellArrow size={12} />
+                        )}
+                      </span>
+                      <span style={{ minWidth: 0, flex: 1 }}>
+                        <span
+                          style={{
+                            display: "block",
+                            color: "var(--fg1)",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {item.title}
+                        </span>
+                        <span
+                          style={{
+                            display: "block",
+                            color: "var(--fg4)",
+                            font: `500 10px/1.25 ${FONT_MONO}`,
+                            marginTop: 3,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {item.description}
+                        </span>
+                      </span>
+                    </Hov>
+                  ))}
+                </div>
+              </>
+            ) : null}
 
             {setupWarning ? (
               <div
@@ -4805,6 +5345,7 @@ export function AgentmuxTerminalApp() {
             sessionById={sessionById}
             activeSessionId={activeDockSessionId}
             terminalInnerMargin={terminalInnerMargin}
+            fontSize={fontSize}
             onTrust={trustDock}
             onRun={runDockControl}
             onCloseSurface={(surfaceId) => void closeDockSurface(surfaceId)}
@@ -4853,6 +5394,27 @@ export function AgentmuxTerminalApp() {
             {sidebarState?.cwd ?? activeWorkspace?.projectRoot ?? ""}
           </span>
           <div style={{ flex: 1 }} />
+          {teamTaskStats.total > 0 || unreadTeamMessageCount > 0 ? (
+            <>
+              <span
+                title={`${teamTaskStats.blocked} blocked, ${teamTaskStats.claimed} claimed`}
+                style={{ fontSize: 10.5, color: "var(--fg4)" }}
+              >
+                Tasks {teamTaskStats.completed}/{teamTaskStats.total}
+                {unreadTeamMessageCount > 0
+                  ? ` - Mail ${unreadTeamMessageCount}`
+                  : ""}
+              </span>
+              <div
+                style={{
+                  width: 1,
+                  height: 13,
+                  background: "var(--border)",
+                  margin: "0 12px",
+                }}
+              />
+            </>
+          ) : null}
           <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>
             {surfaces.length}surface · {terminalSurfaces.length}터미널 ·{" "}
             {runningCount}실행
@@ -4959,6 +5521,7 @@ export function AgentmuxTerminalApp() {
             setFontSize={setFontSize}
             setTerminalInnerMargin={updateTerminalInnerMargin}
             onDismissNotification={(id) => void ctl.dismissNotification(id)}
+            onFocusNotificationSession={focusSessionPane}
             onRunNotificationAction={runNotificationAction}
             onReloadConfig={() => void reloadConfig()}
             onExportConfig={(scope) => void exportConfig(scope)}
@@ -5184,7 +5747,7 @@ function WorkspaceCard({
   onClick: () => void;
 }) {
   const needsInput = attentionCount > 0;
-  const dot = needsInput ? theme.warn : running ? "var(--accent)" : theme.fg4;
+  const dot = needsInput ? "var(--accent)" : running ? "var(--accent)" : theme.fg4;
   const workspaceColor = ws.color?.trim() || "var(--accent)";
   const workspaceIcon = ws.icon?.trim() || ws.name.slice(0, 1).toUpperCase();
   const statusText = needsInput
@@ -5212,6 +5775,7 @@ function WorkspaceCard({
       className="agentmux-workspace-card"
       data-agentmux-workspace={ws.workspaceId}
       data-agentmux-active={active ? "true" : "false"}
+      data-agentmux-attention={needsInput ? "true" : "false"}
       draggable={draggable}
       onDragStart={onDragStart}
       onDragOver={onDragOver}
@@ -5223,7 +5787,10 @@ function WorkspaceCard({
         borderRadius: 9,
         cursor: editing ? "default" : draggable ? "grab" : "pointer",
         background: active ? "var(--s2)" : "transparent",
-        border: `1px solid ${active ? workspaceColor : "var(--border-subtle)"}`,
+        border: `1px solid ${
+          needsInput ? "var(--accent)" : active ? workspaceColor : "var(--border-subtle)"
+        }`,
+        boxShadow: needsInput ? "0 0 0 3px rgba(88, 166, 255, 0.14)" : "none",
       }}
       hover={active || editing ? {} : { background: "var(--s2)" }}
       onClick={editing ? undefined : onClick}
@@ -5268,7 +5835,7 @@ function WorkspaceCard({
             borderRadius: "50%",
             flex: "none",
             background: dot,
-            boxShadow: running ? "0 0 6px var(--accent)" : "none",
+            boxShadow: needsInput || running ? "0 0 6px var(--accent)" : "none",
           }}
         />
         {editing ? (
@@ -5399,7 +5966,7 @@ function WorkspaceCard({
       <div
         style={{
           font: `400 11px/1.35 ${FONT_SANS}`,
-          color: needsInput ? theme.warn : "var(--fg2)",
+          color: needsInput ? "var(--accent)" : "var(--fg2)",
           marginTop: 5,
         }}
       >
@@ -5417,13 +5984,13 @@ function WorkspaceCard({
             background: "var(--accent-soft)",
           }}
         >
-          <span style={{ color: theme.warn, display: "flex" }}>
+          <span style={{ color: "var(--accent)", display: "flex" }}>
             <IconBubble />
           </span>
           <span
             style={{
               font: `600 10px/1 ${FONT_SANS}`,
-              color: theme.warn,
+              color: "var(--accent)",
               whiteSpace: "nowrap",
             }}
           >
@@ -5619,6 +6186,340 @@ function SidebarMetadataPanel({
   );
 }
 
+function TeamCollaborationPanel({
+  tasks,
+  messages,
+  activeSessionId,
+  onFocusSession,
+  onClaimTask,
+  onCompleteTask,
+  onUnblockTask,
+  onMarkMessageRead,
+}: {
+  tasks: TeamTask[];
+  messages: TeamMessage[];
+  activeSessionId: string | null;
+  onFocusSession: (sessionId: string | null | undefined) => boolean;
+  onClaimTask: (taskId: string, sessionId: string) => void;
+  onCompleteTask: (taskId: string) => void;
+  onUnblockTask: (taskId: string) => void;
+  onMarkMessageRead: (messageId: string) => void;
+}) {
+  if (tasks.length === 0 && messages.length === 0) {
+    return null;
+  }
+  const completed = tasks.filter((task) => task.status === "completed").length;
+  const blocked = tasks.filter((task) => task.status === "blocked").length;
+  const unread = messages.filter((message) => !message.readAt).length;
+  const progress = tasks.length > 0 ? completed / tasks.length : 0;
+  const visibleTasks = tasks
+    .filter((task) => task.status !== "completed")
+    .slice(0, 5);
+  const visibleMessages = messages.slice(0, 4);
+
+  return (
+    <div
+      data-agentmux-team-panel
+      style={{ margin: "12px 0 2px", padding: "0 6px" }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 8,
+          padding: "4px 0 7px",
+        }}
+      >
+        <span
+          style={{
+            font: `700 10px/1 ${FONT_SANS}`,
+            letterSpacing: ".08em",
+            textTransform: "uppercase",
+            color: "var(--fg4)",
+          }}
+        >
+          Team
+        </span>
+        <span
+          style={{ font: `600 10px/1 ${FONT_MONO}`, color: "var(--fg4)" }}
+        >
+          {tasks.length > 0 ? `${completed}/${tasks.length}` : "mailbox"}
+        </span>
+      </div>
+
+      {tasks.length > 0 ? (
+        <div style={{ marginBottom: 8 }}>
+          <div
+            style={{
+              height: 5,
+              borderRadius: 999,
+              background: "var(--s2)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                width: `${Math.round(progress * 100)}%`,
+                height: "100%",
+                background: blocked > 0 ? "var(--warn, #FBBF24)" : "var(--accent)",
+              }}
+            />
+          </div>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 8,
+              marginTop: 6,
+              font: `500 10px/1 ${FONT_SANS}`,
+              color: "var(--fg4)",
+            }}
+          >
+            <span>Tasks {completed}/{tasks.length}</span>
+            {blocked > 0 ? <span>{blocked} blocked</span> : null}
+          </div>
+        </div>
+      ) : null}
+
+      {visibleTasks.length > 0 ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+          {visibleTasks.map((task) => (
+            <div
+              key={task.taskId}
+              data-agentmux-team-task={task.taskId}
+              style={{
+                border: "1px solid var(--border)",
+                borderRadius: 7,
+                background: "var(--s1)",
+                padding: "7px 7px 6px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  minWidth: 0,
+                }}
+              >
+                <span
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: "50%",
+                    flex: "none",
+                    background: teamTaskStatusColor(task.status),
+                  }}
+                />
+                <span
+                  title={task.title}
+                  style={{
+                    minWidth: 0,
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    font: `600 11px/1.25 ${FONT_SANS}`,
+                    color: "var(--fg2)",
+                  }}
+                >
+                  {task.title}
+                </span>
+                <span
+                  style={{
+                    flex: "none",
+                    font: `600 9px/1 ${FONT_MONO}`,
+                    color: teamTaskStatusColor(task.status),
+                  }}
+                >
+                  {task.status}
+                </span>
+              </div>
+              {task.blockedReason ? (
+                <div
+                  style={{
+                    marginTop: 5,
+                    font: `400 10px/1.25 ${FONT_SANS}`,
+                    color: "var(--warn, #FBBF24)",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {task.blockedReason}
+                </div>
+              ) : null}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 5,
+                  marginTop: 6,
+                }}
+              >
+                {task.assignedSessionId ? (
+                  <button
+                    type="button"
+                    className="agentmux-team-button"
+                    onClick={() => onFocusSession(task.assignedSessionId)}
+                  >
+                    {shortSessionId(task.assignedSessionId)}
+                  </button>
+                ) : activeSessionId ? (
+                  <button
+                    type="button"
+                    className="agentmux-team-button"
+                    onClick={() => onClaimTask(task.taskId, activeSessionId)}
+                  >
+                    Claim
+                  </button>
+                ) : null}
+                {task.status === "blocked" ? (
+                  <button
+                    type="button"
+                    className="agentmux-team-button"
+                    onClick={() => onUnblockTask(task.taskId)}
+                  >
+                    Unblock
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="agentmux-team-button"
+                  onClick={() => onCompleteTask(task.taskId)}
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {visibleMessages.length > 0 ? (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+            marginTop: visibleTasks.length > 0 ? 9 : 0,
+          }}
+        >
+          <div
+            style={{
+              font: `600 10px/1 ${FONT_SANS}`,
+              color: unread > 0 ? "var(--accent)" : "var(--fg4)",
+            }}
+          >
+            Mailbox {unread > 0 ? `${unread} unread` : "all read"}
+          </div>
+          {visibleMessages.map((message) => {
+            const focusSessionId = message.toSessionId ?? message.fromSessionId;
+            return (
+              <div
+                key={message.messageId}
+                data-agentmux-team-message={message.messageId}
+                style={{
+                  border: "1px solid var(--border)",
+                  borderRadius: 7,
+                  background: message.readAt ? "var(--s1)" : "var(--accent-soft)",
+                  padding: "7px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    marginBottom: 4,
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 7,
+                      height: 7,
+                      borderRadius: "50%",
+                      flex: "none",
+                      background: message.readAt ? "var(--fg4)" : "var(--accent)",
+                    }}
+                  />
+                  <span
+                    style={{
+                      minWidth: 0,
+                      flex: 1,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      font: `600 10px/1 ${FONT_MONO}`,
+                      color: "var(--fg3)",
+                    }}
+                  >
+                    {message.kind}
+                    {focusSessionId ? ` - ${shortSessionId(focusSessionId)}` : ""}
+                  </span>
+                </div>
+                <div
+                  title={message.body}
+                  style={{
+                    font: `400 10.5px/1.35 ${FONT_SANS}`,
+                    color: "var(--fg2)",
+                    display: "-webkit-box",
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: "vertical",
+                    overflow: "hidden",
+                  }}
+                >
+                  {message.body}
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 5,
+                    marginTop: 6,
+                  }}
+                >
+                  {focusSessionId ? (
+                    <button
+                      type="button"
+                      className="agentmux-team-button"
+                      onClick={() => onFocusSession(focusSessionId)}
+                    >
+                      Focus
+                    </button>
+                  ) : null}
+                  {!message.readAt ? (
+                    <button
+                      type="button"
+                      className="agentmux-team-button"
+                      onClick={() => onMarkMessageRead(message.messageId)}
+                    >
+                      Read
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function teamTaskStatusColor(status: string): string {
+  if (status === "completed") return "var(--ok, #4ADE80)";
+  if (status === "blocked") return "var(--warn, #FBBF24)";
+  if (status === "claimed") return "var(--accent)";
+  return "var(--fg4)";
+}
+
+function shortSessionId(sessionId: string | null | undefined): string {
+  if (!sessionId) return "session";
+  return sessionId.length > 10 ? sessionId.slice(-8) : sessionId;
+}
+
 function DockPanel({
   client,
   dock,
@@ -5629,6 +6530,7 @@ function DockPanel({
   sessionById,
   activeSessionId,
   terminalInnerMargin,
+  fontSize,
   onTrust,
   onRun,
   onCloseSurface,
@@ -5643,6 +6545,7 @@ function DockPanel({
   sessionById: Map<string, TerminalSession>;
   activeSessionId: string | null;
   terminalInnerMargin: number;
+  fontSize: number;
   onTrust: () => void;
   onRun: (control: DockControl) => void;
   onCloseSurface: (surfaceId: string) => void;
@@ -6002,6 +6905,7 @@ function DockPanel({
                     sessionId={session.sessionId}
                     active={activeSessionId === session.sessionId}
                     innerMargin={terminalInnerMargin}
+                    fontSize={fontSize}
                     onFocus={() => onFocusSession(session.sessionId)}
                   />
                 </div>
@@ -6597,6 +7501,7 @@ interface SettingsModalProps {
   setFontSize: (size: number) => void;
   setTerminalInnerMargin: (size: number) => void;
   onDismissNotification: (id: string) => void;
+  onFocusNotificationSession: (sessionId: string | null | undefined) => boolean;
   onRunNotificationAction: (
     hook: AppConfigNotificationAction,
     notification: NotificationSummary,
@@ -7376,6 +8281,7 @@ function SettingsModal(props: SettingsModalProps) {
     setFontSize,
     setTerminalInnerMargin,
     onDismissNotification,
+    onFocusNotificationSession,
     onRunNotificationAction,
     onReloadConfig,
     onExportConfig,
@@ -8896,6 +9802,26 @@ function SettingsModal(props: SettingsModalProps) {
                           {n.message}
                         </div>
                       </div>
+                      {n.sessionId ? (
+                        <button
+                          type="button"
+                          className="agentmux-notification-focus"
+                          onClick={() => onFocusNotificationSession(n.sessionId)}
+                          style={{
+                            flex: "none",
+                            marginLeft: 12,
+                            background: "var(--accent-soft)",
+                            border: "1px solid rgba(88, 166, 255, 0.38)",
+                            borderRadius: 7,
+                            padding: "6px 10px",
+                            cursor: "pointer",
+                            font: `600 11px/1 ${FONT_SANS}`,
+                            color: "var(--accent)",
+                          }}
+                        >
+                          Focus
+                        </button>
+                      ) : null}
                       {notificationActionsFor(n).map(
                         ({ hook, action }, index) => (
                           <button

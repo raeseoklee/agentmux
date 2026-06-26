@@ -16,7 +16,7 @@ use agentmux_backend::{
 };
 use agentmux_backend_conpty::ConptyBackend;
 use agentmux_backend_ssh::SshDirectBackend;
-use agentmux_backend_tmux::TmuxControlBackend;
+use agentmux_backend_tmux::{posix_shell_quote, TmuxControlBackend};
 use agentmux_backend_wsl::{
     discover_wsl_distributions as discover_wsl_distributions_from_backend, PipeBackend,
     WslDiagnosticCode, WslDirectBackend, WslDirectConfig, WslDistribution,
@@ -61,12 +61,16 @@ use agentmux_ipc::{
     PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, PaneUnmountSurfaceParams,
     ProfileCreateParams, ProfileIdParams, ProfileListResult, ProfileSummaryResult,
     ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, SessionIdParams, SessionSpawnParams, SessionSpawnResult,
-    SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams, SidebarLogListResult,
-    SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams, SidebarStateResult,
-    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult, SidebarStatusSetParams,
-    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams, SurfaceSummaryResult,
-    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, TmuxDiagnosticsParams,
+    ResponseEnvelope, ResponseOutcome, SessionAttachParams, SessionIdParams, SessionSendTextParams,
+    SessionSpawnParams, SessionSpawnResult, SessionSummaryResult, SidebarLogAddParams,
+    SidebarLogListParams, SidebarLogListResult, SidebarLogResult, SidebarProgressResult,
+    SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams, SidebarStatusListResult,
+    SidebarStatusResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
+    SurfaceCreateBrowserParams, SurfaceSummaryResult, SystemCapabilitiesResult,
+    SystemIdentifyParams, SystemIdentifyResult, TeamMessageListParams, TeamMessageListResult,
+    TeamMessageMarkReadParams, TeamMessageResult, TeamMessageSendParams, TeamTaskBlockParams,
+    TeamTaskClaimParams, TeamTaskCreateParams, TeamTaskDependencyParams, TeamTaskIdParams,
+    TeamTaskListParams, TeamTaskListResult, TeamTaskResult, TmuxDiagnosticsParams,
     TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult, WorkspaceCreateParams,
     WorkspaceDetailResult, WorkspaceGroupCreateParams, WorkspaceGroupIdParams,
     WorkspaceGroupListParams, WorkspaceGroupListResult, WorkspaceGroupMemberParams,
@@ -78,8 +82,9 @@ use agentmux_ipc::{
 use agentmux_store::{
     PersistedAgentState, PersistedDockTrust, PersistedNotification, PersistedPane,
     PersistedProfile, PersistedSession, PersistedSidebarLog, PersistedSidebarProgress,
-    PersistedSidebarStatus, PersistedSurface, PersistedWorkspace, PersistedWorkspaceGroup,
-    PersistedWorkspaceGroupMember, RecoverySnapshot, SqliteStore, StoreError, WorkspaceBundle,
+    PersistedSidebarStatus, PersistedSurface, PersistedTeamMessage, PersistedTeamTask,
+    PersistedWorkspace, PersistedWorkspaceGroup, PersistedWorkspaceGroupMember, RecoverySnapshot,
+    SqliteStore, StoreError, WorkspaceBundle,
 };
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use tauri::ipc::Channel;
@@ -256,6 +261,7 @@ pub struct DesktopControlState {
     output_pump_hot_until: Mutex<Option<Instant>>,
     output_stream_metrics: Mutex<OutputStreamMetrics>,
     output_pressure: Mutex<HashMap<String, OutputPressureRecord>>,
+    input_command_buffers: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -370,6 +376,7 @@ impl DesktopControlState {
             output_pump_hot_until: Mutex::new(None),
             output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
             output_pressure: Mutex::new(HashMap::new()),
+            input_command_buffers: Mutex::new(HashMap::new()),
         };
         // Durable-session recovery is deliberately NOT run here: it probes
         // wsl.exe/tmux and can block for seconds. The desktop host runs it on a
@@ -398,6 +405,7 @@ impl DesktopControlState {
             output_pump_hot_until: Mutex::new(None),
             output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
             output_pressure: Mutex::new(HashMap::new()),
+            input_command_buffers: Mutex::new(HashMap::new()),
         };
         Ok(state)
     }
@@ -597,11 +605,36 @@ impl DesktopControlState {
         };
         control
             .runtime_mut()
-            .send_text(&SessionId::from_string(session_id), text)
+            .send_text(&SessionId::from_string(session_id), text.clone())
             .map_err(|error| DesktopHostError::StateUnavailable(error.to_string()))?;
         control.collect_events();
         drop(control);
         self.mark_output_pump_hot();
+        self.detect_agent_launch_from_terminal_input(session_id, &text);
+        Ok(())
+    }
+
+    pub fn send_paste_direct(
+        &self,
+        session_id: &str,
+        text: String,
+        bracketed: bool,
+    ) -> Result<(), DesktopHostError> {
+        let Ok(mut control) = self.control.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop control state is unavailable".to_string(),
+            ));
+        };
+        control
+            .runtime_mut()
+            .send_paste(&SessionId::from_string(session_id), text.clone(), bracketed)
+            .map_err(|error| DesktopHostError::StateUnavailable(error.to_string()))?;
+        control.collect_events();
+        drop(control);
+        self.mark_output_pump_hot();
+        if text.contains('\r') || text.contains('\n') {
+            self.detect_agent_launch_from_terminal_input(session_id, &text);
+        }
         Ok(())
     }
 
@@ -906,19 +939,12 @@ impl DesktopControlState {
         let Ok(snapshot) = self.recovery_snapshot() else {
             return;
         };
-        let workspace_profiles = snapshot
-            .workspaces
-            .iter()
-            .map(|workspace| {
-                (
-                    workspace.workspace_id.clone(),
-                    workspace.environment_profile_id.clone(),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let recoverable_agents = self.recoverable_agent_states_by_session();
+        let mounted_terminals = mounted_terminal_surfaces_by_session(&snapshot);
+        let workspace_profiles = workspace_backend_profiles(&snapshot);
 
-        for session in snapshot.sessions {
-            if !should_attach_recovering_session(&session) {
+        for session in snapshot.sessions.iter() {
+            if !should_attach_recovering_session(session) {
                 continue;
             }
             let Some(backend_ref) = session.backend_native_id.clone() else {
@@ -928,11 +954,13 @@ impl DesktopControlState {
                 .get(&session.workspace_id)
                 .cloned()
                 .flatten();
+            let should_try_attach =
+                tmux_session_exists(backend_profile.as_deref(), &backend_ref) != Some(false);
             let params_json = serde_json::json!({
-                "session_id": session.session_id,
-                "workspace_id": session.workspace_id,
-                "backend": session.backend_kind,
-                "backend_profile": backend_profile,
+                "session_id": session.session_id.clone(),
+                "workspace_id": session.workspace_id.clone(),
+                "backend": session.backend_kind.clone(),
+                "backend_profile": backend_profile.clone(),
                 "backend_ref": backend_ref,
                 "columns": 120,
                 "rows": 30,
@@ -940,19 +968,57 @@ impl DesktopControlState {
             })
             .to_string();
 
-            let response = self.handle_request(RequestEnvelope::new(
-                "desktop_startup_recover_durable_session",
-                "session.attach",
-                params_json,
-                self.control_token.clone(),
-            ));
-            if matches!(response.outcome, ResponseOutcome::Ok { .. }) {
-                let _ = self.persist_session_summary_from_id(
-                    match response_result_json::<SessionSpawnResult>(&response) {
-                        Ok(result) => result.session_id,
-                        Err(_) => continue,
-                    },
-                );
+            if should_try_attach {
+                let response = self.handle_request(RequestEnvelope::new(
+                    "desktop_startup_recover_durable_session",
+                    "session.attach",
+                    params_json,
+                    self.control_token.clone(),
+                ));
+                if matches!(response.outcome, ResponseOutcome::Ok { .. }) {
+                    let Ok(result) = response_result_json::<SessionSpawnResult>(&response) else {
+                        continue;
+                    };
+                    let _ = self.persist_session_summary_from_id(result.session_id.clone());
+                    if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
+                        self.replay_restored_agent_state(
+                            &result.session_id,
+                            &session.command,
+                            agent_state,
+                            None,
+                        );
+                    }
+                    continue;
+                }
+            }
+
+            let Some((pane_id, surface_id)) = mounted_terminals.get(&session.session_id) else {
+                continue;
+            };
+            if session.command.is_empty() {
+                continue;
+            }
+            if let Some(result) = self.respawn_persisted_terminal_into_pane(
+                session,
+                pane_id,
+                backend_profile,
+                "durable",
+                "desktop_startup_respawn_durable_session",
+            ) {
+                if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
+                    self.replay_restored_agent_launch_command(
+                        &result.session_id,
+                        session,
+                        agent_state,
+                    );
+                    self.replay_restored_agent_state(
+                        &result.session_id,
+                        &session.command,
+                        agent_state,
+                        Some("running"),
+                    );
+                }
+                self.delete_superseded_terminal(surface_id, &session.session_id);
             }
         }
     }
@@ -995,29 +1061,23 @@ impl DesktopControlState {
     ///
     /// Ephemeral terminal processes (ConPTY / direct WSL) don't survive app exit;
     /// `reconcile_orphaned_ephemeral_sessions` marks their sessions 'disconnected'.
-    /// Here we re-spawn a fresh shell into each such pane using the session's
-    /// stored command, so the user's terminal layout could come back LIVE instead
-    /// of as reopenable empty panes.
-    ///
-    /// OFF BY DEFAULT (opt in with `AGENTMUX_ENABLE_TERMINAL_RESTORE`). A single
-    /// restart works (clean-room verified: both panes of a split tab come back
-    /// live and render their prompts), but it is NOT yet idempotent — across
-    /// repeated restarts the spawn-into-pane can grow nested splits and leak
-    /// orphaned surfaces (which then surface as phantom tabs in the UI). Until
-    /// that's fixed, dead ephemeral terminals show as reopenable panes instead.
-    /// `MAX_RESTORE` caps the fan-out as a safety net while it's opt-in.
+    /// Re-spawn each persisted terminal command into its original leaf pane, then
+    /// delete the superseded dead surface/session so repeated app restarts remain
+    /// idempotent.
     pub fn restore_ephemeral_terminals(&self) {
-        if std::env::var_os("AGENTMUX_ENABLE_TERMINAL_RESTORE").is_none() {
-            return;
-        }
         let Ok(snapshot) = self.recovery_snapshot() else {
             return;
         };
+        let recoverable_agents = self.recoverable_agent_states_by_session();
+        let workspace_profiles = workspace_backend_profiles(&snapshot);
         const MAX_RESTORE: usize = 32;
         let mut restored = 0usize;
         for pane in &snapshot.panes {
             if restored >= MAX_RESTORE {
                 break;
+            }
+            if pane.kind != "leaf" {
+                continue;
             }
             let Some(surface_id) = pane.mounted_surface_id.as_ref() else {
                 continue;
@@ -1032,46 +1092,167 @@ impl DesktopControlState {
             let Some(session_id) = surface.session_id.as_ref() else {
                 continue;
             };
-            // Only restore a disconnected ephemeral terminal session that still
-            // carries a command to replay.
+            // Restore disconnected ephemeral terminal processes. If the session
+            // had an active agent, restore it even if the last persisted state
+            // was not normalized as disconnected.
             let Some(session) = snapshot.sessions.iter().find(|s| {
                 &s.session_id == session_id
                     && s.durability != "durable"
-                    && s.state == "disconnected"
                     && matches!(s.backend_kind.as_str(), "conpty" | "wsl-direct")
                     && !s.command.is_empty()
+                    && (s.state == "disconnected"
+                        || recoverable_agents.contains_key(s.session_id.as_str()))
             }) else {
                 continue;
             };
-            let params = serde_json::json!({
-                "workspace_id": pane.workspace_id,
-                "backend": session.backend_kind,
-                "command": session.command,
-                "cwd": session.cwd,
-                "columns": 120,
-                "rows": 30,
-                "durability": "ephemeral",
-                "placement": "active_pane",
-                "pane_id": pane.pane_id,
-            })
-            .to_string();
-            let response = self.handle_request(RequestEnvelope::new(
+            let backend_profile = workspace_profiles
+                .get(&session.workspace_id)
+                .cloned()
+                .flatten();
+            if let Some(result) = self.respawn_persisted_terminal_into_pane(
+                session,
+                &pane.pane_id,
+                backend_profile,
+                "ephemeral",
                 "desktop_startup_restore_terminal",
-                "session.spawn",
-                params,
-                self.control_token.clone(),
-            ));
-            // On success the pane now mounts a fresh live surface; drop the old
-            // disconnected surface (now orphaned) and its dead session so they
-            // don't accumulate across restarts. On failure leave them so the UI
-            // still offers the reopenable pane.
-            if matches!(response.outcome, ResponseOutcome::Ok { .. }) {
-                if let Ok(mut store) = self.store.lock() {
-                    let _ = store.delete_surface(&surface.surface_id);
-                    let _ = store.delete_session(&session.session_id);
+            ) {
+                if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
+                    self.replay_restored_agent_launch_command(
+                        &result.session_id,
+                        session,
+                        agent_state,
+                    );
+                    self.replay_restored_agent_state(
+                        &result.session_id,
+                        &session.command,
+                        agent_state,
+                        Some("running"),
+                    );
                 }
+                self.delete_superseded_terminal(&surface.surface_id, &session.session_id);
                 restored += 1;
             }
+        }
+    }
+
+    fn recoverable_agent_states_by_session(&self) -> HashMap<String, PersistedAgentState> {
+        let Ok(store) = self.store.lock() else {
+            return HashMap::new();
+        };
+        let Ok(states) = store.list_agent_states(None) else {
+            return HashMap::new();
+        };
+        states
+            .into_iter()
+            .filter(should_restore_agent_state)
+            .map(|state| (state.session_id.clone(), state))
+            .collect()
+    }
+
+    fn respawn_persisted_terminal_into_pane(
+        &self,
+        session: &PersistedSession,
+        pane_id: &str,
+        backend_profile: Option<String>,
+        durability: &str,
+        request_id: &str,
+    ) -> Option<SessionSpawnResult> {
+        let params = serde_json::json!({
+            "workspace_id": session.workspace_id.clone(),
+            "backend": session.backend_kind.clone(),
+            "backend_profile": backend_profile,
+            "command": session.command.clone(),
+            "cwd": session.cwd.clone(),
+            "columns": 120,
+            "rows": 30,
+            "durability": durability,
+            "placement": "active_pane",
+            "pane_id": pane_id,
+        })
+        .to_string();
+        let response = self.handle_request(RequestEnvelope::new(
+            request_id,
+            "session.spawn",
+            params,
+            self.control_token.clone(),
+        ));
+        response_result_json::<SessionSpawnResult>(&response).ok()
+    }
+
+    fn replay_restored_agent_state(
+        &self,
+        session_id: &str,
+        command: &[String],
+        previous: &PersistedAgentState,
+        state_override: Option<&str>,
+    ) {
+        let command_label = command.join(" ");
+        let restored_label = restored_agent_command_label(previous)
+            .filter(|label| is_known_agent_launch(label))
+            .filter(|_| !persisted_command_already_launches_agent(command));
+        let label = restored_label.as_deref().unwrap_or(command_label.trim());
+        let label = if label.is_empty() { "agent" } else { label };
+        let state = state_override.unwrap_or(previous.state.as_str());
+        let mut telemetry = previous
+            .telemetry_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok())
+            .unwrap_or_default();
+        if telemetry.activity.is_none() {
+            telemetry.activity = Some("agent".to_string());
+        }
+        if telemetry.session.is_none() {
+            telemetry.session = Some(label.to_string());
+        }
+        let reason = if state_override.is_some() {
+            Some(format!("Agent restored: {label}"))
+        } else {
+            previous
+                .reason
+                .clone()
+                .or_else(|| Some(format!("Agent restored: {label}")))
+        };
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "state": state,
+            "reason": reason,
+            "telemetry": telemetry,
+        })
+        .to_string();
+        let _ = self.handle_request(RequestEnvelope::new(
+            "desktop_startup_replay_agent_state",
+            "agent.set_state",
+            params,
+            self.control_token.clone(),
+        ));
+    }
+
+    fn replay_restored_agent_launch_command(
+        &self,
+        session_id: &str,
+        session: &PersistedSession,
+        previous: &PersistedAgentState,
+    ) {
+        let Some(command_line) = restored_agent_launch_line(session, previous) else {
+            return;
+        };
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "text": format!("{command_line}\r"),
+        })
+        .to_string();
+        let _ = self.handle_request(RequestEnvelope::new(
+            "desktop_startup_replay_agent_command",
+            "session.send_text",
+            params,
+            self.control_token.clone(),
+        ));
+    }
+
+    fn delete_superseded_terminal(&self, surface_id: &str, session_id: &str) {
+        if let Ok(mut store) = self.store.lock() {
+            let _ = store.delete_surface(surface_id);
+            let _ = store.delete_session(session_id);
         }
     }
 
@@ -1177,6 +1358,16 @@ impl DesktopControlState {
             "notification.list" => self.handle_notification_list(&request),
             "notification.dismiss" => self.handle_notification_dismiss(&request),
             "notification.clear" => self.handle_notification_clear(&request),
+            "team.task.list" => self.handle_team_task_list(&request),
+            "team.task.create" => self.handle_team_task_create(&request),
+            "team.task.claim" => self.handle_team_task_claim(&request),
+            "team.task.complete" => self.handle_team_task_complete(&request),
+            "team.task.block" => self.handle_team_task_block(&request),
+            "team.task.unblock" => self.handle_team_task_unblock(&request),
+            "team.task.set_dependency" => self.handle_team_task_set_dependency(&request),
+            "team.message.list" => self.handle_team_message_list(&request),
+            "team.message.send" => self.handle_team_message_send(&request),
+            "team.message.mark_read" => self.handle_team_message_mark_read(&request),
             "sidebar.set_status" => self.handle_sidebar_set_status(&request),
             "sidebar.clear_status" => self.handle_sidebar_clear_status(&request),
             "sidebar.list_status" => self.handle_sidebar_list_status(&request),
@@ -1229,7 +1420,11 @@ impl DesktopControlState {
 
         let result = match request.method.as_str() {
             "session.spawn" => self.persist_spawn(control, request, response),
+            "session.attach" => self.persist_attach(control, request, response),
             "session.get" => self.persist_session_summary(response),
+            "session.send_text" => {
+                self.persist_detected_agent_launch_from_send_text(control, request)
+            }
             "agent.set_state" => self.persist_agent_set_state(control, response),
             "agent.clear_attention" => self.persist_agent_clear_attention(request),
             _ => Ok(()),
@@ -1264,6 +1459,76 @@ impl DesktopControlState {
         let existing = store.load_workspace_bundle(&params.workspace_id)?;
         let bundle = workspace_bundle_from_spawn(&params, &result, &summary, existing);
         store.save_workspace_bundle(&bundle)?;
+        drop(store);
+        let command_label = params.command.join(" ");
+        if is_known_agent_launch(&command_label) {
+            let _ = self.apply_detected_agent_launch(control, &result.session_id, &command_label);
+        }
+        Ok(())
+    }
+
+    fn persist_attach(
+        &self,
+        control: &mut DesktopRuntimeControl,
+        request: &RequestEnvelope,
+        response: &ResponseEnvelope,
+    ) -> Result<(), DesktopHostError> {
+        let params: SessionAttachParams = request.parse_params()?;
+        let result: SessionSpawnResult = response_result_json(response)?;
+        let summary = session_summary(control, &result.session_id, &self.control_token)?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let Some(mut bundle) = store.load_workspace_bundle(&params.workspace_id)? else {
+            return Ok(());
+        };
+        let now = timestamp();
+        if let Some(session) = bundle
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == result.session_id)
+        {
+            session.backend_kind = summary.backend_kind;
+            session.backend_native_id = summary
+                .backend_native_id
+                .or_else(|| Some(params.backend_ref.clone()));
+            session.state = summary.state;
+            session.exit_code = summary.exit_code;
+            session.durability = params
+                .durability
+                .clone()
+                .unwrap_or_else(|| session.durability.clone());
+            session.last_seen_at = Some(now.clone());
+            session.updated_at = now.clone();
+            if session.command.is_empty() {
+                session.command = vec!["attach".to_string(), params.backend_ref.clone()];
+            }
+        } else {
+            bundle.sessions.push(PersistedSession {
+                session_id: result.session_id.clone(),
+                workspace_id: params.workspace_id.clone(),
+                backend_kind: summary.backend_kind,
+                backend_attachment_id: None,
+                backend_native_id: summary
+                    .backend_native_id
+                    .or_else(|| Some(params.backend_ref.clone())),
+                cwd: None,
+                command: vec!["attach".to_string(), params.backend_ref.clone()],
+                state: summary.state,
+                exit_code: summary.exit_code,
+                durability: params
+                    .durability
+                    .clone()
+                    .unwrap_or_else(|| "durable".to_string()),
+                created_at: now.clone(),
+                last_seen_at: Some(now.clone()),
+                updated_at: now.clone(),
+            });
+        }
+        bundle.workspace.updated_at = now;
+        store.save_workspace_bundle(&bundle)?;
         Ok(())
     }
 
@@ -1281,6 +1546,117 @@ impl DesktopControlState {
             &timestamp(),
         )?;
         Ok(())
+    }
+
+    fn persist_detected_agent_launch_from_send_text(
+        &self,
+        control: &mut DesktopRuntimeControl,
+        request: &RequestEnvelope,
+    ) -> Result<(), DesktopHostError> {
+        let params: SessionSendTextParams = request.parse_params()?;
+        for label in self.completed_terminal_input_lines(&params.session_id, &params.text) {
+            let _ = self.apply_detected_agent_launch(control, &params.session_id, &label);
+        }
+        Ok(())
+    }
+
+    fn detect_agent_launch_from_terminal_input(&self, session_id: &str, text: &str) {
+        let labels = self.completed_terminal_input_lines(session_id, text);
+        if labels.is_empty() {
+            return;
+        }
+        let Ok(mut control) = self.control.lock() else {
+            return;
+        };
+        for label in labels {
+            let _ = self.apply_detected_agent_launch(&mut control, session_id, &label);
+        }
+    }
+
+    fn completed_terminal_input_lines(&self, session_id: &str, text: &str) -> Vec<String> {
+        const MAX_TRACKED_COMMAND_BYTES: usize = 4096;
+        let Ok(mut buffers) = self.input_command_buffers.lock() else {
+            return Vec::new();
+        };
+        let buffer = buffers.entry(session_id.to_string()).or_default();
+        let mut completed = Vec::new();
+        let mut previous_was_newline = false;
+
+        for ch in text.chars() {
+            match ch {
+                '\r' | '\n' => {
+                    if previous_was_newline && buffer.is_empty() {
+                        continue;
+                    }
+                    let line = buffer.trim();
+                    if !line.is_empty() && is_known_agent_launch(line) {
+                        completed.push(line.to_string());
+                    }
+                    buffer.clear();
+                    previous_was_newline = true;
+                }
+                '\u{8}' | '\u{7f}' => {
+                    buffer.pop();
+                    previous_was_newline = false;
+                }
+                '\u{3}' | '\u{4}' => {
+                    buffer.clear();
+                    previous_was_newline = false;
+                }
+                '\t' => {
+                    if buffer.len() < MAX_TRACKED_COMMAND_BYTES {
+                        buffer.push(ch);
+                    } else {
+                        buffer.clear();
+                    }
+                    previous_was_newline = false;
+                }
+                other if !other.is_control() => {
+                    if buffer.len() < MAX_TRACKED_COMMAND_BYTES {
+                        buffer.push(other);
+                    } else {
+                        buffer.clear();
+                    }
+                    previous_was_newline = false;
+                }
+                _ => {
+                    previous_was_newline = false;
+                }
+            }
+        }
+
+        completed
+    }
+
+    fn apply_detected_agent_launch(
+        &self,
+        control: &mut DesktopRuntimeControl,
+        session_id: &str,
+        label: &str,
+    ) -> Result<(), DesktopHostError> {
+        let trimmed = label.trim();
+        if trimmed.is_empty() || !is_known_agent_launch(trimmed) {
+            return Ok(());
+        }
+        let agent = agent_command_name(first_command_word(trimmed).unwrap_or(trimmed));
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "state": "running",
+            "reason": format!("Agent started: {trimmed}"),
+            "telemetry": {
+                "activity": "agent",
+                "session": trimmed,
+                "ctx": agent,
+            },
+        })
+        .to_string();
+        let response = control.handle_request(RequestEnvelope::new(
+            "desktop_detect_agent_launch_from_input",
+            "agent.set_state",
+            params,
+            self.control_token.clone(),
+        ));
+        self.persist_agent_set_state(control, &response)
     }
 
     fn persist_session_summary_from_id(&self, session_id: String) -> Result<(), DesktopHostError> {
@@ -3889,6 +4265,282 @@ impl DesktopControlState {
         ))
     }
 
+    fn handle_team_task_list(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskListParams = request.parse_params()?;
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let tasks = team_task_results_from_store(&store, params.workspace_id.as_deref())?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &TeamTaskListResult { tasks },
+        ))
+    }
+
+    fn handle_team_task_create(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskCreateParams = request.parse_params()?;
+        let title = non_empty(params.title, "task title")?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let workspace_id = resolve_workspace_id(&store, Some(&params.workspace_id))?;
+        let dependency_ready = team_dependencies_satisfied(&store, &params.depends_on)?;
+        let task = PersistedTeamTask {
+            task_id: format!("task_{}", unique_time_id()),
+            workspace_id,
+            title,
+            description: trim_optional(params.description),
+            status: if dependency_ready { "ready" } else { "blocked" }.to_string(),
+            assigned_session_id: trim_optional(params.assigned_session_id),
+            blocked_reason: (!dependency_ready).then(|| "waiting_on_dependency".to_string()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            completed_at: None,
+        };
+        store.upsert_team_task(&task)?;
+        store.replace_team_task_dependencies(&task.task_id, &params.depends_on, &now)?;
+        let dependencies = store.list_team_task_dependencies(Some(&task.workspace_id))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &team_task_result(&task, &dependencies),
+        ))
+    }
+
+    fn handle_team_task_claim(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskClaimParams = request.parse_params()?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let task = load_team_task_or_not_found(&store, &params.task_id)?;
+        store.set_team_task_status(
+            &params.task_id,
+            "claimed",
+            params.session_id.as_deref(),
+            None,
+            None,
+            &now,
+        )?;
+        let task = store.load_team_task(&params.task_id)?.unwrap_or(task);
+        let dependencies = store.list_team_task_dependencies(Some(&task.workspace_id))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &team_task_result(&task, &dependencies),
+        ))
+    }
+
+    fn handle_team_task_complete(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskIdParams = request.parse_params()?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let task = load_team_task_or_not_found(&store, &params.task_id)?;
+        store.set_team_task_status(&params.task_id, "completed", None, None, Some(&now), &now)?;
+        unblock_dependency_ready_tasks(&mut store, &task.workspace_id, &now)?;
+        let task = store.load_team_task(&params.task_id)?.unwrap_or(task);
+        let dependencies = store.list_team_task_dependencies(Some(&task.workspace_id))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &team_task_result(&task, &dependencies),
+        ))
+    }
+
+    fn handle_team_task_block(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskBlockParams = request.parse_params()?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let task = load_team_task_or_not_found(&store, &params.task_id)?;
+        let reason = trim_optional(params.reason);
+        store.set_team_task_status(
+            &params.task_id,
+            "blocked",
+            None,
+            reason.as_deref(),
+            None,
+            &now,
+        )?;
+        let task = store.load_team_task(&params.task_id)?.unwrap_or(task);
+        let dependencies = store.list_team_task_dependencies(Some(&task.workspace_id))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &team_task_result(&task, &dependencies),
+        ))
+    }
+
+    fn handle_team_task_unblock(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskIdParams = request.parse_params()?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let task = load_team_task_or_not_found(&store, &params.task_id)?;
+        store.set_team_task_status(&params.task_id, "ready", None, None, None, &now)?;
+        let task = store.load_team_task(&params.task_id)?.unwrap_or(task);
+        let dependencies = store.list_team_task_dependencies(Some(&task.workspace_id))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &team_task_result(&task, &dependencies),
+        ))
+    }
+
+    fn handle_team_task_set_dependency(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamTaskDependencyParams = request.parse_params()?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let task = load_team_task_or_not_found(&store, &params.task_id)?;
+        store.replace_team_task_dependencies(&params.task_id, &params.depends_on, &now)?;
+        let dependency_ready = team_dependencies_satisfied(&store, &params.depends_on)?;
+        if !dependency_ready {
+            store.set_team_task_status(
+                &params.task_id,
+                "blocked",
+                None,
+                Some("waiting_on_dependency"),
+                None,
+                &now,
+            )?;
+        } else if task.status == "blocked"
+            && task.blocked_reason.as_deref() == Some("waiting_on_dependency")
+        {
+            store.set_team_task_status(&params.task_id, "ready", None, None, None, &now)?;
+        }
+        let task = store.load_team_task(&params.task_id)?.unwrap_or(task);
+        let dependencies = store.list_team_task_dependencies(Some(&task.workspace_id))?;
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &team_task_result(&task, &dependencies),
+        ))
+    }
+
+    fn handle_team_message_list(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamMessageListParams = request.parse_params()?;
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let messages = store
+            .list_team_messages(
+                params.workspace_id.as_deref(),
+                params.include_read.unwrap_or(true),
+            )?
+            .iter()
+            .map(team_message_result)
+            .collect();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &TeamMessageListResult { messages },
+        ))
+    }
+
+    fn handle_team_message_send(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamMessageSendParams = request.parse_params()?;
+        let body = non_empty(params.body, "message body")?;
+        let now = timestamp();
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let workspace_id = resolve_workspace_id(&store, Some(&params.workspace_id))?;
+        let message = PersistedTeamMessage {
+            message_id: format!("msg_{}", unique_time_id()),
+            workspace_id: workspace_id.clone(),
+            thread_id: trim_optional(params.thread_id),
+            from_session_id: trim_optional(params.from_session_id),
+            to_session_id: trim_optional(params.to_session_id),
+            body,
+            kind: trim_optional(params.kind).unwrap_or_else(|| "mailbox".to_string()),
+            created_at: now.clone(),
+            read_at: None,
+        };
+        store.upsert_team_message(&message)?;
+        let notification = PersistedNotification {
+            notification_id: format!("not_team_message_{}", unique_time_id()),
+            notification_type: "team.message".to_string(),
+            severity: "info".to_string(),
+            workspace_id: Some(workspace_id),
+            session_id: message.to_session_id.clone(),
+            title: "Agent message".to_string(),
+            message: message.body.clone(),
+            created_at: now,
+            dismissed: false,
+        };
+        store.upsert_notification(&notification)?;
+        let result = team_message_result(&message);
+        self.dispatch_desktop_notification(&notification_result_from_persisted(&notification));
+        Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
+    }
+
+    fn handle_team_message_mark_read(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: TeamMessageMarkReadParams = request.parse_params()?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        if !store.mark_team_message_read(&params.message_id, &timestamp())? {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Team message not found.",
+            )));
+        }
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &AckResult { ok: true },
+        ))
+    }
+
     fn handle_sidebar_set_status(
         &self,
         request: &RequestEnvelope,
@@ -5267,6 +5919,7 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "surface.create_browser",
         "surface.close",
         "session.spawn",
+        "session.attach",
         "session.list",
         "session.get",
         "session.send_text",
@@ -5285,6 +5938,16 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "notification.list",
         "notification.dismiss",
         "notification.clear",
+        "team.task.list",
+        "team.task.create",
+        "team.task.claim",
+        "team.task.complete",
+        "team.task.block",
+        "team.task.unblock",
+        "team.task.set_dependency",
+        "team.message.list",
+        "team.message.send",
+        "team.message.mark_read",
         "sidebar.set_status",
         "sidebar.clear_status",
         "sidebar.list_status",
@@ -7859,6 +8522,25 @@ fn tmux_diagnostics(distribution: Option<&str>) -> TmuxDiagnosticsResult {
     }
 }
 
+fn tmux_session_exists(distribution: Option<&str>, session_name: &str) -> Option<bool> {
+    if session_name.trim().is_empty() {
+        return Some(false);
+    }
+    let mut command = Command::new("wsl.exe");
+    hide_console_window(&mut command);
+    if let Some(distribution) = distribution.filter(|value| !value.trim().is_empty()) {
+        command.arg("--distribution").arg(distribution);
+    }
+    let target = posix_shell_quote(session_name.to_string());
+    command.args([
+        "--exec",
+        "sh",
+        "-lc",
+        &format!("tmux has-session -t {target} >/dev/null 2>&1"),
+    ]);
+    command.status().ok().map(|status| status.success())
+}
+
 #[cfg(windows)]
 fn hide_console_window(command: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -8226,6 +8908,16 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "notification.list"
             | "notification.dismiss"
             | "notification.clear"
+            | "team.task.list"
+            | "team.task.create"
+            | "team.task.claim"
+            | "team.task.complete"
+            | "team.task.block"
+            | "team.task.unblock"
+            | "team.task.set_dependency"
+            | "team.message.list"
+            | "team.message.send"
+            | "team.message.mark_read"
             | "sidebar.set_status"
             | "sidebar.clear_status"
             | "sidebar.list_status"
@@ -9536,6 +10228,104 @@ fn sidebar_log_result(log: &PersistedSidebarLog) -> SidebarLogResult {
     }
 }
 
+fn team_task_result(task: &PersistedTeamTask, dependencies: &[(String, String)]) -> TeamTaskResult {
+    TeamTaskResult {
+        task_id: task.task_id.clone(),
+        workspace_id: task.workspace_id.clone(),
+        title: task.title.clone(),
+        description: task.description.clone(),
+        status: task.status.clone(),
+        assigned_session_id: task.assigned_session_id.clone(),
+        blocked_reason: task.blocked_reason.clone(),
+        depends_on: dependencies
+            .iter()
+            .filter_map(|(task_id, depends_on)| {
+                (task_id == &task.task_id).then(|| depends_on.clone())
+            })
+            .collect(),
+        created_at: task.created_at.clone(),
+        updated_at: task.updated_at.clone(),
+        completed_at: task.completed_at.clone(),
+    }
+}
+
+fn team_task_results_from_store(
+    store: &SqliteStore,
+    workspace_id: Option<&str>,
+) -> Result<Vec<TeamTaskResult>, DesktopHostError> {
+    let tasks = store.list_team_tasks(workspace_id)?;
+    let dependencies = store.list_team_task_dependencies(workspace_id)?;
+    Ok(tasks
+        .iter()
+        .map(|task| team_task_result(task, &dependencies))
+        .collect())
+}
+
+fn team_message_result(message: &PersistedTeamMessage) -> TeamMessageResult {
+    TeamMessageResult {
+        message_id: message.message_id.clone(),
+        workspace_id: message.workspace_id.clone(),
+        thread_id: message.thread_id.clone(),
+        from_session_id: message.from_session_id.clone(),
+        to_session_id: message.to_session_id.clone(),
+        body: message.body.clone(),
+        kind: message.kind.clone(),
+        created_at: message.created_at.clone(),
+        read_at: message.read_at.clone(),
+    }
+}
+
+fn load_team_task_or_not_found(
+    store: &SqliteStore,
+    task_id: &str,
+) -> Result<PersistedTeamTask, DesktopHostError> {
+    store.load_team_task(task_id)?.ok_or_else(|| {
+        DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!("Team task '{task_id}' was not found."),
+        ))
+    })
+}
+
+fn team_dependencies_satisfied(
+    store: &SqliteStore,
+    depends_on: &[String],
+) -> Result<bool, DesktopHostError> {
+    for task_id in depends_on {
+        let task = load_team_task_or_not_found(store, task_id)?;
+        if task.status != "completed" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn unblock_dependency_ready_tasks(
+    store: &mut SqliteStore,
+    workspace_id: &str,
+    updated_at: &str,
+) -> Result<(), DesktopHostError> {
+    let tasks = store.list_team_tasks(Some(workspace_id))?;
+    let dependencies = store.list_team_task_dependencies(Some(workspace_id))?;
+    let completed: HashSet<&str> = tasks
+        .iter()
+        .filter(|task| task.status == "completed")
+        .map(|task| task.task_id.as_str())
+        .collect();
+    for task in tasks.iter().filter(|task| {
+        task.status == "blocked" && task.blocked_reason.as_deref() == Some("waiting_on_dependency")
+    }) {
+        let ready = dependencies
+            .iter()
+            .filter(|(task_id, _)| task_id == &task.task_id)
+            .all(|(_, depends_on)| completed.contains(depends_on.as_str()));
+        if ready {
+            store.set_team_task_status(&task.task_id, "ready", None, None, None, updated_at)?;
+        }
+    }
+    Ok(())
+}
+
 fn sidebar_state_result(
     store: &SqliteStore,
     workspace_id: &str,
@@ -9834,6 +10624,157 @@ fn should_attach_recovering_session(session: &PersistedSession) -> bool {
         && session.state == "recovering"
         && session.backend_kind == "wsl-tmux-control"
         && session.backend_native_id.is_some()
+}
+
+fn workspace_backend_profiles(snapshot: &RecoverySnapshot) -> HashMap<String, Option<String>> {
+    snapshot
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                workspace.workspace_id.clone(),
+                workspace
+                    .default_wsl_distribution
+                    .clone()
+                    .or_else(|| workspace.environment_profile_id.clone()),
+            )
+        })
+        .collect()
+}
+
+fn mounted_terminal_surfaces_by_session(
+    snapshot: &RecoverySnapshot,
+) -> HashMap<String, (String, String)> {
+    let terminal_surfaces = snapshot
+        .surfaces
+        .iter()
+        .filter(|surface| surface.surface_type == "terminal")
+        .filter_map(|surface| {
+            surface
+                .session_id
+                .as_ref()
+                .map(|session_id| (surface.surface_id.as_str(), session_id.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut mounted = HashMap::new();
+    for pane in &snapshot.panes {
+        let Some(surface_id) = pane.mounted_surface_id.as_deref() else {
+            continue;
+        };
+        let Some(session_id) = terminal_surfaces.get(surface_id) else {
+            continue;
+        };
+        mounted.insert(
+            (*session_id).to_string(),
+            (pane.pane_id.clone(), surface_id.to_string()),
+        );
+    }
+    mounted
+}
+
+fn should_restore_agent_state(state: &PersistedAgentState) -> bool {
+    if !matches!(
+        state.state.as_str(),
+        "running" | "waiting_for_input" | "idle"
+    ) {
+        return false;
+    }
+
+    if let Some(activity) = state
+        .telemetry_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok())
+        .and_then(|telemetry| telemetry.activity)
+    {
+        return matches!(activity.as_str(), "agent" | "agent_team")
+            || activity.starts_with("agent.");
+    }
+
+    state.reason.as_deref().is_some_and(|reason| {
+        reason.starts_with("Agent started:") || reason.starts_with("Agent restored:")
+    })
+}
+
+fn restored_agent_launch_line(
+    session: &PersistedSession,
+    state: &PersistedAgentState,
+) -> Option<String> {
+    let command_line = restored_agent_command_label(state)?;
+    let command_line = command_line.trim();
+    if command_line.is_empty()
+        || command_line.chars().any(|ch| ch.is_control() && ch != '\t')
+        || !is_known_agent_launch(command_line)
+        || persisted_command_already_launches_agent(&session.command)
+    {
+        return None;
+    }
+    Some(command_line.to_string())
+}
+
+fn restored_agent_command_label(state: &PersistedAgentState) -> Option<String> {
+    state
+        .telemetry_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok())
+        .and_then(|telemetry| telemetry.session)
+        .or_else(|| {
+            state
+                .reason
+                .as_deref()
+                .and_then(|reason| reason.strip_prefix("Agent started:"))
+                .or_else(|| {
+                    state
+                        .reason
+                        .as_deref()
+                        .and_then(|reason| reason.strip_prefix("Agent restored:"))
+                })
+                .map(str::trim)
+                .map(ToString::to_string)
+        })
+}
+
+fn persisted_command_already_launches_agent(command: &[String]) -> bool {
+    command
+        .iter()
+        .any(|part| is_known_agent_launch(part.trim()))
+}
+
+fn is_known_agent_launch(command_line: &str) -> bool {
+    first_command_word(command_line)
+        .map(agent_command_name)
+        .is_some_and(|name| matches!(name.as_str(), "claude" | "codex"))
+}
+
+fn first_command_word(command_line: &str) -> Option<&str> {
+    let command_line = command_line.trim();
+    if command_line.is_empty() {
+        return None;
+    }
+    if let Some(rest) = command_line.strip_prefix('"') {
+        return rest
+            .find('"')
+            .map(|index| &rest[..index])
+            .filter(|value| !value.is_empty());
+    }
+    if let Some(rest) = command_line.strip_prefix('\'') {
+        return rest
+            .find('\'')
+            .map(|index| &rest[..index])
+            .filter(|value| !value.is_empty());
+    }
+    command_line.split_whitespace().next()
+}
+
+fn agent_command_name(word: &str) -> String {
+    let file_name = word
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(word)
+        .trim_matches(|ch| ch == '"' || ch == '\'');
+    file_name
+        .strip_suffix(".exe")
+        .unwrap_or(file_name)
+        .to_ascii_lowercase()
 }
 
 /// The numeric sequence embedded in a domain id like `pane_00000042` -> 42.
@@ -12707,6 +13648,291 @@ mod tests {
             state: "recovering".to_string(),
             ..session
         }));
+    }
+
+    #[test]
+    fn mounted_terminal_surfaces_are_indexed_by_session() {
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+        let snapshot = RecoverySnapshot {
+            workspaces: vec![bundle.workspace],
+            panes: bundle.panes,
+            surfaces: bundle.surfaces,
+            sessions: bundle.sessions,
+        };
+
+        let mounted = mounted_terminal_surfaces_by_session(&snapshot);
+
+        assert_eq!(
+            mounted.get("ses_surface"),
+            Some(&("pane_left".to_string(), "surf_terminal".to_string()))
+        );
+    }
+
+    #[test]
+    fn restore_agent_state_filter_requires_active_agent_metadata() {
+        assert!(should_restore_agent_state(&PersistedAgentState {
+            session_id: "ses_agent".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude".to_string()),
+            updated_at: "now".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude"}"#.to_string()),
+        }));
+        assert!(should_restore_agent_state(&PersistedAgentState {
+            session_id: "ses_agent_team".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "waiting_for_input".to_string(),
+            attention: true,
+            reason: None,
+            updated_at: "now".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent_team","session":"omo:split-window"}"#.to_string(),
+            ),
+        }));
+        assert!(!should_restore_agent_state(&PersistedAgentState {
+            session_id: "ses_done".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "completed".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude".to_string()),
+            updated_at: "now".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude"}"#.to_string()),
+        }));
+        assert!(!should_restore_agent_state(&PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("plain shell".to_string()),
+            updated_at: "now".to_string(),
+            telemetry_json: None,
+        }));
+    }
+
+    #[test]
+    fn workspace_backend_profiles_prefer_default_wsl_distribution() {
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.workspace.environment_profile_id = Some("LegacyProfile".to_string());
+        bundle.workspace.default_wsl_distribution = Some("Ubuntu-24.04".to_string());
+        let snapshot = RecoverySnapshot {
+            workspaces: vec![bundle.workspace],
+            panes: Vec::new(),
+            surfaces: Vec::new(),
+            sessions: Vec::new(),
+        };
+
+        let profiles = workspace_backend_profiles(&snapshot);
+
+        assert_eq!(
+            profiles
+                .get("ws_surface")
+                .and_then(|value| value.as_deref()),
+            Some("Ubuntu-24.04")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_replays_known_agent_for_shell_sessions() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["bash".to_string(), "-l".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude --resume".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude --resume"}"#.to_string()),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude --resume")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_skips_sessions_that_already_spawn_agent() {
+        let session = PersistedSession {
+            session_id: "ses_agent".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-tmux-control".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: Some("agentmux_ses_agent".to_string()),
+            cwd: Some("/tmp".to_string()),
+            command: vec!["claude".to_string()],
+            state: "recovering".to_string(),
+            exit_code: None,
+            durability: "durable".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_agent".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude"}"#.to_string()),
+        };
+
+        assert_eq!(restored_agent_launch_line(&session, &state), None);
+    }
+
+    #[test]
+    fn persisted_spawn_detects_agent_command_labels() {
+        assert!(is_known_agent_launch(
+            "claude --dangerously-skip-permissions"
+        ));
+        assert!(is_known_agent_launch("codex resume abc123"));
+        assert!(!is_known_agent_launch("powershell.exe -NoLogo"));
+    }
+
+    #[test]
+    fn terminal_input_buffer_detects_manual_agent_launches() {
+        let state = DesktopControlState::new();
+
+        assert!(state
+            .completed_terminal_input_lines("ses_manual", "cla")
+            .is_empty());
+        assert_eq!(
+            state.completed_terminal_input_lines(
+                "ses_manual",
+                "ude --dangerously-skip-permissions\r"
+            ),
+            vec!["claude --dangerously-skip-permissions".to_string()]
+        );
+        assert!(state
+            .completed_terminal_input_lines("ses_manual", "ls\r")
+            .is_empty());
+        assert!(state
+            .completed_terminal_input_lines("ses_manual", "co")
+            .is_empty());
+        assert_eq!(
+            state.completed_terminal_input_lines("ses_manual", "dex resume abc123\n"),
+            vec!["codex resume abc123".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_input_buffer_handles_edits_and_cancellations() {
+        let state = DesktopControlState::new();
+
+        assert!(state
+            .completed_terminal_input_lines("ses_edit", "clad")
+            .is_empty());
+        assert_eq!(
+            state.completed_terminal_input_lines("ses_edit", "\u{7f}ude\r\n"),
+            vec!["claude".to_string()]
+        );
+
+        assert!(state
+            .completed_terminal_input_lines("ses_cancel", "claude")
+            .is_empty());
+        assert!(state
+            .completed_terminal_input_lines("ses_cancel", "\u{3}")
+            .is_empty());
+        assert!(state
+            .completed_terminal_input_lines("ses_cancel", "\r")
+            .is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn restore_ephemeral_terminals_respawns_and_replays_agent_state_idempotently() {
+        let state = DesktopControlState::new();
+        {
+            let mut bundle = workspace_bundle_with_unmounted_surface();
+            bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+            bundle.sessions[0].command = vec![
+                "cmd.exe".to_string(),
+                "/d".to_string(),
+                "/q".to_string(),
+                "/c".to_string(),
+                "ping -n 4 127.0.0.1 >nul".to_string(),
+            ];
+            let mut store = state.store.lock().unwrap();
+            store.save_workspace_bundle(&bundle).unwrap();
+            store
+                .upsert_agent_state(&PersistedAgentState {
+                    session_id: "ses_surface".to_string(),
+                    workspace_id: "ws_surface".to_string(),
+                    state: "running".to_string(),
+                    attention: false,
+                    reason: Some("Agent started: claude".to_string()),
+                    updated_at: "before".to_string(),
+                    telemetry_json: Some(r#"{"activity":"agent","session":"claude"}"#.to_string()),
+                })
+                .unwrap();
+        }
+
+        state.seed_id_counter();
+        state.restore_ephemeral_terminals();
+        let snapshot = state.recovery_snapshot().unwrap();
+        let terminal_surfaces = snapshot
+            .surfaces
+            .iter()
+            .filter(|surface| surface.surface_type == "terminal")
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_surfaces.len(), 1);
+        assert_ne!(terminal_surfaces[0].surface_id, "surf_terminal");
+        let first_session_id = terminal_surfaces[0].session_id.as_ref().unwrap().clone();
+        assert_ne!(first_session_id, "ses_surface");
+        assert_eq!(
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == "pane_left")
+                .unwrap()
+                .mounted_surface_id
+                .as_deref(),
+            Some(terminal_surfaces[0].surface_id.as_str())
+        );
+        {
+            let store = state.store.lock().unwrap();
+            assert!(store.load_agent_state("ses_surface").unwrap().is_none());
+            let restored = store.load_agent_state(&first_session_id).unwrap().unwrap();
+            assert_eq!(restored.state, "running");
+            assert_eq!(restored.reason.as_deref(), Some("Agent restored: claude"));
+        }
+
+        {
+            let mut store = state.store.lock().unwrap();
+            store
+                .update_session_state(&first_session_id, "disconnected", None, "later")
+                .unwrap();
+        }
+        state.restore_ephemeral_terminals();
+        let snapshot = state.recovery_snapshot().unwrap();
+        let terminal_surfaces = snapshot
+            .surfaces
+            .iter()
+            .filter(|surface| surface.surface_type == "terminal")
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_surfaces.len(), 1);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(!snapshot
+            .sessions
+            .iter()
+            .any(|session| session.session_id == first_session_id));
+        assert_eq!(snapshot.panes.len(), 3);
     }
 
     #[test]

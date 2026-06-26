@@ -48,6 +48,51 @@ export interface NotificationSummary {
   dismissed: boolean;
 }
 
+export type TeamTaskStatus = "ready" | "claimed" | "blocked" | "completed";
+
+export interface TeamTask {
+  taskId: string;
+  workspaceId: string;
+  title: string;
+  description?: string | null;
+  status: TeamTaskStatus | string;
+  assignedSessionId?: string | null;
+  blockedReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  dependsOn: string[];
+}
+
+export interface TeamTaskCreateInput {
+  workspaceId: string;
+  title: string;
+  description?: string | null;
+  assignedSessionId?: string | null;
+  dependsOn?: string[] | null;
+}
+
+export interface TeamMessage {
+  messageId: string;
+  workspaceId: string;
+  threadId?: string | null;
+  fromSessionId?: string | null;
+  toSessionId?: string | null;
+  body: string;
+  kind: string;
+  createdAt: string;
+  readAt?: string | null;
+}
+
+export interface TeamMessageSendInput {
+  workspaceId: string;
+  threadId?: string | null;
+  fromSessionId?: string | null;
+  toSessionId?: string | null;
+  body: string;
+  kind?: string | null;
+}
+
 export interface SidebarStatus {
   workspaceId: string;
   key: string;
@@ -660,6 +705,7 @@ export interface ControlClient {
     report: OutputPressureReport,
   ): Promise<void>;
   sendText(sessionId: string, text: string): Promise<void>;
+  sendPaste(sessionId: string, text: string): Promise<void>;
   sendKey(sessionId: string, key: string): Promise<void>;
   resize(sessionId: string, columns: number, rows: number): Promise<void>;
   listAgentAttention(workspaceId?: string | null): Promise<AgentState[]>;
@@ -671,6 +717,19 @@ export interface ControlClient {
     includeDismissed?: boolean;
   }): Promise<NotificationSummary[]>;
   dismissNotification(notificationId: string): Promise<void>;
+  listTeamTasks(workspaceId?: string | null): Promise<TeamTask[]>;
+  createTeamTask(input: TeamTaskCreateInput): Promise<TeamTask>;
+  claimTeamTask(taskId: string, sessionId: string): Promise<TeamTask>;
+  completeTeamTask(taskId: string): Promise<TeamTask>;
+  blockTeamTask(taskId: string, reason?: string | null): Promise<TeamTask>;
+  unblockTeamTask(taskId: string): Promise<TeamTask>;
+  setTeamTaskDependencies(taskId: string, dependsOn: string[]): Promise<TeamTask>;
+  listTeamMessages(
+    workspaceId?: string | null,
+    includeRead?: boolean,
+  ): Promise<TeamMessage[]>;
+  sendTeamMessage(input: TeamMessageSendInput): Promise<TeamMessage>;
+  markTeamMessageRead(messageId: string): Promise<void>;
   getSidebarState(workspaceId?: string | null): Promise<SidebarState>;
 }
 
@@ -1889,6 +1948,33 @@ class TauriControlClient implements ControlClient {
     });
   }
 
+  async sendPaste(sessionId: string, text: string): Promise<void> {
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      await this.invoke("session_send_paste_direct", {
+        session_id: sessionId,
+        text,
+        bracketed: true,
+      });
+      return;
+    } catch {
+      // Older hosts fall back to the JSON control plane; if that is also
+      // missing, plain text input still preserves the user's paste payload.
+    }
+    try {
+      await this.call("session.send_paste", {
+        session_id: sessionId,
+        text,
+        bracketed: true,
+      });
+      return;
+    } catch {
+      await this.sendText(sessionId, text);
+    }
+  }
+
   async sendKey(sessionId: string, key: string): Promise<void> {
     await this.call("session.send_key", {
       session_id: sessionId,
@@ -1952,6 +2038,100 @@ class TauriControlClient implements ControlClient {
   async dismissNotification(notificationId: string): Promise<void> {
     await this.call("notification.dismiss", {
       notification_id: notificationId,
+    });
+  }
+
+  async listTeamTasks(workspaceId?: string | null): Promise<TeamTask[]> {
+    const result = await this.call<{ tasks: TeamTaskWire[] }>("team.task.list", {
+      workspace_id: workspaceId ?? null,
+    });
+    return result.tasks.map(mapTeamTask);
+  }
+
+  async createTeamTask(input: TeamTaskCreateInput): Promise<TeamTask> {
+    const result = await this.call<TeamTaskWire>("team.task.create", {
+      workspace_id: input.workspaceId,
+      title: input.title,
+      description: input.description ?? null,
+      assigned_session_id: input.assignedSessionId ?? null,
+      depends_on: input.dependsOn ?? [],
+    });
+    return mapTeamTask(result);
+  }
+
+  async claimTeamTask(taskId: string, sessionId: string): Promise<TeamTask> {
+    const result = await this.call<TeamTaskWire>("team.task.claim", {
+      task_id: taskId,
+      session_id: sessionId,
+    });
+    return mapTeamTask(result);
+  }
+
+  async completeTeamTask(taskId: string): Promise<TeamTask> {
+    const result = await this.call<TeamTaskWire>("team.task.complete", {
+      task_id: taskId,
+    });
+    return mapTeamTask(result);
+  }
+
+  async blockTeamTask(
+    taskId: string,
+    reason?: string | null,
+  ): Promise<TeamTask> {
+    const result = await this.call<TeamTaskWire>("team.task.block", {
+      task_id: taskId,
+      reason: reason ?? null,
+    });
+    return mapTeamTask(result);
+  }
+
+  async unblockTeamTask(taskId: string): Promise<TeamTask> {
+    const result = await this.call<TeamTaskWire>("team.task.unblock", {
+      task_id: taskId,
+    });
+    return mapTeamTask(result);
+  }
+
+  async setTeamTaskDependencies(
+    taskId: string,
+    dependsOn: string[],
+  ): Promise<TeamTask> {
+    const result = await this.call<TeamTaskWire>("team.task.set_dependency", {
+      task_id: taskId,
+      depends_on: dependsOn,
+    });
+    return mapTeamTask(result);
+  }
+
+  async listTeamMessages(
+    workspaceId?: string | null,
+    includeRead = true,
+  ): Promise<TeamMessage[]> {
+    const result = await this.call<{ messages: TeamMessageWire[] }>(
+      "team.message.list",
+      {
+        workspace_id: workspaceId ?? null,
+        include_read: includeRead,
+      },
+    );
+    return result.messages.map(mapTeamMessage);
+  }
+
+  async sendTeamMessage(input: TeamMessageSendInput): Promise<TeamMessage> {
+    const result = await this.call<TeamMessageWire>("team.message.send", {
+      workspace_id: input.workspaceId,
+      thread_id: input.threadId ?? null,
+      from_session_id: input.fromSessionId ?? null,
+      to_session_id: input.toSessionId ?? null,
+      body: input.body,
+      kind: input.kind ?? "mailbox",
+    });
+    return mapTeamMessage(result);
+  }
+
+  async markTeamMessageRead(messageId: string): Promise<void> {
+    await this.call("team.message.mark_read", {
+      message_id: messageId,
     });
   }
 
@@ -2029,16 +2209,24 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly panes = new Map<string, PaneSummary[]>();
   private readonly agentStates = new Map<string, AgentState>();
   private readonly notifications: NotificationSummary[] = [];
+  private readonly teamTasks = new Map<string, TeamTask>();
+  private readonly teamMessages: TeamMessage[] = [];
   private readonly sidebarStates = new Map<string, SidebarState>();
   private readonly terminalSurfaces: SurfaceSummary[] = [];
   private readonly sessions = new Map<string, TerminalSession>();
   private readonly outputs = new Map<string, string>();
+  private readonly terminalResizeLog = new Map<
+    string,
+    Array<{ columns: number; rows: number }>
+  >();
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
   private readonly browserActionLog: string[] = [];
   private readonly wslDistributions: WslDistribution[];
   private workspaceGroupCounter = 0;
   private terminalCounter = 0;
+  private teamTaskCounter = 0;
+  private teamMessageCounter = 0;
   private lastSessionId?: string;
   private profileCounter = 3;
   private readonly profiles: SshProfile[] = [
@@ -2079,6 +2267,8 @@ class BrowserPreviewControlClient implements ControlClient {
     const previewApi: BrowserPreviewApi = {
       syntheticAgentState: (detail) => this.applySyntheticAgentState(detail),
       sidebarState: (detail) => this.applySyntheticSidebarState(detail),
+      teamTask: (detail) => this.applySyntheticTeamTask(detail),
+      teamMessage: (detail) => this.applySyntheticTeamMessage(detail),
       browserUrl: (surfaceId?: string) => {
         const id =
           surfaceId ??
@@ -2089,6 +2279,10 @@ class BrowserPreviewControlClient implements ControlClient {
       terminalOutput: (sessionId?: string) => {
         const id = sessionId ?? this.lastSessionId;
         return id ? (this.outputs.get(id) ?? null) : null;
+      },
+      terminalResizes: (sessionId?: string) => {
+        const id = sessionId ?? this.lastSessionId;
+        return id ? [...(this.terminalResizeLog.get(id) ?? [])] : [];
       },
     };
     window.__AGENTMUX_PREVIEW__ = previewApi;
@@ -3443,6 +3637,10 @@ class BrowserPreviewControlClient implements ControlClient {
     this.outputs.set(sessionId, output);
   }
 
+  async sendPaste(sessionId: string, text: string): Promise<void> {
+    await this.sendText(sessionId, text);
+  }
+
   async sendKey(sessionId: string, key: string): Promise<void> {
     if (key === "enter") {
       this.outputs.set(sessionId, (this.outputs.get(sessionId) ?? "") + "\r\n");
@@ -3450,10 +3648,13 @@ class BrowserPreviewControlClient implements ControlClient {
   }
 
   async resize(
-    _sessionId: string,
-    _columns: number,
-    _rows: number,
+    sessionId: string,
+    columns: number,
+    rows: number,
   ): Promise<void> {
+    const entries = this.terminalResizeLog.get(sessionId) ?? [];
+    entries.push({ columns, rows });
+    this.terminalResizeLog.set(sessionId, entries);
     return;
   }
 
@@ -3509,6 +3710,145 @@ class BrowserPreviewControlClient implements ControlClient {
     }
   }
 
+  async listTeamTasks(workspaceId?: string | null): Promise<TeamTask[]> {
+    return [...this.teamTasks.values()]
+      .filter((task) => !workspaceId || task.workspaceId === workspaceId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .map(cloneTeamTask);
+  }
+
+  async createTeamTask(input: TeamTaskCreateInput): Promise<TeamTask> {
+    const now = new Date().toISOString();
+    const dependsOn = input.dependsOn ?? [];
+    const status = this.teamDependenciesSatisfied(dependsOn)
+      ? "ready"
+      : "blocked";
+    const task: TeamTask = {
+      taskId: `task_preview_${++this.teamTaskCounter}`,
+      workspaceId: input.workspaceId,
+      title: input.title.trim() || `Task ${this.teamTaskCounter}`,
+      description: input.description?.trim() || null,
+      status,
+      assignedSessionId: input.assignedSessionId ?? null,
+      blockedReason: status === "blocked" ? "waiting_on_dependency" : null,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      dependsOn: [...dependsOn],
+    };
+    this.teamTasks.set(task.taskId, task);
+    return cloneTeamTask(task);
+  }
+
+  async claimTeamTask(taskId: string, sessionId: string): Promise<TeamTask> {
+    const task = this.findTeamTask(taskId);
+    task.status = "claimed";
+    task.assignedSessionId = sessionId;
+    task.blockedReason = null;
+    task.updatedAt = new Date().toISOString();
+    return cloneTeamTask(task);
+  }
+
+  async completeTeamTask(taskId: string): Promise<TeamTask> {
+    const task = this.findTeamTask(taskId);
+    const now = new Date().toISOString();
+    task.status = "completed";
+    task.blockedReason = null;
+    task.completedAt = now;
+    task.updatedAt = now;
+    this.unblockReadyPreviewTasks(task.workspaceId);
+    return cloneTeamTask(task);
+  }
+
+  async blockTeamTask(
+    taskId: string,
+    reason?: string | null,
+  ): Promise<TeamTask> {
+    const task = this.findTeamTask(taskId);
+    task.status = "blocked";
+    task.blockedReason = reason?.trim() || null;
+    task.updatedAt = new Date().toISOString();
+    return cloneTeamTask(task);
+  }
+
+  async unblockTeamTask(taskId: string): Promise<TeamTask> {
+    const task = this.findTeamTask(taskId);
+    task.status = "ready";
+    task.blockedReason = null;
+    task.updatedAt = new Date().toISOString();
+    return cloneTeamTask(task);
+  }
+
+  async setTeamTaskDependencies(
+    taskId: string,
+    dependsOn: string[],
+  ): Promise<TeamTask> {
+    const task = this.findTeamTask(taskId);
+    task.dependsOn = [...dependsOn];
+    if (!this.teamDependenciesSatisfied(task.dependsOn)) {
+      task.status = "blocked";
+      task.blockedReason = "waiting_on_dependency";
+    } else if (
+      task.status === "blocked" &&
+      task.blockedReason === "waiting_on_dependency"
+    ) {
+      task.status = "ready";
+      task.blockedReason = null;
+    }
+    task.updatedAt = new Date().toISOString();
+    return cloneTeamTask(task);
+  }
+
+  async listTeamMessages(
+    workspaceId?: string | null,
+    includeRead = true,
+  ): Promise<TeamMessage[]> {
+    return this.teamMessages
+      .filter((message) => !workspaceId || message.workspaceId === workspaceId)
+      .filter((message) => includeRead || !message.readAt)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map(cloneTeamMessage);
+  }
+
+  async sendTeamMessage(input: TeamMessageSendInput): Promise<TeamMessage> {
+    const now = new Date().toISOString();
+    const message: TeamMessage = {
+      messageId: `message_preview_${++this.teamMessageCounter}`,
+      workspaceId: input.workspaceId,
+      threadId: input.threadId ?? null,
+      fromSessionId: input.fromSessionId ?? null,
+      toSessionId: input.toSessionId ?? null,
+      body: input.body.trim(),
+      kind: input.kind?.trim() || "mailbox",
+      createdAt: now,
+      readAt: null,
+    };
+    this.teamMessages.unshift(message);
+    if (message.toSessionId) {
+      this.notifications.unshift({
+        notificationId: `not_preview_team_${this.teamMessageCounter}`,
+        notificationType: "team.message",
+        severity: "info",
+        workspaceId: input.workspaceId,
+        sessionId: message.toSessionId,
+        title: "Team message",
+        message: message.body,
+        createdAt: now,
+        dismissed: false,
+      });
+    }
+    return cloneTeamMessage(message);
+  }
+
+  async markTeamMessageRead(messageId: string): Promise<void> {
+    const message = this.teamMessages.find(
+      (candidate) => candidate.messageId === messageId,
+    );
+    if (message && !message.readAt) {
+      message.readAt = new Date().toISOString();
+    }
+  }
+
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
     const workspace = workspaceId
       ? this.findWorkspace(workspaceId)
@@ -3536,6 +3876,35 @@ class BrowserPreviewControlClient implements ControlClient {
       throw new Error(`Workspace '${workspaceId}' was not found.`);
     }
     return workspace;
+  }
+
+  private findTeamTask(taskId: string): TeamTask {
+    const task = this.teamTasks.get(taskId);
+    if (!task) {
+      throw new Error(`Team task '${taskId}' was not found.`);
+    }
+    return task;
+  }
+
+  private teamDependenciesSatisfied(dependsOn: string[]): boolean {
+    return dependsOn.every(
+      (taskId) => this.teamTasks.get(taskId)?.status === "completed",
+    );
+  }
+
+  private unblockReadyPreviewTasks(workspaceId: string): void {
+    for (const task of this.teamTasks.values()) {
+      if (
+        task.workspaceId === workspaceId &&
+        task.status === "blocked" &&
+        task.blockedReason === "waiting_on_dependency" &&
+        this.teamDependenciesSatisfied(task.dependsOn)
+      ) {
+        task.status = "ready";
+        task.blockedReason = null;
+        task.updatedAt = new Date().toISOString();
+      }
+    }
   }
 
   private findWorkspaceGroup(groupId: string): WorkspaceGroup {
@@ -3587,6 +3956,7 @@ class BrowserPreviewControlClient implements ControlClient {
       browserId: browserId ?? null,
     });
     this.outputs.set(sessionId, output);
+    this.terminalResizeLog.set(sessionId, []);
     this.lastSessionId = sessionId;
     if (placement === "dock") {
       return session;
@@ -4046,6 +4416,56 @@ class BrowserPreviewControlClient implements ControlClient {
         this.readPreviewProjectConfig(workspaceId),
       );
     }
+  }
+
+  private applySyntheticTeamTask(detail: SyntheticTeamTaskDetail = {}): void {
+    const workspace = detail.workspaceId
+      ? this.findWorkspace(detail.workspaceId)
+      : this.workspaces[0];
+    if (!workspace) {
+      return;
+    }
+    const now = new Date().toISOString();
+    const taskId = detail.taskId ?? `task_preview_${++this.teamTaskCounter}`;
+    const status = detail.status ?? "ready";
+    this.teamTasks.set(taskId, {
+      taskId,
+      workspaceId: workspace.workspaceId,
+      title: detail.title ?? `Task ${this.teamTaskCounter}`,
+      description: detail.description ?? null,
+      status,
+      assignedSessionId: detail.assignedSessionId ?? null,
+      blockedReason:
+        status === "blocked"
+          ? detail.blockedReason ?? "waiting_on_dependency"
+          : detail.blockedReason ?? null,
+      createdAt: detail.createdAt ?? now,
+      updatedAt: detail.updatedAt ?? now,
+      completedAt: detail.completedAt ?? (status === "completed" ? now : null),
+      dependsOn: detail.dependsOn ?? [],
+    });
+  }
+
+  private applySyntheticTeamMessage(detail: SyntheticTeamMessageDetail = {}): void {
+    const workspace = detail.workspaceId
+      ? this.findWorkspace(detail.workspaceId)
+      : this.workspaces[0];
+    if (!workspace) {
+      return;
+    }
+    const now = new Date().toISOString();
+    const message: TeamMessage = {
+      messageId: detail.messageId ?? `message_preview_${++this.teamMessageCounter}`,
+      workspaceId: workspace.workspaceId,
+      threadId: detail.threadId ?? null,
+      fromSessionId: detail.fromSessionId ?? null,
+      toSessionId: detail.toSessionId ?? null,
+      body: detail.body ?? "Synthetic team message",
+      kind: detail.kind ?? "mailbox",
+      createdAt: detail.createdAt ?? now,
+      readAt: detail.readAt ?? null,
+    };
+    this.teamMessages.unshift(message);
   }
 
   private applySyntheticAgentState(
@@ -4692,6 +5112,16 @@ class ServerControlClient extends BrowserPreviewControlClient {
     });
   }
 
+  async sendPaste(sessionId: string, text: string): Promise<void> {
+    if (this.sendServerSocketMessage(sessionId, { type: "paste", text })) {
+      return;
+    }
+    await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/paste`, {
+      method: "POST",
+      body: JSON.stringify({ text, bracketed: true }),
+    });
+  }
+
   async sendKey(sessionId: string, key: string): Promise<void> {
     if (this.sendServerSocketMessage(sessionId, { type: "key", key })) {
       return;
@@ -5091,12 +5521,41 @@ interface SyntheticSidebarStateDetail {
   logs?: Array<Partial<SidebarLogEntry> & { message: string }>;
 }
 
+interface SyntheticTeamTaskDetail {
+  taskId?: string;
+  workspaceId?: string;
+  title?: string;
+  description?: string | null;
+  status?: string;
+  assignedSessionId?: string | null;
+  blockedReason?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  completedAt?: string | null;
+  dependsOn?: string[];
+}
+
+interface SyntheticTeamMessageDetail {
+  messageId?: string;
+  workspaceId?: string;
+  threadId?: string | null;
+  fromSessionId?: string | null;
+  toSessionId?: string | null;
+  body?: string;
+  kind?: string;
+  createdAt?: string;
+  readAt?: string | null;
+}
+
 interface BrowserPreviewApi {
   syntheticAgentState(detail?: SyntheticAgentStateDetail): void;
   sidebarState(detail?: SyntheticSidebarStateDetail): void;
+  teamTask(detail?: SyntheticTeamTaskDetail): void;
+  teamMessage(detail?: SyntheticTeamMessageDetail): void;
   browserUrl(surfaceId?: string): string | null;
   browserActions(): string[];
   terminalOutput(sessionId?: string): string | null;
+  terminalResizes(sessionId?: string): Array<{ columns: number; rows: number }>;
 }
 
 interface WorkspaceSummaryWire {
@@ -5186,6 +5645,32 @@ interface NotificationSummaryWire {
   message: string;
   created_at: string;
   dismissed: boolean;
+}
+
+interface TeamTaskWire {
+  task_id: string;
+  workspace_id: string;
+  title: string;
+  description?: string | null;
+  status: string;
+  assigned_session_id?: string | null;
+  blocked_reason?: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+  depends_on: string[];
+}
+
+interface TeamMessageWire {
+  message_id: string;
+  workspace_id: string;
+  thread_id?: string | null;
+  from_session_id?: string | null;
+  to_session_id?: string | null;
+  body: string;
+  kind: string;
+  created_at: string;
+  read_at?: string | null;
 }
 
 interface SidebarStatusWire {
@@ -5515,6 +6000,47 @@ function mapNotification(value: NotificationSummaryWire): NotificationSummary {
     createdAt: value.created_at,
     dismissed: value.dismissed,
   };
+}
+
+function mapTeamTask(value: TeamTaskWire): TeamTask {
+  return {
+    taskId: value.task_id,
+    workspaceId: value.workspace_id,
+    title: value.title,
+    description: value.description,
+    status: value.status,
+    assignedSessionId: value.assigned_session_id,
+    blockedReason: value.blocked_reason,
+    createdAt: value.created_at,
+    updatedAt: value.updated_at,
+    completedAt: value.completed_at,
+    dependsOn: value.depends_on ?? [],
+  };
+}
+
+function mapTeamMessage(value: TeamMessageWire): TeamMessage {
+  return {
+    messageId: value.message_id,
+    workspaceId: value.workspace_id,
+    threadId: value.thread_id,
+    fromSessionId: value.from_session_id,
+    toSessionId: value.to_session_id,
+    body: value.body,
+    kind: value.kind,
+    createdAt: value.created_at,
+    readAt: value.read_at,
+  };
+}
+
+function cloneTeamTask(task: TeamTask): TeamTask {
+  return {
+    ...task,
+    dependsOn: [...task.dependsOn],
+  };
+}
+
+function cloneTeamMessage(message: TeamMessage): TeamMessage {
+  return { ...message };
 }
 
 function mapSidebarStatus(value: SidebarStatusWire): SidebarStatus {

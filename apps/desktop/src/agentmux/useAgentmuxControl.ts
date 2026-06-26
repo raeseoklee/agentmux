@@ -11,6 +11,10 @@ import {
   type SshProfile,
   type SshProfileInput,
   type SurfaceSummary,
+  type TeamMessage,
+  type TeamMessageSendInput,
+  type TeamTask,
+  type TeamTaskCreateInput,
   type TerminalSession,
   type TerminalProfile,
   type WorkspaceDetail,
@@ -109,6 +113,53 @@ function notificationsEqual(
       left.severity !== right.severity ||
       left.title !== right.title ||
       left.message !== right.message
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function teamTasksEqual(a: TeamTask[], b: TeamTask[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (
+      left.taskId !== right.taskId ||
+      left.workspaceId !== right.workspaceId ||
+      left.title !== right.title ||
+      left.description !== right.description ||
+      left.status !== right.status ||
+      left.assignedSessionId !== right.assignedSessionId ||
+      left.blockedReason !== right.blockedReason ||
+      left.updatedAt !== right.updatedAt ||
+      left.completedAt !== right.completedAt ||
+      !sameIdList(left.dependsOn, right.dependsOn)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function teamMessagesEqual(a: TeamMessage[], b: TeamMessage[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index];
+    const right = b[index];
+    if (
+      left.messageId !== right.messageId ||
+      left.workspaceId !== right.workspaceId ||
+      left.threadId !== right.threadId ||
+      left.fromSessionId !== right.fromSessionId ||
+      left.toSessionId !== right.toSessionId ||
+      left.body !== right.body ||
+      left.kind !== right.kind ||
+      left.createdAt !== right.createdAt ||
+      left.readAt !== right.readAt
     ) {
       return false;
     }
@@ -302,6 +353,8 @@ export interface AgentmuxControl {
   attention: AgentState[];
   agentStates: AgentState[];
   notifications: NotificationSummary[];
+  teamTasks: TeamTask[];
+  teamMessages: TeamMessage[];
   sidebarState: SidebarState | null;
   wslDistributions: WslDistribution[];
   profiles: SshProfile[];
@@ -330,6 +383,15 @@ export interface AgentmuxControl {
   ) => Promise<WorkspaceGroup | null>;
   createWorkspaceInGroup: (groupId: string, name?: string) => Promise<WorkspaceSummary | null>;
   spawnDefaultTerminal: () => Promise<void>;
+  spawnTerminalProfile: (
+    profile: TerminalProfile,
+    distribution?: string | null
+  ) => Promise<void>;
+  spawnTerminalProfileInPane: (
+    paneId: string,
+    profile: TerminalProfile,
+    distribution?: string | null
+  ) => Promise<void>;
   spawnDefaultTerminalInPane: (paneId: string) => Promise<void>;
   spawnDurableTerminalInPane: (paneId: string) => Promise<void>;
   spawnWslTerminal: (distribution: string) => Promise<void>;
@@ -387,6 +449,17 @@ export interface AgentmuxControl {
   browserEvaluate: (surfaceId: string, script: string, frameId?: string | null) => Promise<void>;
   clearAttention: (sessionId: string) => Promise<void>;
   dismissNotification: (notificationId: string) => Promise<void>;
+  createTeamTask: (
+    input: Omit<TeamTaskCreateInput, "workspaceId"> & { workspaceId?: string }
+  ) => Promise<TeamTask | null>;
+  claimTeamTask: (taskId: string, sessionId: string) => Promise<TeamTask | null>;
+  completeTeamTask: (taskId: string) => Promise<TeamTask | null>;
+  blockTeamTask: (taskId: string, reason?: string | null) => Promise<TeamTask | null>;
+  unblockTeamTask: (taskId: string) => Promise<TeamTask | null>;
+  sendTeamMessage: (
+    input: Omit<TeamMessageSendInput, "workspaceId"> & { workspaceId?: string }
+  ) => Promise<TeamMessage | null>;
+  markTeamMessageRead: (messageId: string) => Promise<void>;
   createProfile: (input: SshProfileInput) => Promise<void>;
   updateProfile: (profileId: string, input: SshProfileInput) => Promise<void>;
   deleteProfile: (profileId: string) => Promise<void>;
@@ -409,6 +482,8 @@ export function useAgentmuxControl(): AgentmuxControl {
   const [attention, setAttention] = useState<AgentState[]>([]);
   const [agentStates, setAgentStates] = useState<AgentState[]>([]);
   const [notifications, setNotifications] = useState<NotificationSummary[]>([]);
+  const [teamTasks, setTeamTasks] = useState<TeamTask[]>([]);
+  const [teamMessages, setTeamMessages] = useState<TeamMessage[]>([]);
   const [sidebarState, setSidebarState] = useState<SidebarState | null>(null);
   const [wslDistributions, setWslDistributions] = useState<WslDistribution[]>([]);
   const [wslChecked, setWslChecked] = useState(false);
@@ -513,13 +588,23 @@ export function useAgentmuxControl(): AgentmuxControl {
       // PR-5: profiles and workspace groups change only on explicit user
       // mutation; they are hydrated once and reloaded by their mutators, so the
       // periodic poll no longer fetches them (per-tick IPC drops 7 -> 4).
-      const [, nextAttention, nextStates, nextNotifications, nextSidebarState] =
+      const [
+        ,
+        nextAttention,
+        nextStates,
+        nextNotifications,
+        nextSidebarState,
+        nextTeamTasks,
+        nextTeamMessages
+      ] =
         await Promise.all([
           loadDetail(workspaceId),
           client.listAgentAttention(null),
           client.listAgentStates(null),
           client.listNotifications({ workspaceId: null, severity: null, includeDismissed: false }),
-          client.getSidebarState(workspaceId)
+          client.getSidebarState(workspaceId),
+          client.listTeamTasks(workspaceId),
+          client.listTeamMessages(workspaceId, true)
         ]);
       // PR-1: gate each setter behind a cheap equality check so a tick that
       // returns identical data produces zero re-renders. loadDetail and
@@ -529,6 +614,8 @@ export function useAgentmuxControl(): AgentmuxControl {
       mergeNotifications(nextNotifications);
       lastSidebarRefreshAtRef.current = Date.now();
       setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
+      setIfChanged(setTeamTasks, nextTeamTasks, teamTasksEqual);
+      setIfChanged(setTeamMessages, nextTeamMessages, teamMessagesEqual);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Control plane request failed.");
@@ -547,13 +634,23 @@ export function useAgentmuxControl(): AgentmuxControl {
         now - lastDetailRefreshAtRef.current >= DETAIL_POLL_INTERVAL_MS;
       const shouldLoadSidebar =
         now - lastSidebarRefreshAtRef.current >= SIDEBAR_POLL_INTERVAL_MS;
-      const [nextDetail, nextAttention, nextStates, nextNotifications, nextSidebarState] =
+      const [
+        nextDetail,
+        nextAttention,
+        nextStates,
+        nextNotifications,
+        nextSidebarState,
+        nextTeamTasks,
+        nextTeamMessages
+      ] =
         await Promise.all([
           shouldLoadDetail ? loadDetail(workspaceId) : Promise.resolve(null),
           client.listAgentAttention(null),
           client.listAgentStates(null),
           client.listNotifications({ workspaceId: null, severity: null, includeDismissed: false }),
-          shouldLoadSidebar ? client.getSidebarState(workspaceId) : Promise.resolve(null)
+          shouldLoadSidebar ? client.getSidebarState(workspaceId) : Promise.resolve(null),
+          client.listTeamTasks(workspaceId),
+          client.listTeamMessages(workspaceId, true)
         ]);
       if (nextDetail) {
         lastDetailRefreshAtRef.current = now;
@@ -565,6 +662,8 @@ export function useAgentmuxControl(): AgentmuxControl {
         lastSidebarRefreshAtRef.current = now;
         setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
       }
+      setIfChanged(setTeamTasks, nextTeamTasks, teamTasksEqual);
+      setIfChanged(setTeamMessages, nextTeamMessages, teamMessagesEqual);
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Control plane request failed.");
@@ -587,6 +686,26 @@ export function useAgentmuxControl(): AgentmuxControl {
       setIfChanged(setSidebarState, next, sidebarStateEqual);
     } catch {
       /* leave the previous sidebar state in place on transient failures */
+    }
+  }, [client]);
+
+  const refreshTeamCollaboration = useCallback(async () => {
+    const workspaceId = activeRef.current;
+    if (!workspaceId) {
+      setTeamTasks([]);
+      setTeamMessages([]);
+      return;
+    }
+    try {
+      const [nextTasks, nextMessages] = await Promise.all([
+        client.listTeamTasks(workspaceId),
+        client.listTeamMessages(workspaceId, true)
+      ]);
+      setIfChanged(setTeamTasks, nextTasks, teamTasksEqual);
+      setIfChanged(setTeamMessages, nextMessages, teamMessagesEqual);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Team state refresh failed.");
     }
   }, [client]);
 
@@ -615,6 +734,8 @@ export function useAgentmuxControl(): AgentmuxControl {
           detailRef.current = null;
           setDetail(null);
           setSidebarState(null);
+          setTeamTasks([]);
+          setTeamMessages([]);
           setReady(true);
           return;
         }
@@ -730,8 +851,9 @@ export function useAgentmuxControl(): AgentmuxControl {
       lastSidebarRefreshAtRef.current = 0;
       persistLastActiveWorkspaceId(workspaceId);
       await loadDetail(workspaceId);
+      await refreshTeamCollaboration();
     },
-    [loadDetail]
+    [loadDetail, refreshTeamCollaboration]
   );
 
   const createWorkspace = useCallback(
@@ -961,11 +1083,13 @@ export function useAgentmuxControl(): AgentmuxControl {
     async (
       workspaceId: string,
       placement: "new_tab" | "active_pane",
-      paneId?: string | null
+      paneId?: string | null,
+      override?: { profile: TerminalProfile; distribution?: string | null }
     ) => {
-      const profile = defaultTerminalProfile(workspaceId);
+      const profile = override?.profile ?? defaultTerminalProfile(workspaceId);
       if (profile === "wsl") {
-        const distribution = defaultWslDistribution(workspaceId);
+        const distribution =
+          override?.distribution ?? defaultWslDistribution(workspaceId);
         if (!distribution) {
           notifyWslRequired();
           throw new Error(WSL_REQUIRED_MESSAGE);
@@ -1000,6 +1124,32 @@ export function useAgentmuxControl(): AgentmuxControl {
     () =>
       withActive(async (workspaceId) => {
         return spawnTerminalForWorkspace(workspaceId, "new_tab");
+      }),
+    [spawnTerminalForWorkspace, withActive]
+  );
+
+  const spawnTerminalProfile = useCallback(
+    (profile: TerminalProfile, distribution?: string | null) =>
+      withActive(async (workspaceId) => {
+        return spawnTerminalForWorkspace(
+          workspaceId,
+          "new_tab",
+          null,
+          { profile, distribution }
+        );
+      }),
+    [spawnTerminalForWorkspace, withActive]
+  );
+
+  const spawnTerminalProfileInPane = useCallback(
+    (paneId: string, profile: TerminalProfile, distribution?: string | null) =>
+      withActive(async (workspaceId) => {
+        return spawnTerminalForWorkspace(
+          workspaceId,
+          "active_pane",
+          paneId,
+          { profile, distribution }
+        );
       }),
     [spawnTerminalForWorkspace, withActive]
   );
@@ -1504,6 +1654,128 @@ export function useAgentmuxControl(): AgentmuxControl {
     [client, refresh]
   );
 
+  const createTeamTask = useCallback(
+    async (
+      input: Omit<TeamTaskCreateInput, "workspaceId"> & { workspaceId?: string }
+    ) => {
+      const workspaceId = input.workspaceId ?? activeRef.current;
+      if (!workspaceId) {
+        return null;
+      }
+      try {
+        const task = await client.createTeamTask({
+          workspaceId,
+          title: input.title,
+          description: input.description,
+          assignedSessionId: input.assignedSessionId,
+          dependsOn: input.dependsOn
+        });
+        await refreshTeamCollaboration();
+        return task;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Task creation failed.");
+        return null;
+      }
+    },
+    [client, refreshTeamCollaboration]
+  );
+
+  const claimTeamTask = useCallback(
+    async (taskId: string, sessionId: string) => {
+      try {
+        const task = await client.claimTeamTask(taskId, sessionId);
+        await refreshTeamCollaboration();
+        return task;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Task claim failed.");
+        return null;
+      }
+    },
+    [client, refreshTeamCollaboration]
+  );
+
+  const completeTeamTask = useCallback(
+    async (taskId: string) => {
+      try {
+        const task = await client.completeTeamTask(taskId);
+        await refreshTeamCollaboration();
+        return task;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Task completion failed.");
+        return null;
+      }
+    },
+    [client, refreshTeamCollaboration]
+  );
+
+  const blockTeamTask = useCallback(
+    async (taskId: string, reason?: string | null) => {
+      try {
+        const task = await client.blockTeamTask(taskId, reason);
+        await refreshTeamCollaboration();
+        return task;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Task block failed.");
+        return null;
+      }
+    },
+    [client, refreshTeamCollaboration]
+  );
+
+  const unblockTeamTask = useCallback(
+    async (taskId: string) => {
+      try {
+        const task = await client.unblockTeamTask(taskId);
+        await refreshTeamCollaboration();
+        return task;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Task unblock failed.");
+        return null;
+      }
+    },
+    [client, refreshTeamCollaboration]
+  );
+
+  const sendTeamMessage = useCallback(
+    async (
+      input: Omit<TeamMessageSendInput, "workspaceId"> & { workspaceId?: string }
+    ) => {
+      const workspaceId = input.workspaceId ?? activeRef.current;
+      if (!workspaceId) {
+        return null;
+      }
+      try {
+        const message = await client.sendTeamMessage({
+          workspaceId,
+          threadId: input.threadId,
+          fromSessionId: input.fromSessionId,
+          toSessionId: input.toSessionId,
+          body: input.body,
+          kind: input.kind
+        });
+        await refreshTeamCollaboration();
+        await refresh();
+        return message;
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Team message send failed.");
+        return null;
+      }
+    },
+    [client, refresh, refreshTeamCollaboration]
+  );
+
+  const markTeamMessageRead = useCallback(
+    async (messageId: string) => {
+      try {
+        await client.markTeamMessageRead(messageId);
+        await refreshTeamCollaboration();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : "Team message update failed.");
+      }
+    },
+    [client, refreshTeamCollaboration]
+  );
+
   const createProfile = useCallback(
     async (input: SshProfileInput) => {
       await client.createProfile(input);
@@ -1568,6 +1840,8 @@ export function useAgentmuxControl(): AgentmuxControl {
     attention,
     agentStates,
     notifications,
+    teamTasks,
+    teamMessages,
     sidebarState,
     wslDistributions,
     profiles,
@@ -1586,6 +1860,8 @@ export function useAgentmuxControl(): AgentmuxControl {
     removeWorkspaceFromGroup,
     createWorkspaceInGroup,
     spawnDefaultTerminal,
+    spawnTerminalProfile,
+    spawnTerminalProfileInPane,
     spawnDefaultTerminalInPane,
     spawnDurableTerminalInPane,
     spawnWslTerminal,
@@ -1622,6 +1898,13 @@ export function useAgentmuxControl(): AgentmuxControl {
     browserEvaluate,
     clearAttention,
     dismissNotification,
+    createTeamTask,
+    claimTeamTask,
+    completeTeamTask,
+    blockTeamTask,
+    unblockTeamTask,
+    sendTeamMessage,
+    markTeamMessageRead,
     createProfile,
     updateProfile,
     deleteProfile,

@@ -76,6 +76,97 @@ test("opens a live terminal", async ({ page }) => {
   await expect(page.getByText("wsl-direct").first()).toBeVisible({
     timeout: 5000,
   });
+  await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
+    "data-agentmux-terminal-unicode-version",
+    "11",
+  );
+  await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
+    "data-agentmux-terminal-custom-glyphs",
+    "false",
+  );
+  await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
+    "data-agentmux-terminal-font-family",
+    /Cascadia Code/,
+  );
+  await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
+    "data-agentmux-terminal-ligatures",
+    "true",
+  );
+  await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
+    "data-agentmux-terminal-font-feature-settings",
+    /"calt" on/,
+  );
+  await expect
+    .poll(() =>
+      page
+        .locator(".xterm")
+        .first()
+        .evaluate((element) => (element as HTMLElement).style.fontFeatureSettings),
+    )
+    .toContain('"calt"');
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.terminalResizes()),
+    )
+    .toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          columns: expect.any(Number),
+          rows: expect.any(Number),
+        }),
+      ]),
+    );
+});
+
+test("live terminal accepts clipboard paste shortcuts", async ({ page }) => {
+  await bootPreview(page);
+
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: async () => "echo pasted-from-clipboard\r",
+        writeText: async (text: string) => {
+          (window as unknown as { __AGENTMUX_TEST_COPIED__?: string }).__AGENTMUX_TEST_COPIED__ =
+            text;
+        },
+      },
+    });
+  });
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await expect(page.locator(".xterm").first()).toBeVisible();
+  await page.locator(".xterm").first().click();
+  await page.keyboard.press("Control+V");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__AGENTMUX_PREVIEW__?.terminalOutput(),
+      ),
+    )
+    .toContain("echo pasted-from-clipboard");
+});
+
+test("terminal profile picker can launch native shells", async ({ page }) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-terminal-profile-menu-button").click();
+  await expect(page.locator(".agentmux-terminal-profile-menu")).toBeVisible();
+  await expect(page.getByText("Windows PowerShell")).toBeVisible();
+  await expect(page.getByText("Command Prompt")).toBeVisible();
+  await expect(page.getByText("Ubuntu")).toBeVisible();
+
+  await page.getByText("Windows PowerShell").click();
+  await expect(page.locator(".agentmux-terminal-profile-menu")).toHaveCount(0);
+  await expect(page.locator(".xterm").first()).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__AGENTMUX_PREVIEW__?.terminalOutput(),
+      ),
+    )
+    .toContain("powershell.exe -NoLogo");
 });
 
 test("TextBox composer sends a draft to the active terminal", async ({
@@ -587,6 +678,38 @@ test("split panes stay scoped to their top tab", async ({ page }) => {
   await expect(
     page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
   ).toHaveCount(2);
+});
+
+test("terminal profile picker can launch native shells in split panes", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+  await page.locator(".agentmux-top-split-vertical").click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(
+    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+  ).toHaveCount(1);
+
+  await page.locator(".agentmux-pane-terminal-profile-menu-button").click();
+  await expect(page.locator(".agentmux-terminal-profile-menu")).toBeVisible();
+  await expect(page.getByText("Open in pane")).toBeVisible();
+  await expect(page.getByText("Command Prompt")).toBeVisible();
+
+  await page.getByText("Command Prompt").click();
+  await expect(page.locator(".agentmux-terminal-profile-menu")).toHaveCount(0);
+  await expect(
+    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+  ).toHaveCount(2);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__AGENTMUX_PREVIEW__?.terminalOutput(),
+      ),
+    )
+    .toContain("cmd.exe /d /q");
 });
 
 test("browser surface opens as a separate top tab", async ({ page }) => {
@@ -1481,6 +1604,52 @@ test("sidebar metadata renders status progress and logs", async ({ page }) => {
   await expect(sidebar).toContainText("Building");
   await expect(sidebar).toContainText("50%");
   await expect(sidebar).toContainText("All tests passed");
+});
+
+test("team collaboration panel renders tasks, mailbox, and context link", async ({ page }) => {
+  await bootPreview(page);
+
+  await page.evaluate(() => {
+    const preview = (window as any).__AGENTMUX_PREVIEW__;
+    preview?.teamTask({
+      taskId: "task_ui_blocked",
+      title: "UserService API spec",
+      status: "blocked",
+      blockedReason: "waiting on API spec",
+    });
+    preview?.teamMessage({
+      messageId: "msg_ui_mailbox",
+      kind: "mailbox",
+      body: "Agent 2 needs https://example.invalid/pr/42 before integration.",
+    });
+  });
+
+  const teamPanel = page.locator("[data-agentmux-team-panel]");
+  await expect(teamPanel).toContainText("UserService API spec", {
+    timeout: 5000,
+  });
+  await expect(teamPanel).toContainText("waiting on API spec");
+  await expect(teamPanel).toContainText("Mailbox 1 unread");
+  await expect(page.locator("body")).toContainText("Tasks 0/1");
+
+  await page.keyboard.press("Control+Shift+L");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserUrl()),
+    )
+    .toBe("https://example.invalid/pr/42");
+
+  await page
+    .locator("[data-agentmux-team-task='task_ui_blocked']")
+    .getByRole("button", { name: "Done" })
+    .click();
+  await expect(page.locator("body")).toContainText("Tasks 1/1");
+
+  await page
+    .locator("[data-agentmux-team-message='msg_ui_mailbox']")
+    .getByRole("button", { name: "Read" })
+    .click();
+  await expect(teamPanel).toContainText("Mailbox all read");
 });
 
 test("Dock panel renders project dock controls", async ({ page }) => {

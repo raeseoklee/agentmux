@@ -47,13 +47,15 @@ export const DEFAULT_SHORTCUT_BINDINGS: ShortcutBindingMap = {
   "app.commandPalette.legacy": "ctrl+k",
   "app.search": "ctrl+f",
   "app.settings": "ctrl+,",
+  "notification.openPanel": "ctrl+i",
   "view.toggleTheme": "ctrl+alt+l",
   "workspace.new": "ctrl+n",
+  "agent.jumpNextAttention": "ctrl+shift+u",
   "terminal.newWsl": "ctrl+t",
   "terminal.textBox": "ctrl+alt+i",
   "pane.splitRight": "ctrl+d",
   "pane.splitDown": "ctrl+shift+d",
-  "browser.openNewTab": "ctrl+shift+l"
+  "browser.openContextLink": "ctrl+shift+l"
 };
 
 export function buildResolvedShortcutBindings(

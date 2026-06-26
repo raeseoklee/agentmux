@@ -410,6 +410,18 @@ pub struct SessionSendTextParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSendPasteParams {
+    pub session_id: String,
+    pub text: String,
+    #[serde(default = "default_bracketed_paste")]
+    pub bracketed: bool,
+}
+
+fn default_bracketed_paste() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionSendKeyParams {
     pub session_id: String,
     pub key: String,
@@ -560,6 +572,66 @@ pub struct SidebarLogAddParams {
 pub struct SidebarLogListParams {
     pub workspace_id: Option<String>,
     pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskListParams {
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskCreateParams {
+    pub workspace_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub assigned_session_id: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskIdParams {
+    pub task_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskClaimParams {
+    pub task_id: String,
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskBlockParams {
+    pub task_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskDependencyParams {
+    pub task_id: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamMessageListParams {
+    pub workspace_id: Option<String>,
+    pub include_read: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamMessageSendParams {
+    pub workspace_id: String,
+    pub thread_id: Option<String>,
+    pub from_session_id: Option<String>,
+    pub to_session_id: Option<String>,
+    pub body: String,
+    pub kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamMessageMarkReadParams {
+    pub message_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -977,6 +1049,44 @@ pub struct SidebarStateResult {
     pub statuses: Vec<SidebarStatusResult>,
     pub progress: Option<SidebarProgressResult>,
     pub logs: Vec<SidebarLogResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskResult {
+    pub task_id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub assigned_session_id: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub depends_on: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamTaskListResult {
+    pub tasks: Vec<TeamTaskResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamMessageResult {
+    pub message_id: String,
+    pub workspace_id: String,
+    pub thread_id: Option<String>,
+    pub from_session_id: Option<String>,
+    pub to_session_id: Option<String>,
+    pub body: String,
+    pub kind: String,
+    pub created_at: String,
+    pub read_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TeamMessageListResult {
+    pub messages: Vec<TeamMessageResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

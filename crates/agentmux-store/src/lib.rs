@@ -200,6 +200,40 @@ CREATE TABLE IF NOT EXISTS dock_trusts (
 );
 "#;
 
+pub const TEAM_COLLABORATION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS team_tasks (
+  task_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL,
+  assigned_session_id TEXT,
+  blocked_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS team_task_dependencies (
+  task_id TEXT NOT NULL,
+  depends_on_task_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS team_messages (
+  message_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  thread_id TEXT,
+  from_session_id TEXT,
+  to_session_id TEXT,
+  body TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  read_at TEXT
+);
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -245,6 +279,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "workspace_terminal_profile_column",
         sql: WORKSPACE_TERMINAL_PROFILE_SCHEMA,
+    },
+    Migration {
+        version: 10,
+        name: "team_collaboration_schema",
+        sql: TEAM_COLLABORATION_SCHEMA,
     },
 ];
 
@@ -440,6 +479,33 @@ pub struct PersistedDockTrust {
     pub config_hash: String,
     pub trusted_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedTeamTask {
+    pub task_id: String,
+    pub workspace_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub assigned_session_id: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedTeamMessage {
+    pub message_id: String,
+    pub workspace_id: String,
+    pub thread_id: Option<String>,
+    pub from_session_id: Option<String>,
+    pub to_session_id: Option<String>,
+    pub body: String,
+    pub kind: String,
+    pub created_at: String,
+    pub read_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -673,6 +739,10 @@ impl SqliteStore {
     /// Delete a session row. Used by startup recovery to drop a dead ephemeral
     /// session that has been superseded by a freshly respawned one.
     pub fn delete_session(&mut self, session_id: &str) -> StoreResult<()> {
+        self.connection.execute(
+            "DELETE FROM agent_states WHERE session_id = ?1",
+            params![session_id],
+        )?;
         self.connection.execute(
             "DELETE FROM sessions WHERE session_id = ?1",
             params![session_id],
@@ -1160,6 +1230,225 @@ impl SqliteStore {
         self.connection
             .execute(&sql, params_from_iter(values))
             .map_err(StoreError::from)
+    }
+
+    pub fn upsert_team_task(&mut self, task: &PersistedTeamTask) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO team_tasks (
+                task_id, workspace_id, title, description, status, assigned_session_id,
+                blocked_reason, created_at, updated_at, completed_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(task_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                title = excluded.title,
+                description = excluded.description,
+                status = excluded.status,
+                assigned_session_id = excluded.assigned_session_id,
+                blocked_reason = excluded.blocked_reason,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at",
+            params![
+                task.task_id,
+                task.workspace_id,
+                task.title,
+                task.description,
+                task.status,
+                task.assigned_session_id,
+                task.blocked_reason,
+                task.created_at,
+                task.updated_at,
+                task.completed_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_team_task(&self, task_id: &str) -> StoreResult<Option<PersistedTeamTask>> {
+        self.connection
+            .query_row(
+                "SELECT task_id, workspace_id, title, description, status, assigned_session_id,
+                        blocked_reason, created_at, updated_at, completed_at
+                 FROM team_tasks
+                 WHERE task_id = ?1",
+                [task_id],
+                team_task_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_team_tasks(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> StoreResult<Vec<PersistedTeamTask>> {
+        if let Some(workspace_id) = workspace_id {
+            let mut statement = self.connection.prepare(
+                "SELECT task_id, workspace_id, title, description, status, assigned_session_id,
+                        blocked_reason, created_at, updated_at, completed_at
+                 FROM team_tasks
+                 WHERE workspace_id = ?1
+                 ORDER BY created_at ASC, task_id ASC",
+            )?;
+            let rows = statement.query_map([workspace_id], team_task_from_row)?;
+            return collect_rows(rows);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, workspace_id, title, description, status, assigned_session_id,
+                    blocked_reason, created_at, updated_at, completed_at
+             FROM team_tasks
+             ORDER BY created_at ASC, task_id ASC",
+        )?;
+        let rows = statement.query_map([], team_task_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn set_team_task_status(
+        &mut self,
+        task_id: &str,
+        status: &str,
+        assigned_session_id: Option<&str>,
+        blocked_reason: Option<&str>,
+        completed_at: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<bool> {
+        let updated = self.connection.execute(
+            "UPDATE team_tasks
+             SET status = ?2,
+                 assigned_session_id = COALESCE(?3, assigned_session_id),
+                 blocked_reason = ?4,
+                 completed_at = ?5,
+                 updated_at = ?6
+             WHERE task_id = ?1",
+            params![
+                task_id,
+                status,
+                assigned_session_id,
+                blocked_reason,
+                completed_at,
+                updated_at
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn replace_team_task_dependencies(
+        &mut self,
+        task_id: &str,
+        depends_on: &[String],
+        created_at: &str,
+    ) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "DELETE FROM team_task_dependencies WHERE task_id = ?1",
+            [task_id],
+        )?;
+        for dependency in depends_on {
+            tx.execute(
+                "INSERT OR IGNORE INTO team_task_dependencies (
+                    task_id, depends_on_task_id, created_at
+                 )
+                 VALUES (?1, ?2, ?3)",
+                params![task_id, dependency, created_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_team_task_dependencies(
+        &self,
+        workspace_id: Option<&str>,
+    ) -> StoreResult<Vec<(String, String)>> {
+        if let Some(workspace_id) = workspace_id {
+            let mut statement = self.connection.prepare(
+                "SELECT d.task_id, d.depends_on_task_id
+                 FROM team_task_dependencies d
+                 INNER JOIN team_tasks t ON t.task_id = d.task_id
+                 WHERE t.workspace_id = ?1
+                 ORDER BY d.task_id ASC, d.depends_on_task_id ASC",
+            )?;
+            let rows = statement.query_map([workspace_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            return collect_rows(rows);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, depends_on_task_id
+             FROM team_task_dependencies
+             ORDER BY task_id ASC, depends_on_task_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        collect_rows(rows)
+    }
+
+    pub fn upsert_team_message(&mut self, message: &PersistedTeamMessage) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO team_messages (
+                message_id, workspace_id, thread_id, from_session_id, to_session_id,
+                body, kind, created_at, read_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(message_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                thread_id = excluded.thread_id,
+                from_session_id = excluded.from_session_id,
+                to_session_id = excluded.to_session_id,
+                body = excluded.body,
+                kind = excluded.kind,
+                read_at = excluded.read_at",
+            params![
+                message.message_id,
+                message.workspace_id,
+                message.thread_id,
+                message.from_session_id,
+                message.to_session_id,
+                message.body,
+                message.kind,
+                message.created_at,
+                message.read_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_team_messages(
+        &self,
+        workspace_id: Option<&str>,
+        include_read: bool,
+    ) -> StoreResult<Vec<PersistedTeamMessage>> {
+        let mut sql = String::from(
+            "SELECT message_id, workspace_id, thread_id, from_session_id, to_session_id,
+                    body, kind, created_at, read_at
+             FROM team_messages",
+        );
+        let mut predicates = Vec::new();
+        let mut values = Vec::new();
+        if let Some(workspace_id) = workspace_id {
+            predicates.push("workspace_id = ?");
+            values.push(workspace_id);
+        }
+        if !include_read {
+            predicates.push("read_at IS NULL");
+        }
+        if !predicates.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&predicates.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at DESC, message_id DESC");
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), team_message_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn mark_team_message_read(&mut self, message_id: &str, read_at: &str) -> StoreResult<bool> {
+        let updated = self.connection.execute(
+            "UPDATE team_messages
+             SET read_at = ?2
+             WHERE message_id = ?1",
+            params![message_id, read_at],
+        )?;
+        Ok(updated > 0)
     }
 
     pub fn upsert_sidebar_status(&mut self, status: &PersistedSidebarStatus) -> StoreResult<()> {
@@ -1862,6 +2151,35 @@ fn dock_trust_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedDoc
     })
 }
 
+fn team_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedTeamTask> {
+    Ok(PersistedTeamTask {
+        task_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        status: row.get(4)?,
+        assigned_session_id: row.get(5)?,
+        blocked_reason: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        completed_at: row.get(9)?,
+    })
+}
+
+fn team_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedTeamMessage> {
+    Ok(PersistedTeamMessage {
+        message_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        thread_id: row.get(2)?,
+        from_session_id: row.get(3)?,
+        to_session_id: row.get(4)?,
+        body: row.get(5)?,
+        kind: row.get(6)?,
+        created_at: row.get(7)?,
+        read_at: row.get(8)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1883,7 +2201,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
     }
 
     #[test]
@@ -1900,6 +2218,17 @@ mod tests {
         assert!(MIGRATIONS[8]
             .sql
             .contains("ADD COLUMN default_terminal_profile"));
+    }
+
+    #[test]
+    fn team_collaboration_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[9].version, 10);
+        assert!(MIGRATIONS[9]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS team_tasks"));
+        assert!(MIGRATIONS[9]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS team_messages"));
     }
 
     #[test]
@@ -2064,6 +2393,28 @@ mod tests {
         assert!(reloaded.surfaces.is_empty());
         assert_eq!(reloaded.sessions.len(), 1);
         assert_eq!(reloaded.sessions[0].session_id, "ses_durable");
+        assert!(store.load_agent_state("ses_native").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_session_removes_agent_state() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.save_workspace_bundle(&sample_bundle()).unwrap();
+        store
+            .upsert_agent_state(&PersistedAgentState {
+                session_id: "ses_native".to_string(),
+                workspace_id: "ws_test".to_string(),
+                state: "running".to_string(),
+                attention: false,
+                reason: Some("Agent started: claude".to_string()),
+                updated_at: "2026-06-18T00:01:30Z".to_string(),
+                telemetry_json: Some(r#"{"activity":"agent","session":"claude"}"#.to_string()),
+            })
+            .unwrap();
+
+        store.delete_session("ses_native").unwrap();
+
+        assert!(store.load_session("ses_native").unwrap().is_none());
         assert!(store.load_agent_state("ses_native").unwrap().is_none());
     }
 

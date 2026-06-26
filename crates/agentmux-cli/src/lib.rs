@@ -40,14 +40,14 @@ use agentmux_ipc::{
     PaneSplitParams, PaneSummaryResult, ProfileListResult, ProfileSummaryResult,
     RecoveryDiagnosticsResult, RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionIdParams,
     SessionListParams, SessionListResult, SessionOutputPressureParams, SessionReadRecentParams,
-    SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams, SessionSendTextParams,
-    SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult,
-    SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams, SidebarLogListParams,
-    SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams,
-    SidebarStatusListResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
-    SurfaceCreateBrowserParams, SurfaceSummaryResult, SystemCapabilitiesResult,
-    SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams, WorkspaceCloseResult,
-    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
+    SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams, SessionSendPasteParams,
+    SessionSendTextParams, SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams,
+    SessionSpawnResult, SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams,
+    SidebarLogListParams, SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult,
+    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusSetParams,
+    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams, SurfaceSummaryResult,
+    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams,
+    WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
     WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
     WorkspaceGroupMemberParams, WorkspaceGroupResult, WorkspaceGroupUpdateParams,
     WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
@@ -831,6 +831,12 @@ struct ServerSpawnRequest {
 #[derive(Debug, Default, serde::Deserialize)]
 struct ServerSendTextRequest {
     text: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ServerSendPasteRequest {
+    text: Option<String>,
+    bracketed: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -6551,6 +6557,9 @@ fn local_server_session_id(request: &RequestEnvelope) -> Result<String, ControlE
         "session.send_text" => request
             .parse_params::<SessionSendTextParams>()
             .map(|params| params.session_id),
+        "session.send_paste" => request
+            .parse_params::<SessionSendPasteParams>()
+            .map(|params| params.session_id),
         "session.send_key" => request
             .parse_params::<SessionSendKeyParams>()
             .map(|params| params.session_id),
@@ -6861,6 +6870,23 @@ fn handle_server_websocket_message(
                 .map_err(|error| CliError::Control(error.to_string()))?,
             )
         }
+        "paste" => {
+            let Some(text) = value.get("text").and_then(|value| value.as_str()) else {
+                return Ok(());
+            };
+            (
+                "session.send_paste",
+                serde_json::to_value(SessionSendPasteParams {
+                    session_id: session_id.to_string(),
+                    text: text.to_string(),
+                    bracketed: value
+                        .get("bracketed")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true),
+                })
+                .map_err(|error| CliError::Control(error.to_string()))?,
+            )
+        }
         "key" => {
             let Some(key) = value.get("key").and_then(|value| value.as_str()) else {
                 return Ok(());
@@ -7068,6 +7094,9 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
             if request.method == "POST" {
                 if let Some(session_id) = session_id_from_path(&request.path, "/send") {
                     return server_send_text_response(&session_id, request, state);
+                }
+                if let Some(session_id) = session_id_from_path(&request.path, "/paste") {
+                    return server_send_paste_response(&session_id, request, state);
                 }
                 if let Some(session_id) = session_id_from_path(&request.path, "/key") {
                     return server_send_key_response(&session_id, request, state);
@@ -7417,6 +7446,32 @@ fn server_send_text_response(
     };
     match state
         .invoke("session.send_text", &params)
+        .and_then(|response| response_result::<serde_json::Value>(&response))
+    {
+        Ok(result) => api_json_response(200, result),
+        Err(error) => api_error_response(503, &server_control_error_message(error, &state.options)),
+    }
+}
+
+fn server_send_paste_response(
+    session_id: &str,
+    request: &HttpRequest,
+    state: &mut ServerState,
+) -> HttpResponse {
+    let parsed = match parse_json_body::<ServerSendPasteRequest>(&request.body) {
+        Ok(value) => value,
+        Err(error) => return api_error_response(400, &error.to_string()),
+    };
+    let Some(text) = parsed.text else {
+        return api_error_response(400, "Missing text.");
+    };
+    let params = SessionSendPasteParams {
+        session_id: session_id.to_string(),
+        text,
+        bracketed: parsed.bracketed.unwrap_or(true),
+    };
+    match state
+        .invoke("session.send_paste", &params)
         .and_then(|response| response_result::<serde_json::Value>(&response))
     {
         Ok(result) => api_json_response(200, result),

@@ -25,6 +25,7 @@ const MAX_RENDER_QUEUE_BYTES = 2 * 1024 * 1024;
 const MAX_RENDER_BATCH_BYTES = 64 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
 const WEBGL_DISABLE_DEBOUNCE_MS = 250;
+const TERMINAL_LINE_HEIGHT = 1.0;
 
 function terminalWebglEnabled(): boolean {
   try {
@@ -102,6 +103,7 @@ interface LiveTerminalProps {
   sessionId: string;
   active: boolean;
   innerMargin?: number;
+  fontSize?: number;
   onFocus?: () => void;
   onError?: () => void;
 }
@@ -120,6 +122,7 @@ export function LiveTerminal({
   sessionId,
   active,
   innerMargin = 0,
+  fontSize = 12.5,
   onFocus,
   onError,
 }: LiveTerminalProps) {
@@ -158,16 +161,63 @@ export function LiveTerminal({
     };
 
     const renderer = new XtermTerminalRenderer();
-    renderer.mount(host, { columns: 120, rows: 30, bytes: encoder.encode("") });
+    renderer.mount(
+      host,
+      { columns: 120, rows: 30, bytes: encoder.encode("") },
+      { fontSize, lineHeight: TERMINAL_LINE_HEIGHT },
+    );
     rendererRef.current = renderer;
     let alive = true;
 
     // --- resize (shared by both output paths) ---
     let resizeTimer: number | null = null;
     let pendingResize: { columns: number; rows: number } | null = null;
-    let lastResizeSent = { columns: 120, rows: 30 };
+    let lastResizeSent = { columns: 0, rows: 0 };
+    const sendResize = (columns: number, rows: number, force = false) => {
+      if (columns <= 0 || rows <= 0) {
+        return;
+      }
+      if (!force && columns === lastResizeSent.columns && rows === lastResizeSent.rows) {
+        return;
+      }
+      lastResizeSent = { columns, rows };
+      client
+        .resize(sessionId, columns, rows)
+        .catch(() => onError?.());
+    };
+    const reportRendererSize = (immediate: boolean) => {
+      const size = renderer.size();
+      if (!size) {
+        return;
+      }
+      if (immediate) {
+        if (resizeTimer !== null) {
+          window.clearTimeout(resizeTimer);
+          resizeTimer = null;
+        }
+        pendingResize = null;
+        sendResize(size.columns, size.rows, true);
+        return;
+      }
+      pendingResize = { columns: size.columns, rows: size.rows };
+      if (resizeTimer !== null) {
+        window.clearTimeout(resizeTimer);
+      }
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        const next = pendingResize;
+        pendingResize = null;
+        if (!next || !alive) {
+          return;
+        }
+        sendResize(next.columns, next.rows);
+      }, 80);
+    };
     const unsubscribeResize = renderer.onResize((columns, rows) => {
-      if (columns === lastResizeSent.columns && rows === lastResizeSent.rows) {
+      if (
+        !alive ||
+        (columns === lastResizeSent.columns && rows === lastResizeSent.rows)
+      ) {
         return;
       }
       pendingResize = { columns, rows };
@@ -181,12 +231,19 @@ export function LiveTerminal({
         if (!next || !alive) {
           return;
         }
-        lastResizeSent = next;
-        client
-          .resize(sessionId, next.columns, next.rows)
-          .catch(() => onError?.());
+        sendResize(next.columns, next.rows);
       }, 80);
     });
+    reportRendererSize(true);
+    const forceResizeTimers = [120, 400, 1000].map((delay) =>
+      window.setTimeout(() => {
+        if (!alive) {
+          return;
+        }
+        renderer.fit();
+        reportRendererSize(true);
+      }, delay)
+    );
     let fitFrame: number | null = null;
     const requestFit = () => {
       if (fitFrame !== null) {
@@ -195,6 +252,7 @@ export function LiveTerminal({
       fitFrame = window.requestAnimationFrame(() => {
         fitFrame = null;
         renderer.fit();
+        reportRendererSize(false);
       });
     };
     const resizeObserver = new ResizeObserver(requestFit);
@@ -208,6 +266,9 @@ export function LiveTerminal({
       }
       if (fitFrame !== null) {
         window.cancelAnimationFrame(fitFrame);
+      }
+      for (const timer of forceResizeTimers) {
+        window.clearTimeout(timer);
       }
       unsubscribeResize();
       resizeObserver.disconnect();
@@ -552,6 +613,12 @@ export function LiveTerminal({
       const unsubscribeInput = renderer.onData((data) => {
         client.sendText(sessionId, data).catch(() => onError?.());
       });
+      const unsubscribePaste = renderer.onPaste((text) => {
+        const sendPaste = client.sendPaste
+          ? client.sendPaste.bind(client)
+          : client.sendText.bind(client);
+        sendPaste(sessionId, text).catch(() => onError?.());
+      });
 
       void client
         .subscribeOutput(sessionId, applyFrame)
@@ -575,6 +642,7 @@ export function LiveTerminal({
         flushTransportDiagnostics();
         flushPressureReport();
         unsubscribeInput();
+        unsubscribePaste();
         unsubscribeOutput?.();
         teardownShared();
       };
@@ -698,6 +766,15 @@ export function LiveTerminal({
           })
           .catch(() => onError?.());
       });
+      const unsubscribePaste = renderer.onPaste((text) => {
+        const sendPaste = client.sendPaste
+          ? client.sendPaste.bind(client)
+          : client.sendText.bind(client);
+        requestSnapshotPoll();
+        sendPaste(sessionId, text)
+          .then(requestSnapshotPoll)
+          .catch(() => onError?.());
+      });
 
       void pollSnapshot();
 
@@ -707,6 +784,7 @@ export function LiveTerminal({
           pollNowRef.current = null;
         }
         unsubscribeInput();
+        unsubscribePaste();
         teardownShared();
       };
     }
@@ -832,6 +910,15 @@ export function LiveTerminal({
         .then(requestFallbackPoll)
         .catch(() => onError?.());
     });
+    const unsubscribePaste = renderer.onPaste((text) => {
+      const sendPaste = client.sendPaste
+        ? client.sendPaste.bind(client)
+        : client.sendText.bind(client);
+      requestFallbackPoll();
+      sendPaste(sessionId, text)
+        .then(requestFallbackPoll)
+        .catch(() => onError?.());
+    });
 
     void poll();
 
@@ -841,6 +928,7 @@ export function LiveTerminal({
         pollNowRef.current = null;
       }
       unsubscribeInput();
+      unsubscribePaste();
       teardownShared();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -853,6 +941,19 @@ export function LiveTerminal({
       pollNowRef.current?.();
     }
   }, [active]);
+
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) {
+      return;
+    }
+    renderer.setTypography({ fontSize, lineHeight: TERMINAL_LINE_HEIGHT });
+    renderer.fit();
+    const size = renderer.size();
+    if (size) {
+      client.resize(sessionId, size.columns, size.rows).catch(() => onError?.());
+    }
+  }, [client, fontSize, onError, sessionId]);
 
   // WebGL remains opt-in because Chromium's glyph atlas can render private-use
   // Nerd Font fallback symbols as tofu on some Windows/WebView2 stacks. Keep
@@ -903,6 +1004,7 @@ export function LiveTerminal({
     >
       <div
         ref={hostRef}
+        className="agentmux-live-terminal-host"
         style={{
           height: "100%",
           width: "100%",

@@ -12,6 +12,28 @@ use agentmux_desktop_host::{
 use agentmux_ipc::{RequestEnvelope, ResponseEnvelope};
 use tauri_plugin_notification::NotificationExt;
 
+#[cfg(windows)]
+const WINDOWS_APP_USER_MODEL_ID: &str = "dev.agentmux.desktop";
+
+#[cfg(windows)]
+fn set_windows_app_user_model_id() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+
+    let app_id: Vec<u16> = OsStr::new(WINDOWS_APP_USER_MODEL_ID)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr());
+    }
+}
+
+#[cfg(not(windows))]
+fn set_windows_app_user_model_id() {}
+
 struct TauriDesktopNotificationAdapter {
     app: tauri::AppHandle,
 }
@@ -87,6 +109,19 @@ fn session_send_text_direct(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+fn session_send_paste_direct(
+    state: tauri::State<'_, Arc<DesktopControlState>>,
+    session_id: String,
+    text: String,
+    bracketed: bool,
+) -> Result<(), String> {
+    state
+        .inner()
+        .send_paste_direct(&session_id, text, bracketed)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 fn session_report_output_pressure(
     state: tauri::State<'_, Arc<DesktopControlState>>,
     session_id: String,
@@ -105,6 +140,8 @@ fn session_report_output_pressure(
 }
 
 fn main() {
+    set_windows_app_user_model_id();
+
     let store_path = default_store_path().expect("failed to resolve AgentMux store path");
     let token_path =
         default_control_token_path().expect("failed to resolve AgentMux control token path");
@@ -126,14 +163,16 @@ fn main() {
     // Recover durable WSL/tmux sessions on a background thread: it probes
     // wsl.exe and can block for seconds, so it must not delay the control pipe
     // server or the window from coming up.
-    let recovery_state = state.clone();
+    let durable_recovery_state = state.clone();
     std::thread::spawn(move || {
-        recovery_state.recover_durable_sessions();
-        // Optionally re-spawn ephemeral terminals into their panes. OFF by default
-        // (opt in with AGENTMUX_ENABLE_TERMINAL_RESTORE) — it isn't robust yet, so
-        // dead ephemeral terminals normally show as reopenable panes instead. No-op
-        // unless the env var is set.
-        recovery_state.restore_ephemeral_terminals();
+        durable_recovery_state.recover_durable_sessions();
+    });
+    // Re-spawn direct WSL/ConPTY agent terminals independently. Durable tmux
+    // recovery can wait on WSL probes; non-durable agent restore should not sit
+    // behind that work because the UI would show disconnected empty panes.
+    let ephemeral_recovery_state = state.clone();
+    std::thread::spawn(move || {
+        ephemeral_recovery_state.restore_ephemeral_terminals();
     });
     // Pre-warm and keep the WSL2 VM resident so terminals open in ~0.35s instead
     // of paying the ~5s cold boot on the first launch (and again after every WSL
@@ -149,6 +188,7 @@ fn main() {
     });
     let notification_state = state.clone();
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             notification_state.set_desktop_notification_adapter(Arc::new(
@@ -165,6 +205,7 @@ fn main() {
             session_subscribe_output,
             session_unsubscribe_output,
             session_send_text_direct,
+            session_send_paste_direct,
             session_report_output_pressure
         ])
         .run(tauri::generate_context!())

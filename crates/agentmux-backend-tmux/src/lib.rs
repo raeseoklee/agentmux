@@ -111,9 +111,13 @@ pub fn tmux_control_launch_command(session_name: &str) -> CommandSpec {
 }
 
 pub fn tmux_control_spawn_command(session_name: &str, command: CommandSpec) -> CommandSpec {
-    let mut spec = tmux_control_launch_command(session_name);
-    spec.args.push(tmux_shell_command(command));
-    spec
+    CommandSpec::with_args(
+        "sh",
+        vec![
+            "-lc".to_string(),
+            tmux_detached_spawn_then_attach_script(session_name, command),
+        ],
+    )
 }
 
 pub fn tmux_control_attach_command(session_name: &str) -> CommandSpec {
@@ -262,7 +266,12 @@ fn send_key_line(target: &str, key: &str) -> String {
 
 pub fn tmux_resize_control_line(target: &str, size: TerminalSize) -> String {
     format!(
-        "resize-pane -t {} -x {} -y {}\n",
+        "refresh-client -C {}x{}\nresize-window -t {} -x {} -y {}\nresize-pane -t {} -x {} -y {}\n",
+        size.columns,
+        size.rows,
+        tmux_control_quote(target),
+        size.columns,
+        size.rows,
         tmux_control_quote(target),
         size.columns,
         size.rows
@@ -282,6 +291,18 @@ pub fn tmux_active_pane_control_line(target: &str) -> String {
         "display-message -p -t {} \"#{{pane_id}}\"\n",
         tmux_control_quote(target)
     )
+}
+
+pub fn tmux_detached_spawn_then_attach_script(session_name: &str, command: CommandSpec) -> String {
+    let target = posix_shell_quote(session_name.to_string());
+    let command = posix_shell_quote(tmux_shell_command(command));
+    format!(
+        "if ! tmux has-session -t {target} 2>/dev/null; then tmux new-session -d -s {target} {command} || exit $?; fi; exec tmux -C attach-session -t {target}"
+    )
+}
+
+pub fn tmux_capture_pane_control_line(target: &str) -> String {
+    format!("capture-pane -p -e -t {}\n", tmux_control_quote(target))
 }
 
 pub fn tmux_send_literal_command(pane_id: &str, text: &str) -> CommandSpec {
@@ -563,6 +584,16 @@ pub struct TmuxControlConfig {
 struct TmuxControlSession {
     session_name: String,
     pane_id: Option<String>,
+    replay_state: TmuxReplayState,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TmuxReplayState {
+    #[default]
+    None,
+    AwaitingActivePane,
+    AwaitingCaptureBegin,
+    Capturing,
 }
 
 pub struct TmuxControlBackend<B = WslDirectBackend> {
@@ -686,12 +717,15 @@ where
             TmuxControlSession {
                 session_name: session_name.clone(),
                 pane_id: None,
+                replay_state: TmuxReplayState::AwaitingActivePane,
             },
         );
         self.parsers
             .insert(session_id.clone(), TmuxControlParser::new());
         handle.backend_kind = BackendKind::WslTmuxControl;
-        handle.backend_native_id = Some(session_name);
+        handle.backend_native_id = Some(session_name.clone());
+        self.send_control_line(&session_id, tmux_active_pane_control_line(&session_name))?;
+        self.send_control_line(&session_id, tmux_capture_pane_control_line(&session_name))?;
         Ok(handle)
     }
 
@@ -716,6 +750,7 @@ where
             TmuxControlSession {
                 session_name: session_name.clone(),
                 pane_id: None,
+                replay_state: TmuxReplayState::AwaitingActivePane,
             },
         );
         self.parsers
@@ -723,6 +758,7 @@ where
         handle.backend_kind = BackendKind::WslTmuxControl;
         handle.backend_native_id = Some(session_name.clone());
         self.send_control_line(&session_id, tmux_active_pane_control_line(&session_name))?;
+        self.send_control_line(&session_id, tmux_capture_pane_control_line(&session_name))?;
         Ok(handle)
     }
 
@@ -802,6 +838,20 @@ impl<B> TmuxControlBackend<B> {
         let mut events = Vec::new();
         for message in parser.push(bytes) {
             match message {
+                TmuxControlMessage::Begin { .. } => {
+                    if let Some(session) = self.sessions.get_mut(session_id) {
+                        if session.replay_state == TmuxReplayState::AwaitingCaptureBegin {
+                            session.replay_state = TmuxReplayState::Capturing;
+                        }
+                    }
+                }
+                TmuxControlMessage::End { .. } => {
+                    if let Some(session) = self.sessions.get_mut(session_id) {
+                        if session.replay_state == TmuxReplayState::Capturing {
+                            session.replay_state = TmuxReplayState::None;
+                        }
+                    }
+                }
                 TmuxControlMessage::Output { pane_id, payload } => {
                     if let Some(session) = self.sessions.get_mut(session_id) {
                         if session.pane_id.is_none() {
@@ -826,9 +876,24 @@ impl<B> TmuxControlBackend<B> {
                         });
                     }
                 }
+                TmuxControlMessage::CommandResponse { line, .. }
+                    if self.sessions.get(session_id).is_some_and(|session| {
+                        session.replay_state == TmuxReplayState::Capturing
+                    }) =>
+                {
+                    let mut bytes = line.into_bytes();
+                    bytes.extend_from_slice(b"\r\n");
+                    events.push(BackendEvent::Output {
+                        session_id: session_id.to_string(),
+                        bytes,
+                    });
+                }
                 TmuxControlMessage::CommandResponse { line, .. } if line.starts_with('%') => {
                     if let Some(session) = self.sessions.get_mut(session_id) {
                         session.pane_id = Some(line);
+                        if session.replay_state == TmuxReplayState::AwaitingActivePane {
+                            session.replay_state = TmuxReplayState::AwaitingCaptureBegin;
+                        }
                         events.push(BackendEvent::HealthChanged {
                             attachment_id: session_id.to_string(),
                             state: BackendHealth::Healthy,
@@ -1007,14 +1072,23 @@ mod tests {
                 "agentmux_demo",
                 CommandSpec::with_args("bash", vec!["-lc".to_string(), "echo hello".to_string()])
             )
+            .executable,
+            "sh"
+        );
+        assert_eq!(
+            tmux_control_spawn_command(
+                "agentmux_demo",
+                CommandSpec::with_args("bash", vec!["-lc".to_string(), "echo hello".to_string()])
+            )
             .args,
             vec![
-                "-C",
-                "new-session",
-                "-A",
-                "-s",
-                "agentmux_demo",
-                "bash -lc 'echo hello'"
+                "-lc",
+                concat!(
+                    "if ! tmux has-session -t agentmux_demo 2>/dev/null; then ",
+                    r#"tmux new-session -d -s agentmux_demo 'bash -lc '\''echo hello'\''' || exit $?; "#,
+                    "fi; ",
+                    "exec tmux -C attach-session -t agentmux_demo"
+                )
             ]
         );
     }
@@ -1076,16 +1150,24 @@ mod tests {
         let spawn = backend.transport().last_spawn.as_ref().unwrap();
         assert_eq!(spawn.backend, Some(BackendKind::WslDirect));
         assert_eq!(spawn.backend_profile.as_deref(), Some("Ubuntu"));
-        assert_eq!(spawn.command.executable, TMUX_EXE);
+        assert_eq!(spawn.command.executable, "sh");
         assert_eq!(
             spawn.command.args,
             vec![
-                "-C",
-                "new-session",
-                "-A",
-                "-s",
-                "agentmux_ses_tmux",
-                "bash -lc 'echo hello'"
+                "-lc",
+                concat!(
+                    "if ! tmux has-session -t agentmux_ses_tmux 2>/dev/null; then ",
+                    r#"tmux new-session -d -s agentmux_ses_tmux 'bash -lc '\''echo hello'\''' || exit $?; "#,
+                    "fi; ",
+                    "exec tmux -C attach-session -t agentmux_ses_tmux"
+                )
+            ]
+        );
+        assert_eq!(
+            backend.transport().sent_text,
+            vec![
+                "display-message -p -t agentmux_ses_tmux \"#{pane_id}\"\n",
+                "capture-pane -p -e -t agentmux_ses_tmux\n"
             ]
         );
     }
@@ -1129,6 +1211,62 @@ mod tests {
                 .as_deref(),
             Some("Ubuntu")
         );
+        assert_eq!(
+            backend.transport().sent_text,
+            vec![
+                "display-message -p -t agentmux_demo123 \"#{pane_id}\"\n",
+                "capture-pane -p -e -t agentmux_demo123\n"
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_replays_captured_pane_contents_after_active_pane_resolution() {
+        let transport = RecordingTransport::default();
+        let mut backend = TmuxControlBackend::with_transport(transport);
+        backend
+            .attach(AttachRequest {
+                session_id: "ses_recovered".to_string(),
+                backend: BackendKind::WslTmuxControl,
+                backend_profile: Some("Ubuntu".to_string()),
+                backend_ref: "agentmux_demo123".to_string(),
+                initial_size: TerminalSize::new(100, 24),
+            })
+            .unwrap();
+        backend.transport_mut().events.push(BackendEvent::Output {
+            session_id: "ses_recovered".to_string(),
+            bytes: concat!(
+                "%begin 1 1 0\n",
+                "%1\n",
+                "%end 1 1 0\n",
+                "%begin 1 2 0\n",
+                "hello\n",
+                "%literal output\n",
+                "world\n",
+                "%end 1 2 0\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        });
+
+        let events = backend.drain_events();
+
+        assert!(events.contains(&BackendEvent::Output {
+            session_id: "ses_recovered".to_string(),
+            bytes: b"hello\r\n".to_vec()
+        }));
+        assert!(events.contains(&BackendEvent::Output {
+            session_id: "ses_recovered".to_string(),
+            bytes: b"%literal output\r\n".to_vec()
+        }));
+        assert!(events.contains(&BackendEvent::Output {
+            session_id: "ses_recovered".to_string(),
+            bytes: b"world\r\n".to_vec()
+        }));
+        assert_eq!(
+            backend.transport().sent_text.last().map(String::as_str),
+            Some("capture-pane -p -e -t agentmux_demo123\n")
+        );
     }
 
     #[test]
@@ -1161,9 +1299,15 @@ mod tests {
         assert_eq!(
             backend.transport().sent_text,
             vec![
+                "display-message -p -t agentmux_ses_tmux \"#{pane_id}\"\n",
+                "capture-pane -p -e -t agentmux_ses_tmux\n",
                 "send-keys -t agentmux_ses_tmux -l hi\n",
                 "send-keys -t agentmux_ses_tmux Enter\n",
-                "resize-pane -t agentmux_ses_tmux -x 120 -y 30\n",
+                concat!(
+                    "refresh-client -C 120x30\n",
+                    "resize-window -t agentmux_ses_tmux -x 120 -y 30\n",
+                    "resize-pane -t agentmux_ses_tmux -x 120 -y 30\n"
+                ),
                 "detach-client\n"
             ]
         );

@@ -94,3 +94,32 @@ body {
 .agentmux-hover {
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
+
+.attention-pill {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+[data-agentmux-attention="true"] {
+  position: relative;
+}
+
+.agentmux-team-button {
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--s2);
+  color: var(--fg3);
+  cursor: pointer;
+  font: 600 9.5px/1 var(--font-sans, system-ui, sans-serif);
+  padding: 4px 6px;
+}
+
+.agentmux-team-button:hover {
+  border-color: var(--accent);
+  color: var(--fg1);
+}
+
+.agentmux-team-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

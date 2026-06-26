@@ -17,9 +17,9 @@ use agentmux_ipc::{
     NotificationListParams, NotificationListResult, NotificationSummaryResult, RequestEnvelope,
     ResponseEnvelope, SessionAttachParams, SessionIdParams, SessionListParams, SessionListResult,
     SessionOutputPressureParams, SessionReadRecentParams, SessionReadRecentResult,
-    SessionResizeParams, SessionSendKeyParams, SessionSendTextParams, SessionSnapshotParams,
-    SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult, SessionSummaryResult,
-    SessionTerminateParams,
+    SessionResizeParams, SessionSendKeyParams, SessionSendPasteParams, SessionSendTextParams,
+    SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult,
+    SessionSummaryResult, SessionTerminateParams,
 };
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -535,6 +535,21 @@ where
     ) -> BackendResult<()> {
         self.backend
             .send_input(session_id.as_str(), InputEvent::Text(text.into()))
+    }
+
+    pub fn send_paste(
+        &mut self,
+        session_id: &SessionId,
+        text: impl Into<String>,
+        bracketed: bool,
+    ) -> BackendResult<()> {
+        self.backend.send_input(
+            session_id.as_str(),
+            InputEvent::Paste {
+                text: text.into(),
+                bracketed,
+            },
+        )
     }
 
     pub fn send_key(&mut self, session_id: &SessionId, key: NamedKey) -> BackendResult<()> {
@@ -1054,6 +1069,7 @@ where
             "session.list" => self.handle_session_list(&request),
             "session.get" => self.handle_session_get(&request),
             "session.send_text" => self.handle_session_send_text(&request),
+            "session.send_paste" => self.handle_session_send_paste(&request),
             "session.send_key" => self.handle_session_send_key(&request),
             "session.resize" => self.handle_session_resize(&request),
             "session.terminate" => self.handle_session_terminate(&request),
@@ -1214,6 +1230,22 @@ where
         let session_id = SessionId::from_string(params.session_id);
         self.runtime
             .send_text(&session_id, params.text)
+            .map_err(control_error_from_backend)?;
+        self.collect_events();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &AckResult { ok: true },
+        ))
+    }
+
+    fn handle_session_send_paste(
+        &mut self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, ControlError> {
+        let params: SessionSendPasteParams = request.parse_params()?;
+        let session_id = SessionId::from_string(params.session_id);
+        self.runtime
+            .send_paste(&session_id, params.text, params.bracketed)
             .map_err(control_error_from_backend)?;
         self.collect_events();
         Ok(ResponseEnvelope::ok_typed(
