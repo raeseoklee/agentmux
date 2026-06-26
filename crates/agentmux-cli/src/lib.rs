@@ -11593,12 +11593,29 @@ fn ensure_omo_package_installed_in_wsl(
 fn ensure_shadow_node_modules_isolated(shadow_dir: &Path) -> Result<&'static str, CliError> {
     let node_modules = shadow_dir.join("node_modules");
     if is_symlink(&node_modules) {
-        fs::remove_file(&node_modules).map_err(CliError::Io)?;
+        remove_symlink_path(&node_modules).map_err(CliError::Io)?;
         fs::create_dir_all(&node_modules).map_err(CliError::Io)?;
         return Ok("symlink-replaced");
     }
     fs::create_dir_all(&node_modules).map_err(CliError::Io)?;
     Ok("isolated")
+}
+
+#[cfg(windows)]
+fn remove_symlink_path(path: &Path) -> std::io::Result<()> {
+    if fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_symlink_path(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
 }
 
 fn extract_output_marker<'a>(output: &'a str, key: &str) -> Option<&'a str> {
