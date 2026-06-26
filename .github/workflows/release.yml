@@ -142,22 +142,22 @@ jobs:
             $verifyAttestation = "# GitHub Artifact Attestation is unavailable for this repository visibility/plan."
           }
 
-          @"
-          ## AgentMux $version
-
-          Windows NSIS installer for $tag.
-
-          - Installer: ``$installerName``
-          - SHA256: ``$sha256``
-          - Provenance: $provenance
-
-          Verify the downloaded installer:
-
-          ````powershell
-          $verifyAttestation
-          Get-FileHash -Algorithm SHA256 .\$installerName
-          ````
-          "@ | Set-Content -LiteralPath release-notes.md -Encoding UTF8
+          @(
+            "## AgentMux $version"
+            ""
+            "Windows NSIS installer for $tag."
+            ""
+            "- Installer: ``$installerName``"
+            "- SHA256: ``$sha256``"
+            "- Provenance: $provenance"
+            ""
+            "Verify the downloaded installer:"
+            ""
+            '```powershell'
+            $verifyAttestation
+            "Get-FileHash -Algorithm SHA256 .\$installerName"
+            '```'
+          ) | Set-Content -LiteralPath release-notes.md -Encoding UTF8
 
       - name: Publish GitHub Release
         shell: pwsh
