@@ -1,0 +1,34 @@
+{
+  "benchmark": "bench_high_output",
+  "backend_kind": "conpty",
+  "hidden_output_line_count": 5000,
+  "visible_probe_count": 10,
+  "hidden_output_duration_ms": 155.8164,
+  "visible_probe_round_trip_stats": {
+    "count": 10,
+    "min_ms": 10.1722,
+    "p50_ms": 20.5396,
+    "p95_ms": 21.0679,
+    "p99_ms": 21.0679,
+    "max_ms": 21.0679
+  },
+  "hidden_recent_buffer_bytes": 404,
+  "process_before": {
+    "working_set_bytes": 8867840,
+    "commit_bytes": 1953792,
+    "handle_count": 166
+  },
+  "process_after": {
+    "working_set_bytes": 9801728,
+    "commit_bytes": 2146304,
+    "handle_count": 181
+  },
+  "queue_after": {
+    "event_queue_depth": 16,
+    "event_history_depth": 16,
+    "event_backlog_limit": 1024,
+    "dropped_event_count": 0,
+    "notification_depth": 0,
+    "notification_limit": 256
+  }
+}

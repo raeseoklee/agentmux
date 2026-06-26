@@ -1,0 +1,34 @@
+﻿{
+    "generated_at":  "2026-06-19T09:41:44.1051524Z",
+    "desktop_executable":  "D:\\Workspace\\irae\\agentmux\\target\\debug\\agentmux-desktop-host.exe",
+    "cli_executable":  "D:\\Workspace\\irae\\agentmux\\target\\debug\\agentmux.exe",
+    "pipe_name":  "\\\\.\\pipe\\agentmux-control-smoke-ce07cb52c2684c9aa93db7e1487eefff",
+    "store_path":  "D:\\Workspace\\irae\\agentmux\\docs\\implementation\\evidence\\20260619-184131-IRAE-DESKTOP-packaged-diagnostics-smoke\\runtime\\agentmux-smoke.sqlite3",
+    "token_path":  "D:\\Workspace\\irae\\agentmux\\docs\\implementation\\evidence\\20260619-184131-IRAE-DESKTOP-packaged-diagnostics-smoke\\runtime\\control.token",
+    "app_process_id":  32348,
+    "diagnostics_schema":  "agentmux.control.v1",
+    "diagnostics_format_version":  "agentmux.diagnostics.v1",
+    "backend_health_count":  0,
+    "queue_pressure_count":  4,
+    "notification_count":  0,
+    "browser_failure_count":  0,
+    "workspace_group_restart_smoke":  "passed",
+    "workspace_group_alpha_id":  "wsg_1781862095779132900",
+    "workspace_group_beta_id":  "wsg_1781862096812481600",
+    "workspace_group_alpha_sort_order":  5,
+    "workspace_group_beta_sort_order":  1,
+    "workspace_group_alpha_member_order":  [
+                                               {
+                                                   "workspace_id":  "ws_00000003",
+                                                   "position":  0
+                                               },
+                                               {
+                                                   "workspace_id":  "ws_00000001",
+                                                   "position":  1
+                                               }
+                                           ],
+    "diagnostics_stdout":  "diagnostics-export.json",
+    "diagnostics_stderr":  "diagnostics-export.stderr.txt",
+    "workspace_groups_before_restart_stdout":  "workspace-groups-before-restart.json",
+    "workspace_groups_after_restart_stdout":  "workspace-groups-after-restart.json"
+}

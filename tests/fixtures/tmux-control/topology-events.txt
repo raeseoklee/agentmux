@@ -1,0 +1,8 @@
+%window-add @1
+%pane-add %1
+%layout-change @1 b25d,120x30,0,0,1
+%session-changed $1 agentmux_ws
+%pane-died %1
+%window-close @1
+%exit
+%weird value

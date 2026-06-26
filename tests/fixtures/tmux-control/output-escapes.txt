@@ -1,0 +1,2 @@
+%output %1 hello\040agentmux\012
+%output %1 path\\tail

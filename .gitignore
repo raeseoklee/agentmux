@@ -1,0 +1,30 @@
+target/
+node_modules/
+dist/
+!docs/implementation/evidence/**/dist/
+!docs/implementation/evidence/**/dist/**
+build/
+.vite/
+.turbo/
+.toolchains/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/binaries/
+*.log
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.token
+docs/implementation/evidence/**/runtime/
+.env
+.env.*
+!.env.example
+
+# Tool/agent state and local test artifacts (not part of the project)
+.omc/
+.codexus/
+test-results/
+tauri-dev.log
+
+# Rebuildable installer binaries kept under evidence/ (the screenshots/JSON next
+# to them are the actual evidence; the ~4MB .exe just bloats the repo)
+docs/implementation/evidence/**/*.exe

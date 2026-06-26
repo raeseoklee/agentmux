@@ -1,0 +1,190 @@
+﻿{
+    "generated_at":  "2026-06-19T10:59:11.1919680Z",
+    "script":  "tools/run-wsl-state-gate.ps1",
+    "expected_state":  "wsl_with_tmux",
+    "observed_state":  "wsl_with_tmux",
+    "passed":  true,
+    "state":  {
+                  "status":  "wsl_with_tmux",
+                  "command":  "C:\\Windows\\system32\\wsl.exe",
+                  "version":  {
+                                  "name":  "wsl-version",
+                                  "file":  "C:\\Windows\\system32\\wsl.exe",
+                                  "arguments":  [
+                                                    "--version"
+                                                ],
+                                  "started_at":  "2026-06-19T10:59:04.7397039Z",
+                                  "exit_code":  0,
+                                  "timed_out":  false,
+                                  "stdout":  "wsl-version.stdout.txt",
+                                  "stderr":  "wsl-version.stderr.txt",
+                                  "stdout_preview":  "WSL ��\u0004�: 2.7.8.0\r\n��\u0010� ��\u0004�: 6.18.33.1-1\r\nWSLg ��\u0004�: 1.0.73.2\r\nMSRDC ��\u0004�: 1.2.6676\r\nDirect3D ��\u0004�: 1.611.1-81528511\r\nDXCore ��\u0004�: 10.0.26100.1-240331-1435.ge-release\r\nWindows ��\u0004�: 10.0.22631.6199\r\n",
+                                  "stderr_preview":  ""
+                              },
+                  "list_quiet":  {
+                                     "name":  "wsl-list-quiet",
+                                     "file":  "C:\\Windows\\system32\\wsl.exe",
+                                     "arguments":  [
+                                                       "--list",
+                                                       "--quiet"
+                                                   ],
+                                     "started_at":  "2026-06-19T10:59:04.8380303Z",
+                                     "exit_code":  0,
+                                     "timed_out":  false,
+                                     "stdout":  "wsl-list-quiet.stdout.txt",
+                                     "stderr":  "wsl-list-quiet.stderr.txt",
+                                     "stdout_preview":  "Ubuntu\r\nNvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2\r\nNvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1\r\n",
+                                     "stderr_preview":  ""
+                                 },
+                  "list_verbose":  {
+                                       "name":  "wsl-list-verbose",
+                                       "file":  "C:\\Windows\\system32\\wsl.exe",
+                                       "arguments":  [
+                                                         "--list",
+                                                         "--verbose"
+                                                     ],
+                                       "started_at":  "2026-06-19T10:59:04.9291470Z",
+                                       "exit_code":  0,
+                                       "timed_out":  false,
+                                       "stdout":  "wsl-list-verbose.stdout.txt",
+                                       "stderr":  "wsl-list-verbose.stderr.txt",
+                                       "stdout_preview":  "  NAME                                      STATE           VERSION\r\n* Ubuntu                                    Stopped         2\r\n  Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2    Stopped         2\r\n  Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1    Stopped         2\r\n",
+                                       "stderr_preview":  ""
+                                   },
+                  "distributions":  [
+                                        {
+                                            "name":  "Ubuntu",
+                                            "reachable":  true,
+                                            "reachability":  {
+                                                                 "name":  "wsl-Ubuntu-reachability",
+                                                                 "file":  "C:\\Windows\\system32\\wsl.exe",
+                                                                 "arguments":  [
+                                                                                   "--distribution",
+                                                                                   "Ubuntu",
+                                                                                   "--exec",
+                                                                                   "sh",
+                                                                                   "-lc",
+                                                                                   "printf \u0027%s\u0027 ok"
+                                                                               ],
+                                                                 "started_at":  "2026-06-19T10:59:05.0045250Z",
+                                                                 "exit_code":  0,
+                                                                 "timed_out":  false,
+                                                                 "stdout":  "wsl-Ubuntu-reachability.stdout.txt",
+                                                                 "stderr":  "wsl-Ubuntu-reachability.stderr.txt",
+                                                                 "stdout_preview":  "ok",
+                                                                 "stderr_preview":  ""
+                                                             },
+                                            "tmux_available":  true,
+                                            "tmux_version":  "tmux 3.2a",
+                                            "tmux_probe":  {
+                                                               "name":  "wsl-Ubuntu-tmux-version",
+                                                               "file":  "C:\\Windows\\system32\\wsl.exe",
+                                                               "arguments":  [
+                                                                                 "--distribution",
+                                                                                 "Ubuntu",
+                                                                                 "--exec",
+                                                                                 "sh",
+                                                                                 "-lc",
+                                                                                 "if command -v tmux \u003e/dev/null 2\u003e\u00261; then tmux -V; else exit 127; fi"
+                                                                             ],
+                                                               "started_at":  "2026-06-19T10:59:07.3984765Z",
+                                                               "exit_code":  0,
+                                                               "timed_out":  false,
+                                                               "stdout":  "wsl-Ubuntu-tmux-version.stdout.txt",
+                                                               "stderr":  "wsl-Ubuntu-tmux-version.stderr.txt",
+                                                               "stdout_preview":  "tmux 3.2a\n",
+                                                               "stderr_preview":  ""
+                                                           }
+                                        },
+                                        {
+                                            "name":  "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2",
+                                            "reachable":  true,
+                                            "reachability":  {
+                                                                 "name":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2-reachability",
+                                                                 "file":  "C:\\Windows\\system32\\wsl.exe",
+                                                                 "arguments":  [
+                                                                                   "--distribution",
+                                                                                   "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2",
+                                                                                   "--exec",
+                                                                                   "sh",
+                                                                                   "-lc",
+                                                                                   "printf \u0027%s\u0027 ok"
+                                                                               ],
+                                                                 "started_at":  "2026-06-19T10:59:07.5432932Z",
+                                                                 "exit_code":  0,
+                                                                 "timed_out":  false,
+                                                                 "stdout":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2-reachability.stdout.txt",
+                                                                 "stderr":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2-reachability.stderr.txt",
+                                                                 "stdout_preview":  "ok",
+                                                                 "stderr_preview":  "wsl: Failed to start the systemd user session for \u0027nvidia\u0027. See journalctl for more details.\n"
+                                                             },
+                                            "tmux_available":  true,
+                                            "tmux_version":  "tmux 3.2a",
+                                            "tmux_probe":  {
+                                                               "name":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2-tmux-version",
+                                                               "file":  "C:\\Windows\\system32\\wsl.exe",
+                                                               "arguments":  [
+                                                                                 "--distribution",
+                                                                                 "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2",
+                                                                                 "--exec",
+                                                                                 "sh",
+                                                                                 "-lc",
+                                                                                 "if command -v tmux \u003e/dev/null 2\u003e\u00261; then tmux -V; else exit 127; fi"
+                                                                             ],
+                                                               "started_at":  "2026-06-19T10:59:08.9747182Z",
+                                                               "exit_code":  0,
+                                                               "timed_out":  false,
+                                                               "stdout":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2-tmux-version.stdout.txt",
+                                                               "stderr":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2-tmux-version.stderr.txt",
+                                                               "stdout_preview":  "tmux 3.2a\n",
+                                                               "stderr_preview":  ""
+                                                           }
+                                        },
+                                        {
+                                            "name":  "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1",
+                                            "reachable":  true,
+                                            "reachability":  {
+                                                                 "name":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1-reachability",
+                                                                 "file":  "C:\\Windows\\system32\\wsl.exe",
+                                                                 "arguments":  [
+                                                                                   "--distribution",
+                                                                                   "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1",
+                                                                                   "--exec",
+                                                                                   "sh",
+                                                                                   "-lc",
+                                                                                   "printf \u0027%s\u0027 ok"
+                                                                               ],
+                                                                 "started_at":  "2026-06-19T10:59:09.1137220Z",
+                                                                 "exit_code":  0,
+                                                                 "timed_out":  false,
+                                                                 "stdout":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1-reachability.stdout.txt",
+                                                                 "stderr":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1-reachability.stderr.txt",
+                                                                 "stdout_preview":  "ok",
+                                                                 "stderr_preview":  ""
+                                                             },
+                                            "tmux_available":  true,
+                                            "tmux_version":  "tmux 3.2a",
+                                            "tmux_probe":  {
+                                                               "name":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1-tmux-version",
+                                                               "file":  "C:\\Windows\\system32\\wsl.exe",
+                                                               "arguments":  [
+                                                                                 "--distribution",
+                                                                                 "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1",
+                                                                                 "--exec",
+                                                                                 "sh",
+                                                                                 "-lc",
+                                                                                 "if command -v tmux \u003e/dev/null 2\u003e\u00261; then tmux -V; else exit 127; fi"
+                                                                             ],
+                                                               "started_at":  "2026-06-19T10:59:11.0367722Z",
+                                                               "exit_code":  0,
+                                                               "timed_out":  false,
+                                                               "stdout":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1-tmux-version.stdout.txt",
+                                                               "stderr":  "wsl-Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1-tmux-version.stderr.txt",
+                                                               "stdout_preview":  "tmux 3.2a\n",
+                                                               "stderr_preview":  ""
+                                                           }
+                                        }
+                                    ],
+                  "selected_distribution":  "Ubuntu"
+              }
+}

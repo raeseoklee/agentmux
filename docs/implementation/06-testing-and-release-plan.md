@@ -109,6 +109,34 @@ Minimum desktop test flows:
 
 UI tests should avoid fragile pixel-only assertions except for rendering smoke tests.
 
+Current coverage note: `apps/desktop/tests/ui/synthetic-attention.spec.ts`
+uses the browser-preview control client to trigger synthetic agent attention and
+verifies the workspace badge, pane badge, attention clear flow, notification
+panel entry, and notification dismissal.
+
+The same Playwright suite also creates a browser surface in the active pane and
+drives navigation, DOM snapshot, screenshot, click, type, and evaluate controls
+through the browser-preview client.
+
+Current unit coverage also verifies that browser command failures are exposed
+through `diagnostics.browser` and persisted as `browser.action_failed`
+notifications.
+
+Goal 8 CDP coverage is split deliberately: unit tests cover CDP command helper
+behavior and runtime selection without launching a browser, while
+`npm run browser:cdp-smoke` launches installed Edge/Chrome in headless mode and
+verifies navigation, screenshot, DOM snapshot, click, type, and evaluate against
+a local HTTP fixture.
+
+The desktop build and UI smoke release gate is captured with:
+
+```powershell
+npm run desktop:gates
+```
+
+That runner records the production frontend build, generated `dist` files, and
+the Playwright smoke suite output.
+
 ## Performance Tests
 
 Performance tests are not optional end-game tests. They begin with Phase 1 and become release gates later.
@@ -120,6 +148,25 @@ Required benchmarks:
 - `bench_high_output`
 - `bench_resize_storm`
 - `bench_restart_recovery`
+
+Current benchmark harnesses:
+
+- `cargo run -p agentmux-bench-single-terminal-latency`
+- `cargo run -p agentmux-bench-many-idle-sessions`
+- `cargo run -p agentmux-bench-high-output`
+- `cargo run -p agentmux-bench-resize-storm`
+- `cargo run -p agentmux-bench-restart-recovery`
+
+The restart-recovery binary uses a simulated durable backend so it can run
+without a WSL/tmux lab. The real WSL/tmux recovery gate is captured separately
+with:
+
+```powershell
+npm run tmux:reattach-smoke
+```
+
+That runner verifies launch/input/output and reattach without duplicating the
+shell process on a reference Windows machine with WSL and tmux installed.
 
 Each run records:
 
@@ -185,6 +232,35 @@ A release candidate must pass:
 - performance release gate
 - installer smoke test
 - diagnostics export smoke test
+
+Current diagnostics export coverage: unit tests exercise `diagnostics.export`
+through the desktop control envelope and verify recovery counts, backend health,
+queue pressure, browser failure history, and persisted notification inclusion.
+The CLI exposes the same bundle through `agentmux diagnostics export`.
+`npm run diagnostics:packaged-smoke` verifies the packaged desktop host named
+pipe path with isolated store, token, and pipe settings.
+`npm run tmux:reattach-smoke` verifies the real WSL/tmux launch and reattach
+path and archives release evidence.
+`npm run installer:build-smoke` verifies that an unsigned NSIS setup executable
+can be produced, prepares the `agentmux.exe` and `cmux.exe` Tauri sidecar
+inputs, compiles the install/uninstall PATH hook, and records the artifact
+hash. Manual release signoff still requires installing and uninstalling that
+setup package on a release machine.
+`npm run installer:contents-gate` opens the generated setup executable without
+installing it, extracts the CLI sidecars with 7-Zip, and compares their hashes
+against the prepared Tauri sidecar inputs. It also verifies that the generated
+installer script includes the AgentMux NSIS hook file and calls the
+install/uninstall PATH hook.
+`npm run installer:lifecycle-gate -- preinstall`, `-- installed`, and
+`-- uninstalled` record non-mutating evidence for each manual installer
+lifecycle phase. The installed phase also verifies registry uninstall metadata,
+the installed executable, an uninstall command, and Start Menu shortcut
+presence. Use `npm run installer:lifecycle-gate -- installed -RequireCli -RequireUserPath`
+for final signoff so installed `agentmux.exe` and `cmux.exe` sidecars plus
+install-directory user PATH registration are also required.
+The 2026-06-25 release closure captured a real NSIS install, installed desktop
+smoke, installed CLI server smoke, and silent uninstall gate in
+`29-installed-lifecycle-e2e-release-closure.md`.
 
 Release candidate must not have:
 

@@ -1,0 +1,25 @@
+[package]
+name = "agentmux-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agentmux-backend = { path = "../agentmux-backend" }
+agentmux-backend-conpty = { path = "../agentmux-backend-conpty" }
+agentmux-backend-wsl = { path = "../agentmux-backend-wsl" }
+agentmux-core = { path = "../agentmux-core" }
+agentmux-ipc = { path = "../agentmux-ipc" }
+serde = "1"
+serde_json = "1"
+tungstenite = "0.24"
+getrandom = "0.2"
+
+[[bin]]
+name = "agentmux"
+path = "src/main.rs"
+
+[[bin]]
+name = "cmux"
+path = "src/cmux.rs"

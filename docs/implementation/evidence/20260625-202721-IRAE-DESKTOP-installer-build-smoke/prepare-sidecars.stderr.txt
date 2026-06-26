@@ -1,0 +1,6 @@
+   Compiling agentmux-backend-conpty v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-backend-conpty)
+   Compiling agentmux-ipc v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-ipc)
+   Compiling agentmux-backend-wsl v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-backend-wsl)
+   Compiling agentmux-core v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-core)
+   Compiling agentmux-cli v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-cli)
+    Finished `release` profile [optimized] target(s) in 51.30s

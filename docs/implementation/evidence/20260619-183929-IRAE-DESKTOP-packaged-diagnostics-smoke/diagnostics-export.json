@@ -1,0 +1,9 @@
+{
+  "schema": "agentmux.control.v1",
+  "id": "cli_diagnostics_export",
+  "outcome": {
+    "Ok": {
+      "result_json": "{\"generated_at\":\"1781861970.657Z\",\"format_version\":\"agentmux.diagnostics.v1\",\"recovery\":{\"workspace_count\":0,\"pane_count\":0,\"surface_count\":0,\"session_count\":0,\"sessions\":[]},\"browser\":{\"failures\":[]},\"notifications\":[],\"backend_health\":[],\"queue_pressure\":[{\"queue\":\"runtime.events.pending\",\"depth\":0,\"capacity\":1024,\"dropped_count\":0,\"state\":\"nominal\"},{\"queue\":\"runtime.events.history\",\"depth\":0,\"capacity\":1024,\"dropped_count\":0,\"state\":\"nominal\"},{\"queue\":\"runtime.notifications\",\"depth\":0,\"capacity\":256,\"dropped_count\":0,\"state\":\"nominal\"},{\"queue\":\"desktop.browser_failures\",\"depth\":0,\"capacity\":100,\"dropped_count\":0,\"state\":\"nominal\"}]}"
+    }
+  }
+}

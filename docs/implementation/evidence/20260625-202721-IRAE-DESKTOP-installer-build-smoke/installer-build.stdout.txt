@@ -1,0 +1,18 @@
+
+> @agentmux/desktop@0.1.0 build
+> tsc --noEmit && vite build
+
+vite v6.4.3 building for production...
+transforming...
+✓ 47 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                           0.56 kB │ gzip:   0.37 kB
+dist/assets/D2CodingNerd-HL2cwMz_.woff2               1,755.05 kB
+dist/assets/PretendardVariable-CJuje-Rk.woff2         2,057.69 kB
+dist/assets/D2CodingNerd-DEiFdCHB.woff                2,475.24 kB
+dist/assets/SymbolsNerdFontMono-Regular-DDncdh2F.ttf  2,507.56 kB
+dist/assets/index-2l8KIlou.css                           15.18 kB │ gzip:   4.57 kB
+dist/assets/addon-webgl-BRBWwLY7.js                     110.65 kB │ gzip:  30.14 kB
+dist/assets/index-g1y159hR.js                           735.72 kB │ gzip: 194.29 kB
+✓ built in 4.30s

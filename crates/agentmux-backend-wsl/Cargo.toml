@@ -1,0 +1,10 @@
+[package]
+name = "agentmux-backend-wsl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agentmux-backend = { path = "../agentmux-backend" }
+agentmux-backend-conpty = { path = "../agentmux-backend-conpty" }

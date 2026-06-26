@@ -1,0 +1,3 @@
+Prepared Tauri sidecar binaries:
+  D:\Workspace\irae\agentmux\apps\desktop\src-tauri\binaries\agentmux-x86_64-pc-windows-msvc.exe
+  D:\Workspace\irae\agentmux\apps\desktop\src-tauri\binaries\cmux-x86_64-pc-windows-msvc.exe

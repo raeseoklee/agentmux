@@ -1,0 +1,11 @@
+
+> @agentmux/desktop@0.1.0 test:ui
+> playwright test
+
+
+Running 2 tests using 1 worker
+
+  ok 1 [chromium] › tests\ui\synthetic-attention.spec.ts:3:1 › synthetic attention appears in workspace, pane, and notification UI (2.3s)
+  ok 2 [chromium] › tests\ui\synthetic-attention.spec.ts:34:1 › browser surface can be created and driven from the pane UI (509ms)
+
+  2 passed (4.6s)

@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentmux.local/schemas/agentmux.config.schema.json",
+  "title": "AgentMux configuration",
+  "description": "Schema for global agentmux.json and project .agentmux/agentmux.json overrides.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "format_version": {
+      "type": "string",
+      "const": "agentmux.config.v1"
+    },
+    "appearance": {
+      "$ref": "#/$defs/appearance"
+    },
+    "shortcuts": {
+      "$ref": "#/$defs/shortcuts"
+    },
+    "actions": {
+      "$ref": "#/$defs/actions"
+    },
+    "ui": {
+      "$ref": "#/$defs/ui"
+    },
+    "notifications": {
+      "$ref": "#/$defs/notifications"
+    }
+  },
+  "$defs": {
+    "appearance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "theme": {
+          "type": "string",
+          "enum": ["dark", "light"]
+        },
+        "accent_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "font_size": {
+          "type": "number",
+          "minimum": 11,
+          "maximum": 16
+        }
+      }
+    },
+    "shortcuts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindings": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "minItems": 2,
+                "maxItems": 2
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "custom": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/customAction"
+          }
+        }
+      }
+    },
+    "customAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "target"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^custom\\.[A-Za-z0-9._-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "group": {
+          "type": "string",
+          "enum": ["agent", "terminal", "workspace", "view", "remote"]
+        },
+        "target": {
+          "type": "string",
+          "enum": ["agent", "wsl-terminal", "browser"]
+        },
+        "command": {
+          "description": "Agent actions run the array as a command. Browser actions support ['open', url, placement], ['new-tab', url], ['active-pane', url], ['screenshot', format, placement], ['dom-snapshot', placement], ['evaluate', script, placement], ['click', selector, placement], and ['type', selector, text, placement]. Placement is new_tab or active_pane.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "workspace_plus_action": {
+          "$ref": "#/$defs/actionReference"
+        },
+        "surface_tab_plus_action": {
+          "$ref": "#/$defs/actionReference"
+        },
+        "surface_tab_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/actionReference"
+          }
+        },
+        "text_box_max_lines": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 12
+        }
+      }
+    },
+    "notifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/notificationAction"
+          }
+        }
+      }
+    },
+    "notificationAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action"],
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/actionReference"
+        },
+        "label": {
+          "type": "string"
+        },
+        "notification_type": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "progress", "success", "warning", "error"]
+        },
+        "dismiss_on_run": {
+          "type": "boolean"
+        }
+      }
+    },
+    "actionReference": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    }
+  }
+}

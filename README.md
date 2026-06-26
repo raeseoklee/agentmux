@@ -1,23 +1,43 @@
 # AgentMux
 
-AgentMux is a Windows-first, cross-platform terminal multiplexer designed for running many AI agent sessions, shells, and browser-assisted development workflows in parallel.
+AgentMux is a Windows desktop terminal multiplexer for running many AI agent
+sessions, shells, and browser-assisted workflows side by side.
 
-The current repository contains the product requirements and implementation design documents that define the first build plan.
+It is designed around three everyday jobs:
+
+- Keep workspaces, tabs, and split panes organized while agents run.
+- Reopen the same workspace after an app restart and reconnect useful sessions.
+- Surface agent status, attention requests, notifications, and diagnostics in one
+  place.
 
 ## Documentation
 
-- [System requirements and detailed design](./docs/ieee-29148-system-design.md)
-- [Implementation documents](./docs/implementation/README.md)
-- [Implementation roadmap](./docs/implementation/00-implementation-roadmap.md)
+Start here:
 
-## Initial Implementation Direction
+- [User manual](./docs/user/manual.md)
+- [Getting started](./docs/user/getting-started.md)
+- [CLI guide](./docs/user/cli.md)
+- [Troubleshooting](./docs/user/troubleshooting.md)
+- [Operations runbook](./docs/operations/release-runbook.md)
+- [Versioning and signed releases](./docs/release/versioning.md)
 
-- Rust core runtime.
-- Tauri-style desktop shell.
-- TypeScript and React UI.
-- Windows ConPTY backend.
-- WSL direct shell backend.
-- WSL durable session backend through tmux-control semantics.
-- Local IPC and CLI control plane.
-- Performance benchmarks from the first vertical slice.
+The full documentation index is in [docs/README.md](./docs/README.md).
 
+## Release Builds
+
+Release builds are published through GitHub Actions from SemVer tags such as
+`v0.1.1`. The release workflow builds the Windows NSIS installer, writes a
+SHA256 checksum, generates a GitHub Artifact Attestation, and uploads the assets
+to the GitHub Release.
+
+After downloading a release installer, verify its provenance:
+
+```powershell
+gh attestation verify .\AgentMux_0.1.1_x64-setup.exe --repo raeseoklee/agentmux
+```
+
+## Development Branch Notes
+
+Detailed implementation notes, goal logs, architecture drafts, and evidence
+captures live on `develop`. They are intentionally not part of the public
+operational documentation set that is intended for `main`.

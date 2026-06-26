@@ -1,0 +1,11 @@
+{
+  "schema": "agentmux.control.v1",
+  "id": "cli_workspace_group_create",
+  "outcome": {
+    "Error": {
+      "code": "unsupported_method",
+      "message": "Unsupported method 'workspace_group.create'.",
+      "details_json": null
+    }
+  }
+}

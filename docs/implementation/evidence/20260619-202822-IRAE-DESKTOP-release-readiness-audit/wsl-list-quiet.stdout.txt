@@ -1,0 +1,4 @@
+﻿Ubuntu
+Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2
+Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1
+

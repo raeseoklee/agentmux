@@ -1,0 +1,72 @@
+﻿{
+  "base_dir": "C:\\Users\\irae\\.cmuxterm",
+  "bin_dir": "C:\\Users\\irae\\.cmuxterm\\bin",
+  "bin_dir_on_path": false,
+  "integrations": [
+    {
+      "checks": [
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\bin\\omo or C:\\Users\\irae\\.cmuxterm\\bin\\omo.cmd",
+          "fix": "Run `cmux integrations install-shims`.",
+          "name": "persistent-wrapper",
+          "ok": false
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\omo-bin\\tmux or C:\\Users\\irae\\.cmuxterm\\omo-bin\\tmux.cmd",
+          "fix": "Run `cmux integrations setup omo` or `cmux integrations install-shims`.",
+          "name": "tmux-shim",
+          "ok": false
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\bin is not currently on PATH",
+          "fix": "Source the generated AgentMux PATH snippet or rerun install-shims with a profile path.",
+          "name": "wrapper-on-path",
+          "ok": false
+        },
+        {
+          "detail": "opencode was not found on the current PATH",
+          "fix": "Install OpenCode and oh-my-opencode in the AgentMux WSL shell, then launch with omo.",
+          "name": "underlying-executable",
+          "ok": false
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\omo-config\\opencode.json and C:\\Users\\irae\\.cmuxterm\\omo-config\\oh-my-opencode.json",
+          "fix": "Run `cmux integrations setup omo` to create the shadow OpenCode config.",
+          "name": "omo-shadow-config",
+          "ok": false
+        },
+        {
+          "detail": "failed to read C:\\Users\\irae\\.cmuxterm\\omo-config\\opencode.json: 지정된 경로를 찾을 수 없습니다. (os error 3)",
+          "fix": "Run `cmux integrations setup omo` to recreate the shadow OpenCode config.",
+          "name": "omo-opencode-plugin",
+          "ok": false
+        },
+        {
+          "detail": "failed to read C:\\Users\\irae\\.cmuxterm\\omo-config\\oh-my-opencode.json: 지정된 경로를 찾을 수 없습니다. (os error 3)",
+          "fix": "Run `cmux integrations setup omo` to recreate the shadow OpenCode config.",
+          "name": "omo-tmux-enabled",
+          "ok": false
+        },
+        {
+          "detail": "C:\\Users\\irae\\.cmuxterm\\omo-config\\node_modules has not been created yet; package setup will create an isolated shadow directory",
+          "fix": null,
+          "name": "omo-node-modules-isolated",
+          "ok": true
+        },
+        {
+          "detail": "npm at D:\\SDK\\nodejs\\npm",
+          "fix": "Run `cmux integrations setup omo --install-packages` or launch `cmux omo`.",
+          "name": "omo-package",
+          "ok": false
+        }
+      ],
+      "command": "omo",
+      "executable": "opencode",
+      "install_hint": "Install OpenCode and oh-my-opencode in the AgentMux WSL shell, then launch with omo.",
+      "integration": "omo",
+      "status": "needs-attention"
+    }
+  ],
+  "wsl_distribution": null
+}
+

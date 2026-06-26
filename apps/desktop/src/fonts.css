@@ -1,0 +1,49 @@
+/*
+ * Pretendard Variable — bundled locally (not from a CDN) so the desktop app
+ * renders identically offline, with no font-loading flash (FOUT) and no
+ * fallback-to-system-serif when the network is slow or blocked. One variable
+ * file covers the full weight range (45–920).
+ *
+ * License: SIL Open Font License 1.1 — Copyright (c) 2021 Kil Hyung-jin.
+ * https://github.com/orioncactus/pretendard
+ */
+@font-face {
+  font-family: "Pretendard Variable";
+  font-weight: 45 920;
+  font-style: normal;
+  font-display: swap;
+  src: url("./assets/fonts/PretendardVariable.woff2") format("woff2-variations");
+}
+
+/*
+ * D2Coding Nerd Font (ligature build) — the terminal font. Bundled locally so
+ * Nerd glyphs (powerline arrows, git/branch icons, devicons) and CJK render in
+ * xterm offline. License: SIL OFL 1.1 (D2Coding) + MIT (Nerd Fonts patch).
+ */
+@font-face {
+  font-family: "D2Coding Nerd";
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+  src:
+    url("./assets/fonts/D2CodingNerd.woff2") format("woff2"),
+    url("./assets/fonts/D2CodingNerd.woff") format("woff");
+}
+
+/*
+ * Symbols Nerd Font Mono — modern Nerd Font v3 symbol fallback. D2Coding Nerd
+ * is kept as the primary terminal face for text/CJK, while this symbols-only
+ * face fills newer private-use glyphs used by prompts such as Starship,
+ * Powerlevel10k, and Claude/agent CLIs.
+ */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+  src: url("./assets/fonts/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  unicode-range:
+    U+E000-F8FF,
+    U+F0000-FFFFD,
+    U+100000-10FFFF;
+}

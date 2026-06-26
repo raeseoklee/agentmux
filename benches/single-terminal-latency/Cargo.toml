@@ -1,0 +1,11 @@
+[package]
+name = "agentmux-bench-single-terminal-latency"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agentmux-bench-support = { path = "../support" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

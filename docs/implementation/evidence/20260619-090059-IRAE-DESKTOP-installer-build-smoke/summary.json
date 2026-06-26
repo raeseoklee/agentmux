@@ -1,0 +1,13 @@
+﻿{
+    "generated_at":  "2026-06-19T00:16:26.2068725Z",
+    "command":  "tauri build --ci --no-sign -b nsis",
+    "exit_code":  0,
+    "installer_path":  "target/release/bundle/nsis/AgentMux_0.1.0_x64-setup.exe",
+    "archived_installer":  "AgentMux_0.1.0_x64-setup.exe",
+    "installer_bytes":  4038939,
+    "installer_sha256":  "CE1FFA7F8E89FA59BA430D9474CD8D66471FDB249466571983FD39D585F55010",
+    "release_executable":  "target/release/agentmux-desktop-host.exe",
+    "release_executable_bytes":  15191552,
+    "stdout":  "installer-build.stdout.txt",
+    "stderr":  "installer-build.stderr.txt"
+}

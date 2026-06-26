@@ -1,0 +1,13 @@
+[package]
+name = "agentmux-bench-restart-recovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agentmux-backend = { path = "../../crates/agentmux-backend" }
+agentmux-bench-support = { path = "../support" }
+agentmux-core = { path = "../../crates/agentmux-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,9 @@
+{
+  "schema": "agentmux.control.v1",
+  "id": "req_spawn",
+  "method": "session.spawn",
+  "params_json": "{\"workspace_id\":\"ws_fixture\",\"backend\":\"conpty\",\"backend_profile\":null,\"command\":[\"cmd.exe\",\"/d\",\"/q\"],\"cwd\":null,\"columns\":120,\"rows\":30,\"durability\":\"ephemeral\"}",
+  "auth": {
+    "token": "redacted"
+  }
+}

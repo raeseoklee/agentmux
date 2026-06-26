@@ -1,0 +1,11 @@
+[package]
+name = "agentmux-backend-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentmux-backend = { path = "../agentmux-backend" }
+# `ring` crypto backend avoids aws-lc-sys, which requires NASM to build.
+russh = { version = "0.54", default-features = false, features = ["ring", "flate2"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time"] }

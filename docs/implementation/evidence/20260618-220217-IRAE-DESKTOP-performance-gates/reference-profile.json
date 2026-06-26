@@ -1,0 +1,43 @@
+﻿{
+    "generated_at":  "2026-06-18T13:02:19.0173709Z",
+    "machine_name":  "IRAE-DESKTOP",
+    "user_domain":  "IRAE-DESKTOP",
+    "os":  {
+               "caption":  "Microsoft Windows 11 Pro for Workstations",
+               "version":  "10.0.22631",
+               "build_number":  "22631",
+               "architecture":  "64비트"
+           },
+    "computer":  {
+                     "manufacturer":  "Micro-Star International Co., Ltd.",
+                     "model":  "MS-7D31",
+                     "total_physical_memory_bytes":  68493266944
+                 },
+    "cpu":  [
+                {
+                    "name":  "13th Gen Intel(R) Core(TM) i9-13900K",
+                    "cores":  24,
+                    "logical_processors":  32,
+                    "max_clock_mhz":  3000
+                }
+            ],
+    "power_scheme":  "전원 구성표 GUID: e9a42b02-d5df-448d-aa00-03f14749eb61  (최고의 성능)",
+    "wsl_version":  "WSL ��\u0004�: 2.7.8.0\r\n\r\n��\u0010� ��\u0004�: 6.18.33.1-1\r\n\r\nWSLg ��\u0004�: 1.0.73.2\r\n\r\nMSRDC ��\u0004�: 1.2.6676\r\n\r\nDirect3D ��\u0004�: 1.611.1-81528511\r\n\r\nDXCore ��\u0004�: 10.0.26100.1-240331-1435.ge-release\r\n\r\nWindows ��\u0004�: 10.0.22631.6199",
+    "wsl_version_values":  [
+                               "2.7.8.0",
+                               "6.18.33.1-1",
+                               "1.0.73.2",
+                               "1.2.6676",
+                               "1.611.1-81528511",
+                               "10.0.26100.1-240331",
+                               "10.0.22631.6199"
+                           ],
+    "wsl_distributions":  "Ubuntu\r\n\r\nNvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2\r\n\r\nNvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1",
+    "wsl_distribution_names":  [
+                                   "Ubuntu",
+                                   "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.2",
+                                   "Nvidia_SDKM_Ubuntu_22.04_JetPack_6.2.1"
+                               ],
+    "display_scale":  null,
+    "notes":  "Set display_scale and release-lab notes manually if Windows does not expose them consistently."
+}

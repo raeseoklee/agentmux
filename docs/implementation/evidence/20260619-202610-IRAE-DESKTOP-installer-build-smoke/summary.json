@@ -1,0 +1,32 @@
+﻿{
+    "generated_at":  "2026-06-19T11:26:51.4046846Z",
+    "command":  "tauri build --ci --no-sign -b nsis",
+    "sidecar_prepare_exit_code":  0,
+    "sidecars":  [
+                     {
+                         "path":  "apps/desktop/src-tauri/binaries/agentmux-x86_64-pc-windows-msvc.exe",
+                         "exists":  true,
+                         "bytes":  2643968,
+                         "sha256":  "F0C0E3E69009E4A7517AB1DAD3F5D91FF7BEA9303BBCCC6D13EC77B8C0F12C75",
+                         "last_write_time":  "2026-06-19T11:06:25.4590834Z"
+                     },
+                     {
+                         "path":  "apps/desktop/src-tauri/binaries/cmux-x86_64-pc-windows-msvc.exe",
+                         "exists":  true,
+                         "bytes":  2643968,
+                         "sha256":  "9D64719DF5DE0DFBF43C20A2EF697DA389A4585D29DD4E26773085E2F9AFC2CD",
+                         "last_write_time":  "2026-06-19T11:06:25.3951732Z"
+                     }
+                 ],
+    "exit_code":  0,
+    "installer_path":  "target/release/bundle/nsis/AgentMux_0.1.0_x64-setup.exe",
+    "archived_installer":  "AgentMux_0.1.0_x64-setup.exe",
+    "installer_bytes":  4846604,
+    "installer_sha256":  "F75DA6687A561EFAABAC03D9748D7D0C1A9027690D2C752A808E5EF0277D2B7A",
+    "release_executable":  "target/release/agentmux-desktop-host.exe",
+    "release_executable_bytes":  16162304,
+    "sidecar_stdout":  "prepare-sidecars.stdout.txt",
+    "sidecar_stderr":  "prepare-sidecars.stderr.txt",
+    "stdout":  "installer-build.stdout.txt",
+    "stderr":  "installer-build.stderr.txt"
+}

@@ -1,0 +1,29 @@
+agentmux <system|workspace|pane|surface|terminal|notification|events|browser|agent|actions|diagnostics|session|config|notify|set-status|clear-status|list-status|set-progress|clear-progress|log|clear-log|list-log|sidebar-state|capabilities|identify|ping|list-workspaces|new-workspace|current-workspace|close-workspace|list-surfaces|new-split|send|send-key|list-notifications|__tmux-compat|integrations|claude-teams|omo|omx|omc> <command> [options]
+
+Try: agentmux workspace list
+Try: agentmux workspace create AgentMux --project D:\work\repo
+Try: agentmux workspace close <id> --policy fail_if_running --yes
+Try: agentmux session spawn --workspace <id> -- cmd.exe /d /q
+Try: agentmux session list --workspace <id>
+Try: agentmux session terminate <id> --mode soft --yes
+Try: agentmux agent set-state <session-id> waiting_for_input --reason "needs input"
+Try: agentmux actions list --workspace <id> --json
+Try: agentmux notification list --severity warning
+Try: agentmux events watch --workspace <id>
+Try: agentmux diagnostics export --json
+Try: agentmux config reload --json
+Try: agentmux terminal run -- cmd.exe /d /q /c "echo agentmux"
+Try: agentmux terminal run --backend wsl-direct --distribution Ubuntu --cwd D:\work\repo -- bash -lc pwd
+Try: agentmux notify --title "Build" --body "Done"
+Try: agentmux set-status build compiling --priority 80
+Try: agentmux set-progress 0.5 --label "Building"
+Try: agentmux log --level success -- "All tests passed"
+Try: agentmux sidebar-state --json
+Try: agentmux identify --json
+Try: cmux list-workspaces --json
+Try: cmux current-workspace
+Try: cmux ping
+Try: cmux claude-teams
+Try: cmux omo --continue
+Try: cmux integrations setup omo --install-packages
+Try: cmux integrations doctor omo --json
