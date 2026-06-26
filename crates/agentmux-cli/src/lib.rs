@@ -105,12 +105,45 @@ pub const COMMAND_FAMILIES: &[&str] = &[
     "omc",
 ];
 
+const PUBLIC_COMMAND_FAMILIES: &[&str] = &[
+    "system",
+    "workspace",
+    "workspace-group",
+    "pane",
+    "surface",
+    "terminal",
+    "server",
+    "ssh",
+    "notification",
+    "events",
+    "browser",
+    "agent",
+    "actions",
+    "diagnostics",
+    "session",
+    "config",
+    "notify",
+    "set-status",
+    "clear-status",
+    "list-status",
+    "set-progress",
+    "clear-progress",
+    "log",
+    "clear-log",
+    "list-log",
+    "sidebar-state",
+    "capabilities",
+    "identify",
+    "ping",
+    "integrations",
+];
+
 pub fn usage() -> String {
     usage_for("agentmux")
 }
 
 pub fn usage_for(program_name: &str) -> String {
-    format!(
+    let mut text = format!(
         concat!(
             "{program_name} <{}> <command> [options]\n\n",
             "Try: {program_name} workspace list\n",
@@ -136,7 +169,6 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} events watch --workspace <id>\n",
             "Try: {program_name} diagnostics export --json\n",
             "Try: {program_name} config reload --json\n",
-            "Try: {program_name} config migrate-cmux --workspace <id>\n",
             "Try: {program_name} config diagnostics --workspace <id>\n",
             "Try: {program_name} config schema --output agentmux.config.schema.json\n",
             "Try: {program_name} terminal run -- cmd.exe /d /q /c \"echo agentmux\"\n",
@@ -147,19 +179,24 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} set-progress 0.5 --label \"Building\"\n",
             "Try: {program_name} log --level success -- \"All tests passed\"\n",
             "Try: {program_name} sidebar-state --json\n",
-            "Try: {program_name} identify --json\n",
-            "Try: cmux list-workspaces --json\n",
-            "Try: cmux current-workspace\n",
-            "Try: cmux ping\n",
-            "Try: cmux claude-teams\n",
-            "Try: cmux omo --continue\n",
-            "Try: cmux integrations install-shims --user-path\n",
-            "Try: cmux integrations setup omo --install-packages --distribution Ubuntu\n",
-            "Try: cmux integrations doctor omo --distribution Ubuntu --json"
+            "Try: {program_name} identify --json"
         ),
-        COMMAND_FAMILIES.join("|"),
+        PUBLIC_COMMAND_FAMILIES.join("|"),
         program_name = program_name
-    )
+    );
+
+    if program_name == "cmux" {
+        text.push_str(concat!(
+            "\nTry: cmux list-workspaces --json",
+            "\nTry: cmux current-workspace",
+            "\nTry: cmux ping",
+            "\nTry: cmux integrations install-shims --user-path",
+            "\nTry: cmux integrations setup omo --install-packages --distribution Ubuntu",
+            "\nTry: cmux integrations doctor omo --distribution Ubuntu --json"
+        ));
+    }
+
+    text
 }
 
 pub fn run_cli<I, S, W>(args: I, output: W) -> Result<(), CliError>
@@ -14305,6 +14342,18 @@ mod tests {
         assert!(text.contains("actions list"));
         assert!(text.contains("notify"));
         assert!(text.contains("sidebar-state"));
+    }
+
+    #[test]
+    fn agentmux_usage_hides_cmux_compat_surface() {
+        let text = usage();
+        assert!(!text.contains("Try: cmux "));
+        assert!(!text.contains("list-workspaces"));
+        assert!(!text.contains("__tmux-compat"));
+        assert!(!text.contains("claude-teams"));
+        assert!(!text.contains("|omo|"));
+        assert!(!text.contains("|omx|"));
+        assert!(!text.contains("|omc"));
     }
 
     #[test]

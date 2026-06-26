@@ -19,6 +19,8 @@
     "server:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-server-mode-smoke.ps1",
     "browser:cdp-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-browser-cdp-smoke.ps1",
     "skills:install": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/install-agentmux-skill.ps1",
+    "version:check": "node tools/check-version.mjs",
+    "version:set": "node tools/set-version.mjs",
     "desktop:dev": "npm --prefix apps/desktop run dev",
     "desktop:build": "npm --prefix apps/desktop run build"
   }
