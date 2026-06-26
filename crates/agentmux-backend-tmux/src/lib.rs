@@ -584,6 +584,7 @@ pub struct TmuxControlConfig {
 struct TmuxControlSession {
     session_name: String,
     pane_id: Option<String>,
+    started: bool,
     replay_state: TmuxReplayState,
 }
 
@@ -717,6 +718,7 @@ where
             TmuxControlSession {
                 session_name: session_name.clone(),
                 pane_id: None,
+                started: false,
                 replay_state: TmuxReplayState::AwaitingActivePane,
             },
         );
@@ -750,6 +752,7 @@ where
             TmuxControlSession {
                 session_name: session_name.clone(),
                 pane_id: None,
+                started: false,
                 replay_state: TmuxReplayState::AwaitingActivePane,
             },
         );
@@ -811,6 +814,12 @@ where
         let mut events = std::mem::take(&mut self.events);
         for event in self.transport.drain_events() {
             match event {
+                BackendEvent::Started { session_id } if self.sessions.contains_key(&session_id) => {
+                    events.push(BackendEvent::HealthChanged {
+                        attachment_id: session_id,
+                        state: BackendHealth::Starting,
+                    });
+                }
                 BackendEvent::Output { session_id, bytes } => {
                     events.extend(self.apply_control_output(&session_id, &bytes));
                 }
@@ -827,6 +836,27 @@ where
 }
 
 impl<B> TmuxControlBackend<B> {
+    fn mark_session_started(
+        sessions: &mut HashMap<String, TmuxControlSession>,
+        session_id: &str,
+        events: &mut Vec<BackendEvent>,
+    ) {
+        let Some(session) = sessions.get_mut(session_id) else {
+            return;
+        };
+        if session.started {
+            return;
+        }
+        session.started = true;
+        events.push(BackendEvent::Started {
+            session_id: session_id.to_string(),
+        });
+        events.push(BackendEvent::HealthChanged {
+            attachment_id: session_id.to_string(),
+            state: BackendHealth::Healthy,
+        });
+    }
+
     fn apply_control_output(&mut self, session_id: &str, bytes: &[u8]) -> Vec<BackendEvent> {
         let Some(parser) = self.parsers.get_mut(session_id) else {
             return vec![BackendEvent::Output {
@@ -853,14 +883,15 @@ impl<B> TmuxControlBackend<B> {
                     }
                 }
                 TmuxControlMessage::Output { pane_id, payload } => {
+                    let mut resolved_pane = false;
                     if let Some(session) = self.sessions.get_mut(session_id) {
                         if session.pane_id.is_none() {
                             session.pane_id = Some(pane_id);
-                            events.push(BackendEvent::HealthChanged {
-                                attachment_id: session_id.to_string(),
-                                state: BackendHealth::Healthy,
-                            });
+                            resolved_pane = true;
                         }
+                    }
+                    if resolved_pane {
+                        Self::mark_session_started(&mut self.sessions, session_id, &mut events);
                     }
                     events.push(BackendEvent::Output {
                         session_id: session_id.to_string(),
@@ -868,12 +899,13 @@ impl<B> TmuxControlBackend<B> {
                     });
                 }
                 TmuxControlMessage::PaneAdd { pane_id } => {
+                    let mut resolved_pane = false;
                     if let Some(session) = self.sessions.get_mut(session_id) {
+                        resolved_pane = session.pane_id.is_none();
                         session.pane_id = Some(pane_id);
-                        events.push(BackendEvent::HealthChanged {
-                            attachment_id: session_id.to_string(),
-                            state: BackendHealth::Healthy,
-                        });
+                    }
+                    if resolved_pane {
+                        Self::mark_session_started(&mut self.sessions, session_id, &mut events);
                     }
                 }
                 TmuxControlMessage::CommandResponse { line, .. }
@@ -889,15 +921,16 @@ impl<B> TmuxControlBackend<B> {
                     });
                 }
                 TmuxControlMessage::CommandResponse { line, .. } if line.starts_with('%') => {
+                    let mut resolved_pane = false;
                     if let Some(session) = self.sessions.get_mut(session_id) {
+                        resolved_pane = session.pane_id.is_none();
                         session.pane_id = Some(line);
                         if session.replay_state == TmuxReplayState::AwaitingActivePane {
                             session.replay_state = TmuxReplayState::AwaitingCaptureBegin;
                         }
-                        events.push(BackendEvent::HealthChanged {
-                            attachment_id: session_id.to_string(),
-                            state: BackendHealth::Healthy,
-                        });
+                    }
+                    if resolved_pane {
+                        Self::mark_session_started(&mut self.sessions, session_id, &mut events);
                     }
                 }
                 TmuxControlMessage::PaneClose { pane_id }
@@ -1218,6 +1251,46 @@ mod tests {
                 "capture-pane -p -e -t agentmux_demo123\n"
             ]
         );
+    }
+
+    #[test]
+    fn transport_start_does_not_mark_tmux_ready_until_control_pane_resolves() {
+        let transport = RecordingTransport::default();
+        let mut backend = TmuxControlBackend::with_transport(transport);
+        backend
+            .spawn(SpawnRequest {
+                session_id: "ses_tmux".to_string(),
+                workspace_id: Some("ws_demo123".to_string()),
+                backend: Some(BackendKind::WslTmuxControl),
+                backend_profile: None,
+                command: CommandSpec::new("bash"),
+                cwd: None,
+                env: Vec::new(),
+                initial_size: TerminalSize::new(80, 24),
+            })
+            .unwrap();
+
+        let startup_events = backend.drain_events();
+        assert!(!startup_events.contains(&BackendEvent::Started {
+            session_id: "ses_tmux".to_string(),
+        }));
+        assert!(startup_events.contains(&BackendEvent::HealthChanged {
+            attachment_id: "ses_tmux".to_string(),
+            state: BackendHealth::Starting,
+        }));
+
+        backend.transport_mut().events.push(BackendEvent::Output {
+            session_id: "ses_tmux".to_string(),
+            bytes: b"%pane-add %4\n".to_vec(),
+        });
+        let ready_events = backend.drain_events();
+        assert!(ready_events.contains(&BackendEvent::Started {
+            session_id: "ses_tmux".to_string(),
+        }));
+        assert!(ready_events.contains(&BackendEvent::HealthChanged {
+            attachment_id: "ses_tmux".to_string(),
+            state: BackendHealth::Healthy,
+        }));
     }
 
     #[test]

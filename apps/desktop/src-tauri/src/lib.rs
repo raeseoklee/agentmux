@@ -219,6 +219,8 @@ pub struct OutputStreamFrame {
     pub bytes_base64: String,
 }
 
+const DURABLE_TMUX_ATTACH_READY_TIMEOUT_MS: u64 = 2_000;
+const DURABLE_TMUX_ATTACH_READY_POLL_MS: u64 = 40;
 const OUTPUT_STREAM_IDLE_PUMP_MS: u64 = 12;
 const OUTPUT_STREAM_HOT_PUMP_MS: u64 = 3;
 const OUTPUT_STREAM_HOT_WINDOW_MS: u64 = 160;
@@ -979,16 +981,19 @@ impl DesktopControlState {
                     let Ok(result) = response_result_json::<SessionSpawnResult>(&response) else {
                         continue;
                     };
-                    let _ = self.persist_session_summary_from_id(result.session_id.clone());
-                    if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
-                        self.replay_restored_agent_state(
-                            &result.session_id,
-                            &session.command,
-                            agent_state,
-                            None,
-                        );
+                    if self.wait_for_recovered_tmux_attach(&result.session_id) {
+                        let _ = self.persist_session_summary_from_id(result.session_id.clone());
+                        if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
+                            self.replay_restored_agent_state(
+                                &result.session_id,
+                                &session.command,
+                                agent_state,
+                                None,
+                            );
+                        }
+                        continue;
                     }
-                    continue;
+                    self.terminate_runtime_session(&result.session_id, TerminationMode::Kill);
                 }
             }
 
@@ -1021,6 +1026,47 @@ impl DesktopControlState {
                 self.delete_superseded_terminal(surface_id, &session.session_id);
             }
         }
+    }
+
+    fn wait_for_recovered_tmux_attach(&self, session_id: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(DURABLE_TMUX_ATTACH_READY_TIMEOUT_MS);
+        loop {
+            let state = {
+                let Ok(mut control) = self.control.lock() else {
+                    return false;
+                };
+                control.collect_events();
+                try_session_summary(&mut control, session_id, &self.control_token)
+                    .ok()
+                    .flatten()
+                    .map(|summary| summary.state)
+            };
+            match state.as_deref() {
+                Some("running") => return true,
+                Some("failed" | "exited" | "lost" | "disconnected") | None => return false,
+                _ if Instant::now() >= deadline => return false,
+                _ => thread::sleep(Duration::from_millis(DURABLE_TMUX_ATTACH_READY_POLL_MS)),
+            }
+        }
+    }
+
+    fn terminate_runtime_session(&self, session_id: &str, mode: TerminationMode) {
+        let mode = match mode {
+            TerminationMode::Soft => "soft",
+            TerminationMode::Interrupt => "interrupt",
+            TerminationMode::Kill => "kill",
+        };
+        let params_json = serde_json::json!({
+            "session_id": session_id,
+            "mode": mode,
+        })
+        .to_string();
+        let _ = self.handle_request(RequestEnvelope::new(
+            "desktop_startup_discard_unhealthy_tmux_attach",
+            "session.terminate",
+            params_json,
+            self.control_token.clone(),
+        ));
     }
 
     /// Reconcile persisted ephemeral sessions on startup.
