@@ -30,12 +30,34 @@ function Resolve-CargoExecutable {
   throw "cargo was not found on PATH or in .toolchains."
 }
 
+function Invoke-AgentMuxCliReleaseBuild {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$CargoPath,
+
+    [int]$MaxAttempts = 3
+  )
+
+  for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+    & $CargoPath build -p agentmux-cli --release
+    if ($LASTEXITCODE -eq 0) {
+      return
+    }
+
+    $exitCode = $LASTEXITCODE
+    if ($attempt -ge $MaxAttempts) {
+      throw "agentmux-cli release build failed with exit code $exitCode after $MaxAttempts attempts."
+    }
+
+    $delaySeconds = 5 * $attempt
+    Write-Warning "agentmux-cli release build failed with exit code $exitCode (attempt $attempt/$MaxAttempts); retrying in $delaySeconds seconds."
+    Start-Sleep -Seconds $delaySeconds
+  }
+}
+
 if (-not $SkipBuild) {
   $cargoPath = Resolve-CargoExecutable
-  & $cargoPath build -p agentmux-cli --release
-  if ($LASTEXITCODE -ne 0) {
-    throw "agentmux-cli release build failed with exit code $LASTEXITCODE."
-  }
+  Invoke-AgentMuxCliReleaseBuild -CargoPath $cargoPath
 }
 
 $binaryDir = Join-Path $desktopTauriDir "binaries"
