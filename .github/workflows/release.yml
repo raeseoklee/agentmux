@@ -136,7 +136,12 @@ jobs:
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
           if (-not $updaterArchive) {
-            throw "Updater archive was not produced under $sourceDir."
+            $installerSignatureSource = "$($installer.FullName).sig"
+            if (Test-Path -LiteralPath $installerSignatureSource) {
+              $updaterArchive = $installer
+            } else {
+              throw "Updater artifact was not produced under $sourceDir."
+            }
           }
           $updaterSignatureSource = "$($updaterArchive.FullName).sig"
           if (-not (Test-Path -LiteralPath $updaterSignatureSource)) {
@@ -148,8 +153,12 @@ jobs:
 
           $installerPath = Join-Path $releaseDir $installer.Name
           Copy-Item -LiteralPath $installer.FullName -Destination $installerPath -Force
-          $updaterArchivePath = Join-Path $releaseDir $updaterArchive.Name
-          Copy-Item -LiteralPath $updaterArchive.FullName -Destination $updaterArchivePath -Force
+          if ($updaterArchive.FullName -eq $installer.FullName) {
+            $updaterArchivePath = $installerPath
+          } else {
+            $updaterArchivePath = Join-Path $releaseDir $updaterArchive.Name
+            Copy-Item -LiteralPath $updaterArchive.FullName -Destination $updaterArchivePath -Force
+          }
           $updaterSignaturePath = "$updaterArchivePath.sig"
           Copy-Item -LiteralPath $updaterSignatureSource -Destination $updaterSignaturePath -Force
 
@@ -224,7 +233,7 @@ jobs:
             "Windows NSIS installer for $tag."
             ""
             "- Installer: ``$installerName``"
-            "- Updater archive: ``$updaterName``"
+            "- Updater artifact: ``$updaterName``"
             "- Updater manifest: ``latest.json``"
             "- SHA256: ``$sha256``"
             "- Provenance: $provenance"
@@ -249,11 +258,13 @@ jobs:
           $updater = "${{ steps.assets.outputs.updater }}"
           $updaterSignature = "${{ steps.assets.outputs.updater_signature }}"
           $latest = "${{ steps.assets.outputs.latest }}"
+          $releaseAssets = @($installer, $checksum, $updater, $updaterSignature, $latest) |
+            Sort-Object -Unique
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $installer $checksum $updater $updaterSignature $latest --clobber
+            gh release upload $tag $releaseAssets --clobber
             gh release edit $tag --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
           } else {
-            gh release create $tag $installer $checksum $updater $updaterSignature $latest --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
+            gh release create $tag $releaseAssets --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
           }
