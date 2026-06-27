@@ -114,13 +114,17 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             throw "Set repository secret TAURI_SIGNING_PRIVATE_KEY to the private key from 'tauri signer generate'."
           }
-          npm run tauri:build -- --ci --no-sign -b nsis --config "${{ steps.updater_config.outputs.path }}"
+          npm run tauri:build -- --ci -b nsis --config "${{ steps.updater_config.outputs.path }}"
 
       - name: Collect release assets
         id: assets
         shell: pwsh
         run: |
           $sourceDir = Join-Path $env:GITHUB_WORKSPACE "target\release\bundle\nsis"
+          Get-ChildItem -LiteralPath $sourceDir -File | Sort-Object Name | ForEach-Object {
+            Write-Host ("Release bundle asset: {0}" -f $_.FullName)
+          }
+
           $installer = Get-ChildItem -LiteralPath $sourceDir -Filter "*setup.exe" -File |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
