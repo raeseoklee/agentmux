@@ -1,5 +1,8 @@
 param(
-  [switch]$SkipBuild
+  [switch]$SkipBuild,
+
+  [ValidateSet("Debug", "Release")]
+  [string]$BuildProfile = "Release"
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,44 +33,54 @@ function Resolve-CargoExecutable {
   throw "cargo was not found on PATH or in .toolchains."
 }
 
-function Invoke-AgentMuxCliReleaseBuild {
+function Invoke-AgentMuxCliBuild {
   param(
     [Parameter(Mandatory = $true)]
     [string]$CargoPath,
 
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("Debug", "Release")]
+    [string]$BuildProfile,
+
     [int]$MaxAttempts = 3
   )
 
+  $cargoArgs = @("build", "-p", "agentmux-cli")
+  if ($BuildProfile -eq "Release") {
+    $cargoArgs += "--release"
+  }
+
   for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-    & $CargoPath build -p agentmux-cli --release
+    & $CargoPath @cargoArgs
     if ($LASTEXITCODE -eq 0) {
       return
     }
 
     $exitCode = $LASTEXITCODE
     if ($attempt -ge $MaxAttempts) {
-      throw "agentmux-cli release build failed with exit code $exitCode after $MaxAttempts attempts."
+      throw "agentmux-cli $BuildProfile build failed with exit code $exitCode after $MaxAttempts attempts."
     }
 
     $delaySeconds = 5 * $attempt
-    Write-Warning "agentmux-cli release build failed with exit code $exitCode (attempt $attempt/$MaxAttempts); retrying in $delaySeconds seconds."
+    Write-Warning "agentmux-cli $BuildProfile build failed with exit code $exitCode (attempt $attempt/$MaxAttempts); retrying in $delaySeconds seconds."
     Start-Sleep -Seconds $delaySeconds
   }
 }
 
 if (-not $SkipBuild) {
   $cargoPath = Resolve-CargoExecutable
-  Invoke-AgentMuxCliReleaseBuild -CargoPath $cargoPath
+  Invoke-AgentMuxCliBuild -CargoPath $cargoPath -BuildProfile $BuildProfile
 }
 
 $binaryDir = Join-Path $desktopTauriDir "binaries"
 New-Item -ItemType Directory -Force -Path $binaryDir | Out-Null
 
+$targetDir = if ($BuildProfile -eq "Release") { "release" } else { "debug" }
 $prepared = @()
 foreach ($name in @("agentmux", "cmux")) {
-  $source = Join-Path $root "target\release\$name.exe"
+  $source = Join-Path $root "target\$targetDir\$name.exe"
   if (-not (Test-Path -LiteralPath $source)) {
-    throw "Required release CLI binary was not found: $source"
+    throw "Required $BuildProfile CLI binary was not found: $source"
   }
 
   $destination = Join-Path $binaryDir "$name-$targetTriple.exe"
