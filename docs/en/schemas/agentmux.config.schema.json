@@ -13,6 +13,12 @@
     "appearance": {
       "$ref": "#/$defs/appearance"
     },
+    "locale": {
+      "$ref": "#/$defs/locale"
+    },
+    "updates": {
+      "$ref": "#/$defs/updates"
+    },
     "shortcuts": {
       "$ref": "#/$defs/shortcuts"
     },
@@ -43,6 +49,26 @@
           "type": "number",
           "minimum": 11,
           "maximum": 16
+        }
+      }
+    },
+    "locale": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "type": "string",
+          "enum": ["en", "ko"]
+        }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_check": {
+          "description": "Check GitHub Releases for AgentMux updates when the packaged desktop app starts. Installation remains user-approved.",
+          "type": "boolean"
         }
       }
     },
@@ -147,6 +173,11 @@
           "type": "integer",
           "minimum": 2,
           "maximum": 12
+        },
+        "terminal_inner_margin": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 32
         }
       }
     },

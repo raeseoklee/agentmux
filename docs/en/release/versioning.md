@@ -35,9 +35,10 @@ git tag v0.1.1
 git push origin v0.1.1
 ```
 
-The release workflow builds the Windows NSIS installer, writes a SHA256 checksum,
-generates a GitHub Artifact Attestation for the installer, and publishes both
-files to the GitHub Release.
+The release workflow builds the Windows NSIS installer, writes a SHA256
+checksum, generates Tauri updater artifacts and `latest.json`, generates a
+GitHub Artifact Attestation for the release assets, and publishes them to the
+GitHub Release.
 
 ## Provenance Verification
 

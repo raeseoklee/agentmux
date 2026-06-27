@@ -75,10 +75,46 @@ jobs:
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-desktop-bundle-binaries.ps1
 
+      - name: Write updater release config
+        id: updater_config
+        shell: pwsh
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_UPDATER_PUBLIC_KEY)) {
+            throw "Set repository variable TAURI_UPDATER_PUBLIC_KEY to the public key from 'tauri signer generate'."
+          }
+
+          $endpoint = "https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
+          $configPath = Join-Path $env:RUNNER_TEMP "tauri.updater.conf.json"
+          $config = [ordered]@{
+            bundle = [ordered]@{
+              createUpdaterArtifacts = $true
+            }
+            plugins = [ordered]@{
+              updater = [ordered]@{
+                pubkey = $env:TAURI_UPDATER_PUBLIC_KEY
+                endpoints = @($endpoint)
+                windows = [ordered]@{
+                  installMode = "passive"
+                }
+              }
+            }
+          }
+          $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
+          "path=$configPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Build NSIS installer
         shell: pwsh
         working-directory: apps/desktop
-        run: npm run tauri:build -- --ci --no-sign -b nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "Set repository secret TAURI_SIGNING_PRIVATE_KEY to the private key from 'tauri signer generate'."
+          }
+          npm run tauri:build -- --ci --no-sign -b nsis --config "${{ steps.updater_config.outputs.path }}"
 
       - name: Collect release assets
         id: assets
@@ -91,21 +127,55 @@ jobs:
           if (-not $installer) {
             throw "NSIS installer was not produced under $sourceDir."
           }
+          $updaterArchive = Get-ChildItem -LiteralPath $sourceDir -Filter "*.zip" -File |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $updaterArchive) {
+            throw "Updater archive was not produced under $sourceDir."
+          }
+          $updaterSignatureSource = "$($updaterArchive.FullName).sig"
+          if (-not (Test-Path -LiteralPath $updaterSignatureSource)) {
+            throw "Updater signature was not produced at $updaterSignatureSource."
+          }
 
           $releaseDir = Join-Path $env:GITHUB_WORKSPACE "dist\release"
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
           $installerPath = Join-Path $releaseDir $installer.Name
           Copy-Item -LiteralPath $installer.FullName -Destination $installerPath -Force
+          $updaterArchivePath = Join-Path $releaseDir $updaterArchive.Name
+          Copy-Item -LiteralPath $updaterArchive.FullName -Destination $updaterArchivePath -Force
+          $updaterSignaturePath = "$updaterArchivePath.sig"
+          Copy-Item -LiteralPath $updaterSignatureSource -Destination $updaterSignaturePath -Force
 
           $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath
           $checksumPath = "$installerPath.sha256"
           "{0}  {1}" -f $hash.Hash, $installer.Name |
             Set-Content -LiteralPath $checksumPath -Encoding ASCII
 
+          $signature = (Get-Content -LiteralPath $updaterSignaturePath -Raw).Trim()
+          $latestPath = Join-Path $releaseDir "latest.json"
+          $downloadUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/${{ steps.version.outputs.tag }}/$($updaterArchive.Name)"
+          $manifest = [ordered]@{
+            version = "${{ steps.version.outputs.version }}"
+            notes = "AgentMux ${{ steps.version.outputs.version }}"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url = $downloadUrl
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $latestPath -Encoding UTF8
+
           "installer=$installerPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "checksum=$checksumPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "updater=$updaterArchivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "updater_signature=$updaterSignaturePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "latest=$latestPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "installer_name=$($installer.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "updater_name=$($updaterArchive.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "sha256=$($hash.Hash)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Resolve attestation support
@@ -123,7 +193,7 @@ jobs:
         if: steps.attestation.outputs.status == 'enabled'
         uses: actions/attest@v4
         with:
-          subject-path: dist/release/*.exe
+          subject-path: dist/release/*
           create-storage-record: false
 
       - name: Write release notes
@@ -132,6 +202,7 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $tag = "${{ steps.version.outputs.tag }}"
           $installerName = "${{ steps.assets.outputs.installer_name }}"
+          $updaterName = "${{ steps.assets.outputs.updater_name }}"
           $sha256 = "${{ steps.assets.outputs.sha256 }}"
           $attestationStatus = "${{ steps.attestation.outputs.status }}"
           if ($attestationStatus -eq "enabled") {
@@ -148,6 +219,8 @@ jobs:
             "Windows NSIS installer for $tag."
             ""
             "- Installer: ``$installerName``"
+            "- Updater archive: ``$updaterName``"
+            "- Updater manifest: ``latest.json``"
             "- SHA256: ``$sha256``"
             "- Provenance: $provenance"
             ""
@@ -168,11 +241,14 @@ jobs:
           $version = "${{ steps.version.outputs.version }}"
           $installer = "${{ steps.assets.outputs.installer }}"
           $checksum = "${{ steps.assets.outputs.checksum }}"
+          $updater = "${{ steps.assets.outputs.updater }}"
+          $updaterSignature = "${{ steps.assets.outputs.updater_signature }}"
+          $latest = "${{ steps.assets.outputs.latest }}"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $installer $checksum --clobber
+            gh release upload $tag $installer $checksum $updater $updaterSignature $latest --clobber
             gh release edit $tag --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
           } else {
-            gh release create $tag $installer $checksum --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
+            gh release create $tag $installer $checksum $updater $updaterSignature $latest --target "${{ github.sha }}" --title "AgentMux $version" --notes-file release-notes.md --latest
           }

@@ -56,7 +56,7 @@ use agentmux_ipc::{
 use tungstenite::{accept_hdr, Error as WsError, Message as WsMessage};
 
 const AGENTMUX_CONFIG_SCHEMA_JSON: &str =
-    include_str!("../../../docs/schemas/agentmux.config.schema.json");
+    include_str!("../../../docs/en/schemas/agentmux.config.schema.json");
 
 pub const COMMAND_FAMILIES: &[&str] = &[
     "system",
@@ -13937,6 +13937,7 @@ where
         "appearance\t{}\t{}\t{}",
         config.appearance.theme, config.appearance.accent_key, config.appearance.font_size
     )?;
+    writeln!(output, "locale\t{}", config.locale.language)?;
     writeln!(output, "shortcuts\t{}", config.shortcuts.bindings.len())?;
     for (action_id, binding) in &config.shortcuts.bindings {
         let binding_json = serde_json::to_string(binding)

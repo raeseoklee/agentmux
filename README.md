@@ -14,12 +14,12 @@ It is designed around three everyday jobs:
 
 Start here:
 
-- [User manual](./docs/user/manual.md)
-- [Getting started](./docs/user/getting-started.md)
-- [CLI guide](./docs/user/cli.md)
-- [Troubleshooting](./docs/user/troubleshooting.md)
-- [Operations runbook](./docs/operations/release-runbook.md)
-- [Versioning and signed releases](./docs/release/versioning.md)
+- [User manual](./docs/en/user/manual.md)
+- [Getting started](./docs/en/user/getting-started.md)
+- [CLI guide](./docs/en/user/cli.md)
+- [Troubleshooting](./docs/en/user/troubleshooting.md)
+- [Operations runbook](./docs/en/operations/release-runbook.md)
+- [Versioning and signed releases](./docs/en/release/versioning.md)
 
 The full documentation index is in [docs/README.md](./docs/README.md).
 
@@ -27,12 +27,14 @@ The full documentation index is in [docs/README.md](./docs/README.md).
 
 Release builds are published through GitHub Actions from SemVer tags such as
 `v0.1.1`. The release workflow builds the Windows NSIS installer, writes a
-SHA256 checksum, generates a GitHub Artifact Attestation, and uploads the assets
-to the GitHub Release.
+SHA256 checksum, generates a GitHub Artifact Attestation when the repository
+visibility and plan support it, and uploads the assets to the GitHub Release.
 
-After downloading a release installer, verify its provenance:
+After downloading a release installer, verify its checksum and, when an
+attestation is present, its provenance:
 
 ```powershell
+Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.1_x64-setup.exe
 gh attestation verify .\AgentMux_0.1.1_x64-setup.exe --repo raeseoklee/agentmux
 ```
 

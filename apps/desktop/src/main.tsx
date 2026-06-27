@@ -5,6 +5,26 @@ import { AgentmuxTerminalApp } from "./agentmux/AgentmuxTerminalApp";
 import "./fonts.css";
 import "./styles.css";
 
+function allowsNativeContextMenu(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    target.closest("[data-agentmux-native-context-menu='true']") !== null
+  );
+}
+
+function installContextMenuGuard() {
+  window.addEventListener(
+    "contextmenu",
+    (event) => {
+      if (allowsNativeContextMenu(event.target)) {
+        return;
+      }
+      event.preventDefault();
+    },
+    { capture: true },
+  );
+}
+
 // The implemented design is the primary product UI. The original backend-wired
 // developer console remains reachable at "#console" (and is what the Playwright
 // UI tests target).
@@ -19,6 +39,8 @@ function Root() {
 
   return hash === "#console" ? <App /> : <AgentmuxTerminalApp />;
 }
+
+installContextMenuGuard();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

@@ -36,21 +36,21 @@ use agentmux_ipc::{
     AgentTelemetry, AppConfigActions, AppConfigAppearance, AppConfigCustomAction,
     AppConfigDiagnosticsEntry, AppConfigDiagnosticsParams, AppConfigDiagnosticsResult,
     AppConfigExportParams, AppConfigExportResult, AppConfigGetParams, AppConfigImportParams,
-    AppConfigMigrateProjectParams, AppConfigMigrateProjectResult, AppConfigNotifications,
-    AppConfigResetParams, AppConfigResult, AppConfigShortcuts, AppConfigUi, AppConfigUpdateParams,
-    BrowserActionResult, BrowserCheckParams, BrowserClickParams, BrowserConsoleMessageResult,
-    BrowserConsoleParams, BrowserConsoleResult, BrowserCookieResult, BrowserCookiesResult,
-    BrowserDiagnosticResult, BrowserDiagnosticsParams, BrowserDiagnosticsResult,
-    BrowserDialogMessageResult, BrowserDialogsParams, BrowserDialogsResult,
-    BrowserDomSnapshotParams, BrowserDomSnapshotResult, BrowserDownloadResult,
-    BrowserDownloadsParams, BrowserDownloadsResult, BrowserErrorEventResult, BrowserErrorsParams,
-    BrowserErrorsResult, BrowserEvaluateParams, BrowserEvaluateResult, BrowserFillParams,
-    BrowserFindParams, BrowserFindResult, BrowserFocusParams, BrowserFrameResult,
-    BrowserFramesResult, BrowserGetParams, BrowserGetResult, BrowserHighlightParams,
-    BrowserHistoryEntryResult, BrowserHistoryResult, BrowserHoverParams, BrowserNavigateParams,
-    BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams, BrowserScreenshotResult,
-    BrowserScrollParams, BrowserSelectParams, BrowserStorageEntryResult, BrowserStorageResult,
-    BrowserSurfaceParams, BrowserTypeParams, BrowserWaitForSelectorParams,
+    AppConfigLocale, AppConfigMigrateProjectParams, AppConfigMigrateProjectResult,
+    AppConfigNotifications, AppConfigResetParams, AppConfigResult, AppConfigShortcuts, AppConfigUi,
+    AppConfigUpdateParams, AppConfigUpdates, BrowserActionResult, BrowserCheckParams,
+    BrowserClickParams, BrowserConsoleMessageResult, BrowserConsoleParams, BrowserConsoleResult,
+    BrowserCookieResult, BrowserCookiesResult, BrowserDiagnosticResult, BrowserDiagnosticsParams,
+    BrowserDiagnosticsResult, BrowserDialogMessageResult, BrowserDialogsParams,
+    BrowserDialogsResult, BrowserDomSnapshotParams, BrowserDomSnapshotResult,
+    BrowserDownloadResult, BrowserDownloadsParams, BrowserDownloadsResult, BrowserErrorEventResult,
+    BrowserErrorsParams, BrowserErrorsResult, BrowserEvaluateParams, BrowserEvaluateResult,
+    BrowserFillParams, BrowserFindParams, BrowserFindResult, BrowserFocusParams,
+    BrowserFrameResult, BrowserFramesResult, BrowserGetParams, BrowserGetResult,
+    BrowserHighlightParams, BrowserHistoryEntryResult, BrowserHistoryResult, BrowserHoverParams,
+    BrowserNavigateParams, BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams,
+    BrowserScreenshotResult, BrowserScrollParams, BrowserSelectParams, BrowserStorageEntryResult,
+    BrowserStorageResult, BrowserSurfaceParams, BrowserTypeParams, BrowserWaitForSelectorParams,
     BrowserWaitForSelectorResult, BrowserZoomParams, ControlError, ControlPipeConnection,
     DiagnosticsBackendHealthResult, DiagnosticsExportResult, DiagnosticsOutputStreamResult,
     DiagnosticsQueuePressureResult, DockConfigResult, DockControlResult, DockGetParams,
@@ -282,6 +282,10 @@ struct AppConfigFile {
     format_version: String,
     #[serde(default = "default_app_config_appearance")]
     appearance: AppConfigAppearance,
+    #[serde(default = "default_app_config_locale")]
+    locale: AppConfigLocale,
+    #[serde(default = "default_app_config_updates")]
+    updates: AppConfigUpdates,
     #[serde(default)]
     shortcuts: AppConfigShortcuts,
     #[serde(default)]
@@ -5021,6 +5025,16 @@ impl DesktopControlState {
                 config.appearance.font_size = normalize_font_size(font_size)?;
             }
         }
+        if let Some(locale) = params.locale {
+            if let Some(language) = locale.language {
+                config.locale.language = normalize_locale_language(&language)?;
+            }
+        }
+        if let Some(updates) = params.updates {
+            if let Some(auto_check) = updates.auto_check {
+                config.updates.auto_check = auto_check;
+            }
+        }
         if let Some(shortcuts) = params.shortcuts {
             if let Some(mut bindings) = shortcuts.bindings {
                 normalize_shortcut_bindings(&mut bindings)?;
@@ -6310,6 +6324,8 @@ fn default_app_config() -> AppConfigFile {
     AppConfigFile {
         format_version: default_app_config_format_version(),
         appearance: default_app_config_appearance(),
+        locale: default_app_config_locale(),
+        updates: default_app_config_updates(),
         shortcuts: AppConfigShortcuts::default(),
         actions: AppConfigActions::default(),
         ui: AppConfigUi::default(),
@@ -6327,6 +6343,16 @@ fn default_app_config_appearance() -> AppConfigAppearance {
         accent_key: "blue".to_string(),
         font_size: 12.5,
     }
+}
+
+fn default_app_config_locale() -> AppConfigLocale {
+    AppConfigLocale {
+        language: "en".to_string(),
+    }
+}
+
+fn default_app_config_updates() -> AppConfigUpdates {
+    AppConfigUpdates { auto_check: true }
 }
 
 enum AppConfigScope {
@@ -6350,6 +6376,7 @@ fn normalize_app_config_file(config: &mut AppConfigFile) -> Result<(), DesktopHo
     config.appearance.theme = normalize_theme(&config.appearance.theme)?;
     config.appearance.accent_key = normalize_accent_key(&config.appearance.accent_key)?;
     config.appearance.font_size = normalize_font_size(config.appearance.font_size)?;
+    config.locale.language = normalize_locale_language(&config.locale.language)?;
     normalize_shortcut_bindings(&mut config.shortcuts.bindings)?;
     normalize_custom_actions(&mut config.actions.custom)?;
     normalize_app_config_ui(&mut config.ui)?;
@@ -6653,6 +6680,8 @@ fn export_app_config_json(config: &AppConfigResult) -> Result<String, DesktopHos
     let value = serde_json::json!({
         "format_version": config.format_version,
         "appearance": config.appearance,
+        "locale": config.locale,
+        "updates": config.updates,
         "shortcuts": config.shortcuts,
         "actions": config.actions,
         "ui": config.ui,
@@ -6685,6 +6714,8 @@ fn app_config_result(
         project_config_path,
         project_config_loaded,
         appearance: config.appearance,
+        locale: config.locale,
+        updates: config.updates,
         shortcuts: config.shortcuts,
         actions: config.actions,
         ui: config.ui,
@@ -7234,6 +7265,17 @@ fn normalize_font_size(value: f64) -> Result<f64, DesktopHostError> {
         )));
     }
     Ok(value.clamp(11.0, 16.0))
+}
+
+fn normalize_locale_language(value: &str) -> Result<String, DesktopHostError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "en" | "en-us" | "en_us" => Ok("en".to_string()),
+        "ko" | "ko-kr" | "ko_kr" => Ok("ko".to_string()),
+        other => Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!("Unsupported locale language '{other}'."),
+        ))),
+    }
 }
 
 fn normalize_shortcut_bindings(

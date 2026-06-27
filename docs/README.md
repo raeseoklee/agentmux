@@ -1,34 +1,15 @@
 # AgentMux Documentation
 
-This directory separates operational documents from development-only material.
-For `main`, publish the user and operations documents unless a release manager
-explicitly decides otherwise.
+The default documentation language is English.
 
-## User Documentation
+- [English documentation](./en/README.md)
+- [Korean documentation](./ko/README.md)
 
-- [Getting started](./user/getting-started.md)
-- [User manual](./user/manual.md)
-- [CLI guide](./user/cli.md)
-- [Troubleshooting](./user/troubleshooting.md)
+Repository documentation is organized by language:
 
-## Operations Documentation
+- `docs/en/**` contains the canonical English documentation.
+- `docs/ko/**` contains Korean translations, Korean originals, and legacy
+  Korean implementation notes.
 
-- [Operations overview](./operations/README.md)
-- [Release runbook](./operations/release-runbook.md)
-- [Main merge policy](./operations/main-merge-policy.md)
-- [Versioning and signed releases](./release/versioning.md)
-- [AgentMux config schema](./schemas/agentmux.config.schema.json)
-
-## Development-Only Documentation
-
-The following paths are useful while building AgentMux, but they should stay out
-of `main` unless they are intentionally promoted:
-
-- `docs/implementation/**`
-- `docs/implementation/evidence/**`
-- `docs/development/**`
-- `docs/ieee-*.md`
-- `docs/features.md`
-
-Use [main-merge-policy.md](./operations/main-merge-policy.md) when promoting
-only operational documentation from `develop` to `main`.
+When adding a new document, add the English version first and link any Korean
+translation from the matching Korean index.

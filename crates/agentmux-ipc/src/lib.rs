@@ -1459,6 +1459,16 @@ pub struct AppConfigAppearance {
     pub font_size: f64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigLocale {
+    pub language: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigUpdates {
+    pub auto_check: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AppConfigShortcuts {
     #[serde(default)]
@@ -1524,6 +1534,8 @@ pub struct AppConfigResult {
     pub project_config_path: Option<String>,
     pub project_config_loaded: bool,
     pub appearance: AppConfigAppearance,
+    pub locale: AppConfigLocale,
+    pub updates: AppConfigUpdates,
     pub shortcuts: AppConfigShortcuts,
     pub actions: AppConfigActions,
     pub ui: AppConfigUi,
@@ -1631,6 +1643,16 @@ pub struct AppConfigAppearanceUpdate {
     pub font_size: Option<f64>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigLocaleUpdate {
+    pub language: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppConfigUpdatesUpdate {
+    pub auto_check: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AppConfigShortcutsUpdate {
     pub bindings: Option<BTreeMap<String, serde_json::Value>>,
@@ -1649,6 +1671,8 @@ pub struct AppConfigUiUpdate {
 pub struct AppConfigUpdateParams {
     pub workspace_id: Option<String>,
     pub appearance: Option<AppConfigAppearanceUpdate>,
+    pub locale: Option<AppConfigLocaleUpdate>,
+    pub updates: Option<AppConfigUpdatesUpdate>,
     pub shortcuts: Option<AppConfigShortcutsUpdate>,
     pub ui: Option<AppConfigUiUpdate>,
 }

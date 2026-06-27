@@ -80,8 +80,8 @@ npm run tmux:reattach-smoke
 
 Evidence:
 
-- [summary.json](./evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/summary.json)
-- [summary](./evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/README.md)
+- [summary.json](../../implementation/evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/summary.json)
+- [summary](../../implementation/evidence/20260618-222707-IRAE-DESKTOP-real-tmux-reattach-smoke/README.md)
 
 ## Remaining Gap
 

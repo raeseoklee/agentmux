@@ -257,6 +257,16 @@ export interface AppConfigAppearance {
   fontSize: number;
 }
 
+export type AppLocaleLanguage = "en" | "ko";
+
+export interface AppConfigLocale {
+  language: AppLocaleLanguage;
+}
+
+export interface AppConfigUpdates {
+  autoCheck: boolean;
+}
+
 export type ShortcutBindingValue = string | [string, string] | null;
 
 export interface AppConfigShortcuts {
@@ -304,6 +314,8 @@ export interface AppConfig {
   projectConfigPath?: string | null;
   projectConfigLoaded: boolean;
   appearance: AppConfigAppearance;
+  locale: AppConfigLocale;
+  updates: AppConfigUpdates;
   shortcuts: AppConfigShortcuts;
   actions: AppConfigActions;
   ui: AppConfigUi;
@@ -352,6 +364,8 @@ export interface DockConfig {
 
 export interface AppConfigUpdate {
   appearance?: Partial<AppConfigAppearance>;
+  locale?: Partial<AppConfigLocale>;
+  updates?: Partial<AppConfigUpdates>;
   shortcuts?: {
     bindings?: Record<string, ShortcutBindingValue>;
   };
@@ -1542,6 +1556,16 @@ class TauriControlClient implements ControlClient {
             theme: update.appearance.theme,
             accent_key: update.appearance.accentKey,
             font_size: update.appearance.fontSize,
+          }
+        : undefined,
+      locale: update.locale
+        ? {
+            language: update.locale.language,
+          }
+        : undefined,
+      updates: update.updates
+        ? {
+            auto_check: update.updates.autoCheck,
           }
         : undefined,
       shortcuts: update.shortcuts
@@ -3361,6 +3385,14 @@ class BrowserPreviewControlClient implements ControlClient {
         ...current.appearance,
         ...(update.appearance ?? {}),
       },
+      locale: {
+        ...current.locale,
+        ...(update.locale ?? {}),
+      },
+      updates: {
+        ...current.updates,
+        ...(update.updates ?? {}),
+      },
       shortcuts: {
         bindings: {
           ...current.shortcuts.bindings,
@@ -4429,6 +4461,12 @@ class BrowserPreviewControlClient implements ControlClient {
         accentKey: "blue",
         fontSize: 12.5,
       },
+      locale: {
+        language: "en",
+      },
+      updates: {
+        autoCheck: true,
+      },
       shortcuts: {
         bindings: {},
       },
@@ -4456,6 +4494,8 @@ class BrowserPreviewControlClient implements ControlClient {
     try {
       const parsed = JSON.parse(raw) as Partial<AppConfig>;
       const appearance: Partial<AppConfigAppearance> = parsed.appearance ?? {};
+      const locale: Partial<AppConfigLocale> = parsed.locale ?? {};
+      const updates: Partial<AppConfigUpdates> = parsed.updates ?? {};
       const shortcuts = parsed.shortcuts ?? fallback.shortcuts;
       const actions = parsed.actions ?? fallback.actions;
       const ui = parsed.ui ?? fallback.ui;
@@ -4480,6 +4520,15 @@ class BrowserPreviewControlClient implements ControlClient {
             Number.isFinite(appearance.fontSize)
               ? Math.min(16, Math.max(11, appearance.fontSize))
               : fallback.appearance.fontSize,
+        },
+        locale: {
+          language: normalizeAppLanguage(locale.language),
+        },
+        updates: {
+          autoCheck:
+            typeof updates.autoCheck === "boolean"
+              ? updates.autoCheck
+              : fallback.updates.autoCheck,
         },
         shortcuts: {
           bindings: sanitizeShortcutBindings(shortcuts.bindings),
@@ -5883,6 +5932,12 @@ interface AppConfigWire {
     accent_key: string;
     font_size: number;
   };
+  locale?: {
+    language?: string | null;
+  };
+  updates?: {
+    auto_check?: boolean | null;
+  };
   shortcuts?: {
     bindings?: Record<string, ShortcutBindingValue>;
   };
@@ -6056,6 +6111,15 @@ function normalizeTerminalProfile(
   return value === "wsl" || value === "powershell" || value === "cmd"
     ? value
     : null;
+}
+
+function normalizeAppLanguage(
+  value: string | null | undefined,
+): AppLocaleLanguage {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === "ko" || normalized === "ko-kr" || normalized === "ko_kr"
+    ? "ko"
+    : "en";
 }
 
 function mapWorkspaceGroup(value: WorkspaceGroupWire): WorkspaceGroup {
@@ -6260,6 +6324,12 @@ function mapAppConfig(value: AppConfigWire): AppConfig {
       accentKey: value.appearance.accent_key,
       fontSize: value.appearance.font_size,
     },
+    locale: {
+      language: normalizeAppLanguage(value.locale?.language),
+    },
+    updates: {
+      autoCheck: value.updates?.auto_check ?? true,
+    },
     shortcuts: {
       bindings: sanitizeShortcutBindings(value.shortcuts?.bindings),
     },
@@ -6355,6 +6425,12 @@ function appConfigExportSnapshot(
       theme: config.appearance.theme,
       accent_key: config.appearance.accentKey,
       font_size: config.appearance.fontSize,
+    },
+    locale: {
+      language: config.locale.language,
+    },
+    updates: {
+      auto_check: config.updates.autoCheck,
     },
     ...shared,
   };
@@ -6480,6 +6556,14 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
     raw.ui && typeof raw.ui === "object"
       ? (raw.ui as Record<string, unknown>)
       : {};
+  const locale =
+    raw.locale && typeof raw.locale === "object"
+      ? (raw.locale as Record<string, unknown>)
+      : {};
+  const updates =
+    raw.updates && typeof raw.updates === "object"
+      ? (raw.updates as Record<string, unknown>)
+      : {};
   const notifications =
     raw.notifications && typeof raw.notifications === "object"
       ? (raw.notifications as Record<string, unknown>)
@@ -6488,6 +6572,7 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
     "format_version" in raw ||
     "project_config_loaded" in raw ||
     "project_config_path" in raw ||
+    "auto_check" in updates ||
     "accent_key" in appearance ||
     "font_size" in appearance ||
     "workspace_plus_action" in ui ||
@@ -6520,6 +6605,15 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
           : "blue",
       fontSize:
         typeof appearance.font_size === "number" ? appearance.font_size : 12.5,
+    },
+    locale: {
+      language: normalizeAppLanguage(
+        typeof locale.language === "string" ? locale.language : null,
+      ),
+    },
+    updates: {
+      autoCheck:
+        typeof updates.auto_check === "boolean" ? updates.auto_check : true,
     },
     shortcuts: raw.shortcuts as AppConfigShortcuts | undefined,
     actions: raw.actions as AppConfigActions | undefined,

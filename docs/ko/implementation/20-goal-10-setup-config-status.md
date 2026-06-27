@@ -84,7 +84,7 @@ This document records the first implementation slice for Goal 10 from the cmux W
 - Settings > General shows the same config diagnostics rows, so invalid JSON or
   ignored `.cmux` fallback state is visible in the app.
 - A published JSON Schema is available at
-  `docs/schemas/agentmux.config.schema.json` for global and project config
+  `docs/en/schemas/agentmux.config.schema.json` for global and project config
   files.
 - The CLI exposes the same schema as `agentmux config schema`, with optional
   `--output <path>` and `--json` support for editor/tool setup scripts.
