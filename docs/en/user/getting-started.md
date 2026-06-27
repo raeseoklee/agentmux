@@ -20,6 +20,10 @@
 3. Run the installer.
 4. Launch AgentMux from the Start menu.
 
+Packaged AgentMux builds check GitHub Releases for updates at startup. Open
+Settings > General > Updates to check manually, install an available update, or
+disable automatic checks.
+
 ## First Run
 
 1. Create or open a workspace.

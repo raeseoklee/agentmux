@@ -46,6 +46,22 @@ test("design boots without a default workspace and can create one", async ({ pag
   await expect(page.locator(".agentmux-workspace-filter-input")).toBeVisible();
 });
 
+test("browser default context menu is suppressed globally", async ({ page }) => {
+  await bootPreview(page);
+
+  const canceled = await page.evaluate(() => {
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 24,
+      clientY: 24,
+    });
+    return !document.body.dispatchEvent(event) || event.defaultPrevented;
+  });
+
+  expect(canceled).toBe(true);
+});
+
 test("status bar shows git branch and short hash", async ({ page }) => {
   await bootPreview(page);
 

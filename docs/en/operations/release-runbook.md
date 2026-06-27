@@ -19,6 +19,27 @@ npm run docs:check
 For a full local installer smoke, build the NSIS installer and verify the output
 before tagging.
 
+## Updater Signing Setup
+
+AgentMux uses the Tauri updater with GitHub Releases as the static update
+endpoint. No separate update server is required for the default release channel.
+
+Generate a Tauri updater keypair once and store the private key outside the
+repository:
+
+```powershell
+npm --prefix apps/desktop exec -- tauri signer generate -- -w "$env:USERPROFILE\.tauri\agentmux.key"
+```
+
+Configure GitHub before publishing a release:
+
+- Repository variable `TAURI_UPDATER_PUBLIC_KEY`: the public key printed by the
+  signer command. This value is embedded in the app and is safe to share.
+- Repository secret `TAURI_SIGNING_PRIVATE_KEY`: the private key content or path
+  used by CI to sign updater artifacts. Never commit this value.
+- Repository secret `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: optional password for
+  the private key.
+
 ## Bump Version
 
 Set the next SemVer version:
@@ -50,10 +71,12 @@ The `release` GitHub Actions workflow will:
 1. Check that the tag and source version match.
 2. Install desktop dependencies.
 3. Build release sidecars.
-4. Build the Windows NSIS installer.
-5. Generate a SHA256 file.
-6. Generate a GitHub Artifact Attestation when available.
-7. Publish the installer and checksum to the GitHub Release.
+4. Merge the updater release config from GitHub variables.
+5. Build the Windows NSIS installer and Tauri updater archive/signature.
+6. Generate a SHA256 file and `latest.json` updater manifest.
+7. Generate a GitHub Artifact Attestation when available.
+8. Publish the installer, checksum, updater archive, updater signature, and
+   `latest.json` to the GitHub Release.
 
 ## Verify Published Release
 
@@ -74,6 +97,14 @@ Get-Content .\AgentMux_0.1.1_x64-setup.exe.sha256
 ```
 
 The hashes must match.
+
+The packaged app checks:
+
+```text
+https://github.com/raeseoklee/agentmux/releases/latest/download/latest.json
+```
+
+Users can disable startup update checks from Settings > General > Updates.
 
 ## Promote Operational Docs to main
 

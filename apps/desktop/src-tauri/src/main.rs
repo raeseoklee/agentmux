@@ -190,6 +190,8 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             notification_state.set_desktop_notification_adapter(Arc::new(
                 TauriDesktopNotificationAdapter {

@@ -48,6 +48,8 @@ states visible and recoverable from one application.
 
 - Windows NSIS installer builds through GitHub Actions.
 - SHA256 checksums and GitHub Release uploads.
+- Tauri updater artifacts and `latest.json` are published to GitHub Releases so
+  packaged desktop apps can check for updates without a separate update server.
 - GitHub Artifact Attestations are generated when the repository visibility and
   plan support them.
 

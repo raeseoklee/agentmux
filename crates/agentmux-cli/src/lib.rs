@@ -13937,6 +13937,7 @@ where
         "appearance\t{}\t{}\t{}",
         config.appearance.theme, config.appearance.accent_key, config.appearance.font_size
     )?;
+    writeln!(output, "locale\t{}", config.locale.language)?;
     writeln!(output, "shortcuts\t{}", config.shortcuts.bindings.len())?;
     for (action_id, binding) in &config.shortcuts.bindings {
         let binding_json = serde_json::to_string(binding)

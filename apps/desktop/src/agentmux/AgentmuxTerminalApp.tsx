@@ -11,6 +11,10 @@ import {
   useRef,
   useState,
 } from "react";
+import type {
+  DownloadEvent,
+  Update as TauriUpdate,
+} from "@tauri-apps/plugin-updater";
 import "./agentmux.css";
 import type {
   AgentState,
@@ -18,6 +22,7 @@ import type {
   AppConfigCustomAction,
   AppConfigDiagnosticEntry,
   AppConfigNotificationAction,
+  AppConfigUpdates,
   AppConfigUi,
   ControlClient,
   DockControl,
@@ -35,6 +40,7 @@ import type {
   TmuxDiagnostics,
   AppConfig,
   AppConfigScope,
+  AppLocaleLanguage,
   WorkspaceGroup,
   WorkspaceUpdateInput,
   WorkspaceDetail,
@@ -97,6 +103,11 @@ import {
   watchMaximized,
 } from "./windowControls";
 import { initZoom, nudgeZoom, resetZoom, ZOOM_STEP } from "./uiZoom";
+import {
+  createTranslator,
+  SUPPORTED_LANGUAGES,
+  type Translator,
+} from "./i18n";
 
 type Overlay = "palette" | "search" | "settings" | "setup" | null;
 type SettingsTab =
@@ -108,6 +119,68 @@ type SettingsTab =
   | "diagnostics";
 
 const SSH_UI_ENABLED = false;
+
+type AppUpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "not_available"
+  | "downloading"
+  | "installed"
+  | "error"
+  | "unsupported";
+
+interface AppUpdateState {
+  status: AppUpdateStatus;
+  currentVersion?: string | null;
+  version?: string | null;
+  date?: string | null;
+  body?: string | null;
+  message?: string | null;
+  downloadedBytes?: number;
+  contentLength?: number | null;
+  lastCheckedAt?: string | null;
+}
+
+const DEFAULT_UPDATES_CONFIG: AppConfigUpdates = {
+  autoCheck: true,
+};
+
+const DEFAULT_UPDATE_STATE: AppUpdateState = {
+  status: "idle",
+  lastCheckedAt: null,
+};
+
+function isTauriDesktopRuntime(): boolean {
+  const runtime = window as Window & {
+    __TAURI__?: { core?: { invoke?: unknown } };
+    __TAURI_INTERNALS__?: unknown;
+  };
+  return Boolean(runtime.__TAURI__?.core?.invoke || runtime.__TAURI_INTERNALS__);
+}
+
+function updateErrorMessage(cause: unknown): string {
+  if (cause instanceof Error && cause.message.trim()) {
+    return cause.message;
+  }
+  if (typeof cause === "string" && cause.trim()) {
+    return cause;
+  }
+  return "unknown updater error";
+}
+
+function updateProgressText(state: AppUpdateState): string {
+  const downloaded = state.downloadedBytes ?? 0;
+  const total = state.contentLength ?? 0;
+  if (total > 0) {
+    const pct = Math.max(0, Math.min(100, Math.round((downloaded / total) * 100)));
+    return `${pct}%`;
+  }
+  if (downloaded > 0) {
+    return `${Math.round(downloaded / 1024)} KB`;
+  }
+  return "";
+}
 
 interface PaletteItem {
   id: string;
@@ -1078,6 +1151,7 @@ interface PaneViewProps {
   terminalInnerMargin: number;
   fontSize: number;
   terminalLaunchPending: boolean;
+  t: Translator;
   focusPane: (paneId: string) => void;
   splitPaneBy: (paneId: string, axis: "horizontal" | "vertical") => void;
   closePane: (paneId: string) => void;
@@ -1120,6 +1194,7 @@ const PaneView = memo(function PaneView({
   terminalInnerMargin,
   fontSize,
   terminalLaunchPending,
+  t,
   focusPane,
   splitPaneBy,
   closePane,
@@ -1362,7 +1437,7 @@ const PaneView = memo(function PaneView({
             >
               <span className="agentmux-term-booting-spinner" />
               <span style={{ font: `600 12px/1 ${FONT_SANS}` }}>
-                에이전트 세션 복원 중…
+                {t("pane.restoring")}
               </span>
               <span
                 style={{
@@ -1389,7 +1464,9 @@ const PaneView = memo(function PaneView({
                 color: "var(--fg4)",
               }}
             >
-              <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>빈 페인</span>
+              <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>
+                {t("pane.empty")}
+              </span>
               <button
                 type="button"
                 disabled={terminalLaunchPending}
@@ -1495,6 +1572,7 @@ export function AgentmuxTerminalApp() {
   } = ctl;
 
   const [theme, setTheme] = useState<ThemeName>("dark");
+  const [language, setLanguage] = useState<AppLocaleLanguage>("en");
   const [accentKey, setAccentKey] = useState("blue");
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("appearance");
@@ -1527,6 +1605,12 @@ export function AgentmuxTerminalApp() {
     [],
   );
   const [uiConfig, setUiConfig] = useState<AppConfigUi>({});
+  const [updatesConfig, setUpdatesConfig] = useState<AppConfigUpdates>(
+    DEFAULT_UPDATES_CONFIG,
+  );
+  const [updateState, setUpdateState] = useState<AppUpdateState>(
+    DEFAULT_UPDATE_STATE,
+  );
   const [notificationActions, setNotificationActions] = useState<
     AppConfigNotificationAction[]
   >([]);
@@ -1578,6 +1662,8 @@ export function AgentmuxTerminalApp() {
     null,
   );
   const terminalLaunchPendingRef = useRef(false);
+  const autoUpdateCheckStartedRef = useRef(false);
+  const updateResourceRef = useRef<TauriUpdate | null>(null);
   const pendingShortcutRef = useRef<string | null>(null);
   const pendingShortcutTimerRef = useRef<number | null>(null);
   const confirmResolverRef = useRef<((confirmed: boolean) => void) | null>(
@@ -1592,6 +1678,8 @@ export function AgentmuxTerminalApp() {
         : "blue",
     );
     setFontSize(Math.min(16, Math.max(11, config.appearance.fontSize)));
+    setLanguage(config.locale.language);
+    setUpdatesConfig(config.updates ?? DEFAULT_UPDATES_CONFIG);
     setShortcutOverrides(config.shortcuts.bindings);
     setCustomActions(config.actions.custom);
     setUiConfig(config.ui ?? {});
@@ -1683,7 +1771,38 @@ export function AgentmuxTerminalApp() {
       .catch(() => undefined);
   }, [accentKey, activeWorkspaceId, client, configLoaded, fontSize, theme]);
 
+  useEffect(() => {
+    if (!configLoaded) {
+      return;
+    }
+    void client
+      .updateConfig(
+        {
+          locale: {
+            language,
+          },
+        },
+        activeWorkspaceId,
+      )
+      .catch(() => undefined);
+  }, [activeWorkspaceId, client, configLoaded, language]);
+
+  useEffect(() => {
+    if (!configLoaded) {
+      return;
+    }
+    void client
+      .updateConfig(
+        {
+          updates: updatesConfig,
+        },
+        activeWorkspaceId,
+      )
+      .catch(() => undefined);
+  }, [activeWorkspaceId, client, configLoaded, updatesConfig]);
+
   const T = THEMES[theme];
+  const t = useMemo(() => createTranslator(language), [language]);
   const accent = ACCENTS.find((a) => a.key === accentKey) ?? ACCENTS[0];
   const isDark = theme === "dark";
   const closeOverlay = useCallback(() => setOverlay(null), []);
@@ -1702,11 +1821,11 @@ export function AgentmuxTerminalApp() {
       confirmResolverRef.current = resolve;
       setConfirmDialog({
         ...options,
-        cancelLabel: options.cancelLabel ?? "Cancel",
+        cancelLabel: options.cancelLabel ?? t("common.cancel"),
         variant: options.variant ?? "default",
       });
     });
-  }, []);
+  }, [t]);
   useEffect(
     () => () => {
       confirmResolverRef.current?.(false);
@@ -1714,6 +1833,132 @@ export function AgentmuxTerminalApp() {
     },
     [],
   );
+  useEffect(
+    () => () => {
+      void updateResourceRef.current?.close().catch(() => undefined);
+      updateResourceRef.current = null;
+    },
+    [],
+  );
+  const setAutoUpdateCheck = useCallback((autoCheck: boolean) => {
+    setUpdatesConfig((current) => ({ ...current, autoCheck }));
+  }, []);
+  const checkForUpdates = useCallback(
+    async (options: { background?: boolean } = {}) => {
+      const background = options.background ?? false;
+      if (!isTauriDesktopRuntime()) {
+        if (!background) {
+          setUpdateState({
+            status: "unsupported",
+            lastCheckedAt: new Date().toISOString(),
+          });
+        }
+        return null;
+      }
+
+      try {
+        if (!background) {
+          setUpdateState((current) => ({
+            ...current,
+            status: "checking",
+            message: null,
+          }));
+        }
+        const updater = await import("@tauri-apps/plugin-updater");
+        await updateResourceRef.current?.close().catch(() => undefined);
+        updateResourceRef.current = null;
+        const update = await updater.check({ timeout: 15_000 });
+        const checkedAt = new Date().toISOString();
+        if (!update) {
+          setUpdateState({
+            status: "not_available",
+            lastCheckedAt: checkedAt,
+          });
+          return null;
+        }
+        updateResourceRef.current = update;
+        setUpdateState({
+          status: "available",
+          currentVersion: update.currentVersion,
+          version: update.version,
+          date: update.date ?? null,
+          body: update.body ?? null,
+          lastCheckedAt: checkedAt,
+        });
+        return update;
+      } catch (cause) {
+        if (!background) {
+          setUpdateState({
+            status: "error",
+            message: updateErrorMessage(cause),
+            lastCheckedAt: new Date().toISOString(),
+          });
+        }
+        return null;
+      }
+    },
+    [],
+  );
+  const installAvailableUpdate = useCallback(async () => {
+    try {
+      let update = updateResourceRef.current;
+      if (!update) {
+        update = await checkForUpdates();
+      }
+      if (!update) {
+        return;
+      }
+
+      let downloadedBytes = 0;
+      let contentLength: number | null = null;
+      setUpdateState((current) => ({
+        ...current,
+        status: "downloading",
+        message: null,
+        downloadedBytes,
+        contentLength,
+      }));
+      await update.downloadAndInstall((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          downloadedBytes = 0;
+          contentLength = event.data.contentLength ?? null;
+        } else if (event.event === "Progress") {
+          downloadedBytes += event.data.chunkLength;
+        }
+        setUpdateState((current) => ({
+          ...current,
+          status: "downloading",
+          downloadedBytes,
+          contentLength,
+        }));
+      });
+      await update.close().catch(() => undefined);
+      updateResourceRef.current = null;
+      setUpdateState((current) => ({
+        ...current,
+        status: "installed",
+      }));
+      const process = await import("@tauri-apps/plugin-process");
+      await process.relaunch();
+    } catch (cause) {
+      setUpdateState((current) => ({
+        ...current,
+        status: "error",
+        message: updateErrorMessage(cause),
+      }));
+    }
+  }, [checkForUpdates]);
+  useEffect(() => {
+    if (
+      !configLoaded ||
+      !updatesConfig.autoCheck ||
+      autoUpdateCheckStartedRef.current
+    ) {
+      return;
+    }
+    autoUpdateCheckStartedRef.current = true;
+    void checkForUpdates({ background: true });
+  }, [checkForUpdates, configLoaded, updatesConfig.autoCheck]);
   const reloadConfig = useCallback(async () => {
     try {
       const config = await client.reloadConfig(activeWorkspaceId);
@@ -1785,8 +2030,8 @@ export function AgentmuxTerminalApp() {
       if (
         !window.confirm(
           scope === "project"
-            ? "Reset project AgentMux config?"
-            : "Reset global AgentMux config?",
+            ? t("config.resetProjectConfirm")
+            : t("config.resetGlobalConfirm"),
         )
       ) {
         return;
@@ -1807,7 +2052,7 @@ export function AgentmuxTerminalApp() {
         );
       }
     },
-    [activeWorkspaceId, applyConfig, client, refreshConfigDiagnostics],
+    [activeWorkspaceId, applyConfig, client, refreshConfigDiagnostics, t],
   );
   const migrateProjectConfig = useCallback(async () => {
     try {
@@ -3747,7 +3992,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "app.commandPalette",
         group: "view",
-        title: "명령 팔레트",
+        title: t("app.commandPalette.open"),
         visibleInPalette: false,
         run: () => {
           setOverlay("palette");
@@ -3758,7 +4003,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "app.commandPalette.legacy",
         group: "view",
-        title: "명령 팔레트",
+        title: t("app.commandPalette.open"),
         visibleInPalette: false,
         run: () => {
           setOverlay("palette");
@@ -3884,7 +4129,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "workspace.new",
         group: "workspace",
-        title: "새 워크스페이스",
+        title: t("workspace.add"),
         keywords: ["workspace"],
         run: () => {
           void createWorkspace();
@@ -3905,7 +4150,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "view.toggleTheme",
         group: "view",
-        title: "테마 전환 (다크 / 라이트)",
+        title: `${t("settings.theme")}: ${t("appearance.dark")} / ${t("appearance.light")}`,
         keywords: ["theme", "dark", "light"],
         run: () => {
           setTheme(isDark ? "light" : "dark");
@@ -3915,7 +4160,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "app.settings",
         group: "view",
-        title: "설정 열기",
+        title: t("app.settings.open"),
         keywords: ["settings"],
         run: () => setOverlay("settings"),
       },
@@ -3936,7 +4181,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "app.search",
         group: "view",
-        title: "활성 창에서 검색",
+        title: t("app.search.activeWindow"),
         keywords: ["find", "search"],
         run: () => setOverlay("search"),
       },
@@ -3960,6 +4205,7 @@ export function AgentmuxTerminalApp() {
       openTextBoxComposer,
       promptCustomAgent,
       splitPaneBy,
+      t,
       workspaceActionDescriptors,
       wslActionDescriptors,
     ],
@@ -4253,7 +4499,7 @@ export function AgentmuxTerminalApp() {
     if (visited.has(paneId)) {
       return (
         <div key={`${paneId}-cycle`} className="agentmux-empty-pane">
-          Invalid pane layout
+          {t("pane.invalidLayout")}
         </div>
       );
     }
@@ -4336,11 +4582,11 @@ export function AgentmuxTerminalApp() {
       ? (agentState?.telemetry ?? null)
       : null;
     const isBrowser = surface?.surfaceType === "browser";
-    const title = surface?.title ?? "빈 페인";
+    const title = surface?.title ?? t("pane.empty");
     const dot = restoringAgent
       ? "var(--accent)"
       : sessionDotColor(T, session, hasAttention);
-    const label = restoringAgent ? "복원 중" : sessionLabel(session, hasAttention);
+    const label = restoringAgent ? t("pane.restoring") : sessionLabel(session, hasAttention);
 
       return (
       <PaneView
@@ -4362,6 +4608,7 @@ export function AgentmuxTerminalApp() {
         terminalInnerMargin={terminalInnerMargin}
         fontSize={fontSize}
         terminalLaunchPending={terminalLaunchPending}
+        t={t}
         focusPane={focusPaneStable}
         splitPaneBy={splitPaneBy}
         closePane={closePaneStable}
@@ -4415,8 +4662,8 @@ export function AgentmuxTerminalApp() {
         >
           <Hov
             tag="button"
-            ariaLabel="사이드바 접기/펼치기"
-            title="사이드바 접기/펼치기 (⌘B)"
+            ariaLabel={t("app.sidebar.toggle")}
+            title={`${t("app.sidebar.toggle")} (⌘B)`}
             style={{
               ...iconBtn,
               marginRight: 6,
@@ -4485,13 +4732,13 @@ export function AgentmuxTerminalApp() {
             onClick={() => setTheme(isDark ? "light" : "dark")}
           >
             {isDark ? <IconMoon /> : <IconSun />}
-            {isDark ? "다크" : "라이트"}
+            {isDark ? t("appearance.dark") : t("appearance.light")}
           </Hov>
           {activeRootIsSplit ? (
             <Hov
               tag="button"
-              ariaLabel="분할 페인 균등 정렬"
-              title="분할 페인 균등 정렬 — 현재 탭의 분할 비율을 모두 50:50으로"
+              ariaLabel={t("app.panes.balance")}
+              title={t("app.panes.balance")}
               style={{ ...iconBtn, marginRight: 2 }}
               hover={iconBtnHover}
               onClick={balanceActivePanes}
@@ -4501,8 +4748,8 @@ export function AgentmuxTerminalApp() {
           ) : null}
           <Hov
             tag="button"
-            ariaLabel="활성 창에서 검색"
-            title="활성 창에서 검색 (⌘P)"
+            ariaLabel={t("app.search.activeWindow")}
+            title={`${t("app.search.activeWindow")} (⌘P)`}
             style={{ ...iconBtn, marginRight: 2 }}
             hover={iconBtnHover}
             onClick={() => setOverlay("search")}
@@ -4511,6 +4758,8 @@ export function AgentmuxTerminalApp() {
           </Hov>
           <Hov
             tag="button"
+            ariaLabel={t("app.commandPalette.open")}
+            title={t("app.commandPalette.open")}
             style={{ ...iconBtn, marginRight: 2 }}
             hover={iconBtnHover}
             onClick={() => {
@@ -4523,6 +4772,8 @@ export function AgentmuxTerminalApp() {
           <Hov
             tag="button"
             className="agentmux-settings-open"
+            ariaLabel={t("app.settings.open")}
+            title={t("app.settings.open")}
             style={iconBtn}
             hover={iconBtnHover}
             onClick={() => setOverlay("settings")}
@@ -4541,8 +4792,8 @@ export function AgentmuxTerminalApp() {
           >
             <Hov
               tag="button"
-              ariaLabel="최소화"
-              title="최소화"
+              ariaLabel={t("app.window.minimize")}
+              title={t("app.window.minimize")}
               style={winCtlBtn}
               hover={winCtlBtnHover}
               onClick={minimizeWindow}
@@ -4551,8 +4802,16 @@ export function AgentmuxTerminalApp() {
             </Hov>
             <Hov
               tag="button"
-              ariaLabel={windowMaximized ? "이전 크기로 복원" : "최대화"}
-              title={windowMaximized ? "이전 크기로 복원" : "최대화"}
+              ariaLabel={
+                windowMaximized
+                  ? t("app.window.restore")
+                  : t("app.window.maximize")
+              }
+              title={
+                windowMaximized
+                  ? t("app.window.restore")
+                  : t("app.window.maximize")
+              }
               style={winCtlBtn}
               hover={winCtlBtnHover}
               onClick={toggleMaximizeWindow}
@@ -4561,8 +4820,8 @@ export function AgentmuxTerminalApp() {
             </Hov>
             <Hov
               tag="button"
-              ariaLabel="닫기"
-              title="닫기"
+              ariaLabel={t("app.window.close")}
+              title={t("app.window.close")}
               style={winCtlBtn}
               hover={{ background: "#e81123", color: "#fff" }}
               onClick={closeWindow}
@@ -4599,7 +4858,7 @@ export function AgentmuxTerminalApp() {
                 padding: "8px 14px 6px",
               }}
             >
-              워크스페이스
+              {t("workspace.section")}
             </div>
             <div
               style={{
@@ -4628,8 +4887,8 @@ export function AgentmuxTerminalApp() {
               <IconSearch size={13} />
               <input
                 className="agentmux-workspace-filter-input"
-                aria-label="Filter workspaces"
-                placeholder="Filter workspaces"
+                aria-label={t("workspace.filter")}
+                placeholder={t("workspace.filter")}
                 value={workspaceFilterText}
                 onChange={(event) =>
                   setWorkspaceFilterText(event.currentTarget.value)
@@ -4654,8 +4913,8 @@ export function AgentmuxTerminalApp() {
                 <Hov
                   tag="button"
                   className="agentmux-workspace-filter-clear"
-                  ariaLabel="Clear workspace filter"
-                  title="Clear"
+                  ariaLabel={t("common.clear")}
+                  title={t("common.clear")}
                   style={{
                     width: 20,
                     height: 20,
@@ -4678,8 +4937,8 @@ export function AgentmuxTerminalApp() {
               <Hov
                 tag="button"
                 className="agentmux-workspace-plus"
-                ariaLabel="워크스페이스 추가"
-                title="워크스페이스 추가"
+                ariaLabel={t("workspace.add")}
+                title={t("workspace.add")}
                 style={{
                   width: 32,
                   height: 32,
@@ -4706,8 +4965,8 @@ export function AgentmuxTerminalApp() {
               <Hov
                 tag="button"
                 className="agentmux-workspace-group-create"
-                ariaLabel="그룹 추가"
-                title="그룹 추가"
+                ariaLabel={t("workspace.createGroup")}
+                title={t("workspace.createGroup")}
                 style={{
                   width: 32,
                   height: 32,
@@ -4761,13 +5020,15 @@ export function AgentmuxTerminalApp() {
                       textOverflow: "ellipsis",
                     }}
                   >
-                    {selectedWorkspaceCount}개 선택
+                    {t("workspace.selectedCount", {
+                      count: selectedWorkspaceCount,
+                    })}
                   </span>
                   <Hov
                     tag="button"
                     className="agentmux-workspace-selection-create-group"
-                    ariaLabel="선택 항목으로 그룹 만들기"
-                    title="선택 항목으로 그룹 만들기"
+                    ariaLabel={t("workspace.createGroupFromSelection")}
+                    title={t("workspace.createGroupFromSelection")}
                     style={groupActionBtn}
                     hover={groupActionHover}
                     onClick={() => {
@@ -4779,8 +5040,8 @@ export function AgentmuxTerminalApp() {
                   <Hov
                     tag="button"
                     className="agentmux-workspace-selection-clear"
-                    ariaLabel="선택 해제"
-                    title="선택 해제"
+                    ariaLabel={t("workspace.clearSelection")}
+                    title={t("workspace.clearSelection")}
                     style={groupActionBtn}
                     hover={groupActionHover}
                     onClick={clearWorkspaceSelection}
@@ -4883,8 +5144,8 @@ export function AgentmuxTerminalApp() {
                       <Hov
                         tag="button"
                         className="agentmux-workspace-group-new-workspace"
-                        ariaLabel={`${group.name}에 워크스페이스 추가`}
-                        title="그룹 안에 워크스페이스 추가"
+                        ariaLabel={`${group.name}: ${t("workspace.group.addWorkspace")}`}
+                        title={t("workspace.group.addWorkspace")}
                         style={groupActionBtn}
                         hover={groupActionHover}
                         onClick={(event) => {
@@ -4897,8 +5158,8 @@ export function AgentmuxTerminalApp() {
                       <Hov
                         tag="button"
                         className="agentmux-workspace-group-move-up"
-                        ariaLabel={`${group.name} 위로 이동`}
-                        title="그룹 위로 이동"
+                        ariaLabel={`${group.name}: ${t("workspace.group.moveUp")}`}
+                        title={t("workspace.group.moveUp")}
                         style={groupActionBtn}
                         hover={groupActionHover}
                         onClick={(event) => {
@@ -4911,8 +5172,8 @@ export function AgentmuxTerminalApp() {
                       <Hov
                         tag="button"
                         className="agentmux-workspace-group-move-down"
-                        ariaLabel={`${group.name} 아래로 이동`}
-                        title="그룹 아래로 이동"
+                        ariaLabel={`${group.name}: ${t("workspace.group.moveDown")}`}
+                        title={t("workspace.group.moveDown")}
                         style={groupActionBtn}
                         hover={groupActionHover}
                         onClick={(event) => {
@@ -4945,11 +5206,15 @@ export function AgentmuxTerminalApp() {
                               ? "agentmux-workspace-group-add-selected"
                               : "agentmux-workspace-group-add-active"
                           }
-                          ariaLabel={`${group.name}에 ${selectedWorkspaceCount > 0 ? "선택 워크스페이스" : "현재 워크스페이스"} 추가`}
+                          ariaLabel={`${group.name}: ${
+                            selectedWorkspaceCount > 0
+                              ? t("workspace.addSelectedToGroup")
+                              : t("workspace.addToGroup")
+                          }`}
                           title={
                             selectedWorkspaceCount > 0
-                              ? "선택 워크스페이스를 그룹에 추가"
-                              : "현재 워크스페이스를 그룹에 추가"
+                              ? t("workspace.addSelectedToGroup")
+                              : t("workspace.addToGroup")
                           }
                           style={groupActionBtn}
                           hover={groupActionHover}
@@ -5153,7 +5418,7 @@ export function AgentmuxTerminalApp() {
                     padding: "6px 6px",
                   }}
                 >
-                  워크스페이스가 없습니다.
+                  {t("workspace.none")}
                 </div>
               ) : null}
 
@@ -5258,7 +5523,9 @@ export function AgentmuxTerminalApp() {
               onClick={() => setOverlay("settings")}
             >
               <IconGear size={14} />
-              <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>설정</span>
+              <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>
+                {t("common.settings")}
+              </span>
             </Hov>
           </div>
 
@@ -6264,8 +6531,8 @@ export function AgentmuxTerminalApp() {
               }}
             >
               {error
-                ? "오류"
-                : sessionLabel(activeSessionState, false) || "대기"}
+                ? t("common.invalid")
+                : sessionLabel(activeSessionState, false) || t("common.idle")}
             </span>
           </div>
         </div>
@@ -6282,9 +6549,12 @@ export function AgentmuxTerminalApp() {
             onMoveSelection={movePaletteSelection}
             onRunSelected={runSelectedPaletteItem}
             stop={stop}
+            t={t}
           />
         ) : null}
-        {overlay === "search" ? <SearchOverlay onClose={closeOverlay} /> : null}
+        {overlay === "search" ? (
+          <SearchOverlay onClose={closeOverlay} t={t} />
+        ) : null}
         {overlay === "setup" ? (
           <SetupModal
             activeWorkspace={activeWorkspace ?? null}
@@ -6303,11 +6573,14 @@ export function AgentmuxTerminalApp() {
         {overlay === "settings" ? (
           <SettingsModal
             isDark={isDark}
+            language={language}
             accentKey={accentKey}
             fontSize={fontSize}
             terminalInnerMargin={terminalInnerMargin}
             settingsTab={settingsTab}
             notifications={notifications}
+            updatesConfig={updatesConfig}
+            updateState={updateState}
             configPath={configPath}
             projectConfigPath={projectConfigPath}
             projectConfigLoaded={projectConfigLoaded}
@@ -6325,10 +6598,12 @@ export function AgentmuxTerminalApp() {
             onClose={closeOverlay}
             stop={stop}
             setSettingsTab={setSettingsTab}
+            setLanguage={setLanguage}
             setTheme={setTheme}
             setAccentKey={setAccentKey}
             setFontSize={setFontSize}
             setTerminalInnerMargin={updateTerminalInnerMargin}
+            setAutoUpdateCheck={setAutoUpdateCheck}
             onDismissNotification={(id) => void ctl.dismissNotification(id)}
             onFocusNotificationSession={focusSessionPane}
             onRunNotificationAction={runNotificationAction}
@@ -6337,6 +6612,8 @@ export function AgentmuxTerminalApp() {
             onImportConfig={(scope) => void importConfig(scope)}
             onResetConfig={(scope) => void resetConfig(scope)}
             onMigrateProjectConfig={() => void migrateProjectConfig()}
+            onCheckForUpdates={() => void checkForUpdates()}
+            onInstallUpdate={() => void installAvailableUpdate()}
             onUpdateShortcut={(actionId, binding) =>
               void updateShortcutBinding(actionId, binding)
             }
@@ -6353,6 +6630,7 @@ export function AgentmuxTerminalApp() {
               void ctl.connectProfile(profile);
               closeOverlay();
             }}
+            t={t}
           />
         ) : null}
         {confirmDialog ? (
@@ -7991,6 +8269,7 @@ function CommandPalette({
   onMoveSelection,
   onRunSelected,
   stop,
+  t,
 }: {
   groups: PaletteGroup[];
   query: string;
@@ -7999,6 +8278,7 @@ function CommandPalette({
   onMoveSelection: (delta: number) => void;
   onRunSelected: () => void;
   stop: (e: { stopPropagation: () => void }) => void;
+  t: Translator;
 }) {
   const onKeyDown = (event: ReactKeyboardEvent) => {
     if (event.key === "ArrowDown") {
@@ -8067,7 +8347,7 @@ function CommandPalette({
             value={query}
             onChange={(e) => onQuery(e.target.value)}
             autoFocus
-            placeholder="명령 실행 또는 워크스페이스 검색…"
+            placeholder={t("app.commandPalette.placeholder")}
             style={{
               flex: 1,
               border: 0,
@@ -8161,7 +8441,7 @@ function CommandPalette({
                 font: `400 13px/1 ${FONT_SANS}`,
               }}
             >
-              결과 없음
+              {t("app.commandPalette.noResults")}
             </div>
           ) : null}
         </div>
@@ -8177,9 +8457,9 @@ function CommandPalette({
             color: "var(--fg4)",
           }}
         >
-          <span>↑↓ 이동</span>
-          <span>↵ 실행</span>
-          <span>esc 닫기</span>
+          <span>{t("app.commandPalette.shortcutMove")}</span>
+          <span>{t("app.commandPalette.shortcutRun")}</span>
+          <span>{t("app.commandPalette.shortcutClose")}</span>
         </div>
       </div>
     </div>
@@ -8213,7 +8493,13 @@ function collectShortcutConflicts(
     }));
 }
 
-function SearchOverlay({ onClose }: { onClose: () => void }) {
+function SearchOverlay({
+  onClose,
+  t,
+}: {
+  onClose: () => void;
+  t: Translator;
+}) {
   const navBtn: CSSProperties = {
     width: 26,
     height: 26,
@@ -8253,7 +8539,7 @@ function SearchOverlay({ onClose }: { onClose: () => void }) {
       </span>
       <input
         autoFocus
-        placeholder="활성 창에서 검색"
+        placeholder={t("app.search.placeholder")}
         style={{
           flex: 1,
           border: 0,
@@ -8281,11 +8567,14 @@ function SearchOverlay({ onClose }: { onClose: () => void }) {
 
 interface SettingsModalProps {
   isDark: boolean;
+  language: AppLocaleLanguage;
   accentKey: string;
   fontSize: number;
   terminalInnerMargin: number;
   settingsTab: SettingsTab;
   notifications: NotificationSummary[];
+  updatesConfig: AppConfigUpdates;
+  updateState: AppUpdateState;
   configPath: string;
   projectConfigPath: string | null;
   projectConfigLoaded: boolean;
@@ -8305,10 +8594,12 @@ interface SettingsModalProps {
   onClose: () => void;
   stop: (e: { stopPropagation: () => void }) => void;
   setSettingsTab: (tab: SettingsTab) => void;
+  setLanguage: (language: AppLocaleLanguage) => void;
   setTheme: (theme: ThemeName) => void;
   setAccentKey: (key: string) => void;
   setFontSize: (size: number) => void;
   setTerminalInnerMargin: (size: number) => void;
+  setAutoUpdateCheck: (enabled: boolean) => void;
   onDismissNotification: (id: string) => void;
   onFocusNotificationSession: (sessionId: string | null | undefined) => boolean;
   onRunNotificationAction: (
@@ -8320,6 +8611,8 @@ interface SettingsModalProps {
   onImportConfig: (scope?: AppConfigScope) => void;
   onResetConfig: (scope?: AppConfigScope) => void;
   onMigrateProjectConfig: () => void;
+  onCheckForUpdates: () => void;
+  onInstallUpdate: () => void;
   onUpdateShortcut: (actionId: string, binding: ShortcutBindingValue) => void;
   onRunTmuxProbe: (distribution?: string | null) => void;
   onUpdateWorkspace: (workspaceId: string, input: WorkspaceUpdateInput) => void;
@@ -8327,6 +8620,7 @@ interface SettingsModalProps {
   onUpdateProfile: (profileId: string, input: SshProfileInput) => void;
   onDeleteProfile: (id: string) => void;
   onConnectProfile: (profile: SshProfile) => void;
+  t: Translator;
 }
 
 interface SetupModalProps {
@@ -9063,11 +9357,14 @@ function SetupModal(props: SetupModalProps) {
 function SettingsModal(props: SettingsModalProps) {
   const {
     isDark,
+    language,
     accentKey,
     fontSize,
     terminalInnerMargin,
     settingsTab,
     notifications,
+    updatesConfig,
+    updateState,
     configPath,
     projectConfigPath,
     projectConfigLoaded,
@@ -9085,10 +9382,12 @@ function SettingsModal(props: SettingsModalProps) {
     onClose,
     stop,
     setSettingsTab,
+    setLanguage,
     setTheme,
     setAccentKey,
     setFontSize,
     setTerminalInnerMargin,
+    setAutoUpdateCheck,
     onDismissNotification,
     onFocusNotificationSession,
     onRunNotificationAction,
@@ -9097,6 +9396,8 @@ function SettingsModal(props: SettingsModalProps) {
     onImportConfig,
     onResetConfig,
     onMigrateProjectConfig,
+    onCheckForUpdates,
+    onInstallUpdate,
     onUpdateShortcut,
     onRunTmuxProbe,
     onUpdateWorkspace,
@@ -9104,6 +9405,7 @@ function SettingsModal(props: SettingsModalProps) {
     onUpdateProfile,
     onDeleteProfile,
     onConnectProfile,
+    t,
   } = props;
   const [workspaceDraft, setWorkspaceDraft] = useState<WorkspaceUpdateInput>({
     name: activeWorkspace?.name ?? "",
@@ -9203,14 +9505,14 @@ function SettingsModal(props: SettingsModalProps) {
     });
   };
   const tabs: { key: SettingsTab; label: string }[] = [
-    { key: "general", label: "일반" },
-    { key: "workspace", label: "프로젝트" },
-    { key: "diagnostics", label: "진단" },
-    { key: "appearance", label: "모양" },
+    { key: "general", label: t("settings.tabs.general") },
+    { key: "workspace", label: t("settings.tabs.workspace") },
+    { key: "diagnostics", label: t("settings.tabs.diagnostics") },
+    { key: "appearance", label: t("settings.tabs.appearance") },
     ...(SSH_UI_ENABLED
-      ? ([{ key: "profiles", label: "프로필 · SSH" }] as const)
+      ? ([{ key: "profiles", label: t("settings.tabs.profiles") }] as const)
       : []),
-    { key: "keys", label: "단축키" },
+    { key: "keys", label: t("settings.tabs.keys") },
   ];
   const fieldLabel: CSSProperties = {
     display: "block",
@@ -9229,6 +9531,31 @@ function SettingsModal(props: SettingsModalProps) {
     font: `500 12px/1.35 ${FONT_SANS}`,
     outline: "none",
   };
+  const updateProgress = updateProgressText(updateState);
+  const updateStatusText =
+    updateState.status === "available"
+      ? t("updates.status.available", {
+          version: updateState.version ?? "",
+        })
+      : updateState.status === "checking"
+        ? t("updates.status.checking")
+        : updateState.status === "downloading"
+          ? t("updates.status.downloading", {
+              progress: updateProgress || "...",
+            })
+          : updateState.status === "installed"
+            ? t("updates.status.installed")
+            : updateState.status === "not_available"
+              ? t("updates.status.notAvailable")
+              : updateState.status === "unsupported"
+                ? t("updates.status.unsupported")
+                : updateState.status === "error"
+                  ? t("updates.status.error", {
+                      message: updateState.message ?? "unknown",
+                    })
+                  : t("updates.status.idle");
+  const updateBusy =
+    updateState.status === "checking" || updateState.status === "downloading";
 
   return (
     <div
@@ -9278,7 +9605,7 @@ function SettingsModal(props: SettingsModalProps) {
               padding: "4px 10px 14px",
             }}
           >
-            설정
+            {t("common.settings")}
           </div>
           {tabs.map((t) => {
             const on = settingsTab === t.key;
@@ -9342,7 +9669,7 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 22,
                 }}
               >
-                모양
+                {t("settings.appearance")}
               </div>
               <div
                 style={{
@@ -9351,7 +9678,7 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 8,
                 }}
               >
-                테마
+                {t("settings.theme")}
               </div>
               <div style={{ display: "flex", gap: 10, marginBottom: 24 }}>
                 <div
@@ -9401,7 +9728,7 @@ function SettingsModal(props: SettingsModalProps) {
                       color: "var(--fg1)",
                     }}
                   >
-                    다크
+                    {t("appearance.dark")}
                   </span>
                 </div>
                 <div
@@ -9451,7 +9778,7 @@ function SettingsModal(props: SettingsModalProps) {
                       color: "var(--fg1)",
                     }}
                   >
-                    라이트
+                    {t("appearance.light")}
                   </span>
                 </div>
               </div>
@@ -9462,7 +9789,7 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 10,
                 }}
               >
-                액센트 색상
+                {t("settings.accentColor")}
               </div>
               <div style={{ display: "flex", gap: 10, marginBottom: 24 }}>
                 {ACCENTS.map((a) => (
@@ -9512,7 +9839,7 @@ function SettingsModal(props: SettingsModalProps) {
                     color: "var(--fg2)",
                   }}
                 >
-                  UI 글자 크기
+                  {t("settings.uiFontSize")}
                 </span>
                 <span
                   style={{
@@ -9550,7 +9877,7 @@ function SettingsModal(props: SettingsModalProps) {
                     color: "var(--fg2)",
                   }}
                 >
-                  Terminal inner margin
+                  {t("settings.terminalInnerMargin")}
                 </span>
                 <span
                   style={{
@@ -9563,7 +9890,7 @@ function SettingsModal(props: SettingsModalProps) {
               </div>
               <input
                 className="agentmux-terminal-inner-margin"
-                aria-label="Terminal inner margin"
+                aria-label={t("settings.terminalInnerMargin")}
                 type="range"
                 min={TERMINAL_INNER_MARGIN_MIN}
                 max={TERMINAL_INNER_MARGIN_MAX}
@@ -9596,7 +9923,7 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 20,
                 }}
               >
-                프로젝트
+                {t("settings.workspace.title")}
               </div>
               {activeWorkspace ? (
                 <>
@@ -9794,7 +10121,7 @@ function SettingsModal(props: SettingsModalProps) {
                       font: `700 12px/1 ${FONT_SANS}`,
                     }}
                   >
-                    Save project
+                    {t("settings.workspace.saveProject")}
                   </button>
                 </>
               ) : (
@@ -9804,7 +10131,7 @@ function SettingsModal(props: SettingsModalProps) {
                     color: "var(--fg4)",
                   }}
                 >
-                  활성 프로젝트가 없습니다.
+                  {t("settings.workspace.noActiveProject")}
                 </div>
               )}
             </form>
@@ -9931,7 +10258,7 @@ function SettingsModal(props: SettingsModalProps) {
                           font: `600 11px/1 ${FONT_SANS}`,
                         }}
                       >
-                        수정
+                        {t("common.edit")}
                       </button>
                       <button
                         type="button"
@@ -9946,7 +10273,7 @@ function SettingsModal(props: SettingsModalProps) {
                           font: `600 11px/1 ${FONT_SANS}`,
                         }}
                       >
-                        접속
+                        {t("common.connect")}
                       </button>
                       <Hov
                         tag="span"
@@ -10104,7 +10431,7 @@ function SettingsModal(props: SettingsModalProps) {
                       }}
                     >
                       {shortcutLabelForAction(shortcutBindings, action.id) ||
-                        "미지정"}
+                        t("common.unassigned")}
                     </span>
                     <button
                       type="button"
@@ -10120,7 +10447,7 @@ function SettingsModal(props: SettingsModalProps) {
                         font: `600 11px/1 ${FONT_SANS}`,
                       }}
                     >
-                      Edit
+                      {t("common.edit")}
                     </button>
                     <button
                       type="button"
@@ -10136,7 +10463,7 @@ function SettingsModal(props: SettingsModalProps) {
                         font: `600 11px/1 ${FONT_SANS}`,
                       }}
                     >
-                      Clear
+                      {t("common.clear")}
                     </button>
                   </div>
                 ))}
@@ -10267,7 +10594,217 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 20,
                 }}
               >
-                일반 · 알림
+                {t("settings.general")}
+              </div>
+              <div
+                data-agentmux-language-settings
+                style={{
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: 14,
+                  marginBottom: 14,
+                }}
+              >
+                <label
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "minmax(0, 1fr) 180px",
+                    alignItems: "center",
+                    gap: 14,
+                  }}
+                >
+                  <span style={{ minWidth: 0 }}>
+                    <span
+                      style={{
+                        display: "block",
+                        font: `700 13px/1.2 ${FONT_SANS}`,
+                        color: "var(--fg1)",
+                      }}
+                    >
+                      {t("language.label")}
+                    </span>
+                    <span
+                      style={{
+                        display: "block",
+                        font: `400 11.5px/1.45 ${FONT_SANS}`,
+                        color: "var(--fg4)",
+                        marginTop: 5,
+                      }}
+                    >
+                      {t("language.savedGlobally")}
+                    </span>
+                  </span>
+                  <select
+                    className="agentmux-language-select"
+                    aria-label={t("language.label")}
+                    value={language}
+                    onChange={(event) =>
+                      setLanguage(event.currentTarget.value as AppLocaleLanguage)
+                    }
+                    style={fieldInput}
+                  >
+                    {SUPPORTED_LANGUAGES.map((option) => (
+                      <option key={option.code} value={option.code}>
+                        {t(option.labelKey)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div
+                data-agentmux-update-settings
+                style={{
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: 14,
+                  marginBottom: 14,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 14,
+                    marginBottom: 12,
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div
+                      style={{
+                        font: `700 13px/1.2 ${FONT_SANS}`,
+                        color: "var(--fg1)",
+                      }}
+                    >
+                      {t("updates.title")}
+                    </div>
+                    <div
+                      style={{
+                        font: `400 11.5px/1.45 ${FONT_SANS}`,
+                        color: "var(--fg4)",
+                        marginTop: 5,
+                      }}
+                    >
+                      {t("updates.autoCheckHint")}
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      flex: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      color: "var(--fg2)",
+                      font: `600 11.5px/1 ${FONT_SANS}`,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={updatesConfig.autoCheck}
+                      onChange={(event) =>
+                        setAutoUpdateCheck(event.currentTarget.checked)
+                      }
+                      style={{ accentColor: "var(--accent)" }}
+                    />
+                    {t("updates.autoCheck")}
+                  </label>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 12,
+                  }}
+                >
+                  <div
+                    className="agentmux-update-status"
+                    style={{
+                      minWidth: 0,
+                      color:
+                        updateState.status === "error"
+                          ? "#ef4444"
+                          : updateState.status === "available"
+                            ? "var(--accent)"
+                            : "var(--fg3)",
+                      font: `500 11.5px/1.45 ${FONT_SANS}`,
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    {updateStatusText}
+                  </div>
+                  <div
+                    style={{
+                      flex: "none",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                    }}
+                  >
+                    {updateState.status === "available" ? (
+                      <button
+                        type="button"
+                        className="agentmux-update-install"
+                        onClick={onInstallUpdate}
+                        disabled={updateBusy}
+                        style={{
+                          background: "var(--accent)",
+                          color: "#fff",
+                          border: 0,
+                          borderRadius: 8,
+                          padding: "8px 13px",
+                          cursor: updateBusy ? "default" : "pointer",
+                          opacity: updateBusy ? 0.55 : 1,
+                          font: `600 12px/1 ${FONT_SANS}`,
+                        }}
+                      >
+                        {t("updates.install")}
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="agentmux-update-check"
+                      onClick={onCheckForUpdates}
+                      disabled={updateBusy}
+                      style={{
+                        background: "var(--s2)",
+                        color: "var(--fg2)",
+                        border: "1px solid var(--border)",
+                        borderRadius: 8,
+                        padding: "8px 11px",
+                        cursor: updateBusy ? "default" : "pointer",
+                        opacity: updateBusy ? 0.55 : 1,
+                        font: `600 12px/1 ${FONT_SANS}`,
+                      }}
+                    >
+                      {t("updates.check")}
+                    </button>
+                  </div>
+                </div>
+                {updateState.body ? (
+                  <details
+                    style={{
+                      marginTop: 10,
+                      color: "var(--fg3)",
+                      font: `400 11.5px/1.45 ${FONT_SANS}`,
+                    }}
+                  >
+                    <summary style={{ cursor: "pointer", color: "var(--fg2)" }}>
+                      {t("updates.releaseNotes")}
+                    </summary>
+                    <pre
+                      style={{
+                        margin: "8px 0 0",
+                        whiteSpace: "pre-wrap",
+                        overflowWrap: "anywhere",
+                        font: `400 11px/1.45 ${FONT_MONO}`,
+                        color: "var(--fg4)",
+                      }}
+                    >
+                      {updateState.body}
+                    </pre>
+                  </details>
+                ) : null}
               </div>
               <div
                 data-agentmux-config-reload
@@ -10294,7 +10831,7 @@ function SettingsModal(props: SettingsModalProps) {
                         color: "var(--fg1)",
                       }}
                     >
-                      Configuration
+                      {t("config.configuration")}
                     </div>
                     <div
                       data-agentmux-global-config-path
@@ -10307,7 +10844,7 @@ function SettingsModal(props: SettingsModalProps) {
                         whiteSpace: "nowrap",
                       }}
                     >
-                      global {configPath || "-"}
+                      {t("config.globalPath", { path: configPath || "-" })}
                     </div>
                     <div
                       data-agentmux-project-config-path
@@ -10322,7 +10859,9 @@ function SettingsModal(props: SettingsModalProps) {
                         whiteSpace: "nowrap",
                       }}
                     >
-                      project {projectConfigPath || "-"}
+                      {t("config.projectPath", {
+                        path: projectConfigPath || "-",
+                      })}
                     </div>
                   </div>
                   <div
@@ -10347,7 +10886,7 @@ function SettingsModal(props: SettingsModalProps) {
                         font: `600 12px/1 ${FONT_SANS}`,
                       }}
                     >
-                      Export
+                      {t("config.export")}
                     </button>
                     <button
                       type="button"
@@ -10363,7 +10902,7 @@ function SettingsModal(props: SettingsModalProps) {
                         font: `600 12px/1 ${FONT_SANS}`,
                       }}
                     >
-                      Import
+                      {t("config.import")}
                     </button>
                     <button
                       type="button"
@@ -10379,7 +10918,7 @@ function SettingsModal(props: SettingsModalProps) {
                         font: `600 12px/1 ${FONT_SANS}`,
                       }}
                     >
-                      Reset
+                      {t("common.reset")}
                     </button>
                     <button
                       type="button"
@@ -10395,7 +10934,7 @@ function SettingsModal(props: SettingsModalProps) {
                         font: `600 12px/1 ${FONT_SANS}`,
                       }}
                     >
-                      Reload
+                      {t("config.reload")}
                     </button>
                   </div>
                 </div>
@@ -10425,7 +10964,7 @@ function SettingsModal(props: SettingsModalProps) {
                       font: `600 11px/1 ${FONT_SANS}`,
                     }}
                   >
-                    Export project
+                    {t("config.exportProject")}
                   </button>
                   <button
                     type="button"
@@ -10443,7 +10982,7 @@ function SettingsModal(props: SettingsModalProps) {
                       font: `600 11px/1 ${FONT_SANS}`,
                     }}
                   >
-                    Import project
+                    {t("config.importProject")}
                   </button>
                   <button
                     type="button"
@@ -10461,7 +11000,7 @@ function SettingsModal(props: SettingsModalProps) {
                       font: `600 11px/1 ${FONT_SANS}`,
                     }}
                   >
-                    Migrate .cmux
+                    {t("config.migrateCmux")}
                   </button>
                   <button
                     type="button"
@@ -10479,8 +11018,17 @@ function SettingsModal(props: SettingsModalProps) {
                       font: `600 11px/1 ${FONT_SANS}`,
                     }}
                   >
-                    Reset project
+                    {t("config.resetProject")}
                   </button>
+                </div>
+                <div
+                  style={{
+                    font: `400 11.5px/1.45 ${FONT_SANS}`,
+                    color: "var(--fg4)",
+                    marginTop: 10,
+                  }}
+                >
+                  {t("config.jsonOnlyHint")}
                 </div>
                 {configDiagnostics.length > 0 ? (
                   <div
@@ -10516,14 +11064,14 @@ function SettingsModal(props: SettingsModalProps) {
                             color: entry.valid ? "var(--accent)" : "#ef4444",
                           }}
                         >
-                          {entry.valid ? "ok" : "invalid"}
+                          {entry.valid ? t("common.ok") : t("common.invalid")}
                         </span>
                         <span
                           style={{
                             color: entry.active ? "var(--fg2)" : "var(--fg4)",
                           }}
                         >
-                          {entry.active ? "active" : "idle"}
+                          {entry.active ? t("common.active") : t("common.idle")}
                         </span>
                         <span
                           title={entry.path ?? ""}
@@ -10569,7 +11117,7 @@ function SettingsModal(props: SettingsModalProps) {
                     color: "var(--fg4)",
                   }}
                 >
-                  활성 알림이 없습니다.
+                  {t("notifications.empty")}
                 </div>
               ) : (
                 <div
@@ -10667,7 +11215,7 @@ function SettingsModal(props: SettingsModalProps) {
                           color: "var(--fg2)",
                         }}
                       >
-                        닫기
+                        {t("common.close")}
                       </button>
                     </div>
                   ))}
