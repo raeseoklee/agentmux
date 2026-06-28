@@ -4,8 +4,11 @@
 
 - Windows 10 or Windows 11.
 - AgentMux installer from the GitHub Release page.
-- WSL is optional for basic PowerShell/cmd terminals, but recommended for Linux
-  shells, durable tmux sessions, and most AI-agent workflows.
+- AgentMux is Windows-only. Native macOS and Linux desktop builds are not
+  supported in the current release line.
+- WSL is optional for basic PowerShell/cmd terminals, but recommended for
+  Linux development shells, durable tmux sessions, and most AI-agent workflows
+  on Windows.
 - `tmux` is required inside WSL when using durable WSL-tmux sessions.
 
 ## Install
@@ -53,6 +56,9 @@ sessions are needed:
 sudo apt update
 sudo apt install tmux
 ```
+
+WSL support does not imply native Linux desktop support. AgentMux runs as a
+Windows application and uses WSL as a Windows-hosted execution environment.
 
 ## Basic Workflow
 

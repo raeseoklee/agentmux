@@ -308,7 +308,7 @@ test("workspace project settings update metadata and agent preset", async ({
   await page.locator(".agentmux-workspace-icon-input").fill("AP");
   await page.locator(".agentmux-workspace-color-green").click();
   await page.locator(".agentmux-workspace-wsl-select").selectOption("Ubuntu");
-  await page.locator(".agentmux-workspace-agent-input").fill("codex --resume");
+  await page.locator(".agentmux-workspace-agent-input").fill("codex");
   await page.locator(".agentmux-workspace-save").click();
   await page.keyboard.press("Escape");
 

@@ -2,8 +2,8 @@
 
 ## Purpose
 
-This runbook describes how to publish an AgentMux Windows release through GitHub
-Actions with checksums and GitHub Artifact Attestations when repository
+This runbook describes how to publish the AgentMux Windows-only release through
+GitHub Actions with checksums and GitHub Artifact Attestations when repository
 visibility and plan support them.
 
 ## Preflight

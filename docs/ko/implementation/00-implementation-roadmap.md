@@ -3,7 +3,7 @@
 Status: Draft
 Date: 2026-06-18
 
-이 로드맵은 AgentMux를 Windows-first AI-agent multiplexer로 구현하기 위한 단계별 실행 계획이다. 각 단계는 독립적으로 검증 가능한 산출물을 가져야 하며, 다음 단계는 이전 단계의 exit criteria가 충족된 뒤 진행한다.
+이 로드맵은 AgentMux를 당분간 Windows-only AI-agent multiplexer로 구현하기 위한 단계별 실행 계획이다. Linux/macOS 네이티브 데스크톱 지원은 플랫폼 backlog로 분리하고, WSL은 Windows 제품의 핵심 Linux 개발 환경 통합으로 다룬다. 각 단계는 독립적으로 검증 가능한 산출물을 가져야 하며, 다음 단계는 이전 단계의 exit criteria가 충족된 뒤 진행한다.
 
 ## Phase 0: Repository Foundation
 

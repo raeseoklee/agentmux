@@ -3,6 +3,10 @@
 AgentMux is a Windows desktop terminal multiplexer for running many AI agent
 sessions, shells, and browser-assisted workflows side by side.
 
+AgentMux is Windows-only for the current product line. Native macOS and Linux
+desktop support is not part of the active release scope; WSL remains a
+first-class Windows integration for Linux development environments.
+
 It is designed around three everyday jobs:
 
 - Keep workspaces, tabs, and split panes organized while agents run.
@@ -20,6 +24,7 @@ Start here:
 - [Troubleshooting](./docs/en/user/troubleshooting.md)
 - [Operations runbook](./docs/en/operations/release-runbook.md)
 - [Versioning and signed releases](./docs/en/release/versioning.md)
+- [Platform backlog](./docs/en/backlog/platform-backlog.md)
 
 The full documentation index is in [docs/README.md](./docs/README.md).
 

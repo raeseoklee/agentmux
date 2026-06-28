@@ -8,7 +8,7 @@ Basis: ISO/IEC/IEEE 29148-style requirements structure and verification discipli
 
 ### 1.1 Purpose
 
-This document defines the system requirements and detailed design for AgentMux, a cross-platform AI-agent terminal multiplexer. The first production target is Windows, with first-class support for Linux development environments through WSL and durable session management through tmux-compatible backend semantics.
+This document defines the system requirements and detailed design for AgentMux, a Windows-only AI-agent terminal multiplexer. The current production target is Windows, with first-class support for Linux development environments through WSL and durable session management through tmux-compatible backend semantics. Native macOS and Linux desktop support is intentionally tracked as backlog, not active release scope.
 
 The document is written as a combined requirements and design specification. Each requirement is uniquely identified, stated in verifiable language, and linked to a planned verification method.
 
@@ -33,6 +33,7 @@ The initial product scope excludes:
 - Strong same-user security isolation.
 - Remote team collaboration over the network.
 - Mobile clients.
+- Native macOS and Linux desktop clients.
 - Full terminal emulator implementation from scratch in the first release.
 
 ### 1.3 Product Vision
@@ -46,7 +47,7 @@ The system shall prioritize:
 - Fast pane switching and input latency.
 - Explicit agent lifecycle visibility.
 - Scriptable, composable primitives.
-- Compatibility with Linux-first development workflows on Windows.
+- Compatibility with Linux-first development workflows on Windows through WSL.
 
 ### 1.4 Definitions
 
@@ -269,6 +270,7 @@ The system is composed of:
 | CR-004 | The control API shall use versioned request and response schemas. | Must | API test |
 | CR-005 | The system shall include forward-compatible capability discovery. | Must | API test |
 | CR-006 | The system shall avoid requiring a specific agent vendor or workflow. | Must | Review |
+| CR-007 | Native macOS and Linux desktop builds shall remain out of scope until promoted from the platform backlog. | Must | Documentation review |
 
 ## 5. External Interface Requirements
 

@@ -1237,8 +1237,7 @@ impl DesktopControlState {
         state_override: Option<&str>,
     ) {
         let command_label = command.join(" ");
-        let restored_label = restored_agent_command_label(previous)
-            .filter(|label| is_known_agent_launch(label))
+        let restored_label = normalized_restored_agent_command_label(previous)
             .filter(|_| !persisted_command_already_launches_agent(command));
         let label = restored_label.as_deref().unwrap_or(command_label.trim());
         let label = if label.is_empty() { "agent" } else { label };
@@ -1251,10 +1250,10 @@ impl DesktopControlState {
         if telemetry.activity.is_none() {
             telemetry.activity = Some("agent".to_string());
         }
-        if telemetry.session.is_none() {
+        if restored_label.is_some() || telemetry.session.is_none() {
             telemetry.session = Some(label.to_string());
         }
-        let reason = if state_override.is_some() {
+        let reason = if restored_label.is_some() || state_override.is_some() {
             Some(format!("Agent restored: {label}"))
         } else {
             previous
@@ -10991,16 +10990,15 @@ fn restored_agent_launch_line(
     session: &PersistedSession,
     state: &PersistedAgentState,
 ) -> Option<String> {
-    let command_line = restored_agent_command_label(state)?;
-    let command_line = command_line.trim();
-    if command_line.is_empty()
-        || command_line.chars().any(|ch| ch.is_control() && ch != '\t')
-        || !is_known_agent_launch(command_line)
-        || persisted_command_already_launches_agent(&session.command)
-    {
+    if persisted_command_already_launches_agent(&session.command) {
         return None;
     }
-    Some(command_line.to_string())
+    normalized_restored_agent_command_label(state)
+}
+
+fn normalized_restored_agent_command_label(state: &PersistedAgentState) -> Option<String> {
+    let command_line = restored_agent_command_label(state)?;
+    normalize_restored_agent_launch(&command_line)
 }
 
 fn restored_agent_command_label(state: &PersistedAgentState) -> Option<String> {
@@ -11035,6 +11033,140 @@ fn is_known_agent_launch(command_line: &str) -> bool {
     first_command_word(command_line)
         .map(agent_command_name)
         .is_some_and(|name| matches!(name.as_str(), "claude" | "codex"))
+}
+
+fn normalize_restored_agent_launch(command_line: &str) -> Option<String> {
+    let command_line = command_line.trim();
+    if command_line.is_empty() || command_line.chars().any(|ch| ch.is_control() && ch != '\t') {
+        return None;
+    }
+    let tokens = split_command_line(command_line)?;
+    let launcher = tokens.first().map(|word| agent_command_name(word))?;
+    match launcher.as_str() {
+        "claude" => Some(normalize_claude_restore_args(&tokens)),
+        "codex" => Some(normalize_codex_restore_args(&tokens)),
+        _ => None,
+    }
+}
+
+fn normalize_claude_restore_args(tokens: &[String]) -> String {
+    let mut restored = vec!["claude".to_string()];
+    let mut index = 1;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if is_resume_selector_flag(token) {
+            index += 1;
+            if index < tokens.len() && !tokens[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if is_resume_selector_assignment(token) {
+            index += 1;
+            continue;
+        }
+        restored.push(tokens[index].clone());
+        index += 1;
+    }
+    join_command_tokens(&restored)
+}
+
+fn normalize_codex_restore_args(tokens: &[String]) -> String {
+    let mut restored = vec!["codex".to_string()];
+    let mut index = 1;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if token.eq_ignore_ascii_case("resume") || token.eq_ignore_ascii_case("continue") {
+            index += 1;
+            while index < tokens.len() && !tokens[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if is_resume_selector_flag(token) {
+            index += 1;
+            if index < tokens.len() && !tokens[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if is_resume_selector_assignment(token) {
+            index += 1;
+            continue;
+        }
+        restored.push(tokens[index].clone());
+        index += 1;
+    }
+    join_command_tokens(&restored)
+}
+
+fn is_resume_selector_flag(token: &str) -> bool {
+    matches!(token, "--resume" | "-r" | "--continue" | "-c")
+}
+
+fn is_resume_selector_assignment(token: &str) -> bool {
+    token.starts_with("--resume=") || token.starts_with("--continue=")
+}
+
+fn split_command_line(command_line: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in command_line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote.is_some_and(|value| value == ch) {
+            quote = None;
+            continue;
+        }
+        if quote.is_none() && matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if quote.is_none() && ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
+fn join_command_tokens(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|token| quote_command_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_command_token(token: &str) -> String {
+    if token.is_empty() || token.chars().any(|ch| ch.is_whitespace()) {
+        format!("\"{}\"", token.replace('"', "\\\""))
+    } else {
+        token.to_string()
+    }
 }
 
 fn first_command_word(command_line: &str) -> Option<&str> {
@@ -12594,7 +12726,7 @@ mod tests {
                 "req_workspace_update",
                 "workspace.update",
                 format!(
-                    r##"{{"workspace_id":"{workspace_id}","name":"Project Alpha","project_root":"D:\\work\\alpha","environment_profile_id":"Ubuntu","description":"demo project","icon":"PA","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_terminal_profile":"powershell","default_agent_command":"codex --resume"}}"##
+                    r##"{{"workspace_id":"{workspace_id}","name":"Project Alpha","project_root":"D:\\work\\alpha","environment_profile_id":"Ubuntu","description":"demo project","icon":"PA","color":"#22C55E","default_wsl_distribution":"Ubuntu","default_terminal_profile":"powershell","default_agent_command":"codex"}}"##
                 ),
                 DESKTOP_CONTROL_TOKEN,
             ),
@@ -12607,7 +12739,7 @@ mod tests {
         assert_eq!(updated["color"], "#22C55E");
         assert_eq!(updated["default_wsl_distribution"], "Ubuntu");
         assert_eq!(updated["default_terminal_profile"], "powershell");
-        assert_eq!(updated["default_agent_command"], "codex --resume");
+        assert_eq!(updated["default_agent_command"], "codex");
 
         let diagnostics = agentmux_control(
             &state,
@@ -14026,7 +14158,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_agent_launch_line_replays_known_agent_for_shell_sessions() {
+    fn restored_agent_launch_line_replays_safe_agent_command_for_shell_sessions() {
         let session = PersistedSession {
             session_id: "ses_shell".to_string(),
             workspace_id: "ws_agent".to_string(),
@@ -14054,7 +14186,80 @@ mod tests {
 
         assert_eq!(
             restored_agent_launch_line(&session, &state).as_deref(),
-            Some("claude --resume")
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_strips_resume_selector_and_keeps_safe_flags() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "conpty".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("D:\\work".to_string()),
+            command: vec!["powershell.exe".to_string(), "-NoLogo".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some(
+                "Agent started: claude --dangerously-skip-permissions --resume".to_string(),
+            ),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"claude --dangerously-skip-permissions --resume"}"#
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude --dangerously-skip-permissions")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_strips_codex_resume_subcommand() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["bash".to_string(), "-l".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: codex resume abc123".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"codex resume abc123"}"#.to_string(),
+            ),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("codex")
         );
     }
 

@@ -3913,7 +3913,7 @@ export function AgentmuxTerminalApp() {
   );
   const promptCustomAgent = useCallback(() => {
     const raw = window.prompt(
-      "durable 세션으로 실행할 에이전트 명령 (예: claude --resume)",
+      "durable 세션으로 실행할 에이전트 명령 (예: claude)",
     );
     const parts = (raw ?? "").trim().split(/\s+/).filter(Boolean);
     if (parts.length > 0) {

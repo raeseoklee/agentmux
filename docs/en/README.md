@@ -10,6 +10,7 @@ repository READMEs, release notes, and operational runbooks.
 - [CLI guide](./user/cli.md)
 - [Feature overview](./features.md)
 - [Troubleshooting](./user/troubleshooting.md)
+- [Platform backlog](./backlog/platform-backlog.md)
 
 ## Operations Documentation
 
@@ -27,6 +28,9 @@ operational documentation set:
 - [Windows bootstrap](./development/bootstrap-windows.md)
 - [System design specification](./ieee-29148-system-design.md)
 - [Desktop performance optimization specification](./ieee-29148-desktop-performance-optimization.md)
+
+AgentMux is Windows-only for the current product line. Native macOS and Linux
+desktop support is intentionally kept in backlog rather than release scope.
 
 Korean documents and legacy Korean implementation notes are indexed from
 [Korean documentation](../ko/README.md).
