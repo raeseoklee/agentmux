@@ -5185,8 +5185,7 @@ impl DesktopControlState {
                     Some(normalize_terminal_start_directory(&directory)?);
             }
             if let Some(cwd) = ui.terminal_start_custom_cwd {
-                config.ui.terminal_start_custom_cwd =
-                    normalize_terminal_start_custom_cwd(cwd);
+                config.ui.terminal_start_custom_cwd = normalize_terminal_start_custom_cwd(cwd);
             }
         }
 
