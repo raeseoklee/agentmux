@@ -13,6 +13,7 @@ Run these checks on the release branch before tagging:
 npm run version:check
 npm --prefix apps/desktop run build
 npm run docs:check
+npm run repo:hygiene
 ```
 
 For a full local installer smoke, build the NSIS installer and verify the output

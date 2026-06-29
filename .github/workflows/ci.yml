@@ -59,3 +59,4 @@ jobs:
         with:
           node-version: 22
       - run: node tools/check-doc-links.mjs
+      - run: node tools/check-repo-hygiene.mjs

@@ -7,7 +7,7 @@ Conforms to ISO/IEC/IEEE 29148:2018 (Requirements engineering — Software requi
 | Document ID | SRS-PERF-001 |
 | Status | Implemented baseline; PR-7 through PR-12 complete |
 | Scope | AgentMux desktop application (Tauri host + React/xterm UI + Rust control plane hot paths) |
-| Related | [ieee-29148-system-design.md](./ieee-29148-system-design.md), [implementation/17-goal-9-performance-diagnostics-status.md](../ko/implementation/17-goal-9-performance-diagnostics-status.md), [implementation/04-ui-terminal-rendering.md](../ko/implementation/04-ui-terminal-rendering.md) |
+| Related | [ieee-29148-system-design.md](./ieee-29148-system-design.md), [Feature overview](./features.md), [Platform backlog](./backlog/platform-backlog.md) |
 
 ## 1. Introduction
 

@@ -5,6 +5,7 @@ $root = (Resolve-Path .).Path
 $localCargoHome = Join-Path $root ".toolchains\cargo"
 $localRustupHome = Join-Path $root ".toolchains\rustup"
 $localCargo = Join-Path $localCargoHome "bin\cargo.exe"
+$localStableBin = Join-Path $localRustupHome "toolchains\stable-x86_64-pc-windows-msvc\bin"
 
 Write-Host "== AgentMux check =="
 
@@ -15,6 +16,9 @@ if (-not $cargoPath -and (Test-Path $localCargo)) {
   $env:RUSTUP_HOME = $localRustupHome
   if (-not $env:RUSTUP_TOOLCHAIN) {
     $env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
+  }
+  if (Test-Path $localStableBin) {
+    $env:PATH = "$localStableBin;$env:PATH"
   }
   $cargoPath = $localCargo
 }
@@ -33,6 +37,8 @@ if ($cargoPath) {
 
 if (Get-Command node -ErrorAction SilentlyContinue) {
   node tools/check-doc-links.mjs
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  node tools/check-repo-hygiene.mjs
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {
   Write-Warning "node was not found on PATH. Install Node.js before running docs checks."

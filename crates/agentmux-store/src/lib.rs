@@ -2710,7 +2710,7 @@ mod tests {
                 name: "Test workspace".to_string(),
                 root_pane_id: "pane_root".to_string(),
                 active_pane_id: "pane_root".to_string(),
-                project_root: Some("D:\\Workspace\\irae\\agentmux".to_string()),
+                project_root: Some("D:\\Projects\\agentmux".to_string()),
                 environment_profile_id: None,
                 description: Some("Primary AgentMux workspace".to_string()),
                 icon: Some("A".to_string()),

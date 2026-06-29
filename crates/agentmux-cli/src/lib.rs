@@ -14896,7 +14896,7 @@ mod tests {
         let spec = build_agent_integration_wsl_command(
             &runtime,
             "Ubuntu",
-            Path::new(r"C:\Projects\agentmux\target\debug\cmux.exe"),
+            Path::new(r"C:\Projects\agentmux\target\debug\agentmux.exe"),
         )
         .unwrap();
 
@@ -14909,11 +14909,11 @@ mod tests {
         assert!(spec
             .args
             .contains(&"OPENCODE_CONFIG_DIR=/mnt/d/agentmux-cmuxterm/omo-config".to_string()));
+        assert!(spec
+            .args
+            .contains(&"CMUX_EXE=/mnt/c/Projects/agentmux/target/debug/agentmux.exe".to_string()));
         assert!(spec.args.contains(
-            &"CMUX_EXE=/mnt/d/Workspace/irae/agentmux/target/debug/cmux.exe".to_string()
-        ));
-        assert!(spec.args.contains(
-            &"AGENTMUX_EXE=/mnt/d/Workspace/irae/agentmux/target/debug/cmux.exe".to_string()
+            &"AGENTMUX_EXE=/mnt/c/Projects/agentmux/target/debug/agentmux.exe".to_string()
         ));
         assert!(spec
             .args

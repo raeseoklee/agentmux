@@ -12757,7 +12757,7 @@ mod tests {
             RequestEnvelope::new(
                 "req_workspace_create",
                 "workspace.create",
-                r#"{"name":"Demo workspace","project_root":"D:\\Workspace\\irae\\agentmux","backend_profile":"local"}"#,
+                r#"{"name":"Demo workspace","project_root":"D:\\Projects\\agentmux","backend_profile":"local"}"#,
                 DESKTOP_CONTROL_TOKEN,
             ),
         );
