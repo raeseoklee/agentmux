@@ -17,7 +17,7 @@
 2. Verify the artifact attestation:
 
    ```powershell
-   gh attestation verify .\AgentMux_0.1.2_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+   gh attestation verify .\AgentMux_0.1.3_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
    ```
 
 3. Run the installer.
@@ -59,6 +59,11 @@ sudo apt install tmux
 
 WSL support does not imply native Linux desktop support. AgentMux runs as a
 Windows application and uses WSL as a Windows-hosted execution environment.
+
+## Before Public Use
+
+Read [Known limitations](./known-limitations.md) if you depend on session
+restore, server mode, or Windows publisher signing.
 
 ## Basic Workflow
 

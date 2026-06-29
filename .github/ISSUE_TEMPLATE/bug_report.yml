@@ -1,0 +1,78 @@
+name: Bug report
+description: Report something that is broken or surprising.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve AgentMux. Please remove secrets, private paths,
+        hostnames, and command output that should not be public.
+  - type: input
+    id: version
+    attributes:
+      label: AgentMux version
+      description: Use the app About panel or release version.
+      placeholder: "0.1.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Desktop UI
+        - Terminal rendering
+        - WSL
+        - Durable tmux
+        - PowerShell or Command Prompt
+        - Session restore
+        - Agent attention or notifications
+        - Browser surface or automation
+        - CLI
+        - Installer or updater
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open AgentMux.
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Windows version, WSL distro, shell profile, and tmux version if relevant.
+      placeholder: |
+        Windows:
+        Shell profile:
+        WSL distro:
+        tmux:
+    validations:
+      required: false
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste redacted output or attach screenshots/logs.
+    validations:
+      required: false

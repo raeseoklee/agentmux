@@ -14,8 +14,8 @@ npm run version:check
 Set the next version:
 
 ```powershell
-npm run version:set -- 0.1.2
-npm run version:check -- --tag v0.1.2
+npm run version:set -- 0.1.3
+npm run version:check -- --tag v0.1.3
 ```
 
 The version script updates:
@@ -31,8 +31,8 @@ The version script updates:
 Push a SemVer tag to trigger the signed release workflow:
 
 ```powershell
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 The release workflow builds the Windows NSIS installer, writes a SHA256
@@ -45,7 +45,7 @@ them to the GitHub Release.
 After downloading the installer from a GitHub Release:
 
 ```powershell
-gh attestation verify .\AgentMux_0.1.2_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+gh attestation verify .\AgentMux_0.1.3_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 The release notes include the exact command and installer hash for each release.

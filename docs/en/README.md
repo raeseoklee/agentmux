@@ -9,6 +9,7 @@ repository READMEs, release notes, and operational runbooks.
 - [User manual](./user/manual.md)
 - [CLI guide](./user/cli.md)
 - [Feature overview](./features.md)
+- [Known limitations](./user/known-limitations.md)
 - [Troubleshooting](./user/troubleshooting.md)
 - [Platform backlog](./backlog/platform-backlog.md)
 
@@ -17,6 +18,8 @@ repository READMEs, release notes, and operational runbooks.
 - [Operations overview](./operations/README.md)
 - [Release runbook](./operations/release-runbook.md)
 - [Main merge policy](./operations/main-merge-policy.md)
+- [Release policy](../release-policy.md)
+- [Release evidence](../release-evidence/0.1.3.md)
 - [Versioning and signed releases](./release/versioning.md)
 - [AgentMux config schema](./schemas/agentmux.config.schema.json)
 

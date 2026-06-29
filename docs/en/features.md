@@ -1,6 +1,6 @@
 # AgentMux Feature Overview
 
-Status: Draft
+Status: Current capabilities for the Windows preview release line.
 
 AgentMux is a Windows desktop terminal multiplexer for AI-agent workflows. Its
 core value is keeping many terminals, agents, browser surfaces, and workspace
@@ -63,5 +63,15 @@ surface for Linux development workflows.
   packaged desktop apps can check for updates without a separate update server.
 - GitHub Artifact Attestations are generated when the repository visibility and
   plan support them.
+
+## Current Limits
+
+- Windows-only desktop product line.
+- Durable WSL-tmux is recommended for long-running agent sessions that should
+  survive restarts.
+- PowerShell and Command Prompt panes can restore layout and restart known
+  commands, but they do not provide tmux-style process persistence.
+- GitHub Artifact Attestation is release provenance, not Windows Authenticode
+  publisher signing.
 
 The Korean feature notes are kept at [../ko/features.md](../ko/features.md).

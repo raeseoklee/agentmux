@@ -147,7 +147,7 @@ requireText(
   releaseWorkflowText,
   releaseWorkflow,
   "actions/attest release step",
-  /uses:\s*actions\/attest@v\d+/,
+  /uses:\s*actions\/attest@(?:v\d+|[a-f0-9]{40})/,
 );
 requireText(
   releaseWorkflowText,

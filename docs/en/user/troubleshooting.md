@@ -76,6 +76,9 @@ Windows ConPTY terminals can restore layout and restart known commands, but they
 do not have tmux-style process persistence. Use durable WSL-tmux for long-running
 agent sessions that must survive app restarts.
 
+For a compact list of product limits, see
+[Known limitations](./known-limitations.md).
+
 ## Git Status Shows `no git`
 
 The status bar reads Git state from the current workspace project root. Set the

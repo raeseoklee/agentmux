@@ -45,15 +45,15 @@ Configure GitHub before publishing a release:
 Set the next SemVer version:
 
 ```powershell
-npm run version:set -- 0.1.2
-npm run version:check -- --tag v0.1.2
+npm run version:set -- 0.1.3
+npm run version:check -- --tag v0.1.3
 ```
 
 Commit the version bump:
 
 ```powershell
 git add package.json apps/desktop/package.json apps/desktop/package-lock.json apps/desktop/src-tauri/tauri.conf.json Cargo.toml
-git commit -m "Release 0.1.2"
+git commit -m "Release 0.1.3"
 git push origin main
 ```
 
@@ -62,8 +62,8 @@ git push origin main
 Create and push the tag:
 
 ```powershell
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 The `release` GitHub Actions workflow will:
@@ -86,14 +86,14 @@ GitHub Release.
 Verify provenance:
 
 ```powershell
-gh attestation verify .\AgentMux_0.1.2_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+gh attestation verify .\AgentMux_0.1.3_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 Verify hash:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.2_x64-setup.exe
-Get-Content .\AgentMux_0.1.2_x64-setup.exe.sha256
+Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.3_x64-setup.exe
+Get-Content .\AgentMux_0.1.3_x64-setup.exe.sha256
 ```
 
 The hashes must match.

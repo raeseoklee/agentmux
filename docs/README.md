@@ -4,6 +4,8 @@ The default documentation language is English.
 
 - [English documentation](./en/README.md)
 - [Korean documentation](./ko/README.md)
+- [Release policy](./release-policy.md)
+- [Release evidence](./release-evidence/0.1.3.md)
 
 Repository documentation is organized by language:
 
