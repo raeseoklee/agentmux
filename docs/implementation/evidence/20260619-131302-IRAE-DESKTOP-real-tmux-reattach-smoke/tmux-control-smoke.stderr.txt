@@ -1,3 +1,0 @@
-   Compiling agentmux-backend-tmux v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-backend-tmux)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
-     Running tests\tmux_control_smoke.rs (target\debug\deps\tmux_control_smoke-8862dd4950cf07d2.exe)

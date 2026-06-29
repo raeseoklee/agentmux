@@ -1,7 +1,9 @@
 {
   "name": "@agentmux/desktop",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
+  "description": "AgentMux desktop shell.",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",

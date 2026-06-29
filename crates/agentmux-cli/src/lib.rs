@@ -14491,17 +14491,15 @@ mod tests {
     #[test]
     fn desktop_ui_dist_candidates_include_packaged_resource_locations() {
         let candidates = desktop_ui_dist_dir_candidates_from(
-            Some(Path::new(r"D:\Workspace\irae\agentmux")),
-            Some(Path::new(r"C:\Users\irae\AppData\Local\AgentMux")),
+            Some(Path::new(r"C:\Projects\agentmux")),
+            Some(Path::new(r"C:\Users\dev\AppData\Local\AgentMux")),
         );
 
-        assert!(candidates.contains(&PathBuf::from(r"C:\Users\irae\AppData\Local\AgentMux\dist")));
+        assert!(candidates.contains(&PathBuf::from(r"C:\Users\dev\AppData\Local\AgentMux\dist")));
         assert!(candidates.contains(&PathBuf::from(
-            r"C:\Users\irae\AppData\Local\AgentMux\resources\dist"
+            r"C:\Users\dev\AppData\Local\AgentMux\resources\dist"
         )));
-        assert!(candidates.contains(&PathBuf::from(
-            r"D:\Workspace\irae\agentmux\apps\desktop\dist"
-        )));
+        assert!(candidates.contains(&PathBuf::from(r"C:\Projects\agentmux\apps\desktop\dist")));
     }
 
     #[test]
@@ -14898,7 +14896,7 @@ mod tests {
         let spec = build_agent_integration_wsl_command(
             &runtime,
             "Ubuntu",
-            Path::new(r"D:\Workspace\irae\agentmux\target\debug\cmux.exe"),
+            Path::new(r"C:\Projects\agentmux\target\debug\cmux.exe"),
         )
         .unwrap();
 
@@ -16546,7 +16544,7 @@ HKEY_CURRENT_USER\Environment
         let options = parse_workspace_create_options(&[
             "AgentMux".to_string(),
             "--project".to_string(),
-            r"D:\Workspace\irae\agentmux".to_string(),
+            r"C:\Projects\agentmux".to_string(),
             "--backend-profile".to_string(),
             "Ubuntu".to_string(),
             "--json".to_string(),
@@ -16560,7 +16558,7 @@ HKEY_CURRENT_USER\Environment
         assert_eq!(options.params.name, "AgentMux");
         assert_eq!(
             options.params.project_root.as_deref(),
-            Some(r"D:\Workspace\irae\agentmux")
+            Some(r"C:\Projects\agentmux")
         );
         assert_eq!(options.params.backend_profile.as_deref(), Some("Ubuntu"));
     }

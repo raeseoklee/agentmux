@@ -1,4 +1,9 @@
-import { Terminal } from "@xterm/xterm";
+import {
+  Terminal,
+  type ILink,
+  type ILinkHandler,
+  type ILinkProvider,
+} from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import type { LigaturesAddon } from "@xterm/addon-ligatures";
@@ -47,10 +52,14 @@ const TERMINAL_LINE_HEIGHT = 1.0;
 type WebglAddonModule = typeof import("@xterm/addon-webgl");
 type LigaturesAddonModule = typeof import("@xterm/addon-ligatures");
 type TauriClipboardModule = typeof import("@tauri-apps/plugin-clipboard-manager");
+type TerminalLinkOpenHandler = (url: string, event: MouseEvent) => void;
 
 let webglAddonModulePromise: Promise<WebglAddonModule> | undefined;
 let ligaturesAddonModulePromise: Promise<LigaturesAddonModule> | undefined;
 let tauriClipboardModulePromise: Promise<TauriClipboardModule> | undefined;
+
+const TERMINAL_URL_PATTERN = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+const TERMINAL_URL_TRAILING_PUNCTUATION = /[),.;:!?\]}]+$/;
 
 function loadWebglAddonModule(): Promise<WebglAddonModule> {
   if (!webglAddonModulePromise) {
@@ -85,6 +94,45 @@ function loadTauriClipboardModule(): Promise<TauriClipboardModule> {
 function isTauriRuntime(): boolean {
   const runtime = window as Window & { __TAURI_INTERNALS__?: unknown };
   return Boolean(window.__TAURI__?.core?.invoke || runtime.__TAURI_INTERNALS__);
+}
+
+function normalizeTerminalUrl(value: string): string | null {
+  const trimmed = value.trim().replace(TERMINAL_URL_TRAILING_PUNCTUATION, "");
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? parsed.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTerminalLinks(lineText: string): Array<{
+  url: string;
+  startIndex: number;
+  endIndex: number;
+}> {
+  const links: Array<{ url: string; startIndex: number; endIndex: number }> = [];
+  TERMINAL_URL_PATTERN.lastIndex = 0;
+  let match: RegExpExecArray | null = null;
+  while ((match = TERMINAL_URL_PATTERN.exec(lineText))) {
+    const raw = match[0];
+    const url = normalizeTerminalUrl(raw);
+    if (!url) {
+      continue;
+    }
+    const endIndex = match.index + raw.replace(
+      TERMINAL_URL_TRAILING_PUNCTUATION,
+      "",
+    ).length;
+    links.push({
+      url,
+      startIndex: match.index,
+      endIndex,
+    });
+  }
+  return links;
 }
 
 function normalizeFontSize(value: unknown): number {
@@ -174,6 +222,8 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private mountedElement?: HTMLElement;
   private inputEventAbort?: AbortController;
   private pasteHandlers = new Set<(text: string) => void>();
+  private openLinkHandler?: TerminalLinkOpenHandler;
+  private linkProviderDisposable?: { dispose(): void };
   // Active WebGL addon, when GPU rendering has been opted into and succeeded.
   private webglAddon?: WebglAddon;
   // Disposes the onContextLoss subscription tied to the current webglAddon.
@@ -208,6 +258,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       fontSize,
       letterSpacing: 0,
       lineHeight,
+      linkHandler: this.createOscLinkHandler(),
       rows: initialState.rows,
       cols: initialState.columns,
       theme: XTERM_THEME
@@ -250,6 +301,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       },
       { signal: inputEventAbort.signal }
     );
+    this.installPlainUrlLinkProvider(terminal);
     fitAddon.fit();
 
     if (initialState.bytes && initialState.bytes.length > 0) {
@@ -308,6 +360,8 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // WebGL addon must be disposed BEFORE the terminal: disposing the terminal
     // first leaves the addon holding a dangling reference / leaked GL context.
     this.disposeWebglAddon();
+    this.linkProviderDisposable?.dispose();
+    this.linkProviderDisposable = undefined;
     this.inputEventAbort?.abort();
     this.inputEventAbort = undefined;
     this.terminal?.dispose();
@@ -378,6 +432,15 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.pasteHandlers.add(handler);
     return () => {
       this.pasteHandlers.delete(handler);
+    };
+  }
+
+  onOpenLink(handler: TerminalLinkOpenHandler): () => void {
+    this.openLinkHandler = handler;
+    return () => {
+      if (this.openLinkHandler === handler) {
+        this.openLinkHandler = undefined;
+      }
     };
   }
 
@@ -525,6 +588,63 @@ export class XtermTerminalRenderer implements TerminalRenderer {
           element.dataset.agentmuxTerminalLigatures = "false";
         }
       });
+  }
+
+  private createOscLinkHandler(): ILinkHandler {
+    return {
+      allowNonHttpProtocols: false,
+      activate: (event, text) => {
+        this.openTerminalLink(text, event);
+      },
+    };
+  }
+
+  private installPlainUrlLinkProvider(terminal: Terminal): void {
+    this.linkProviderDisposable?.dispose();
+    const provider: ILinkProvider = {
+      provideLinks: (bufferLineNumber, callback) => {
+        const line = terminal.buffer.active.getLine(bufferLineNumber - 1);
+        if (!line) {
+          callback(undefined);
+          return;
+        }
+        const lineText = line.translateToString(true);
+        const links: ILink[] = extractTerminalLinks(lineText).map(
+          ({ url, startIndex, endIndex }) => ({
+            text: url,
+            range: {
+              start: { x: startIndex + 1, y: bufferLineNumber },
+              end: { x: endIndex, y: bufferLineNumber },
+            },
+            decorations: {
+              pointerCursor: true,
+              underline: true,
+            },
+            activate: (event, text) => {
+              this.openTerminalLink(text, event);
+            },
+          }),
+        );
+        callback(links.length > 0 ? links : undefined);
+      },
+    };
+    this.linkProviderDisposable = terminal.registerLinkProvider(provider);
+  }
+
+  private openTerminalLink(text: string, event: MouseEvent): void {
+    const url = normalizeTerminalUrl(text);
+    const handler = this.openLinkHandler;
+    if (!url || !handler) {
+      return;
+    }
+    // Keep terminal clicks safe for focus/selection/TUI mouse input. Windows
+    // users get Ctrl-click; macOS/server-preview users get Cmd-click.
+    if (!event.ctrlKey && !event.metaKey) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    handler(url, event);
   }
 
   private handleClipboardKey(terminal: Terminal, event: KeyboardEvent): boolean {

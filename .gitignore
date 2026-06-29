@@ -1,12 +1,14 @@
 target/
 node_modules/
 dist/
-!docs/implementation/evidence/**/dist/
-!docs/implementation/evidence/**/dist/**
 build/
 .vite/
 .turbo/
 .toolchains/
+.vs/
+.claude/
+.mcp.json
+AGENTS.md
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/binaries/
 *.log
@@ -25,6 +27,10 @@ docs/implementation/evidence/**/runtime/
 test-results/
 tauri-dev.log
 
-# Rebuildable installer binaries kept under evidence/ (the screenshots/JSON next
-# to them are the actual evidence; the ~4MB .exe just bloats the repo)
-docs/implementation/evidence/**/*.exe
+# Local verification output. Keep the harness artifacts locally, but do not
+# publish logs, extracted installers, temporary stores, or machine-specific
+# evidence.
+docs/implementation/evidence/**
+!docs/implementation/evidence/
+!docs/implementation/evidence/README.md
+docs/ko/implementation/**

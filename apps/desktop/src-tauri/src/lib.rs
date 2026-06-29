@@ -11457,10 +11457,7 @@ mod tests {
         );
         assert_eq!(translate_wsl_path("/mnt/c"), "C:\\");
         // Non-/mnt and already-Windows paths pass through unchanged.
-        assert_eq!(
-            translate_wsl_path("/home/irae/project"),
-            "/home/irae/project"
-        );
+        assert_eq!(translate_wsl_path("/home/dev/project"), "/home/dev/project");
         assert_eq!(
             translate_wsl_path("D:\\already\\windows"),
             "D:\\already\\windows"

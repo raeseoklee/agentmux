@@ -1,8 +1,0 @@
-   Compiling windows_x86_64_msvc v0.52.6
-   Compiling windows-targets v0.52.6
-   Compiling windows-sys v0.59.0
-   Compiling agentmux-backend-conpty v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-backend-conpty)
-   Compiling agentmux-backend-wsl v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-backend-wsl)
-   Compiling agentmux-backend-tmux v0.1.0 (D:\Workspace\irae\agentmux\crates\agentmux-backend-tmux)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.11s
-     Running tests\tmux_control_smoke.rs (target\debug\deps\tmux_control_smoke-8862dd4950cf07d2.exe)

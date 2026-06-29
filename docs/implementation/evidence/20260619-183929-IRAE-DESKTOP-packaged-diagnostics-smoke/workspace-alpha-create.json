@@ -1,9 +1,0 @@
-{
-  "schema": "agentmux.control.v1",
-  "id": "cli_workspace_create",
-  "outcome": {
-    "Ok": {
-      "result_json": "{\"workspace_id\":\"ws_00000001\",\"name\":\"SmokeAlpha\",\"root_pane_id\":\"pane_00000002\",\"active_pane_id\":\"pane_00000002\",\"project_root\":null,\"environment_profile_id\":null,\"description\":null,\"icon\":null,\"color\":null,\"default_wsl_distribution\":null,\"default_agent_command\":null}"
-    }
-  }
-}

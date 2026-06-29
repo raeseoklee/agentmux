@@ -1,16 +1,13 @@
-# AgentMux 한국어 문서
+# AgentMux Korean Documentation
 
-AgentMux의 기본 문서는 영어입니다. 새 문서를 추가할 때는 먼저
-[영문 문서](../en/README.md)에 추가하고, 한국어 번역이나 한국어 원문은 이
-디렉터리에서 연결합니다.
+English documentation is the canonical documentation set. Korean documents in
+this directory are public translations or Korean originals intended for users.
 
-## 한국어 문서
+## Documents
 
-- [기능 목록](./features.md)
-- [구현 기록 및 목표 문서](./implementation/README.md)
+- [Feature overview](./features.md)
 
-## 참고
+## Notes
 
-- 사용자/운영 문서의 기준 버전은 [영문 문서](../en/README.md)입니다.
-- 한국어 구현 문서는 개발 히스토리 보존 목적이므로 `main`에 포함할 때는
-  릴리스 관리자가 의도적으로 승격해야 합니다.
+Development-only implementation logs and verification evidence are intentionally
+kept local and out of the public git index.

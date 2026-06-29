@@ -162,7 +162,7 @@ AgentMux의 정체성은 **Windows에서 여러 AI 에이전트 세션·셸·브
 | 기능 | 성숙도 | 설명 |
 |---|---|---|
 | 진단 export | ✅ | `diagnostics.export`(+`agentmux diagnostics export`)가 백엔드 health(백엔드별 active/recovering/failed), 큐 압력(depth/capacity/dropped), 브라우저 실패 히스토리, 알림 요약, 복구 진단을 한 번에 내보냄 |
-| 성능 벤치마크 게이트 | ✅ | 5종 벤치마크: single-terminal-latency, many-idle-sessions, high-output, resize-storm, restart-recovery. 레퍼런스 Windows 머신(IRAE-DESKTOP)에서 JSON 증거 기록 |
+| 성능 벤치마크 게이트 | ✅ | 5종 벤치마크: single-terminal-latency, many-idle-sessions, high-output, resize-storm, restart-recovery. 레퍼런스 Windows 환경에서 JSON 증거 기록 |
 | Windows 설치 패키지 (NSIS) | ✅ | `agentmux.exe` + `cmux.exe` CLI 사이드카를 포함한 NSIS 설치 프로그램 빌드. 설치 파일 내용 게이트로 사이드카 추출·해시 검증 |
 | 클린 머신 릴리스 검증 | 🟡 | 자동 게이트는 그린. preinstall / CLI 포함 installed(-RequireCli) / uninstalled 라이프사이클과 WSL 부재·tmux 부재 매트릭스의 클린 머신 패스가 최종 릴리스 전 남음 |
 

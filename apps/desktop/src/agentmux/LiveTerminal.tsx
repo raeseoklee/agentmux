@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   ControlClient,
   OutputPressureReport,
@@ -227,6 +227,8 @@ interface LiveTerminalProps {
   fontSize?: number;
   onFocus?: () => void;
   onError?: () => void;
+  onOpenLink?: (url: string, event: MouseEvent) => void;
+  onExitIntent?: () => void;
 }
 
 interface TerminalRestorePreviewProps {
@@ -362,10 +364,15 @@ export function LiveTerminal({
   fontSize = 12.5,
   onFocus,
   onError,
+  onOpenLink,
+  onExitIntent,
 }: LiveTerminalProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
   const activeRef = useRef(active);
+  const onOpenLinkRef = useRef(onOpenLink);
+  const onExitIntentRef = useRef(onExitIntent);
+  const inputLineRef = useRef("");
   const bootingRef = useRef(true);
   const pollNowRef = useRef<(() => void) | null>(null);
   const webglDisableTimerRef = useRef<number | null>(null);
@@ -375,6 +382,39 @@ export function LiveTerminal({
   // "starting…" overlay so a slow cold start (notably the first WSL2 VM boot,
   // ~5s, during which the PTY emits nothing) never looks like a broken pane.
   const [booting, setBooting] = useState(true);
+
+  const notePossibleExitInput = useCallback((data: string) => {
+    let shouldRefresh = false;
+    for (const char of data) {
+      if (char === "\u0004") {
+        shouldRefresh = true;
+        inputLineRef.current = "";
+        continue;
+      }
+      if (char === "\u0003") {
+        inputLineRef.current = "";
+        continue;
+      }
+      if (char === "\r" || char === "\n") {
+        const command = inputLineRef.current.trim().toLowerCase();
+        inputLineRef.current = "";
+        if (command === "exit" || command === "logout") {
+          shouldRefresh = true;
+        }
+        continue;
+      }
+      if (char === "\b" || char === "\u007f") {
+        inputLineRef.current = inputLineRef.current.slice(0, -1);
+        continue;
+      }
+      if (char >= " " && char !== "\u007f") {
+        inputLineRef.current = `${inputLineRef.current}${char}`.slice(-256);
+      }
+    }
+    if (shouldRefresh) {
+      onExitIntentRef.current?.();
+    }
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -403,6 +443,9 @@ export function LiveTerminal({
       { columns: 120, rows: 30, bytes: encoder.encode("") },
       { fontSize, lineHeight: TERMINAL_LINE_HEIGHT },
     );
+    const unsubscribeOpenLink = renderer.onOpenLink((url, event) => {
+      onOpenLinkRef.current?.(url, event);
+    });
     rendererRef.current = renderer;
     let alive = true;
     let previewCacheBytes = readTerminalPreviewCache(sessionId) ?? new Uint8Array(0);
@@ -548,6 +591,7 @@ export function LiveTerminal({
         window.clearTimeout(timer);
       }
       unsubscribeResize();
+      unsubscribeOpenLink();
       resizeObserver.disconnect();
       renderer.dispose();
       flushPreviewCache();
@@ -891,9 +935,11 @@ export function LiveTerminal({
       }
 
       const unsubscribeInput = renderer.onData((data) => {
+        notePossibleExitInput(data);
         client.sendText(sessionId, data).catch(() => onError?.());
       });
       const unsubscribePaste = renderer.onPaste((text) => {
+        notePossibleExitInput(text);
         const sendPaste = client.sendPaste
           ? client.sendPaste.bind(client)
           : client.sendText.bind(client);
@@ -1041,6 +1087,7 @@ export function LiveTerminal({
       pollNowRef.current = requestSnapshotPoll;
 
       const unsubscribeInput = renderer.onData((data) => {
+        notePossibleExitInput(data);
         client
           .sendText(sessionId, data)
           .then(() => {
@@ -1050,6 +1097,7 @@ export function LiveTerminal({
           .catch(() => onError?.());
       });
       const unsubscribePaste = renderer.onPaste((text) => {
+        notePossibleExitInput(text);
         const sendPaste = client.sendPaste
           ? client.sendPaste.bind(client)
           : client.sendText.bind(client);
@@ -1191,6 +1239,7 @@ export function LiveTerminal({
     pollNowRef.current = requestFallbackPoll;
 
     const unsubscribeInput = renderer.onData((data) => {
+      notePossibleExitInput(data);
       requestFallbackPoll();
       client
         .sendText(sessionId, data)
@@ -1198,6 +1247,7 @@ export function LiveTerminal({
         .catch(() => onError?.());
     });
     const unsubscribePaste = renderer.onPaste((text) => {
+      notePossibleExitInput(text);
       const sendPaste = client.sendPaste
         ? client.sendPaste.bind(client)
         : client.sendText.bind(client);
@@ -1220,6 +1270,14 @@ export function LiveTerminal({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, sessionId]);
+
+  useEffect(() => {
+    onOpenLinkRef.current = onOpenLink;
+  }, [onOpenLink]);
+
+  useEffect(() => {
+    onExitIntentRef.current = onExitIntent;
+  }, [onExitIntent]);
 
   useEffect(() => {
     activeRef.current = active;

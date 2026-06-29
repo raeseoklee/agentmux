@@ -1,2 +1,0 @@
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
-     Running unittests src\lib.rs (target\debug\deps\agentmux_browser-e669d8273d939f9a.exe)

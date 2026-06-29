@@ -1,9 +1,0 @@
-{
-  "schema": "agentmux.control.v1",
-  "id": "cli_diagnostics_export",
-  "outcome": {
-    "Ok": {
-      "result_json": "{\"generated_at\":\"1782388092.205Z\",\"format_version\":\"agentmux.diagnostics.v1\",\"recovery\":{\"workspace_count\":0,\"pane_count\":0,\"surface_count\":0,\"session_count\":0,\"sessions\":[]},\"browser\":{\"failures\":[]},\"notifications\":[],\"backend_health\":[],\"queue_pressure\":[{\"queue\":\"runtime.events.pending\",\"depth\":0,\"capacity\":1024,\"dropped_count\":0,\"state\":\"nominal\"},{\"queue\":\"runtime.events.history\",\"depth\":0,\"capacity\":1024,\"dropped_count\":0,\"state\":\"nominal\"},{\"queue\":\"runtime.notifications\",\"depth\":0,\"capacity\":256,\"dropped_count\":0,\"state\":\"nominal\"},{\"queue\":\"desktop.browser_failures\",\"depth\":0,\"capacity\":100,\"dropped_count\":0,\"state\":\"nominal\"}],\"output_stream\":{\"active_sessions\":0,\"active_subscriptions\":0,\"frames_sent\":0,\"bytes_sent\":0,\"send_failures\":0,\"closed_channels\":0,\"pump_runs\":65,\"pump_active_runs\":0,\"pump_idle_runs\":65,\"last_frame_at\":null,\"renderer_queued_bytes\":0,\"renderer_max_queued_bytes\":0,\"renderer_backpressure_events\":0,\"renderer_write_in_flight_sessions\":0}}"
-    }
-  }
-}

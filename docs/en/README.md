@@ -32,5 +32,4 @@ operational documentation set:
 AgentMux is Windows-only for the current product line. Native macOS and Linux
 desktop support is intentionally kept in backlog rather than release scope.
 
-Korean documents and legacy Korean implementation notes are indexed from
-[Korean documentation](../ko/README.md).
+Korean documents are indexed from [Korean documentation](../ko/README.md).

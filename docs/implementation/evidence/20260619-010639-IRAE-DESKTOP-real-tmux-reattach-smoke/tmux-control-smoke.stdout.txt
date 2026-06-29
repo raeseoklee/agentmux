@@ -1,7 +1,0 @@
-
-running 2 tests
-test tmux_control_launches_in_wsl_and_round_trips_output ... ok
-test tmux_control_reattaches_without_duplicating_shell_process ... ok
-
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.45s
-

@@ -1169,7 +1169,7 @@ mod tests {
                     "bash",
                     vec!["-lc".to_string(), "echo hello".to_string()],
                 ),
-                cwd: Some("/home/irae/repo".to_string()),
+                cwd: Some("/home/dev/repo".to_string()),
                 env: Vec::new(),
                 initial_size: TerminalSize::new(120, 30),
             })

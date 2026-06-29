@@ -2766,7 +2766,7 @@ mod tests {
                     backend_kind: "wsl-tmux-control".to_string(),
                     backend_attachment_id: Some("att_durable".to_string()),
                     backend_native_id: Some("tmux-pane-1".to_string()),
-                    cwd: Some("/home/irae/project".to_string()),
+                    cwd: Some("/home/dev/project".to_string()),
                     command: vec!["bash".to_string()],
                     state: "running".to_string(),
                     exit_code: None,

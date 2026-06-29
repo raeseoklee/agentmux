@@ -40,12 +40,13 @@ surface for Linux development workflows.
 - The command palette action `browser.openContextLink` opens the first URL found
   in the current selection, notifications, team messages, team tasks, or
   attention reason in an AgentMux browser tab.
+- Terminal OSC 8 hyperlinks and plain `http://` / `https://` URLs can be opened
+  from terminal output with Ctrl-click on Windows, or Cmd-click in compatible
+  browser-hosted sessions. AgentMux opens the link in an embedded browser split
+  beside the terminal pane.
 - CDP-backed browser automation supports navigation, screenshot, DOM snapshot,
   click, type, and evaluate operations.
 - Browser actions are scoped to the selected surface.
-- Direct terminal-output hyperlink routing, including OSC 8 links and plain URL
-  click/modified-click routing into an embedded split browser, is not yet
-  implemented.
 
 ## Control Plane and CLI
 

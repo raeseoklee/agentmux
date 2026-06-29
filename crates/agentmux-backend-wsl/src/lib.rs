@@ -899,14 +899,14 @@ mod tests {
 
     #[test]
     fn fallback_path_conversion_ignores_non_windows_paths() {
-        assert_eq!(fallback_windows_path_to_wsl("/home/irae/repo"), None);
+        assert_eq!(fallback_windows_path_to_wsl("/home/dev/repo"), None);
     }
 
     #[test]
     fn cwd_resolution_accepts_wsl_and_windows_paths() {
         assert_eq!(
-            resolve_wsl_cwd(Some("/home/irae/repo"), DEFAULT_WSL_CWD).unwrap(),
-            "/home/irae/repo"
+            resolve_wsl_cwd(Some("/home/dev/repo"), DEFAULT_WSL_CWD).unwrap(),
+            "/home/dev/repo"
         );
         assert_eq!(
             resolve_wsl_cwd(Some(r"D:\work\repo"), DEFAULT_WSL_CWD).unwrap(),

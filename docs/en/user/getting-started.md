@@ -14,10 +14,10 @@
 ## Install
 
 1. Download the latest `AgentMux_*_x64-setup.exe` from GitHub Releases.
-2. Optionally verify the artifact attestation:
+2. Verify the artifact attestation:
 
    ```powershell
-   gh attestation verify .\AgentMux_0.1.1_x64-setup.exe --repo raeseoklee/agentmux
+   gh attestation verify .\AgentMux_0.1.2_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
    ```
 
 3. Run the installer.

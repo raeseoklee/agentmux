@@ -12,6 +12,8 @@ export type I18nKey =
   | "app.commandPalette.shortcutRun"
   | "app.panes.balance"
   | "app.settings.open"
+  | "app.version"
+  | "app.version.current"
   | "app.window.minimize"
   | "app.window.maximize"
   | "app.window.restore"
@@ -129,6 +131,8 @@ const en: Record<I18nKey, string> = {
   "app.commandPalette.shortcutRun": "enter run",
   "app.panes.balance": "Balance split panes",
   "app.settings.open": "Open settings",
+  "app.version": "Version",
+  "app.version.current": "Current AgentMux version",
   "app.window.minimize": "Minimize",
   "app.window.maximize": "Maximize",
   "app.window.restore": "Restore",
@@ -234,6 +238,8 @@ const ko: Record<I18nKey, string> = {
   "app.commandPalette.shortcutRun": "enter 실행",
   "app.panes.balance": "분할창 균등 정렬",
   "app.settings.open": "설정 열기",
+  "app.version": "버전",
+  "app.version.current": "현재 AgentMux 버전",
   "app.window.minimize": "최소화",
   "app.window.maximize": "최대화",
   "app.window.restore": "이전 크기로 복원",

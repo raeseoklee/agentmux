@@ -83,6 +83,16 @@ Visible states include:
 When an agent waits for input or completes, AgentMux can show pane badges,
 workspace sidebar attention, and OS notifications.
 
+## Browser Surfaces
+
+AgentMux can open browser surfaces inside the workspace for documentation,
+issues, pull requests, local preview servers, and agent-generated links.
+
+When a terminal prints an OSC 8 hyperlink or a plain `http://` / `https://`
+URL, Ctrl-click the link to open it in an embedded browser split beside that
+terminal. In browser-hosted sessions that use macOS-style shortcuts, Cmd-click
+works the same way.
+
 ## Clipboard
 
 Use standard terminal clipboard behavior:

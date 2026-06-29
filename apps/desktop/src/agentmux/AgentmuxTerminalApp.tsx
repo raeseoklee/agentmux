@@ -108,6 +108,7 @@ import {
   SUPPORTED_LANGUAGES,
   type Translator,
 } from "./i18n";
+import desktopPackage from "../../package.json";
 
 type Overlay = "palette" | "search" | "settings" | "setup" | null;
 type SettingsTab =
@@ -119,6 +120,8 @@ type SettingsTab =
   | "diagnostics";
 
 const SSH_UI_ENABLED = false;
+const APP_VERSION =
+  typeof desktopPackage.version === "string" ? desktopPackage.version : "0.0.0";
 
 type AppUpdateStatus =
   | "idle"
@@ -462,9 +465,42 @@ function moveIdByDirection(
 
 const URL_PATTERN = /\bhttps?:\/\/[^\s<>"')\]]+/i;
 
+function normalizeHttpUrl(value: string): string | null {
+  const trimmed = value.trim().replace(/[),.;:!?\]}]+$/, "");
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? parsed.href
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function extractFirstUrl(value: string | null | undefined): string | null {
   const match = value?.match(URL_PATTERN);
-  return match?.[0] ?? null;
+  return match ? normalizeHttpUrl(match[0]) : null;
+}
+
+function targetPaneForSplitBrowser(
+  detail: WorkspaceDetail,
+  splitPaneId: string,
+): string | null {
+  const children = detail.panes.filter(
+    (pane) => pane.parentPaneId === splitPaneId && pane.kind === "leaf",
+  );
+  const emptyChild = children.find((pane) => !pane.mountedSurfaceId);
+  if (emptyChild) {
+    return emptyChild.paneId;
+  }
+  const secondChild = children[1];
+  if (secondChild) {
+    return secondChild.paneId;
+  }
+  const activePane = detail.panes.find(
+    (pane) => pane.paneId === detail.workspace.activePaneId && pane.kind === "leaf",
+  );
+  return activePane?.paneId ?? null;
 }
 
 function sessionDotColor(
@@ -1171,6 +1207,8 @@ interface PaneViewProps {
     paneId?: string | null,
   ) => void;
   openDurableTerminalInPane: (paneId: string) => void;
+  onOpenTerminalLink: (url: string, paneId: string) => void;
+  onTerminalExitIntent: () => void;
   onPaneDragStart: (
     event: ReactDragEvent<HTMLElement>,
     paneId: string,
@@ -1211,6 +1249,8 @@ const PaneView = memo(function PaneView({
   openTerminalInPane,
   openTerminalProfileMenu,
   openDurableTerminalInPane,
+  onOpenTerminalLink,
+  onTerminalExitIntent,
   onPaneDragStart,
   onPaneDragOver,
   onPaneDrop,
@@ -1463,6 +1503,8 @@ const PaneView = memo(function PaneView({
               fontSize={fontSize}
               onFocus={() => focusPane(pane.paneId)}
               onError={onTerminalError}
+              onOpenLink={(url) => onOpenTerminalLink(url, pane.paneId)}
+              onExitIntent={onTerminalExitIntent}
             />
           ) : isBrowser && surface ? (
             <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
@@ -1591,6 +1633,8 @@ export function AgentmuxTerminalApp() {
     attentionBySession,
     agentBySession,
   } = ctl;
+  const autoClosingExitedSessionsRef = useRef<Set<string>>(new Set());
+  const exitIntentRefreshTimersRef = useRef<number[]>([]);
 
   const [theme, setTheme] = useState<ThemeName>("dark");
   const [language, setLanguage] = useState<AppLocaleLanguage>("en");
@@ -2273,6 +2317,63 @@ export function AgentmuxTerminalApp() {
   );
   const paneHostingSurface = (surfaceId: string): PaneSummary | undefined =>
     panes.find((pane) => pane.mountedSurfaceId === surfaceId);
+
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      return;
+    }
+
+    const paneByMountedSurfaceId = new Map(
+      panes
+        .filter((pane) => pane.mountedSurfaceId)
+        .map((pane) => [pane.mountedSurfaceId ?? "", pane] as const),
+    );
+
+    for (const surface of surfaces) {
+      if (surface.surfaceType !== "terminal" || !surface.sessionId) {
+        continue;
+      }
+      const session = sessionById.get(surface.sessionId);
+      if (session?.state !== "exited") {
+        continue;
+      }
+      const pane = paneByMountedSurfaceId.get(surface.surfaceId);
+      if (!pane) {
+        continue;
+      }
+      const key = `${activeWorkspaceId}:${session.sessionId}`;
+      if (autoClosingExitedSessionsRef.current.has(key)) {
+        continue;
+      }
+      autoClosingExitedSessionsRef.current.add(key);
+      void (async () => {
+        try {
+          if (pane.parentPaneId) {
+            await ctl.closePane(pane.paneId);
+          } else {
+            await ctl.closeSurface(surface.surfaceId);
+          }
+        } catch (error) {
+          console.warn("[agentmux] failed to auto-close exited terminal pane", {
+            error,
+            paneId: pane.paneId,
+            sessionId: session.sessionId,
+            surfaceId: surface.surfaceId,
+          });
+          window.setTimeout(() => {
+            autoClosingExitedSessionsRef.current.delete(key);
+          }, 1500);
+        }
+      })();
+    }
+  }, [
+    activeWorkspaceId,
+    ctl.closePane,
+    ctl.closeSurface,
+    panes,
+    sessionById,
+    surfaces,
+  ]);
   const attentionPaneQueue = useMemo<AttentionPaneTarget[]>(() => {
     const surfaceBySession = new Map(
       surfaces
@@ -3490,6 +3591,51 @@ export function AgentmuxTerminalApp() {
     }
     closeOverlay();
   }, [attention, closeOverlay, ctl, notifications, teamMessages, teamTasks]);
+  const openTerminalLinkInBrowserSplit = useCallback(
+    async (rawUrl: string, paneId: string) => {
+      const url = normalizeHttpUrl(rawUrl);
+      if (!url || !activeWorkspaceId) {
+        return;
+      }
+
+      try {
+        const splitDetail = await client.splitPane(
+          activeWorkspaceId,
+          paneId,
+          "vertical",
+        );
+        const browserPaneId = targetPaneForSplitBrowser(splitDetail, paneId);
+        if (!browserPaneId) {
+          throw new Error("Could not find a split pane for the browser.");
+        }
+        const surface = await client.createBrowserSurface(
+          activeWorkspaceId,
+          browserPaneId,
+          "default",
+          "active_pane",
+        );
+        await client.browserNavigate(surface.surfaceId, url);
+        await ctl.refresh();
+      } catch (error) {
+        console.warn("[agentmux] failed to open terminal link in split browser", {
+          error,
+          paneId,
+          url,
+        });
+        const surface = await ctl.createBrowserSurface("new_tab");
+        if (surface) {
+          await ctl.browserNavigate(surface.surfaceId, url);
+        }
+      }
+    },
+    [
+      activeWorkspaceId,
+      client,
+      ctl.browserNavigate,
+      ctl.createBrowserSurface,
+      ctl.refresh,
+    ],
+  );
   const addTerminalProfile = useCallback(
     async (item: TerminalProfileMenuItem) => {
       if (item.disabled) {
@@ -3805,6 +3951,24 @@ export function AgentmuxTerminalApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [ctl.closeSurface],
   );
+  const queueTerminalExitRefresh = useCallback(() => {
+    for (const delayMs of [300, 1200]) {
+      const timer = window.setTimeout(() => {
+        exitIntentRefreshTimersRef.current =
+          exitIntentRefreshTimersRef.current.filter((candidate) => candidate !== timer);
+        void ctl.refresh();
+      }, delayMs);
+      exitIntentRefreshTimersRef.current.push(timer);
+    }
+  }, [ctl.refresh]);
+  useEffect(() => {
+    return () => {
+      for (const timer of exitIntentRefreshTimersRef.current) {
+        window.clearTimeout(timer);
+      }
+      exitIntentRefreshTimersRef.current = [];
+    };
+  }, []);
   const refreshStable = useCallback(
     () => {
       void ctl.refresh();
@@ -4637,6 +4801,8 @@ export function AgentmuxTerminalApp() {
         openTerminalInPane={openTerminalInPane}
         openTerminalProfileMenu={openTerminalProfileMenu}
         openDurableTerminalInPane={openDurableTerminalInPane}
+        onOpenTerminalLink={openTerminalLinkInBrowserSplit}
+        onTerminalExitIntent={queueTerminalExitRefresh}
         onPaneDragStart={beginPaneSurfaceDrag}
         onPaneDragOver={allowPaneSurfaceDrop}
         onPaneDrop={(event, targetPane) => {
@@ -10616,6 +10782,52 @@ function SettingsModal(props: SettingsModalProps) {
                 }}
               >
                 {t("settings.general")}
+              </div>
+              <div
+                data-agentmux-app-version
+                style={{
+                  border: "1px solid var(--border)",
+                  borderRadius: 8,
+                  padding: 14,
+                  marginBottom: 14,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 14,
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      font: `700 13px/1.2 ${FONT_SANS}`,
+                      color: "var(--fg1)",
+                    }}
+                  >
+                    {t("app.version")}
+                  </div>
+                  <div
+                    style={{
+                      font: `400 11.5px/1.45 ${FONT_SANS}`,
+                      color: "var(--fg4)",
+                      marginTop: 5,
+                    }}
+                  >
+                    {t("app.version.current")}
+                  </div>
+                </div>
+                <code
+                  style={{
+                    flex: "none",
+                    border: "1px solid var(--border)",
+                    borderRadius: 7,
+                    padding: "7px 10px",
+                    background: "var(--canvas)",
+                    color: "var(--fg2)",
+                    font: `700 12px/1 ${FONT_MONO}`,
+                  }}
+                >
+                  v{APP_VERSION}
+                </code>
               </div>
               <div
                 data-agentmux-language-settings

@@ -28,19 +28,23 @@ Start here:
 
 The full documentation index is in [docs/README.md](./docs/README.md).
 
+## License
+
+AgentMux is licensed under the MIT License. See [LICENSE](./LICENSE) and
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
 ## Release Builds
 
 Release builds are published through GitHub Actions from SemVer tags such as
-`v0.1.1`. The release workflow builds the Windows NSIS installer, writes a
-SHA256 checksum, generates a GitHub Artifact Attestation when the repository
-visibility and plan support it, and uploads the assets to the GitHub Release.
+`v0.1.2`. The release workflow builds the Windows NSIS installer, writes a
+SHA256 checksum, generates and verifies GitHub Artifact Attestations for the
+release assets, and uploads the assets to the GitHub Release.
 
-After downloading a release installer, verify its checksum and, when an
-attestation is present, its provenance:
+After downloading a release installer, verify its checksum and provenance:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.1_x64-setup.exe
-gh attestation verify .\AgentMux_0.1.1_x64-setup.exe --repo raeseoklee/agentmux
+Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.2_x64-setup.exe
+gh attestation verify .\AgentMux_0.1.2_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 ## Development Branch Notes

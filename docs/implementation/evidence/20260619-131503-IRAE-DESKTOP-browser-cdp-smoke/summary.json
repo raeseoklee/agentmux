@@ -1,8 +1,0 @@
-﻿{
-    "generated_at":  "2026-06-19T04:15:05.2388585Z",
-    "command":  "cargo test -p agentmux-browser cdp_browser_launches_real_browser_smoke -- --ignored --nocapture",
-    "exit_code":  0,
-    "result":  "passed",
-    "stdout":  "browser-cdp-smoke.stdout.txt",
-    "stderr":  "browser-cdp-smoke.stderr.txt"
-}

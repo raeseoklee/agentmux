@@ -3,12 +3,11 @@
 ## Purpose
 
 This runbook describes how to publish the AgentMux Windows-only release through
-GitHub Actions with checksums and GitHub Artifact Attestations when repository
-visibility and plan support them.
+GitHub Actions with checksums and GitHub Artifact Attestations.
 
 ## Preflight
 
-Run these checks on `develop` before tagging:
+Run these checks on the release branch before tagging:
 
 ```powershell
 npm run version:check
@@ -45,16 +44,16 @@ Configure GitHub before publishing a release:
 Set the next SemVer version:
 
 ```powershell
-npm run version:set -- 0.1.1
-npm run version:check -- --tag v0.1.1
+npm run version:set -- 0.1.2
+npm run version:check -- --tag v0.1.2
 ```
 
 Commit the version bump:
 
 ```powershell
 git add package.json apps/desktop/package.json apps/desktop/package-lock.json apps/desktop/src-tauri/tauri.conf.json Cargo.toml
-git commit -m "Release 0.1.1"
-git push origin develop
+git commit -m "Release 0.1.2"
+git push origin main
 ```
 
 ## Tag Release
@@ -62,8 +61,8 @@ git push origin develop
 Create and push the tag:
 
 ```powershell
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 The `release` GitHub Actions workflow will:
@@ -74,7 +73,7 @@ The `release` GitHub Actions workflow will:
 4. Merge the updater release config from GitHub variables.
 5. Build the Windows NSIS installer and Tauri updater archive/signature.
 6. Generate a SHA256 file and `latest.json` updater manifest.
-7. Generate a GitHub Artifact Attestation when available.
+7. Generate and verify GitHub Artifact Attestations for the release assets.
 8. Publish the installer, checksum, updater archive, updater signature, and
    `latest.json` to the GitHub Release.
 
@@ -83,17 +82,17 @@ The `release` GitHub Actions workflow will:
 After the workflow completes, download the installer and checksum from the
 GitHub Release.
 
-Verify provenance when the release notes say an attestation was generated:
+Verify provenance:
 
 ```powershell
-gh attestation verify .\AgentMux_0.1.1_x64-setup.exe --repo raeseoklee/agentmux
+gh attestation verify .\AgentMux_0.1.2_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 Verify hash:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.1_x64-setup.exe
-Get-Content .\AgentMux_0.1.1_x64-setup.exe.sha256
+Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.2_x64-setup.exe
+Get-Content .\AgentMux_0.1.2_x64-setup.exe.sha256
 ```
 
 The hashes must match.

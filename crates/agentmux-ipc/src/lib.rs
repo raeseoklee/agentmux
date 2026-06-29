@@ -2142,7 +2142,7 @@ mod tests {
         let request = RequestEnvelope::new(
             "req_spawn",
             "session.spawn",
-            r#"{"workspace_id":"ws_1","backend":"wsl-direct","backend_profile":"Ubuntu","command":["bash"],"cwd":"/home/irae","columns":80,"rows":24,"durability":"ephemeral"}"#,
+            r#"{"workspace_id":"ws_1","backend":"wsl-direct","backend_profile":"Ubuntu","command":["bash"],"cwd":"/home/dev","columns":80,"rows":24,"durability":"ephemeral"}"#,
             "token",
         );
 

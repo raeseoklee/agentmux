@@ -1,1 +1,0 @@
-agentmux: workspace create accepts exactly one name.

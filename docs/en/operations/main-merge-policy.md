@@ -11,6 +11,10 @@ captures on `develop`.
 Use this allowlist when promoting documentation:
 
 - `README.md`
+- `LICENSE`
+- `SECURITY.md`
+- `CONTRIBUTING.md`
+- `THIRD_PARTY_NOTICES.md`
 - `docs/README.md`
 - `docs/en/README.md`
 - `docs/en/features.md`
@@ -46,6 +50,8 @@ Release automation and version tooling may also be merged when needed:
 - `docs/en/ieee-*.md`
 - `.codexus/**`
 - `.vs/**`
+- `.claude/**`
+- `AGENTS.md`
 - local MCP/config files such as `.mcp.json`
 
 ## Recommended Promotion Command
@@ -55,7 +61,7 @@ From a clean working tree:
 ```powershell
 git checkout main
 git pull origin main
-git checkout develop -- README.md docs/README.md docs/en/README.md docs/en/features.md docs/en/user docs/en/operations docs/en/release/versioning.md docs/en/schemas/agentmux.config.schema.json docs/ko/README.md
+git checkout develop -- README.md LICENSE SECURITY.md CONTRIBUTING.md THIRD_PARTY_NOTICES.md docs/README.md docs/en/README.md docs/en/features.md docs/en/user docs/en/operations docs/en/release/versioning.md docs/en/schemas/agentmux.config.schema.json docs/ko/README.md
 npm run docs:check
 git status --short
 git commit -m "Publish AgentMux operations documentation"
@@ -75,6 +81,7 @@ Remove them in a separate cleanup commit:
 
 ```powershell
 git rm -r docs/ko/implementation docs/implementation/evidence docs/en/development
+git rm --cached --ignore-unmatch AGENTS.md .mcp.json
 git rm docs/en/ieee-29148-desktop-performance-optimization.md docs/en/ieee-29148-system-design.md
 git commit -m "Remove development-only docs from main"
 ```

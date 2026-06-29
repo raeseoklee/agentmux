@@ -2433,10 +2433,10 @@ mod tests {
 
     #[test]
     fn parse_osc7_cwd_handles_st_terminator_and_percent_decoding() {
-        let bytes = b"\x1b]7;file://host/home/irae/my%20project\x1b\\";
+        let bytes = b"\x1b]7;file://host/home/dev/my%20project\x1b\\";
         assert_eq!(
             parse_osc7_cwd(bytes),
-            Some("/home/irae/my project".to_string())
+            Some("/home/dev/my project".to_string())
         );
     }
 
@@ -3313,7 +3313,7 @@ mod tests {
         let spawn = control.handle_request(request(
             "req_spawn",
             "session.spawn",
-            r#"{"workspace_id":"ws_test","backend":"wsl-direct","command":["bash"],"cwd":"/home/irae","columns":80,"rows":24,"durability":"ephemeral"}"#,
+            r#"{"workspace_id":"ws_test","backend":"wsl-direct","command":["bash"],"cwd":"/home/dev","columns":80,"rows":24,"durability":"ephemeral"}"#,
         ));
         let session_id = ok_json(&spawn)
             .split("\"session_id\":\"")

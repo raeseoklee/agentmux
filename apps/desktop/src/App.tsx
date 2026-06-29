@@ -14,8 +14,9 @@ import {
 import { XtermTerminalRenderer } from "./terminal/XtermTerminalRenderer";
 
 const encoder = new TextEncoder();
-const DEFAULT_PROJECT_ROOT = "D:\\Workspace\\irae\\agentmux";
+const DEFAULT_PROJECT_ROOT: string | null = null;
 const DEFAULT_WORKSPACE_NAME = "Workspace 1";
+const NO_PROJECT_ROOT_LABEL = "No project root set";
 
 interface BrowserPaneState {
   url: string;
@@ -912,7 +913,7 @@ export function App() {
   }
 
   const workspaceName = activeWorkspace?.name ?? DEFAULT_WORKSPACE_NAME;
-  const workspaceRoot = activeWorkspace?.projectRoot ?? DEFAULT_PROJECT_ROOT;
+  const workspaceRoot = activeWorkspace?.projectRoot ?? NO_PROJECT_ROOT_LABEL;
   const paneById = useMemo(() => new Map(panes.map((pane) => [pane.paneId, pane])), [panes]);
   const childrenByParent = useMemo(() => {
     const children = new Map<string, PaneSummary[]>();
