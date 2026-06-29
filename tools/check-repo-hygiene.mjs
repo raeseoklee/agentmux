@@ -58,6 +58,21 @@ function isPublicDoc(file) {
   return normalized.startsWith("docs/en/") || normalized.startsWith("docs/ko/");
 }
 
+function requireFileText(relativeFile) {
+  const absoluteFile = path.join(root, relativeFile);
+  if (!fs.existsSync(absoluteFile)) {
+    failures.push(`${relativeFile}: required file is missing`);
+    return "";
+  }
+  return fs.readFileSync(absoluteFile, "utf8");
+}
+
+function requireText(text, relativeFile, description, pattern) {
+  if (!pattern.test(text)) {
+    failures.push(`${relativeFile}: missing ${description}`);
+  }
+}
+
 for (const relativeFile of trackedFiles) {
   const absoluteFile = path.join(root, relativeFile);
   if (!fs.existsSync(absoluteFile)) {
@@ -107,6 +122,51 @@ for (const relativeFile of trackedFiles) {
     }
   }
 }
+
+const releaseWorkflow = ".github/workflows/release.yml";
+const releaseWorkflowText = requireFileText(releaseWorkflow);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "OIDC permission for GitHub Artifact Attestations",
+  /^\s*id-token:\s*write\s*$/m,
+);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "attestations write permission",
+  /^\s*attestations:\s*write\s*$/m,
+);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "artifact metadata write permission",
+  /^\s*artifact-metadata:\s*write\s*$/m,
+);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "actions/attest release step",
+  /uses:\s*actions\/attest@v\d+/,
+);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "release asset subject path attestation",
+  /^\s*subject-path:\s*dist\/release\/\*\s*$/m,
+);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "post-generation attestation verification",
+  /gh\s+attestation\s+verify/,
+);
+requireText(
+  releaseWorkflowText,
+  releaseWorkflow,
+  "signer workflow bound attestation verification",
+  /--signer-workflow\s+\$workflow/,
+);
 
 if (failures.length > 0) {
   console.error("Repository hygiene check failed:");
