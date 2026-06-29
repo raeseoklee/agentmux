@@ -482,6 +482,49 @@ function extractFirstUrl(value: string | null | undefined): string | null {
   return match ? normalizeHttpUrl(match[0]) : null;
 }
 
+// Where terminal links (e.g. Claude Code / OAuth login URLs) open. The system
+// browser is the default because the embedded browser surface cannot service a
+// CLI's localhost loopback auth callback. Persisted client-side so the choice
+// survives restarts without a backend config round-trip.
+export type TerminalLinkOpenMode = "system" | "in-app";
+const TERMINAL_LINK_OPEN_MODE_KEY = "agentmux.terminal.linkOpenMode";
+const DEFAULT_TERMINAL_LINK_OPEN_MODE: TerminalLinkOpenMode = "system";
+
+function readTerminalLinkOpenMode(): TerminalLinkOpenMode {
+  try {
+    return window.localStorage?.getItem(TERMINAL_LINK_OPEN_MODE_KEY) === "in-app"
+      ? "in-app"
+      : DEFAULT_TERMINAL_LINK_OPEN_MODE;
+  } catch {
+    return DEFAULT_TERMINAL_LINK_OPEN_MODE;
+  }
+}
+
+function writeTerminalLinkOpenMode(mode: TerminalLinkOpenMode): void {
+  try {
+    window.localStorage?.setItem(TERMINAL_LINK_OPEN_MODE_KEY, mode);
+  } catch {
+    // Preference persistence is best-effort; storage may be unavailable.
+  }
+}
+
+// Open a URL in the OS default browser. In the Tauri host this calls the
+// dependency-free `open_external_url` command; on vite preview / server mode
+// there is no host, so fall back to a new browser tab.
+async function openUrlInSystemBrowser(url: string): Promise<boolean> {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (invoke) {
+    try {
+      await invoke("open_external_url", { url });
+      return true;
+    } catch (error) {
+      console.warn("[agentmux] system browser open failed", { error, url });
+      return false;
+    }
+  }
+  return window.open(url, "_blank", "noopener,noreferrer") !== null;
+}
+
 function targetPaneForSplitBrowser(
   detail: WorkspaceDetail,
   splitPaneId: string,
@@ -1680,6 +1723,12 @@ export function AgentmuxTerminalApp() {
     [],
   );
   const [uiConfig, setUiConfig] = useState<AppConfigUi>({});
+  const [terminalLinkOpenMode, setTerminalLinkOpenModeState] =
+    useState<TerminalLinkOpenMode>(readTerminalLinkOpenMode);
+  const setTerminalLinkOpenMode = useCallback((mode: TerminalLinkOpenMode) => {
+    setTerminalLinkOpenModeState(mode);
+    writeTerminalLinkOpenMode(mode);
+  }, []);
   const [updatesConfig, setUpdatesConfig] = useState<AppConfigUpdates>(
     DEFAULT_UPDATES_CONFIG,
   );
@@ -3604,7 +3653,22 @@ export function AgentmuxTerminalApp() {
   const openTerminalLinkInBrowserSplit = useCallback(
     async (rawUrl: string, paneId: string) => {
       const url = normalizeHttpUrl(rawUrl);
-      if (!url || !activeWorkspaceId) {
+      if (!url) {
+        return;
+      }
+
+      // Default: hand off to the OS browser so OAuth/login loopback callbacks
+      // (Claude Code, etc.) complete. The in-app split browser is opt-in.
+      if (terminalLinkOpenMode === "system") {
+        const opened = await openUrlInSystemBrowser(url);
+        if (opened) {
+          return;
+        }
+        // System open unavailable (or refused): fall through to the in-app
+        // browser so the link is never silently dropped.
+      }
+
+      if (!activeWorkspaceId) {
         return;
       }
 
@@ -3639,6 +3703,7 @@ export function AgentmuxTerminalApp() {
       }
     },
     [
+      terminalLinkOpenMode,
       activeWorkspaceId,
       client,
       ctl.browserNavigate,
@@ -6800,6 +6865,8 @@ export function AgentmuxTerminalApp() {
             setAccentKey={setAccentKey}
             setFontSize={setFontSize}
             setTerminalInnerMargin={updateTerminalInnerMargin}
+            terminalLinkOpenMode={terminalLinkOpenMode}
+            setTerminalLinkOpenMode={setTerminalLinkOpenMode}
             setAutoUpdateCheck={setAutoUpdateCheck}
             onDismissNotification={(id) => void ctl.dismissNotification(id)}
             onFocusNotificationSession={focusSessionPane}
@@ -8768,6 +8835,7 @@ interface SettingsModalProps {
   accentKey: string;
   fontSize: number;
   terminalInnerMargin: number;
+  terminalLinkOpenMode: TerminalLinkOpenMode;
   settingsTab: SettingsTab;
   notifications: NotificationSummary[];
   updatesConfig: AppConfigUpdates;
@@ -8796,6 +8864,7 @@ interface SettingsModalProps {
   setAccentKey: (key: string) => void;
   setFontSize: (size: number) => void;
   setTerminalInnerMargin: (size: number) => void;
+  setTerminalLinkOpenMode: (mode: TerminalLinkOpenMode) => void;
   setAutoUpdateCheck: (enabled: boolean) => void;
   onDismissNotification: (id: string) => void;
   onFocusNotificationSession: (sessionId: string | null | undefined) => boolean;
@@ -9558,6 +9627,7 @@ function SettingsModal(props: SettingsModalProps) {
     accentKey,
     fontSize,
     terminalInnerMargin,
+    terminalLinkOpenMode,
     settingsTab,
     notifications,
     updatesConfig,
@@ -9584,6 +9654,7 @@ function SettingsModal(props: SettingsModalProps) {
     setAccentKey,
     setFontSize,
     setTerminalInnerMargin,
+    setTerminalLinkOpenMode,
     setAutoUpdateCheck,
     onDismissNotification,
     onFocusNotificationSession,
@@ -10102,6 +10173,61 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 24,
                 }}
               />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                  marginBottom: 9,
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      font: `600 12px/1 ${FONT_SANS}`,
+                      color: "var(--fg2)",
+                    }}
+                  >
+                    {t("settings.terminalLinkOpen")}
+                  </div>
+                  <div
+                    style={{
+                      font: `400 11.5px/1.45 ${FONT_SANS}`,
+                      color: "var(--fg4)",
+                      marginTop: 5,
+                    }}
+                  >
+                    {t("settings.terminalLinkOpenHint")}
+                  </div>
+                </div>
+                <select
+                  className="agentmux-terminal-link-open-mode"
+                  aria-label={t("settings.terminalLinkOpen")}
+                  value={terminalLinkOpenMode}
+                  onChange={(e) =>
+                    setTerminalLinkOpenMode(
+                      e.currentTarget.value === "in-app" ? "in-app" : "system",
+                    )
+                  }
+                  style={{
+                    flex: "none",
+                    background: "var(--bg2)",
+                    color: "var(--fg1)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: "6px 8px",
+                    font: `500 11.5px/1 ${FONT_SANS}`,
+                  }}
+                >
+                  <option value="system">
+                    {t("settings.terminalLinkOpen.system")}
+                  </option>
+                  <option value="in-app">
+                    {t("settings.terminalLinkOpen.inApp")}
+                  </option>
+                </select>
+              </div>
             </>
           ) : null}
 

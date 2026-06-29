@@ -75,6 +75,10 @@ export type I18nKey =
   | "settings.accentColor"
   | "settings.uiFontSize"
   | "settings.terminalInnerMargin"
+  | "settings.terminalLinkOpen"
+  | "settings.terminalLinkOpenHint"
+  | "settings.terminalLinkOpen.system"
+  | "settings.terminalLinkOpen.inApp"
   | "settings.workspace.noActiveProject"
   | "settings.workspace.saveProject"
   | "settings.workspace.title"
@@ -82,6 +86,8 @@ export type I18nKey =
   | "updates.autoCheckHint"
   | "updates.check"
   | "updates.install"
+  | "updates.notification.body"
+  | "updates.notification.title"
   | "updates.releaseNotes"
   | "updates.status.available"
   | "updates.status.checking"
@@ -194,6 +200,11 @@ const en: Record<I18nKey, string> = {
   "settings.accentColor": "Accent color",
   "settings.uiFontSize": "UI font size",
   "settings.terminalInnerMargin": "Terminal inner margin",
+  "settings.terminalLinkOpen": "Open terminal links in",
+  "settings.terminalLinkOpenHint":
+    "System browser is required for OAuth/login flows (e.g. Claude Code) to complete their localhost callback.",
+  "settings.terminalLinkOpen.system": "System browser",
+  "settings.terminalLinkOpen.inApp": "In-app browser",
   "settings.workspace.noActiveProject": "No active project.",
   "settings.workspace.saveProject": "Save project",
   "settings.workspace.title": "Project",
@@ -201,6 +212,8 @@ const en: Record<I18nKey, string> = {
   "updates.autoCheckHint": "AgentMux checks GitHub Releases at startup. Installation still requires your approval.",
   "updates.check": "Check for updates",
   "updates.install": "Download and install",
+  "updates.notification.body": "AgentMux {version} is ready to download from Settings.",
+  "updates.notification.title": "AgentMux update available",
   "updates.releaseNotes": "Release notes",
   "updates.status.available": "Version {version} is available.",
   "updates.status.checking": "Checking for updates...",
@@ -301,6 +314,11 @@ const ko: Record<I18nKey, string> = {
   "settings.accentColor": "강조 색상",
   "settings.uiFontSize": "UI 글자 크기",
   "settings.terminalInnerMargin": "터미널 내부 여백",
+  "settings.terminalLinkOpen": "터미널 링크 열기",
+  "settings.terminalLinkOpenHint":
+    "OAuth/로그인 흐름(예: Claude Code)이 localhost 콜백을 완료하려면 시스템 브라우저가 필요합니다.",
+  "settings.terminalLinkOpen.system": "시스템 브라우저",
+  "settings.terminalLinkOpen.inApp": "앱 내부 브라우저",
   "settings.workspace.noActiveProject": "활성 프로젝트가 없습니다.",
   "settings.workspace.saveProject": "프로젝트 저장",
   "settings.workspace.title": "프로젝트",
@@ -308,6 +326,8 @@ const ko: Record<I18nKey, string> = {
   "updates.autoCheckHint": "AgentMux가 시작될 때 GitHub Release를 확인합니다. 설치는 사용자가 승인해야 진행됩니다.",
   "updates.check": "업데이트 확인",
   "updates.install": "다운로드 및 설치",
+  "updates.notification.body": "설정에서 AgentMux {version}을 다운로드할 수 있습니다.",
+  "updates.notification.title": "AgentMux 업데이트 사용 가능",
   "updates.releaseNotes": "릴리스 노트",
   "updates.status.available": "버전 {version} 업데이트가 있습니다.",
   "updates.status.checking": "업데이트 확인 중...",
