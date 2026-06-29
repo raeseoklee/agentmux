@@ -37,6 +37,7 @@ import type {
   TeamTask,
   TerminalSession,
   TerminalProfile,
+  TerminalStartDirectory,
   TmuxDiagnostics,
   AppConfig,
   AppConfigScope,
@@ -47,7 +48,6 @@ import type {
   WorkspaceSummary,
 } from "../control/ControlClient";
 import {
-  ACTION_GROUP_LABELS,
   buildResolvedShortcutBindings,
   buildShortcutIndex,
   chordKey,
@@ -55,6 +55,7 @@ import {
   normalizeShortcutBinding,
   parseShortcutBindingInput,
   shortcutLabelForAction,
+  type ActionGroup,
   type ActionDescriptor,
   type ResolvedShortcutBindings,
   type ShortcutBindingValue,
@@ -330,6 +331,13 @@ const FONT_SANS = FONT_MONO;
 const DEFAULT_WORKSPACE_PLUS_ACTION = "workspace.new";
 const DEFAULT_SURFACE_TAB_PLUS_ACTION = "terminal.newWsl";
 const DEFAULT_SURFACE_TAB_ACTIONS = ["pane.splitRight", "pane.splitDown"];
+const ACTION_GROUP_ORDER: ActionGroup[] = [
+  "agent",
+  "terminal",
+  "workspace",
+  "view",
+  "remote",
+];
 const TEXT_BOX_DEFAULT_MAX_LINES = 7;
 const TEXT_BOX_MIN_LINES = 2;
 const TEXT_BOX_MAX_LINES = 12;
@@ -595,6 +603,52 @@ function sessionLabel(
       return session.state;
   }
 }
+
+function translatedSessionLabel(
+  t: Translator,
+  session: TerminalSession | undefined,
+  attention: boolean,
+): string {
+  if (attention) return t("session.status.attention");
+  if (!session) return "";
+  switch (session.state) {
+    case "running":
+      return t("session.status.running");
+    case "starting":
+      return t("session.status.starting");
+    case "recovering":
+      return t("session.status.recovering");
+    case "detached":
+      return t("session.status.detached");
+    case "disconnected":
+      return t("session.status.disconnected");
+    case "exited":
+      return t("session.status.exited");
+    case "failed":
+      return t("session.status.failed");
+    case "lost":
+      return t("session.status.lost");
+    default:
+      return session.state;
+  }
+}
+
+function actionGroupLabel(t: Translator, group: ActionGroup): string {
+  switch (group) {
+    case "agent":
+      return t("action.group.agent");
+    case "terminal":
+      return t("action.group.terminal");
+    case "workspace":
+      return t("action.group.workspace");
+    case "view":
+      return t("action.group.view");
+    case "remote":
+      return t("action.group.remote");
+  }
+}
+
+void sessionLabel;
 
 // A session backs a live terminal only while running/starting. Store-only
 // recovery sessions must render placeholders until the backend reattaches.
@@ -1639,7 +1693,7 @@ const PaneView = memo(function PaneView({
                   e.stopPropagation();
                   openDurableTerminalInPane(pane.paneId);
                 }}
-                title="재시작에도 살아남는 durable WSL 세션 (tmux). 연결이 끊겨도 재접속됩니다."
+                title="Durable WSL session (tmux) survives restarts and reconnects after disconnects."
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -1654,7 +1708,7 @@ const PaneView = memo(function PaneView({
                   font: `600 11px/1 ${FONT_SANS}`,
                 }}
               >
-                <IconServer size={12} /> Durable 터미널 (tmux)
+                <IconServer size={12} /> Durable terminal (tmux)
               </button>
             </div>
           )}
@@ -4173,7 +4227,7 @@ export function AgentmuxTerminalApp() {
   );
   const promptCustomAgent = useCallback(() => {
     const raw = window.prompt(
-      "durable 세션으로 실행할 에이전트 명령 (예: claude)",
+      "Agent command to run in a durable session (for example: claude)",
     );
     const parts = (raw ?? "").trim().split(/\s+/).filter(Boolean);
     if (parts.length > 0) {
@@ -4224,7 +4278,7 @@ export function AgentmuxTerminalApp() {
       workspaces.map<ActionDescriptor>((ws) => ({
         id: `workspace.select.${ws.workspaceId}`,
         group: "workspace",
-        title: `이동: ${ws.name}`,
+        title: `Switch to ${ws.name}`,
         keywords: [ws.projectRoot ?? "", ws.name],
         run: () => {
           void ctl.selectWorkspace(ws.workspaceId);
@@ -4238,7 +4292,7 @@ export function AgentmuxTerminalApp() {
       wslDistributions.map<ActionDescriptor>((distribution) => ({
         id: `wsl.open.${distribution.name}`,
         group: "remote",
-        title: `WSL 셸: ${distribution.name}`,
+        title: `WSL shell: ${distribution.name}`,
         keywords: [distribution.name, distribution.isDefault ? "default" : ""],
         run: () => {
           void ctl.spawnWslTerminal(distribution.name);
@@ -4274,7 +4328,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "agent.launchClaude",
         group: "agent",
-        title: "Claude Code 실행 (durable tmux)",
+        title: "Run Claude Code (durable tmux)",
         keywords: ["claude", "tmux"],
         run: () => {
           void ctl.spawnAgent(["claude"]);
@@ -4284,7 +4338,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "agent.launchCodex",
         group: "agent",
-        title: "Codex 실행 (durable tmux)",
+        title: "Run Codex (durable tmux)",
         keywords: ["codex", "tmux"],
         run: () => {
           void ctl.spawnAgent(["codex"]);
@@ -4294,7 +4348,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "agent.launchCustom",
         group: "agent",
-        title: "커스텀 에이전트 실행…",
+        title: "Run custom agent...",
         keywords: ["custom", "tmux"],
         run: promptCustomAgent,
       },
@@ -4518,6 +4572,9 @@ export function AgentmuxTerminalApp() {
   const terminalInnerMargin = clampTerminalInnerMargin(
     uiConfig.terminalInnerMargin,
   );
+  const terminalStartDirectory =
+    uiConfig.terminalStartDirectory ?? "home";
+  const terminalStartCustomCwd = uiConfig.terminalStartCustomCwd ?? "";
   const updateTerminalInnerMargin = useCallback(
     (value: number) => {
       const nextMargin = clampTerminalInnerMargin(value);
@@ -4530,6 +4587,46 @@ export function AgentmuxTerminalApp() {
           {
             ui: {
               terminalInnerMargin: nextMargin,
+            },
+          },
+          activeWorkspaceId,
+        )
+        .then((config) => applyConfig(config))
+        .catch(() => undefined);
+    },
+    [activeWorkspaceId, applyConfig, client],
+  );
+  const updateTerminalStartDirectory = useCallback(
+    (value: TerminalStartDirectory) => {
+      setUiConfig((current) => ({
+        ...current,
+        terminalStartDirectory: value,
+      }));
+      void client
+        .updateConfig(
+          {
+            ui: {
+              terminalStartDirectory: value,
+            },
+          },
+          activeWorkspaceId,
+        )
+        .then((config) => applyConfig(config))
+        .catch(() => undefined);
+    },
+    [activeWorkspaceId, applyConfig, client],
+  );
+  const updateTerminalStartCustomCwd = useCallback(
+    (value: string) => {
+      setUiConfig((current) => ({
+        ...current,
+        terminalStartCustomCwd: value,
+      }));
+      void client
+        .updateConfig(
+          {
+            ui: {
+              terminalStartCustomCwd: value,
             },
           },
           activeWorkspaceId,
@@ -4661,9 +4758,8 @@ export function AgentmuxTerminalApp() {
   }, [confirmDialog, executeAction, overlay, shortcutIndex]);
 
   const q = query.trim().toLowerCase();
-  const rawGroups = Object.entries(ACTION_GROUP_LABELS).map(
-    ([group, label]) => ({
-      label,
+  const rawGroups = ACTION_GROUP_ORDER.map((group) => ({
+      label: actionGroupLabel(t, group),
       items: actions
         .filter(
           (action) =>
@@ -4846,7 +4942,9 @@ export function AgentmuxTerminalApp() {
     const dot = restoringAgent
       ? "var(--accent)"
       : sessionDotColor(T, session, hasAttention);
-    const label = restoringAgent ? t("pane.restoring") : sessionLabel(session, hasAttention);
+    const label = restoringAgent
+      ? t("pane.restoring")
+      : translatedSessionLabel(t, session, hasAttention);
 
       return (
       <PaneView
@@ -5540,6 +5638,7 @@ export function AgentmuxTerminalApp() {
                             key={ws.workspaceId}
                             ws={ws}
                             theme={T}
+                            t={t}
                             active={ws.workspaceId === activeWorkspaceId}
                             attentionCount={
                               attentionByWorkspace.get(ws.workspaceId) ?? 0
@@ -5619,6 +5718,7 @@ export function AgentmuxTerminalApp() {
                   key={ws.workspaceId}
                   ws={ws}
                   theme={T}
+                  t={t}
                   active={ws.workspaceId === activeWorkspaceId}
                   attentionCount={attentionByWorkspace.get(ws.workspaceId) ?? 0}
                   sessionCount={
@@ -6754,8 +6854,11 @@ export function AgentmuxTerminalApp() {
             </>
           ) : null}
           <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>
-            {surfaces.length}surface · {terminalSurfaces.length}터미널 ·{" "}
-            {runningCount}실행
+            {t("statusbar.surfaceSummary", {
+              surfaces: surfaces.length,
+              terminals: terminalSurfaces.length,
+              running: runningCount,
+            })}
           </span>
           <div
             style={{
@@ -6794,7 +6897,8 @@ export function AgentmuxTerminalApp() {
             >
               {error
                 ? t("common.invalid")
-                : sessionLabel(activeSessionState, false) || t("common.idle")}
+                : translatedSessionLabel(t, activeSessionState, false) ||
+                  t("common.idle")}
             </span>
           </div>
         </div>
@@ -6839,6 +6943,8 @@ export function AgentmuxTerminalApp() {
             accentKey={accentKey}
             fontSize={fontSize}
             terminalInnerMargin={terminalInnerMargin}
+            terminalStartDirectory={terminalStartDirectory}
+            terminalStartCustomCwd={terminalStartCustomCwd}
             settingsTab={settingsTab}
             notifications={notifications}
             updatesConfig={updatesConfig}
@@ -6865,6 +6971,8 @@ export function AgentmuxTerminalApp() {
             setAccentKey={setAccentKey}
             setFontSize={setFontSize}
             setTerminalInnerMargin={updateTerminalInnerMargin}
+            setTerminalStartDirectory={updateTerminalStartDirectory}
+            setTerminalStartCustomCwd={updateTerminalStartCustomCwd}
             terminalLinkOpenMode={terminalLinkOpenMode}
             setTerminalLinkOpenMode={setTerminalLinkOpenMode}
             setAutoUpdateCheck={setAutoUpdateCheck}
@@ -7053,6 +7161,7 @@ function TextBoxComposer({
 function WorkspaceCard({
   ws,
   theme,
+  t,
   active,
   attentionCount,
   sessionCount,
@@ -7076,6 +7185,7 @@ function WorkspaceCard({
 }: {
   ws: WorkspaceSummary;
   theme: ThemeTokens;
+  t: Translator;
   active: boolean;
   attentionCount: number;
   sessionCount?: number;
@@ -7108,6 +7218,14 @@ function WorkspaceCard({
       : sessionCount !== undefined
         ? `${sessionCount} 세션`
         : "대기 중";
+  const displayStatusText = needsInput
+    ? t("workspace.status.needsInput")
+    : running
+      ? t("workspace.status.running")
+      : sessionCount !== undefined
+        ? t("workspace.status.sessionCount", { count: sessionCount })
+        : t("workspace.status.idle");
+  void statusText;
   const moveButtonStyle: CSSProperties = {
     width: 18,
     height: 18,
@@ -7321,7 +7439,7 @@ function WorkspaceCard({
           marginTop: 5,
         }}
       >
-        {statusText}
+        {displayStatusText}
       </div>
       {needsInput ? (
         <div
@@ -8835,6 +8953,8 @@ interface SettingsModalProps {
   accentKey: string;
   fontSize: number;
   terminalInnerMargin: number;
+  terminalStartDirectory: TerminalStartDirectory;
+  terminalStartCustomCwd: string;
   terminalLinkOpenMode: TerminalLinkOpenMode;
   settingsTab: SettingsTab;
   notifications: NotificationSummary[];
@@ -8864,6 +8984,8 @@ interface SettingsModalProps {
   setAccentKey: (key: string) => void;
   setFontSize: (size: number) => void;
   setTerminalInnerMargin: (size: number) => void;
+  setTerminalStartDirectory: (value: TerminalStartDirectory) => void;
+  setTerminalStartCustomCwd: (value: string) => void;
   setTerminalLinkOpenMode: (mode: TerminalLinkOpenMode) => void;
   setAutoUpdateCheck: (enabled: boolean) => void;
   onDismissNotification: (id: string) => void;
@@ -9627,6 +9749,8 @@ function SettingsModal(props: SettingsModalProps) {
     accentKey,
     fontSize,
     terminalInnerMargin,
+    terminalStartDirectory,
+    terminalStartCustomCwd,
     terminalLinkOpenMode,
     settingsTab,
     notifications,
@@ -9654,6 +9778,8 @@ function SettingsModal(props: SettingsModalProps) {
     setAccentKey,
     setFontSize,
     setTerminalInnerMargin,
+    setTerminalStartDirectory,
+    setTerminalStartCustomCwd,
     setTerminalLinkOpenMode,
     setAutoUpdateCheck,
     onDismissNotification,
@@ -10189,6 +10315,92 @@ function SettingsModal(props: SettingsModalProps) {
                       color: "var(--fg2)",
                     }}
                   >
+                    {t("settings.terminalStartDirectory")}
+                  </div>
+                  <div
+                    style={{
+                      font: `400 11.5px/1.45 ${FONT_SANS}`,
+                      color: "var(--fg4)",
+                      marginTop: 5,
+                    }}
+                  >
+                    {t("settings.terminalStartDirectoryHint")}
+                  </div>
+                </div>
+                <select
+                  className="agentmux-terminal-start-directory"
+                  aria-label={t("settings.terminalStartDirectory")}
+                  value={terminalStartDirectory}
+                  onChange={(e) =>
+                    setTerminalStartDirectory(
+                      e.currentTarget.value === "workspace"
+                        ? "workspace"
+                        : e.currentTarget.value === "custom"
+                          ? "custom"
+                          : "home",
+                    )
+                  }
+                  style={{
+                    flex: "none",
+                    background: "var(--bg2)",
+                    color: "var(--fg1)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: "6px 8px",
+                    font: `500 11.5px/1 ${FONT_SANS}`,
+                  }}
+                >
+                  <option value="home">
+                    {t("settings.terminalStartDirectory.home")}
+                  </option>
+                  <option value="workspace">
+                    {t("settings.terminalStartDirectory.workspace")}
+                  </option>
+                  <option value="custom">
+                    {t("settings.terminalStartDirectory.custom")}
+                  </option>
+                </select>
+              </div>
+              {terminalStartDirectory === "custom" ? (
+                <input
+                  className="agentmux-terminal-start-custom-cwd"
+                  aria-label={t("settings.terminalStartCustomCwd")}
+                  value={terminalStartCustomCwd}
+                  placeholder={t("settings.terminalStartCustomCwdPlaceholder")}
+                  onChange={(event) =>
+                    setTerminalStartCustomCwd(event.currentTarget.value)
+                  }
+                  style={{
+                    width: "100%",
+                    boxSizing: "border-box",
+                    background: "var(--bg2)",
+                    color: "var(--fg1)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: "7px 9px",
+                    font: `500 11.5px/1 ${FONT_MONO}`,
+                    marginBottom: 24,
+                  }}
+                />
+              ) : (
+                <div style={{ marginBottom: 24 }} />
+              )}
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                  marginBottom: 9,
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      font: `600 12px/1 ${FONT_SANS}`,
+                      color: "var(--fg2)",
+                    }}
+                  >
                     {t("settings.terminalLinkOpen")}
                   </div>
                   <div
@@ -10655,7 +10867,7 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 20,
                 }}
               >
-                단축키
+                {t("settings.keys")}
               </div>
               {shortcutConflicts.length > 0 ? (
                 <div

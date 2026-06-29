@@ -1389,7 +1389,7 @@ export function LiveTerminal({
         >
           <span className="agentmux-term-booting-spinner" />
           <span style={{ fontSize: 13, letterSpacing: 0.2 }}>
-            터미널 시작 중…
+            Starting terminal...
           </span>
         </div>
       )}

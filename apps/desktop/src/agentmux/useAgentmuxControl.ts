@@ -34,10 +34,10 @@ const LAST_ACTIVE_WORKSPACE_STORAGE_KEY = "agentmux.ui.lastActiveWorkspaceId.v1"
 const LOCAL_NOTIFICATION_PREFIX = "local_";
 const WSL_REQUIRED_NOTIFICATION_ID = `${LOCAL_NOTIFICATION_PREFIX}wsl_required`;
 const WSL_REQUIRED_MESSAGE =
-  "AgentMux는 Windows에서 WSL을 기본 터미널 실행 환경으로 사용합니다. PowerShell에서 `wsl --install`로 WSL 배포판을 설치한 뒤 다시 시도하세요.";
+  "AgentMux uses WSL as the default terminal runtime on Windows. Install a WSL distribution with `wsl --install` in PowerShell, then try again.";
 const TMUX_REQUIRED_NOTIFICATION_ID = `${LOCAL_NOTIFICATION_PREFIX}tmux_required`;
 const TMUX_REQUIRED_MESSAGE =
-  "선택된 WSL 배포판에 tmux가 필요합니다. WSL에서 `sudo apt update && sudo apt install -y tmux`를 실행한 뒤 다시 시도하세요.";
+  "The selected WSL distribution needs tmux. Run `sudo apt update && sudo apt install -y tmux` in WSL, then try again.";
 
 const DEFAULT_TERMINAL_PROFILE: TerminalProfile = "wsl";
 const NATIVE_TERMINAL_COMMANDS: Record<Exclude<TerminalProfile, "wsl">, string[]> = {
@@ -541,7 +541,7 @@ export function useAgentmuxControl(): AgentmuxControl {
       severity: "warning",
       workspaceId: activeRef.current,
       sessionId: null,
-      title: "WSL 설치 필요",
+      title: "WSL installation required",
       message: WSL_REQUIRED_MESSAGE
     });
     setError(WSL_REQUIRED_MESSAGE);
@@ -555,7 +555,7 @@ export function useAgentmuxControl(): AgentmuxControl {
         severity: "warning",
         workspaceId: activeRef.current,
         sessionId: null,
-        title: "tmux 설치 필요",
+        title: "tmux installation required",
         message
       });
       setError(message);
@@ -1058,6 +1058,26 @@ export function useAgentmuxControl(): AgentmuxControl {
     [workspaces]
   );
 
+  const terminalStartCwd = useCallback(
+    async (workspaceId: string): Promise<string | null> => {
+      try {
+        const config = await client.getConfig(workspaceId);
+        const mode = config.ui.terminalStartDirectory ?? "home";
+        if (mode === "workspace") {
+          return workspaceProjectRoot(workspaceId);
+        }
+        if (mode === "custom") {
+          const cwd = config.ui.terminalStartCustomCwd?.trim();
+          return cwd ? cwd : null;
+        }
+      } catch {
+        /* keep terminal creation usable if config loading fails */
+      }
+      return null;
+    },
+    [client, workspaceProjectRoot]
+  );
+
   const defaultWslDistribution = useCallback(
     (workspaceId: string) => {
       const workspace = workspaces.find((candidate) => candidate.workspaceId === workspaceId);
@@ -1094,21 +1114,23 @@ export function useAgentmuxControl(): AgentmuxControl {
           notifyWslRequired();
           throw new Error(WSL_REQUIRED_MESSAGE);
         }
+        const cwd = await terminalStartCwd(workspaceId);
         return client.spawnWslTerminal(
           workspaceId,
           distribution,
-          workspaceProjectRoot(workspaceId),
+          cwd,
           placement,
           paneId
         );
       }
 
+      const cwd = await terminalStartCwd(workspaceId);
       return client.spawnNativeTerminal(
         workspaceId,
         NATIVE_TERMINAL_COMMANDS[profile],
         placement,
         paneId,
-        workspaceProjectRoot(workspaceId)
+        cwd
       );
     },
     [
@@ -1116,7 +1138,7 @@ export function useAgentmuxControl(): AgentmuxControl {
       defaultTerminalProfile,
       defaultWslDistribution,
       notifyWslRequired,
-      workspaceProjectRoot
+      terminalStartCwd
     ]
   );
 
@@ -1170,28 +1192,30 @@ export function useAgentmuxControl(): AgentmuxControl {
           notifyWslRequired();
           throw new Error(WSL_REQUIRED_MESSAGE);
         }
+        const cwd = await terminalStartCwd(workspaceId);
         return client.spawnDurableWslTerminal(
           workspaceId,
           distribution,
-          workspaceProjectRoot(workspaceId),
+          cwd,
           "active_pane",
           paneId
         );
       }),
-    [client, defaultWslDistribution, notifyWslRequired, withActive, workspaceProjectRoot]
+    [client, defaultWslDistribution, notifyWslRequired, terminalStartCwd, withActive]
   );
 
   const spawnWslTerminal = useCallback(
     (distribution: string) =>
       withActive(async (workspaceId) => {
+        const cwd = await terminalStartCwd(workspaceId);
         return client.spawnWslTerminal(
           workspaceId,
           distribution || null,
-          workspaceProjectRoot(workspaceId),
+          cwd,
           "new_tab"
         );
       }),
-    [client, withActive, workspaceProjectRoot]
+    [client, terminalStartCwd, withActive]
   );
 
   useEffect(() => {

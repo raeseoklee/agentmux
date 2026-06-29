@@ -52,6 +52,12 @@ const TERMINAL_FONT_FAMILY = [
 ].join(", ");
 const TERMINAL_FONT_SIZE = 12.5;
 const TERMINAL_LINE_HEIGHT = 1.0;
+const WHEEL_PIXEL_LINE_HEIGHT = 24;
+const WHEEL_MIN_LINES = 1;
+const WHEEL_MAX_LINES = 12;
+const TRANSIENT_SCROLLBAR_MS = 800;
+const PAGE_UP_SEQUENCE = "\x1b[5~";
+const PAGE_DOWN_SEQUENCE = "\x1b[6~";
 type WebglAddonModule = typeof import("@xterm/addon-webgl");
 type LigaturesAddonModule = typeof import("@xterm/addon-ligatures");
 type TauriClipboardModule = typeof import("@tauri-apps/plugin-clipboard-manager");
@@ -150,6 +156,25 @@ function normalizeLineHeight(value: unknown): number {
     : TERMINAL_LINE_HEIGHT;
 }
 
+function wheelDeltaLines(event: WheelEvent, rows: number): number {
+  const delta = Math.abs(event.deltaY);
+  if (delta === 0) {
+    return 0;
+  }
+  let lines: number;
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+    lines = Math.max(1, rows - 1);
+  } else if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+    lines = delta;
+  } else {
+    lines = delta / WHEEL_PIXEL_LINE_HEIGHT;
+  }
+  return Math.min(
+    WHEEL_MAX_LINES,
+    Math.max(WHEEL_MIN_LINES, Math.ceil(lines)),
+  );
+}
+
 function fallbackWriteClipboardText(text: string): boolean {
   const textarea = document.createElement("textarea");
   const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -242,6 +267,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private webglGeneration = 0;
   private fontReadyPromise?: Promise<void>;
   private ligaturesReadyPromise?: Promise<void>;
+  private scrollbarHideTimer?: number;
 
   mount(
     element: HTMLElement,
@@ -283,6 +309,9 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.ligaturesReadyPromise = this.enableLigatures(terminal, element);
     terminal.attachCustomKeyEventHandler((event) =>
       this.handleClipboardKey(terminal, event)
+    );
+    terminal.attachCustomWheelEventHandler((event) =>
+      this.handleWheelEvent(terminal, element, event)
     );
     const inputEventAbort = new AbortController();
     element.addEventListener(
@@ -367,6 +396,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.disposeWebglAddon();
     this.linkProviderDisposable?.dispose();
     this.linkProviderDisposable = undefined;
+    this.clearTransientScrollbar();
     this.inputEventAbort?.abort();
     this.inputEventAbort = undefined;
     this.terminal?.dispose();
@@ -650,6 +680,72 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     event.preventDefault();
     event.stopPropagation();
     handler(url, event);
+  }
+
+  private handleWheelEvent(
+    terminal: Terminal,
+    element: HTMLElement,
+    event: WheelEvent,
+  ): boolean {
+    if (this.terminal !== terminal || event.ctrlKey || event.metaKey) {
+      return true;
+    }
+
+    const lines = wheelDeltaLines(event, terminal.rows);
+    if (lines === 0) {
+      return true;
+    }
+
+    const direction = event.deltaY > 0 ? 1 : -1;
+    const buffer = terminal.buffer.active;
+    if (buffer.type === "normal") {
+      const hasScrollback = buffer.baseY > 0;
+      const canScrollUp = hasScrollback && direction < 0 && buffer.viewportY > 0;
+      const canScrollDown =
+        hasScrollback && direction > 0 && buffer.viewportY < buffer.baseY;
+      const canScroll = canScrollUp || canScrollDown;
+      if (canScroll) {
+        terminal.scrollLines(direction * lines);
+        this.showTransientScrollbar(element);
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
+    }
+
+    if (terminal.modes.mouseTrackingMode !== "none") {
+      return true;
+    }
+
+    terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
+    this.showTransientScrollbar(element);
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  }
+
+  private showTransientScrollbar(element: HTMLElement): void {
+    if (this.scrollbarHideTimer !== undefined) {
+      window.clearTimeout(this.scrollbarHideTimer);
+      this.scrollbarHideTimer = undefined;
+    }
+    element.dataset.agentmuxTerminalScrolling = "true";
+    this.scrollbarHideTimer = window.setTimeout(() => {
+      if (this.mountedElement === element) {
+        element.dataset.agentmuxTerminalScrolling = "false";
+      }
+      this.scrollbarHideTimer = undefined;
+    }, TRANSIENT_SCROLLBAR_MS);
+  }
+
+  private clearTransientScrollbar(): void {
+    if (this.scrollbarHideTimer !== undefined) {
+      window.clearTimeout(this.scrollbarHideTimer);
+      this.scrollbarHideTimer = undefined;
+    }
+    if (this.mountedElement) {
+      this.mountedElement.dataset.agentmuxTerminalScrolling = "false";
+    }
   }
 
   private handleClipboardKey(terminal: Terminal, event: KeyboardEvent): boolean {

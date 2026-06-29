@@ -276,6 +276,8 @@ export interface AppConfigUpdates {
   autoCheck: boolean;
 }
 
+export type TerminalStartDirectory = "home" | "workspace" | "custom";
+
 export type ShortcutBindingValue = string | [string, string] | null;
 
 export interface AppConfigShortcuts {
@@ -303,6 +305,8 @@ export interface AppConfigUi {
   surfaceTabActions?: string[] | null;
   textBoxMaxLines?: number | null;
   terminalInnerMargin?: number | null;
+  terminalStartDirectory?: TerminalStartDirectory | null;
+  terminalStartCustomCwd?: string | null;
 }
 
 export interface AppConfigNotificationAction {
@@ -1590,6 +1594,8 @@ class TauriControlClient implements ControlClient {
             surface_tab_actions: update.ui.surfaceTabActions,
             text_box_max_lines: update.ui.textBoxMaxLines,
             terminal_inner_margin: update.ui.terminalInnerMargin,
+            terminal_start_directory: update.ui.terminalStartDirectory,
+            terminal_start_custom_cwd: update.ui.terminalStartCustomCwd,
           }
         : undefined,
     });
@@ -4523,6 +4529,8 @@ class BrowserPreviewControlClient implements ControlClient {
         surfaceTabActions: null,
         textBoxMaxLines: null,
         terminalInnerMargin: null,
+        terminalStartDirectory: "home",
+        terminalStartCustomCwd: null,
       },
       notifications: {
         actions: [],
@@ -5994,6 +6002,8 @@ interface AppConfigWire {
     surface_tab_actions?: string[] | null;
     text_box_max_lines?: number | null;
     terminal_inner_margin?: number | null;
+    terminal_start_directory?: string | null;
+    terminal_start_custom_cwd?: string | null;
   };
   notifications?: {
     actions?: AppConfigNotificationActionWire[];
@@ -6386,6 +6396,12 @@ function mapAppConfig(value: AppConfigWire): AppConfig {
       surfaceTabActions: value.ui?.surface_tab_actions ?? null,
       textBoxMaxLines: value.ui?.text_box_max_lines ?? null,
       terminalInnerMargin: value.ui?.terminal_inner_margin ?? null,
+      terminalStartDirectory: normalizeTerminalStartDirectory(
+        value.ui?.terminal_start_directory,
+      ),
+      terminalStartCustomCwd: sanitizeTerminalStartCustomCwd(
+        value.ui?.terminal_start_custom_cwd,
+      ),
     }),
     notifications: {
       actions: sanitizeNotificationActions(
@@ -6449,6 +6465,8 @@ function appConfigExportSnapshot(
       surface_tab_actions: config.ui.surfaceTabActions ?? null,
       text_box_max_lines: config.ui.textBoxMaxLines ?? null,
       terminal_inner_margin: config.ui.terminalInnerMargin ?? null,
+      terminal_start_directory: config.ui.terminalStartDirectory ?? null,
+      terminal_start_custom_cwd: config.ui.terminalStartCustomCwd ?? null,
     },
     notifications: {
       actions: config.notifications.actions.map((action) => ({
@@ -6492,6 +6510,8 @@ function previewProjectConfigExportSnapshot(
       surface_tab_actions: config?.ui?.surfaceTabActions ?? null,
       text_box_max_lines: config?.ui?.textBoxMaxLines ?? null,
       terminal_inner_margin: config?.ui?.terminalInnerMargin ?? null,
+      terminal_start_directory: config?.ui?.terminalStartDirectory ?? null,
+      terminal_start_custom_cwd: config?.ui?.terminalStartCustomCwd ?? null,
     },
     notifications: {
       actions: (config?.notifications?.actions ?? []).map((action) => ({
@@ -6540,6 +6560,14 @@ function mergePreviewProjectConfig(
         project.ui?.textBoxMaxLines ?? base.ui.textBoxMaxLines ?? null,
       terminalInnerMargin:
         project.ui?.terminalInnerMargin ?? base.ui.terminalInnerMargin ?? null,
+      terminalStartDirectory:
+        project.ui?.terminalStartDirectory ??
+        base.ui.terminalStartDirectory ??
+        "home",
+      terminalStartCustomCwd:
+        project.ui?.terminalStartCustomCwd ??
+        base.ui.terminalStartCustomCwd ??
+        null,
     },
     notifications: {
       actions: mergePreviewNotificationActions(
@@ -6681,6 +6709,16 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
         typeof ui.terminal_inner_margin === "number"
           ? ui.terminal_inner_margin
           : null,
+      terminalStartDirectory: normalizeTerminalStartDirectory(
+        typeof ui.terminal_start_directory === "string"
+          ? ui.terminal_start_directory
+          : null,
+      ),
+      terminalStartCustomCwd: sanitizeTerminalStartCustomCwd(
+        typeof ui.terminal_start_custom_cwd === "string"
+          ? ui.terminal_start_custom_cwd
+          : null,
+      ),
     },
     notifications: {
       actions: Array.isArray(notifications.actions)
@@ -7297,6 +7335,24 @@ function sanitizeTerminalInnerMargin(value: unknown): number | null {
   return Math.min(32, Math.max(0, rounded));
 }
 
+function normalizeTerminalStartDirectory(
+  value: unknown,
+): TerminalStartDirectory {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "workspace" || normalized === "custom") {
+    return normalized;
+  }
+  return "home";
+}
+
+function sanitizeTerminalStartCustomCwd(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
 function sanitizeAppConfigUi(
   value: Partial<AppConfigUi> | undefined,
 ): AppConfigUi {
@@ -7307,6 +7363,12 @@ function sanitizeAppConfigUi(
     textBoxMaxLines: sanitizeTextBoxMaxLines(value?.textBoxMaxLines),
     terminalInnerMargin: sanitizeTerminalInnerMargin(
       value?.terminalInnerMargin,
+    ),
+    terminalStartDirectory: normalizeTerminalStartDirectory(
+      value?.terminalStartDirectory,
+    ),
+    terminalStartCustomCwd: sanitizeTerminalStartCustomCwd(
+      value?.terminalStartCustomCwd,
     ),
   };
 }

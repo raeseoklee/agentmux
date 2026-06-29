@@ -795,6 +795,9 @@ impl DesktopControlState {
         if params.pane_id.is_none() {
             params.pane_id = Some(pane_id.clone());
         }
+        if Self::should_default_conpty_cwd_to_home(&params) {
+            params.cwd = default_windows_shell_cwd();
+        }
         let mut env = std::mem::take(&mut params.env);
         let extra_wsl_env_keys = env
             .iter()
@@ -818,6 +821,17 @@ impl DesktopControlState {
             params_json,
             ..request
         })
+    }
+
+    fn should_default_conpty_cwd_to_home(params: &SessionSpawnParams) -> bool {
+        let backend = params.backend.as_deref().unwrap_or("conpty").trim();
+        backend == "conpty"
+            && params
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+                .is_none()
     }
 
     fn resolve_spawn_pane_id(&self, params: &SessionSpawnParams) -> Result<String, ControlError> {
@@ -5166,6 +5180,13 @@ impl DesktopControlState {
             if let Some(margin) = ui.terminal_inner_margin {
                 config.ui.terminal_inner_margin = Some(normalize_terminal_inner_margin(margin)?);
             }
+            if let Some(directory) = ui.terminal_start_directory {
+                config.ui.terminal_start_directory =
+                    Some(normalize_terminal_start_directory(&directory)?);
+            }
+            if let Some(cwd) = ui.terminal_start_custom_cwd {
+                config.ui.terminal_start_custom_cwd = normalize_terminal_start_custom_cwd(cwd);
+            }
         }
 
         save_app_config(&self.config_path, &config)?;
@@ -7429,6 +7450,12 @@ fn normalize_app_config_ui(ui: &mut AppConfigUi) -> Result<(), DesktopHostError>
     if let Some(margin) = ui.terminal_inner_margin {
         ui.terminal_inner_margin = Some(normalize_terminal_inner_margin(margin)?);
     }
+    if let Some(directory) = ui.terminal_start_directory.take() {
+        ui.terminal_start_directory = Some(normalize_terminal_start_directory(&directory)?);
+    }
+    if let Some(cwd) = ui.terminal_start_custom_cwd.take() {
+        ui.terminal_start_custom_cwd = normalize_terminal_start_custom_cwd(cwd);
+    }
 
     Ok(())
 }
@@ -7566,6 +7593,29 @@ fn invalid_terminal_inner_margin(value: u8) -> DesktopHostError {
             "Config ui.terminal_inner_margin must be between {TERMINAL_INNER_MARGIN_MIN} and {TERMINAL_INNER_MARGIN_MAX}; got {value}."
         ),
     ))
+}
+
+fn normalize_terminal_start_directory(value: &str) -> Result<String, DesktopHostError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "home" => Ok("home".to_string()),
+        "workspace" => Ok("workspace".to_string()),
+        "custom" => Ok("custom".to_string()),
+        other => Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Config ui.terminal_start_directory must be 'home', 'workspace', or 'custom'; got '{other}'."
+            ),
+        ))),
+    }
+}
+
+fn normalize_terminal_start_custom_cwd(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn normalize_custom_actions(actions: &mut [AppConfigCustomAction]) -> Result<(), DesktopHostError> {
@@ -8359,6 +8409,12 @@ fn merge_app_config_ui(ui: &mut AppConfigUi, overrides: AppConfigUi) {
     }
     if overrides.terminal_inner_margin.is_some() {
         ui.terminal_inner_margin = overrides.terminal_inner_margin;
+    }
+    if overrides.terminal_start_directory.is_some() {
+        ui.terminal_start_directory = overrides.terminal_start_directory;
+    }
+    if overrides.terminal_start_custom_cwd.is_some() {
+        ui.terminal_start_custom_cwd = overrides.terminal_start_custom_cwd;
     }
 }
 

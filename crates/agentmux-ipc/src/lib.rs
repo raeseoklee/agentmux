@@ -1493,6 +1493,10 @@ pub struct AppConfigUi {
     pub text_box_max_lines: Option<u8>,
     #[serde(default)]
     pub terminal_inner_margin: Option<u8>,
+    #[serde(default)]
+    pub terminal_start_directory: Option<String>,
+    #[serde(default)]
+    pub terminal_start_custom_cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1665,6 +1669,8 @@ pub struct AppConfigUiUpdate {
     pub surface_tab_actions: Option<Vec<String>>,
     pub text_box_max_lines: Option<u8>,
     pub terminal_inner_margin: Option<u8>,
+    pub terminal_start_directory: Option<String>,
+    pub terminal_start_custom_cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
