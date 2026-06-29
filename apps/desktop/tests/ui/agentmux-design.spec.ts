@@ -1694,6 +1694,25 @@ test("settings can migrate preview cmux project config", async ({ page }) => {
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 });
 
+test("settings hides cmux project diagnostics when no legacy config exists", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-settings-open").click();
+  await page.locator(".agentmux-settings-tab-general").click();
+
+  await expect(
+    page.locator('[data-agentmux-config-diagnostic-source="global"]'),
+  ).toHaveCount(1);
+  await expect(
+    page.locator('[data-agentmux-config-diagnostic-source="project"]'),
+  ).toHaveCount(1);
+  await expect(
+    page.locator('[data-agentmux-config-diagnostic-source="cmux_project"]'),
+  ).toHaveCount(0);
+});
+
 test("unfinished SSH UI is hidden from settings and sidebar", async ({
   page,
 }) => {

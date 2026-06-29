@@ -3496,7 +3496,7 @@ class BrowserPreviewControlClient implements ControlClient {
       projectKey && window.localStorage.getItem(projectKey),
     );
     const cmuxExists = Boolean(cmuxKey && window.localStorage.getItem(cmuxKey));
-    return [
+    const entries: AppConfigDiagnosticEntry[] = [
       {
         source: "global",
         path: "localStorage://agentmux.preview.config.v1",
@@ -3515,19 +3515,20 @@ class BrowserPreviewControlClient implements ControlClient {
           ? "Preview AgentMux project config is readable."
           : "Preview AgentMux project config is absent.",
       },
-      {
+    ];
+    if (cmuxExists) {
+      entries.push({
         source: "cmux_project",
         path: cmuxKey,
-        exists: cmuxExists,
+        exists: true,
         valid: true,
-        active: !projectExists && cmuxExists,
-        message: cmuxExists
-          ? projectExists
-            ? "Preview .cmux config is ignored because project config exists."
-            : "Preview .cmux config is available as fallback."
-          : "Preview .cmux config is absent.",
-      },
-    ];
+        active: !projectExists,
+        message: projectExists
+          ? "Preview legacy cmux config is ignored because AgentMux project config exists."
+          : "Preview legacy cmux config is available for migration.",
+      });
+    }
+    return entries;
   }
 
   async getDock(workspaceId?: string | null): Promise<DockConfig> {

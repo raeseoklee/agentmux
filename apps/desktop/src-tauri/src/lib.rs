@@ -5311,7 +5311,7 @@ impl DesktopControlState {
                     if project_exists {
                         None
                     } else {
-                        Some("AgentMux project config is absent; .cmux fallback may be used.")
+                        Some("AgentMux project config is absent.")
                     },
                 ));
             } else {
@@ -5327,28 +5327,19 @@ impl DesktopControlState {
 
             if let Some(path) = cmux_path {
                 let cmux_exists = path.exists();
-                entries.push(diagnose_project_app_config(
-                    "cmux_project",
-                    &path,
-                    cmux_exists,
-                    !project_exists && cmux_exists,
-                    if project_exists {
-                        Some("Ignored because AgentMux project config exists.")
-                    } else if cmux_exists {
-                        None
-                    } else {
-                        Some("No cmux project config fallback found.")
-                    },
-                ));
-            } else {
-                entries.push(config_diagnostics_entry(
-                    "cmux_project",
-                    None,
-                    false,
-                    true,
-                    false,
-                    "Workspace has no project_root for cmux project config.",
-                ));
+                if cmux_exists {
+                    entries.push(diagnose_project_app_config(
+                        "cmux_project",
+                        &path,
+                        true,
+                        !project_exists,
+                        if project_exists {
+                            Some("Legacy cmux config is ignored because AgentMux project config exists.")
+                        } else {
+                            Some("Legacy cmux config is available for migration.")
+                        },
+                    ));
+                }
             }
         }
 
@@ -12600,6 +12591,45 @@ mod tests {
         cleanup_temp_db(&store_path);
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn desktop_config_diagnostics_hides_missing_cmux_project_source() {
+        let state = DesktopControlState::new_in_memory_with_token("configured-token").unwrap();
+        let created = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_workspace",
+                "workspace.create",
+                r#"{"name":"Config diagnostics","project_root":null,"backend_profile":null}"#,
+                "configured-token",
+            ),
+        );
+        let workspace_id = response_value(&created)["workspace_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let diagnostics = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_config_diagnostics",
+                "config.diagnostics",
+                serde_json::json!({ "workspace_id": workspace_id }).to_string(),
+                "configured-token",
+            ),
+        );
+        let value = response_value(&diagnostics);
+        let entries = value["entries"].as_array().unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry["source"] == serde_json::json!("global")));
+        assert!(entries
+            .iter()
+            .any(|entry| entry["source"] == serde_json::json!("project")));
+        assert!(!entries
+            .iter()
+            .any(|entry| entry["source"] == serde_json::json!("cmux_project")));
     }
 
     #[test]
