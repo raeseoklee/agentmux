@@ -62,7 +62,7 @@ import {
 } from "./actions";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
 import { Hov } from "./Hov";
-import { LiveTerminal } from "./LiveTerminal";
+import { LiveTerminal, TerminalRestorePreview } from "./LiveTerminal";
 import { SplitHandle } from "./SplitHandle";
 import { useAgentmuxControl } from "./useAgentmuxControl";
 import {
@@ -1227,6 +1227,37 @@ const PaneView = memo(function PaneView({
   const restoringLabel = restoringAgent
     ? restoringAgentLabel
     : session?.backendKind ?? "terminal";
+  const restoreFallback = (
+    <div
+      style={{
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+        alignItems: "center",
+        justifyContent: "center",
+        color: "var(--fg3)",
+        background: "var(--term)",
+      }}
+    >
+      <span className="agentmux-term-booting-spinner" />
+      <span style={{ font: `600 12px/1 ${FONT_SANS}` }}>
+        {t("pane.restoring")}
+      </span>
+      <span
+        style={{
+          font: `600 10px/1 ${FONT_MONO}`,
+          color: "var(--accent)",
+          background: "var(--accent-soft)",
+          border: "1px solid rgba(88, 166, 255, 0.28)",
+          borderRadius: 4,
+          padding: "4px 7px",
+        }}
+      >
+        {restoringLabel}
+      </span>
+    </div>
+  );
 
   return (
     <div
@@ -1435,36 +1466,13 @@ const PaneView = memo(function PaneView({
             />
           ) : isBrowser && surface ? (
             <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
-          ) : restoringAgent || restoringTerminal ? (
-            <div
-              style={{
-                height: "100%",
-                display: "flex",
-                flexDirection: "column",
-                gap: 10,
-                alignItems: "center",
-                justifyContent: "center",
-                color: "var(--fg3)",
-                background: "var(--term)",
-              }}
-            >
-              <span className="agentmux-term-booting-spinner" />
-              <span style={{ font: `600 12px/1 ${FONT_SANS}` }}>
-                {t("pane.restoring")}
-              </span>
-              <span
-                style={{
-                  font: `600 10px/1 ${FONT_MONO}`,
-                  color: "var(--accent)",
-                  background: "var(--accent-soft)",
-                  border: "1px solid rgba(88, 166, 255, 0.28)",
-                  borderRadius: 4,
-                  padding: "4px 7px",
-                }}
-              >
-                {restoringLabel}
-              </span>
-            </div>
+          ) : (restoringAgent || restoringTerminal) && session ? (
+            <TerminalRestorePreview
+              sessionId={session.sessionId}
+              innerMargin={terminalInnerMargin}
+              fontSize={fontSize}
+              fallback={restoreFallback}
+            />
           ) : (
             <div
               style={{

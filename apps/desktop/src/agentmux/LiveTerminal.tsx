@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   ControlClient,
   OutputPressureReport,
@@ -26,10 +26,31 @@ const MAX_RENDER_BATCH_BYTES = 64 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
 const WEBGL_DISABLE_DEBOUNCE_MS = 250;
 const TERMINAL_LINE_HEIGHT = 1.0;
+const PREVIEW_CACHE_ENABLED_KEY = "agentmux.terminal.previewCache";
+const PREVIEW_CACHE_PREFIX = "agentmux.terminal.preview.v1.";
+const PREVIEW_CACHE_MAX_BYTES = 64 * 1024;
+const PREVIEW_CACHE_FLUSH_MS = 350;
+const PREVIEW_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+interface TerminalPreviewCacheEntry {
+  version: 1;
+  sessionId: string;
+  bytesBase64: string;
+  byteCount: number;
+  updatedAt: number;
+}
 
 function terminalWebglEnabled(): boolean {
   try {
     return window.localStorage?.getItem("agentmux.terminal.webgl") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function terminalPreviewCacheEnabled(): boolean {
+  try {
+    return window.localStorage?.getItem(PREVIEW_CACHE_ENABLED_KEY) === "1";
   } catch {
     return false;
   }
@@ -98,6 +119,106 @@ function documentHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden";
 }
 
+function previewCacheKey(sessionId: string): string {
+  return `${PREVIEW_CACHE_PREFIX}${sessionId}`;
+}
+
+function trimPreviewBytes(bytes: Uint8Array): Uint8Array {
+  if (bytes.length <= PREVIEW_CACHE_MAX_BYTES) {
+    return bytes;
+  }
+  return bytes.subarray(bytes.length - PREVIEW_CACHE_MAX_BYTES);
+}
+
+function concatPreviewBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
+  if (left.length === 0) {
+    return trimPreviewBytes(right);
+  }
+  if (right.length >= PREVIEW_CACHE_MAX_BYTES) {
+    return trimPreviewBytes(right);
+  }
+  const total = Math.min(PREVIEW_CACHE_MAX_BYTES, left.length + right.length);
+  const merged = new Uint8Array(total);
+  const leftTake = Math.min(left.length, total - right.length);
+  if (leftTake > 0) {
+    merged.set(left.subarray(left.length - leftTake), 0);
+  }
+  merged.set(right, leftTake);
+  return merged;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return window.btoa(binary);
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+export function readTerminalPreviewCache(sessionId: string): Uint8Array | null {
+  if (!terminalPreviewCacheEnabled()) {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage?.getItem(previewCacheKey(sessionId));
+    if (!raw) {
+      return null;
+    }
+    const entry = JSON.parse(raw) as Partial<TerminalPreviewCacheEntry>;
+    if (
+      entry.version !== 1 ||
+      entry.sessionId !== sessionId ||
+      typeof entry.bytesBase64 !== "string" ||
+      typeof entry.updatedAt !== "number" ||
+      Date.now() - entry.updatedAt > PREVIEW_CACHE_MAX_AGE_MS
+    ) {
+      window.localStorage?.removeItem(previewCacheKey(sessionId));
+      return null;
+    }
+    const bytes = trimPreviewBytes(base64ToBytes(entry.bytesBase64));
+    return bytes.length > 0 ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeTerminalPreviewCache(sessionId: string, bytes: Uint8Array): void {
+  if (!terminalPreviewCacheEnabled()) {
+    return;
+  }
+
+  try {
+    const trimmed = trimPreviewBytes(bytes);
+    if (trimmed.length === 0) {
+      window.localStorage?.removeItem(previewCacheKey(sessionId));
+      return;
+    }
+    const entry: TerminalPreviewCacheEntry = {
+      version: 1,
+      sessionId,
+      bytesBase64: bytesToBase64(trimmed),
+      byteCount: trimmed.length,
+      updatedAt: Date.now(),
+    };
+    window.localStorage?.setItem(previewCacheKey(sessionId), JSON.stringify(entry));
+  } catch {
+    // Preview cache is an optional UX accelerator; terminal IO must never fail
+    // because storage quota or WebView persistence is unavailable.
+  }
+}
+
 interface LiveTerminalProps {
   client: ControlClient;
   sessionId: string;
@@ -106,6 +227,122 @@ interface LiveTerminalProps {
   fontSize?: number;
   onFocus?: () => void;
   onError?: () => void;
+}
+
+interface TerminalRestorePreviewProps {
+  sessionId: string;
+  innerMargin?: number;
+  fontSize?: number;
+  fallback: ReactNode;
+}
+
+export function TerminalRestorePreview({
+  sessionId,
+  innerMargin = 0,
+  fontSize = 12.5,
+  fallback,
+}: TerminalRestorePreviewProps) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const [cachedBytes, setCachedBytes] = useState<Uint8Array | null>(() =>
+    readTerminalPreviewCache(sessionId),
+  );
+  const margin = Math.min(32, Math.max(0, Math.round(innerMargin)));
+
+  useEffect(() => {
+    setCachedBytes(readTerminalPreviewCache(sessionId));
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!cachedBytes || cachedBytes.length === 0) {
+      return;
+    }
+    const host = hostRef.current;
+    if (!host) {
+      return;
+    }
+    const renderer = new XtermTerminalRenderer();
+    renderer.mount(
+      host,
+      { columns: 120, rows: 30, bytes: cachedBytes },
+      { fontSize, lineHeight: TERMINAL_LINE_HEIGHT },
+    );
+
+    let fitFrame: number | null = null;
+    const requestFit = () => {
+      if (fitFrame !== null) {
+        return;
+      }
+      fitFrame = window.requestAnimationFrame(() => {
+        fitFrame = null;
+        renderer.fit();
+      });
+    };
+    const resizeObserver = new ResizeObserver(requestFit);
+    resizeObserver.observe(host);
+    const timers = [80, 300, 900].map((delay) =>
+      window.setTimeout(() => renderer.fit(), delay),
+    );
+
+    return () => {
+      if (fitFrame !== null) {
+        window.cancelAnimationFrame(fitFrame);
+      }
+      for (const timer of timers) {
+        window.clearTimeout(timer);
+      }
+      resizeObserver.disconnect();
+      renderer.dispose();
+    };
+  }, [cachedBytes, fontSize]);
+
+  if (!cachedBytes || cachedBytes.length === 0) {
+    return <>{fallback}</>;
+  }
+
+  return (
+    <div
+      style={{
+        height: "100%",
+        minHeight: 0,
+        minWidth: 0,
+        position: "relative",
+        background: "var(--term)",
+        padding: margin,
+        boxSizing: "border-box",
+      }}
+    >
+      <div
+        ref={hostRef}
+        aria-label="Restored terminal preview"
+        style={{
+          height: "100%",
+          minHeight: 0,
+          minWidth: 0,
+          overflow: "hidden",
+        }}
+      />
+      <div
+        style={{
+          position: "absolute",
+          top: 8 + margin,
+          right: 10 + margin,
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          border: "1px solid rgba(88, 166, 255, 0.28)",
+          borderRadius: 6,
+          background: "rgba(13, 17, 23, 0.82)",
+          color: "var(--fg3)",
+          font: "600 10px/1 var(--font-sans, system-ui, sans-serif)",
+          padding: "5px 7px",
+          pointerEvents: "none",
+        }}
+      >
+        <span className="agentmux-term-booting-spinner" />
+        Restoring
+      </div>
+    </div>
+  );
 }
 
 // A self-contained, live xterm terminal bound to one backend session. Multiple
@@ -168,6 +405,46 @@ export function LiveTerminal({
     );
     rendererRef.current = renderer;
     let alive = true;
+    let previewCacheBytes = readTerminalPreviewCache(sessionId) ?? new Uint8Array(0);
+    let previewFlushTimer: number | null = null;
+
+    const clearPreviewFlush = () => {
+      if (previewFlushTimer !== null) {
+        window.clearTimeout(previewFlushTimer);
+        previewFlushTimer = null;
+      }
+    };
+
+    const flushPreviewCache = () => {
+      clearPreviewFlush();
+      writeTerminalPreviewCache(sessionId, previewCacheBytes);
+    };
+
+    const schedulePreviewFlush = () => {
+      if (previewFlushTimer !== null) {
+        return;
+      }
+      previewFlushTimer = window.setTimeout(
+        flushPreviewCache,
+        PREVIEW_CACHE_FLUSH_MS,
+      );
+    };
+
+    const replacePreviewCache = (bytes: Uint8Array) => {
+      if (bytes.length === 0) {
+        return;
+      }
+      previewCacheBytes = trimPreviewBytes(bytes);
+      schedulePreviewFlush();
+    };
+
+    const appendPreviewCache = (bytes: Uint8Array) => {
+      if (bytes.length === 0) {
+        return;
+      }
+      previewCacheBytes = concatPreviewBytes(previewCacheBytes, bytes);
+      schedulePreviewFlush();
+    };
 
     // --- resize (shared by both output paths) ---
     let resizeTimer: number | null = null;
@@ -273,6 +550,7 @@ export function LiveTerminal({
       unsubscribeResize();
       resizeObserver.disconnect();
       renderer.dispose();
+      flushPreviewCache();
       if (rendererRef.current === renderer) {
         rendererRef.current = null;
       }
@@ -512,6 +790,7 @@ export function LiveTerminal({
         });
         renderer.reset();
         clearRenderQueue();
+        replacePreviewCache(snap.bytes);
         if (snap.bytes.length > 0) {
           enqueueRenderBytes(snap.bytes);
         }
@@ -592,6 +871,7 @@ export function LiveTerminal({
         const duplicateBytes = Math.max(0, expected - fromOffset);
         const next = duplicateBytes > 0 ? bytes.subarray(duplicateBytes) : bytes;
         if (next.length > 0) {
+          appendPreviewCache(next);
           enqueueRenderBytes(next);
         }
         expected = frameEnd;
@@ -718,6 +998,9 @@ export function LiveTerminal({
             }
             if (snap.baseOffset > expected) {
               renderer.reset(); // fell behind the ring; resync from base
+              replacePreviewCache(snap.bytes);
+            } else {
+              appendPreviewCache(snap.bytes);
             }
             if (snap.bytes.length > 0) {
               renderer.write(snap.bytes);
@@ -857,7 +1140,9 @@ export function LiveTerminal({
             renderedText = text;
             renderer.reset();
             if (text.length > 0) {
-              renderer.write(encoder.encode(text));
+              const bytes = encoder.encode(text);
+              replacePreviewCache(bytes);
+              renderer.write(bytes);
               hadOutput = true;
               const diagnostics =
                 terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
@@ -871,7 +1156,9 @@ export function LiveTerminal({
           const next = text.slice(renderedText.length);
           renderedText = text;
           if (next.length > 0) {
-            renderer.write(encoder.encode(next));
+            const bytes = encoder.encode(next);
+            appendPreviewCache(bytes);
+            renderer.write(bytes);
             hadOutput = true;
             const diagnostics =
               terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
@@ -959,6 +1246,10 @@ export function LiveTerminal({
   // Nerd Font fallback symbols as tofu on some Windows/WebView2 stacks. Keep
   // the default path glyph-faithful; allow explicit perf testing with
   // localStorage.agentmux.terminal.webgl = "1".
+  //
+  // Terminal preview cache is also opt-in because terminal output can contain
+  // secrets. Local users can enable it with:
+  // localStorage.agentmux.terminal.previewCache = "1".
   useEffect(() => {
     const renderer = rendererRef.current;
     if (!renderer) {

@@ -37,9 +37,15 @@ surface for Linux development workflows.
 ## Browser and Automation
 
 - Browser surfaces can be opened beside terminal sessions.
+- The command palette action `browser.openContextLink` opens the first URL found
+  in the current selection, notifications, team messages, team tasks, or
+  attention reason in an AgentMux browser tab.
 - CDP-backed browser automation supports navigation, screenshot, DOM snapshot,
   click, type, and evaluate operations.
 - Browser actions are scoped to the selected surface.
+- Direct terminal-output hyperlink routing, including OSC 8 links and plain URL
+  click/modified-click routing into an embedded split browser, is not yet
+  implemented.
 
 ## Control Plane and CLI
 
