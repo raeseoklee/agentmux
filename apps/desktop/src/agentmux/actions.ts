@@ -35,11 +35,11 @@ const DISABLED_SHORTCUTS = new Set(["", "none", "clear", "unbound", "disabled"])
 const MODIFIER_ORDER = ["ctrl", "alt", "shift", "meta"] as const;
 
 export const ACTION_GROUP_LABELS: Record<ActionGroup, string> = {
-  agent: "에이전트",
-  terminal: "터미널",
-  workspace: "워크스페이스",
-  view: "보기",
-  remote: "원격 · WSL"
+  agent: "Agent",
+  terminal: "Terminal",
+  workspace: "Workspace",
+  view: "View",
+  remote: "Remote · WSL"
 };
 
 export const DEFAULT_SHORTCUT_BINDINGS: ShortcutBindingMap = {

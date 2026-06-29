@@ -99,21 +99,39 @@ body {
 
 [data-agentmux-terminal-inner-margin] .xterm-viewport,
 .agentmux-live-terminal-host .xterm-viewport {
+  scrollbar-width: none;
+  scrollbar-color: transparent transparent;
+}
+
+[data-agentmux-terminal-inner-margin] .agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"] .xterm-viewport,
+.agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"] .xterm-viewport {
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }
 
 [data-agentmux-terminal-inner-margin] .xterm-viewport::-webkit-scrollbar,
 .agentmux-live-terminal-host .xterm-viewport::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+[data-agentmux-terminal-inner-margin] .agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"] .xterm-viewport::-webkit-scrollbar,
+.agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"] .xterm-viewport::-webkit-scrollbar {
   width: 9px;
+  height: 9px;
 }
 
 [data-agentmux-terminal-inner-margin] .xterm-viewport::-webkit-scrollbar-thumb,
 .agentmux-live-terminal-host .xterm-viewport::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
+  background: transparent;
   border: 2px solid transparent;
   border-radius: 6px;
   background-clip: content-box;
+}
+
+[data-agentmux-terminal-inner-margin] .agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"] .xterm-viewport::-webkit-scrollbar-thumb,
+.agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"] .xterm-viewport::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
 }
 
 [data-agentmux-terminal-inner-margin] .xterm-viewport::-webkit-scrollbar-track,

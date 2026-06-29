@@ -75,10 +75,36 @@ export type I18nKey =
   | "settings.accentColor"
   | "settings.uiFontSize"
   | "settings.terminalInnerMargin"
+  | "settings.terminalStartDirectory"
+  | "settings.terminalStartDirectoryHint"
+  | "settings.terminalStartDirectory.home"
+  | "settings.terminalStartDirectory.workspace"
+  | "settings.terminalStartDirectory.custom"
+  | "settings.terminalStartCustomCwd"
+  | "settings.terminalStartCustomCwdPlaceholder"
   | "settings.terminalLinkOpen"
   | "settings.terminalLinkOpenHint"
   | "settings.terminalLinkOpen.system"
   | "settings.terminalLinkOpen.inApp"
+  | "session.status.attention"
+  | "session.status.running"
+  | "session.status.starting"
+  | "session.status.recovering"
+  | "session.status.detached"
+  | "session.status.disconnected"
+  | "session.status.exited"
+  | "session.status.failed"
+  | "session.status.lost"
+  | "workspace.status.needsInput"
+  | "workspace.status.running"
+  | "workspace.status.sessionCount"
+  | "workspace.status.idle"
+  | "statusbar.surfaceSummary"
+  | "action.group.agent"
+  | "action.group.terminal"
+  | "action.group.workspace"
+  | "action.group.view"
+  | "action.group.remote"
   | "settings.workspace.noActiveProject"
   | "settings.workspace.saveProject"
   | "settings.workspace.title"
@@ -200,11 +226,38 @@ const en: Record<I18nKey, string> = {
   "settings.accentColor": "Accent color",
   "settings.uiFontSize": "UI font size",
   "settings.terminalInnerMargin": "Terminal inner margin",
+  "settings.terminalStartDirectory": "Terminal start directory",
+  "settings.terminalStartDirectoryHint":
+    "New empty terminals start here. Empty custom paths fall back to the home directory.",
+  "settings.terminalStartDirectory.home": "Home directory",
+  "settings.terminalStartDirectory.workspace": "Workspace project",
+  "settings.terminalStartDirectory.custom": "Custom path",
+  "settings.terminalStartCustomCwd": "Custom terminal start path",
+  "settings.terminalStartCustomCwdPlaceholder": "D:\\Workspace\\project or /mnt/d/Workspace/project",
   "settings.terminalLinkOpen": "Open terminal links in",
   "settings.terminalLinkOpenHint":
     "System browser is required for OAuth/login flows (e.g. Claude Code) to complete their localhost callback.",
   "settings.terminalLinkOpen.system": "System browser",
   "settings.terminalLinkOpen.inApp": "In-app browser",
+  "session.status.attention": "Waiting for input",
+  "session.status.running": "Running",
+  "session.status.starting": "Starting",
+  "session.status.recovering": "Recovering",
+  "session.status.detached": "Detached",
+  "session.status.disconnected": "Disconnected",
+  "session.status.exited": "Exited",
+  "session.status.failed": "Failed",
+  "session.status.lost": "Lost",
+  "workspace.status.needsInput": "Agent waiting for input",
+  "workspace.status.running": "Session running",
+  "workspace.status.sessionCount": "{count} sessions",
+  "workspace.status.idle": "Idle",
+  "statusbar.surfaceSummary": "{surfaces} surfaces · {terminals} terminals · {running} running",
+  "action.group.agent": "Agent",
+  "action.group.terminal": "Terminal",
+  "action.group.workspace": "Workspace",
+  "action.group.view": "View",
+  "action.group.remote": "Remote · WSL",
   "settings.workspace.noActiveProject": "No active project.",
   "settings.workspace.saveProject": "Save project",
   "settings.workspace.title": "Project",
@@ -351,6 +404,33 @@ const ko: Record<I18nKey, string> = {
   "workspace.none": "워크스페이스 없음",
   "workspace.section": "워크스페이스",
   "workspace.selectedCount": "{count}개 선택",
+  "settings.terminalStartDirectory": "터미널 시작 위치",
+  "settings.terminalStartDirectoryHint":
+    "새 빈 터미널이 이 위치에서 시작됩니다. 사용자 지정 경로가 비어 있으면 홈 디렉터리를 사용합니다.",
+  "settings.terminalStartDirectory.home": "홈 디렉터리",
+  "settings.terminalStartDirectory.workspace": "워크스페이스 프로젝트",
+  "settings.terminalStartDirectory.custom": "사용자 지정 경로",
+  "settings.terminalStartCustomCwd": "사용자 지정 터미널 시작 경로",
+  "settings.terminalStartCustomCwdPlaceholder": "D:\\Workspace\\project 또는 /mnt/d/Workspace/project",
+  "session.status.attention": "입력 대기",
+  "session.status.running": "실행 중",
+  "session.status.starting": "시작 중",
+  "session.status.recovering": "복구 중",
+  "session.status.detached": "분리됨",
+  "session.status.disconnected": "연결 끊김",
+  "session.status.exited": "종료됨",
+  "session.status.failed": "실패",
+  "session.status.lost": "손실됨",
+  "workspace.status.needsInput": "에이전트가 입력을 기다리는 중",
+  "workspace.status.running": "세션 실행 중",
+  "workspace.status.sessionCount": "{count}개 세션",
+  "workspace.status.idle": "대기 중",
+  "statusbar.surfaceSummary": "{surfaces} surface · {terminals} 터미널 · {running} 실행",
+  "action.group.agent": "에이전트",
+  "action.group.terminal": "터미널",
+  "action.group.workspace": "워크스페이스",
+  "action.group.view": "보기",
+  "action.group.remote": "원격 · WSL",
 };
 
 const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {
