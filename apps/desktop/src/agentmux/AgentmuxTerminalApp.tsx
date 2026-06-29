@@ -517,7 +517,8 @@ function sessionLabel(
   }
 }
 
-// A session backs a live terminal only while running/starting/recovering. Dead
+// A session backs a live terminal only while running/starting. Store-only
+// recovery sessions must render placeholders until the backend reattaches.
 // or detached sessions (disconnected, detached, exited, failed, lost) — e.g. an
 // ephemeral terminal whose process did not survive an app restart — must NOT
 // mount a LiveTerminal: its snapshot poll would only ever return SessionNotFound
@@ -528,8 +529,16 @@ function isLiveSession(session: TerminalSession | undefined): boolean {
     !!session &&
     (session.state === "running" ||
       session.state === "starting" ||
-      session.state === "recovering" ||
       session.state === "preview")
+  );
+}
+
+function isRecoveringPlaceholder(
+  session: TerminalSession | undefined,
+  isBrowser: boolean,
+): boolean {
+  return Boolean(
+    session && !isBrowser && session.state === "recovering" && !isLiveSession(session),
   );
 }
 
@@ -541,7 +550,7 @@ function isRestorableAgentPlaceholder(
   return Boolean(
     session &&
       !isBrowser &&
-      session.state === "disconnected" &&
+      (session.state === "disconnected" || session.state === "recovering") &&
       agentState &&
       !isLiveSession(session),
   );
@@ -1213,7 +1222,11 @@ const PaneView = memo(function PaneView({
     agentState,
     isBrowser,
   );
+  const restoringTerminal = isRecoveringPlaceholder(session, isBrowser);
   const restoringAgentLabel = agentRestoreLabel(agentState);
+  const restoringLabel = restoringAgent
+    ? restoringAgentLabel
+    : session?.backendKind ?? "terminal";
 
   return (
     <div
@@ -1422,7 +1435,7 @@ const PaneView = memo(function PaneView({
             />
           ) : isBrowser && surface ? (
             <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
-          ) : restoringAgent ? (
+          ) : restoringAgent || restoringTerminal ? (
             <div
               style={{
                 height: "100%",
@@ -1449,7 +1462,7 @@ const PaneView = memo(function PaneView({
                   padding: "4px 7px",
                 }}
               >
-                {restoringAgentLabel}
+                {restoringLabel}
               </span>
             </div>
           ) : (

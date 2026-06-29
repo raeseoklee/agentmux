@@ -102,6 +102,7 @@ const TEXT_BOX_MAX_LINES: u8 = 12;
 const TERMINAL_INNER_MARGIN_MIN: u8 = 0;
 const TERMINAL_INNER_MARGIN_MAX: u8 = 32;
 const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(3);
+const TMUX_SESSION_EXISTS_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Clone)]
 struct GitStatusCacheEntry {
@@ -998,6 +999,7 @@ impl DesktopControlState {
                         continue;
                     }
                     self.terminate_runtime_session(&result.session_id, TerminationMode::Kill);
+                    self.mark_persisted_session_disconnected(&session.session_id);
                 }
             }
 
@@ -1014,20 +1016,34 @@ impl DesktopControlState {
                 "durable",
                 "desktop_startup_respawn_durable_session",
             ) {
-                if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
-                    self.replay_restored_agent_launch_command(
+                if self.wait_for_recovered_tmux_attach(&result.session_id) {
+                    let _ = self.persist_session_summary_from_id(result.session_id.clone());
+                    if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
+                        self.replay_restored_agent_launch_command(
+                            &result.session_id,
+                            session,
+                            agent_state,
+                        );
+                        self.replay_restored_agent_state(
+                            &result.session_id,
+                            &session.command,
+                            agent_state,
+                            Some("running"),
+                        );
+                    }
+                    self.delete_superseded_terminal(surface_id, &session.session_id);
+                } else {
+                    self.terminate_runtime_session(&result.session_id, TerminationMode::Kill);
+                    self.discard_failed_recovery_spawn(
+                        &session.workspace_id,
+                        pane_id,
+                        surface_id,
+                        &session.session_id,
                         &result.session_id,
-                        session,
-                        agent_state,
-                    );
-                    self.replay_restored_agent_state(
-                        &result.session_id,
-                        &session.command,
-                        agent_state,
-                        Some("running"),
                     );
                 }
-                self.delete_superseded_terminal(surface_id, &session.session_id);
+            } else {
+                self.mark_persisted_session_disconnected(&session.session_id);
             }
         }
     }
@@ -1071,6 +1087,57 @@ impl DesktopControlState {
             params_json,
             self.control_token.clone(),
         ));
+    }
+
+    fn mark_persisted_session_disconnected(&self, session_id: &str) {
+        let Ok(mut store) = self.store.lock() else {
+            return;
+        };
+        let _ = store.update_session_state(session_id, "disconnected", None, &timestamp());
+    }
+
+    fn discard_failed_recovery_spawn(
+        &self,
+        workspace_id: &str,
+        pane_id: &str,
+        previous_surface_id: &str,
+        previous_session_id: &str,
+        failed_session_id: &str,
+    ) {
+        let Ok(mut store) = self.store.lock() else {
+            return;
+        };
+        let Ok(Some(mut bundle)) = store.load_workspace_bundle(workspace_id) else {
+            return;
+        };
+        let now = timestamp();
+        let failed_surface_ids = bundle
+            .surfaces
+            .iter()
+            .filter(|surface| surface.session_id.as_deref() == Some(failed_session_id))
+            .map(|surface| surface.surface_id.clone())
+            .collect::<HashSet<_>>();
+        bundle
+            .surfaces
+            .retain(|surface| !failed_surface_ids.contains(&surface.surface_id));
+        bundle
+            .sessions
+            .retain(|session| session.session_id != failed_session_id);
+        if let Some(pane) = bundle.panes.iter_mut().find(|pane| pane.pane_id == pane_id) {
+            pane.mounted_surface_id = Some(previous_surface_id.to_string());
+            pane.updated_at = now.clone();
+        }
+        if let Some(session) = bundle
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == previous_session_id)
+        {
+            session.state = "disconnected".to_string();
+            session.exit_code = None;
+            session.updated_at = now.clone();
+        }
+        bundle.workspace.updated_at = now;
+        let _ = store.save_workspace_bundle(&bundle);
     }
 
     /// Reconcile persisted ephemeral sessions on startup.
@@ -8687,7 +8754,31 @@ fn tmux_session_exists(distribution: Option<&str>, session_name: &str) -> Option
         "-lc",
         &format!("tmux has-session -t {target} >/dev/null 2>&1"),
     ]);
-    command.status().ok().map(|status| status.success())
+    command_status_success_with_timeout(
+        command,
+        Duration::from_millis(TMUX_SESSION_EXISTS_TIMEOUT_MS),
+    )
+}
+
+fn command_status_success_with_timeout(mut command: Command, timeout: Duration) -> Option<bool> {
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -14291,6 +14382,87 @@ mod tests {
         };
 
         assert_eq!(restored_agent_launch_line(&session, &state), None);
+    }
+
+    #[test]
+    fn failed_durable_recovery_spawn_rolls_back_to_previous_surface() {
+        let state = DesktopControlState::new();
+        {
+            let mut bundle = workspace_bundle_with_unmounted_surface();
+            bundle.panes[1].mounted_surface_id = Some("surf_failed".to_string());
+            bundle.sessions[0].backend_kind = "wsl-tmux-control".to_string();
+            bundle.sessions[0].backend_native_id = Some("agentmux_ses_surface".to_string());
+            bundle.sessions[0].state = "recovering".to_string();
+            bundle.sessions[0].durability = "durable".to_string();
+            bundle.surfaces.push(PersistedSurface {
+                surface_id: "surf_failed".to_string(),
+                workspace_id: "ws_surface".to_string(),
+                surface_type: "terminal".to_string(),
+                title: "Failed recovery".to_string(),
+                session_id: Some("ses_failed".to_string()),
+                browser_id: None,
+                created_at: "before".to_string(),
+                last_visible_at: None,
+                updated_at: "before".to_string(),
+            });
+            bundle.sessions.push(PersistedSession {
+                session_id: "ses_failed".to_string(),
+                workspace_id: "ws_surface".to_string(),
+                backend_kind: "wsl-tmux-control".to_string(),
+                backend_attachment_id: None,
+                backend_native_id: Some("agentmux_ses_failed".to_string()),
+                cwd: Some("/tmp".to_string()),
+                command: vec!["claude".to_string()],
+                state: "starting".to_string(),
+                exit_code: None,
+                durability: "durable".to_string(),
+                created_at: "before".to_string(),
+                last_seen_at: None,
+                updated_at: "before".to_string(),
+            });
+            state
+                .store
+                .lock()
+                .unwrap()
+                .save_workspace_bundle(&bundle)
+                .unwrap();
+        }
+
+        state.discard_failed_recovery_spawn(
+            "ws_surface",
+            "pane_left",
+            "surf_terminal",
+            "ses_surface",
+            "ses_failed",
+        );
+
+        let bundle = state
+            .store
+            .lock()
+            .unwrap()
+            .load_workspace_bundle("ws_surface")
+            .unwrap()
+            .unwrap();
+        let pane = bundle
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == "pane_left")
+            .unwrap();
+        assert_eq!(pane.mounted_surface_id.as_deref(), Some("surf_terminal"));
+        assert!(!bundle
+            .surfaces
+            .iter()
+            .any(|surface| surface.surface_id == "surf_failed"));
+        assert!(!bundle
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "ses_failed"));
+        let previous = bundle
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "ses_surface")
+            .unwrap();
+        assert_eq!(previous.state, "disconnected");
     }
 
     #[test]
