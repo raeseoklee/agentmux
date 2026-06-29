@@ -304,10 +304,13 @@ export function TerminalRestorePreview({
   return (
     <div
       style={{
+        display: "flex",
+        flexDirection: "column",
         height: "100%",
         minHeight: 0,
         minWidth: 0,
         position: "relative",
+        overflow: "hidden",
         background: "var(--term)",
         padding: margin,
         boxSizing: "border-box",
@@ -317,6 +320,7 @@ export function TerminalRestorePreview({
         ref={hostRef}
         aria-label="Restored terminal preview"
         style={{
+          flex: "1 1 0",
           height: "100%",
           minHeight: 0,
           minWidth: 0,
@@ -1341,12 +1345,15 @@ export function LiveTerminal({
       onMouseDown={onFocus}
       data-agentmux-terminal-inner-margin={margin}
       style={{
+        display: "flex",
+        flexDirection: "column",
         position: "relative",
         height: "100%",
         width: "100%",
         minHeight: 0,
         minWidth: 0,
         boxSizing: "border-box",
+        overflow: "hidden",
         padding: margin,
         background: XTERM_THEME.background,
       }}
@@ -1355,10 +1362,12 @@ export function LiveTerminal({
         ref={hostRef}
         className="agentmux-live-terminal-host"
         style={{
+          flex: "1 1 0",
           height: "100%",
           width: "100%",
           minHeight: 0,
           minWidth: 0,
+          overflow: "hidden",
           background: XTERM_THEME.background,
         }}
       />

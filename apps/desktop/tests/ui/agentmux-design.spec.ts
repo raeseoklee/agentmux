@@ -164,6 +164,65 @@ test("live terminal accepts clipboard paste shortcuts", async ({ page }) => {
     .toContain("echo pasted-from-clipboard");
 });
 
+test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => {
+  await bootPreview(page);
+
+  const longOutput = Array.from(
+    { length: 90 },
+    (_, index) => `scroll-line-${String(index + 1).padStart(2, "0")}`,
+  ).join("\r\n");
+
+  await page.evaluate((text) => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: async () => `${text}\r`,
+        writeText: async () => {},
+      },
+    });
+  }, longOutput);
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await expect(page.locator(".xterm").first()).toBeVisible();
+  await page.locator(".xterm").first().click();
+  await page.keyboard.press("Control+V");
+
+  const viewport = page.locator(".agentmux-live-terminal-host .xterm-viewport").first();
+  await expect(viewport).toBeVisible();
+  await expect
+    .poll(() =>
+      viewport.evaluate((node) => {
+        const element = node as HTMLElement;
+        return element.clientHeight;
+      }),
+    )
+    .toBeGreaterThan(0);
+  await expect(viewport).toHaveCSS("overflow-y", /auto|scroll/);
+  const visibleTopLine = async () =>
+    page.locator(".xterm-rows").first().evaluate((node) => {
+      const matches = [
+        ...(node.textContent ?? "").matchAll(/scroll-line-(\d+)/g),
+      ].map((match) => Number(match[1]));
+      return matches.length > 0 ? Math.min(...matches) : null;
+    });
+  await expect
+    .poll(() => page.locator(".xterm").first().textContent())
+    .toContain("scroll-line-89");
+  const beforeWheelTop = await visibleTopLine();
+  expect(beforeWheelTop).not.toBeNull();
+
+  const box = await page.locator(".xterm").first().boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(
+    (box?.x ?? 0) + (box?.width ?? 0) / 2,
+    (box?.y ?? 0) + (box?.height ?? 0) / 2,
+  );
+  await page.mouse.wheel(0, -1800);
+  await expect
+    .poll(() => visibleTopLine())
+    .toBeLessThan(beforeWheelTop ?? 0);
+});
+
 test("terminal profile picker can launch native shells", async ({ page }) => {
   await bootPreview(page);
 

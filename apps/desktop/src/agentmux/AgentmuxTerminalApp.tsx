@@ -1492,7 +1492,17 @@ const PaneView = memo(function PaneView({
           flexDirection: "column",
         }}
       >
-        <div style={{ flex: 1, minHeight: 0, minWidth: 0, position: "relative" }}>
+        <div
+          style={{
+            flex: "1 1 0",
+            minHeight: 0,
+            minWidth: 0,
+            position: "relative",
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
           {session && isLiveSession(session) && !isBrowser ? (
             <LiveTerminal
               key={session.sessionId}
