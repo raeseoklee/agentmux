@@ -187,17 +187,29 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   await page.locator(".xterm").first().click();
   await page.keyboard.press("Control+V");
 
-  const viewport = page.locator(".agentmux-live-terminal-host .xterm-viewport").first();
-  await expect(viewport).toBeVisible();
+  // xterm 6 scrolls via the VS Code ScrollableElement (.xterm-scrollable-element),
+  // not the legacy .xterm-viewport. Assert the real scroller is present and that
+  // its vertical slider renders (shorter than its track) once content overflows.
+  const scrollable = page
+    .locator(".agentmux-live-terminal-host .xterm-scrollable-element")
+    .first();
+  const scrollbarSlider = page
+    .locator(
+      ".agentmux-live-terminal-host .xterm-scrollable-element > .scrollbar.vertical > .slider",
+    )
+    .first();
+  await expect(scrollable).toBeVisible();
   await expect
     .poll(() =>
-      viewport.evaluate((node) => {
-        const element = node as HTMLElement;
-        return element.clientHeight;
+      scrollbarSlider.evaluate((node) => {
+        const rect = (node as HTMLElement).getBoundingClientRect();
+        const trackRect = (
+          (node as HTMLElement).parentElement as HTMLElement
+        ).getBoundingClientRect();
+        return rect.height > 0 && rect.height <= trackRect.height;
       }),
     )
-    .toBeGreaterThan(0);
-  await expect(viewport).toHaveCSS("overflow-y", /auto|scroll/);
+    .toBe(true);
   const visibleTopLine = async () =>
     page.locator(".xterm-rows").first().evaluate((node) => {
       const matches = [

@@ -19,7 +19,10 @@ export const XTERM_THEME = {
   background: "#0e1116",
   foreground: "#d7dde7",
   cursor: "#f1cf89",
-  selectionBackground: "#2d5f73"
+  selectionBackground: "#2d5f73",
+  scrollbarSliderBackground: "rgba(170, 183, 201, 0.28)",
+  scrollbarSliderHoverBackground: "rgba(190, 202, 220, 0.46)",
+  scrollbarSliderActiveBackground: "rgba(210, 220, 235, 0.64)"
 } as const;
 
 const TERMINAL_PRIMARY_FONT = "Cascadia Code";
@@ -259,8 +262,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       letterSpacing: 0,
       lineHeight,
       linkHandler: this.createOscLinkHandler(),
+      overviewRuler: { width: 9 },
       rows: initialState.rows,
       cols: initialState.columns,
+      scrollback: 10_000,
       theme: XTERM_THEME
     });
     const fitAddon = new FitAddon();

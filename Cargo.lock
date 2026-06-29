@@ -45,11 +45,11 @@ dependencies = [
 
 [[package]]
 name = "agentmux-backend"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "agentmux-backend-conpty"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "windows-sys 0.59.0",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-backend-ssh"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "russh",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-backend-tmux"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-backend-wsl",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-backend-wsl"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-backend-conpty",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-bench-high-output"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-bench-support",
  "serde",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-bench-many-idle-sessions"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-bench-support",
  "serde",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-bench-resize-storm"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-bench-support",
  "serde",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-bench-restart-recovery"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-bench-support",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-bench-single-terminal-latency"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-bench-support",
  "serde",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-bench-support"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-backend-conpty",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-browser"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
  "serde_json",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-backend-conpty",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-backend-conpty",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-desktop-host"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "agentmux-backend",
  "agentmux-backend-conpty",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-ipc"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-store"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rusqlite",
  "serde_json",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "agentmux-telemetry"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "ahash"

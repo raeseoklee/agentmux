@@ -121,6 +121,49 @@ fn session_send_paste_direct(
         .map_err(|error| error.to_string())
 }
 
+/// Open an http(s) URL in the user's system default browser.
+///
+/// Terminal links (e.g. Claude Code / OAuth login URLs) need a real browser so
+/// the localhost loopback callback completes — the embedded browser surface
+/// cannot service a CLI's auth flow. This is intentionally dependency-free
+/// (no opener/shell plugin) and restricted to http/https so it can never be
+/// turned into an arbitrary command or protocol launcher.
+#[tauri::command(rename_all = "snake_case")]
+fn open_external_url(url: String) -> Result<(), String> {
+    let target = url.trim();
+    let is_http = target.starts_with("http://") || target.starts_with("https://");
+    if !is_http || target.chars().any(char::is_control) {
+        return Err(format!("refusing to open non-http(s) url: {url}"));
+    }
+    open_url_in_system_browser(target).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn open_url_in_system_browser(url: &str) -> std::io::Result<()> {
+    // rundll32 receives the URL as a single argv entry, so OAuth callback URLs
+    // containing `&`/`?` are not reinterpreted by a shell (unlike `cmd /C start`).
+    std::process::Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn open_url_in_system_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn open_url_in_system_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+}
+
 #[tauri::command(rename_all = "snake_case")]
 fn session_report_output_pressure(
     state: tauri::State<'_, Arc<DesktopControlState>>,
@@ -208,7 +251,8 @@ fn main() {
             session_unsubscribe_output,
             session_send_text_direct,
             session_send_paste_direct,
-            session_report_output_pressure
+            session_report_output_pressure,
+            open_external_url
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AgentMux desktop app");

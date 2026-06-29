@@ -1266,6 +1266,33 @@ impl DesktopControlState {
             .collect()
     }
 
+    fn restore_cwd_for_session(&self, session: &PersistedSession) -> Option<String> {
+        let project_root = self.workspace_project_root_for_restore(&session.workspace_id);
+        if let Some(cwd) =
+            clean_optional_text(session.cwd.clone()).filter(|cwd| !is_host_process_working_dir(cwd))
+        {
+            return Some(cwd);
+        }
+        project_root.or_else(|| {
+            if session.backend_kind == "conpty" {
+                default_windows_shell_cwd()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn workspace_project_root_for_restore(&self, workspace_id: &str) -> Option<String> {
+        let Ok(store) = self.store.lock() else {
+            return None;
+        };
+        store
+            .load_workspace_bundle(workspace_id)
+            .ok()
+            .flatten()
+            .and_then(|bundle| clean_optional_text(bundle.workspace.project_root))
+    }
+
     fn respawn_persisted_terminal_into_pane(
         &self,
         session: &PersistedSession,
@@ -1279,7 +1306,7 @@ impl DesktopControlState {
             "backend": session.backend_kind.clone(),
             "backend_profile": backend_profile,
             "command": session.command.clone(),
-            "cwd": session.cwd.clone(),
+            "cwd": self.restore_cwd_for_session(session),
             "columns": 120,
             "rows": 30,
             "durability": durability,
@@ -10812,6 +10839,44 @@ fn translate_wsl_path(path: &str) -> String {
     format!("{}:{}", drive.to_ascii_uppercase(), win_rest)
 }
 
+fn is_host_process_working_dir(path: &str) -> bool {
+    let path = translate_wsl_path(path.trim());
+    let Ok(current_dir) = env::current_dir() else {
+        return false;
+    };
+    paths_equivalent(Path::new(&path), &current_dir)
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    normalized_path_text(&left) == normalized_path_text(&right)
+}
+
+fn normalized_path_text(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn default_windows_shell_cwd() -> Option<String> {
+    env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(
+            || match (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH")) {
+                (Some(drive), Some(path)) => {
+                    let mut home = PathBuf::from(drive);
+                    home.push(path);
+                    Some(home)
+                }
+                _ => None,
+            },
+        )
+        .map(|path| path.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);
@@ -14554,9 +14619,16 @@ mod tests {
     #[cfg(windows)]
     fn restore_ephemeral_terminals_respawns_and_replays_agent_state_idempotently() {
         let state = DesktopControlState::new();
+        let project_root = unique_temp_db_path("restore-ephemeral-project-root");
+        fs::create_dir_all(&project_root).unwrap();
+        let project_root_text = project_root.to_string_lossy().to_string();
         {
             let mut bundle = workspace_bundle_with_unmounted_surface();
+            bundle.workspace.project_root = Some(project_root_text.clone());
             bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+            bundle.sessions[0].cwd = env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
             bundle.sessions[0].command = vec![
                 "cmd.exe".to_string(),
                 "/d".to_string(),
@@ -14604,6 +14676,15 @@ mod tests {
         {
             let store = state.store.lock().unwrap();
             assert!(store.load_agent_state("ses_surface").unwrap().is_none());
+            let restored_session = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.session_id == first_session_id)
+                .unwrap();
+            assert_eq!(
+                restored_session.cwd.as_deref(),
+                Some(project_root_text.as_str())
+            );
             let restored = store.load_agent_state(&first_session_id).unwrap().unwrap();
             assert_eq!(restored.state, "running");
             assert_eq!(restored.reason.as_deref(), Some("Agent restored: claude"));
@@ -14629,6 +14710,7 @@ mod tests {
             .iter()
             .any(|session| session.session_id == first_session_id));
         assert_eq!(snapshot.panes.len(), 3);
+        let _ = fs::remove_dir_all(project_root);
     }
 
     #[test]

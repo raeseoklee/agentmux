@@ -48,6 +48,15 @@ export interface NotificationSummary {
   dismissed: boolean;
 }
 
+export interface NotificationCreateInput {
+  title: string;
+  body?: string | null;
+  subtitle?: string | null;
+  severity?: string | null;
+  workspaceId?: string | null;
+  sessionId?: string | null;
+}
+
 export type TeamTaskStatus = "ready" | "claimed" | "blocked" | "completed";
 
 export interface TeamTask {
@@ -735,6 +744,7 @@ export interface ControlClient {
     severity?: string | null;
     includeDismissed?: boolean;
   }): Promise<NotificationSummary[]>;
+  createNotification(input: NotificationCreateInput): Promise<NotificationSummary>;
   dismissNotification(notificationId: string): Promise<void>;
   listTeamTasks(workspaceId?: string | null): Promise<TeamTask[]>;
   createTeamTask(input: TeamTaskCreateInput): Promise<TeamTask>;
@@ -2081,6 +2091,20 @@ class TauriControlClient implements ControlClient {
       include_dismissed: options.includeDismissed ?? false,
     });
     return result.notifications.map(mapNotification);
+  }
+
+  async createNotification(
+    input: NotificationCreateInput,
+  ): Promise<NotificationSummary> {
+    const result = await this.call<NotificationSummaryWire>("notification.create", {
+      title: input.title,
+      body: input.body ?? null,
+      subtitle: input.subtitle ?? null,
+      severity: input.severity ?? null,
+      workspace_id: input.workspaceId ?? null,
+      session_id: input.sessionId ?? null,
+    });
+    return mapNotification(result);
   }
 
   async dismissNotification(notificationId: string): Promise<void> {
@@ -3818,6 +3842,25 @@ class BrowserPreviewControlClient implements ControlClient {
       }
       return true;
     });
+  }
+
+  async createNotification(
+    input: NotificationCreateInput,
+  ): Promise<NotificationSummary> {
+    const now = new Date().toISOString();
+    const notification: NotificationSummary = {
+      notificationId: `notif_preview_${Date.now()}_${this.notifications.length + 1}`,
+      notificationType: "cli.notification",
+      severity: input.severity ?? "info",
+      workspaceId: input.workspaceId ?? null,
+      sessionId: input.sessionId ?? null,
+      title: input.title,
+      message: input.body ?? input.subtitle ?? input.title,
+      createdAt: now,
+      dismissed: false,
+    };
+    this.notifications.unshift(notification);
+    return notification;
   }
 
   async dismissNotification(notificationId: string): Promise<void> {
