@@ -1023,16 +1023,18 @@ impl DesktopControlState {
             if session.command.is_empty() {
                 continue;
             }
+            let agent_state = recoverable_agents.get(&session.session_id);
             if let Some(result) = self.respawn_persisted_terminal_into_pane(
                 session,
                 pane_id,
                 backend_profile,
                 "durable",
                 "desktop_startup_respawn_durable_session",
+                agent_state,
             ) {
                 if self.wait_for_recovered_tmux_attach(&result.session_id) {
                     let _ = self.persist_session_summary_from_id(result.session_id.clone());
-                    if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
+                    if let Some(agent_state) = agent_state {
                         self.replay_restored_agent_launch_command(
                             &result.session_id,
                             session,
@@ -1246,6 +1248,7 @@ impl DesktopControlState {
                 backend_profile,
                 "ephemeral",
                 "desktop_startup_restore_terminal",
+                recoverable_agents.get(&session.session_id),
             ) {
                 if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
                     self.replay_restored_agent_launch_command(
@@ -1285,6 +1288,16 @@ impl DesktopControlState {
         if let Some(cwd) =
             clean_optional_text(session.cwd.clone()).filter(|cwd| !is_host_process_working_dir(cwd))
         {
+            if persisted_command_already_launches_agent(&session.command)
+                && is_probably_home_directory(&cwd)
+            {
+                if let Some(context_cwd) = project_root
+                    .clone()
+                    .or_else(|| self.workspace_context_cwd_for_restore(session))
+                {
+                    return Some(context_cwd);
+                }
+            }
             return Some(cwd);
         }
         project_root.or_else(|| {
@@ -1307,6 +1320,41 @@ impl DesktopControlState {
             .and_then(|bundle| clean_optional_text(bundle.workspace.project_root))
     }
 
+    fn workspace_context_cwd_for_restore(&self, session: &PersistedSession) -> Option<String> {
+        let Ok(store) = self.store.lock() else {
+            return None;
+        };
+        let bundle = store
+            .load_workspace_bundle(&session.workspace_id)
+            .ok()
+            .flatten()?;
+        let mut seen = HashSet::new();
+        let mut candidate_session_ids = Vec::new();
+        if let Some(active_id) = active_session_id(&bundle) {
+            candidate_session_ids.push(active_id);
+        }
+        candidate_session_ids.extend(bundle.sessions.iter().map(|value| value.session_id.clone()));
+
+        for session_id in candidate_session_ids {
+            if !seen.insert(session_id.clone()) || session_id == session.session_id {
+                continue;
+            }
+            let Some(cwd) = bundle
+                .sessions
+                .iter()
+                .find(|value| value.session_id == session_id)
+                .and_then(|value| clean_optional_text(value.cwd.clone()))
+            else {
+                continue;
+            };
+            if !is_host_process_working_dir(&cwd) && !is_probably_home_directory(&cwd) {
+                return Some(cwd);
+            }
+        }
+
+        None
+    }
+
     fn respawn_persisted_terminal_into_pane(
         &self,
         session: &PersistedSession,
@@ -1314,12 +1362,14 @@ impl DesktopControlState {
         backend_profile: Option<String>,
         durability: &str,
         request_id: &str,
+        agent_state: Option<&PersistedAgentState>,
     ) -> Option<SessionSpawnResult> {
+        let command = restored_spawn_command_for_session(session, agent_state);
         let params = serde_json::json!({
             "workspace_id": session.workspace_id.clone(),
             "backend": session.backend_kind.clone(),
             "backend_profile": backend_profile,
-            "command": session.command.clone(),
+            "command": command,
             "cwd": self.restore_cwd_for_session(session),
             "columns": 120,
             "rows": 30,
@@ -1703,6 +1753,7 @@ impl DesktopControlState {
             summary.exit_code,
             &timestamp(),
         )?;
+        store.update_session_cwd(&summary.session_id, summary.cwd.as_deref(), &timestamp())?;
         Ok(())
     }
 
@@ -1836,6 +1887,7 @@ impl DesktopControlState {
             summary.exit_code,
             &timestamp(),
         )?;
+        store.update_session_cwd(&summary.session_id, summary.cwd.as_deref(), &timestamp())?;
         Ok(())
     }
 
@@ -3641,7 +3693,11 @@ impl DesktopControlState {
             }
             "agent.launchCodex" => {
                 let workspace = self.action_workspace(params.workspace_id.as_deref())?;
-                self.run_agent_action(action_id, &workspace, vec!["codex".to_string()])
+                self.run_agent_action(
+                    action_id,
+                    &workspace,
+                    vec!["codex".to_string(), "--no-alt-screen".to_string()],
+                )
             }
             "app.commandPalette"
             | "app.commandPalette.legacy"
@@ -3732,7 +3788,7 @@ impl DesktopControlState {
                 backend: Some("wsl-tmux-control".to_string()),
                 backend_profile: workspace.default_wsl_distribution.clone(),
                 command,
-                cwd: workspace.project_root.clone(),
+                cwd: self.agent_action_cwd(workspace)?,
                 env: Vec::new(),
                 columns: 120,
                 rows: 30,
@@ -3747,6 +3803,35 @@ impl DesktopControlState {
             result.session_id,
             "agent session spawned",
         ))
+    }
+
+    fn agent_action_cwd(
+        &self,
+        workspace: &WorkspaceSummaryResult,
+    ) -> Result<Option<String>, DesktopHostError> {
+        if let Some(project_root) = clean_optional_text(workspace.project_root.clone()) {
+            return Ok(Some(project_root));
+        }
+
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let Some(bundle) = store.load_workspace_bundle(&workspace.workspace_id)? else {
+            return Ok(None);
+        };
+        Ok(active_session_id(&bundle)
+            .as_deref()
+            .and_then(|session_id| {
+                bundle
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+            })
+            .and_then(|session| clean_optional_text(session.cwd.clone()))
+            .filter(|cwd| !is_host_process_working_dir(cwd))
+            .or_else(|| clean_optional_text(bundle.workspace.project_root)))
     }
 
     fn run_pane_split_action(
@@ -5186,6 +5271,10 @@ impl DesktopControlState {
             }
             if let Some(cwd) = ui.terminal_start_custom_cwd {
                 config.ui.terminal_start_custom_cwd = normalize_terminal_start_custom_cwd(cwd);
+            }
+            if let Some(behavior) = ui.terminal_split_behavior {
+                config.ui.terminal_split_behavior =
+                    Some(normalize_terminal_split_behavior(&behavior)?);
             }
         }
 
@@ -6953,8 +7042,8 @@ fn builtin_action_results() -> Vec<ActionSummaryResult> {
             "Launch Codex",
             "agent",
             "agent",
-            &["codex"],
-            &["codex", "tmux"],
+            &["codex", "--no-alt-screen"],
+            &["codex", "tmux", "no-alt-screen"],
         ),
         builtin_action(
             "agent.launchCustom",
@@ -7456,6 +7545,9 @@ fn normalize_app_config_ui(ui: &mut AppConfigUi) -> Result<(), DesktopHostError>
     if let Some(cwd) = ui.terminal_start_custom_cwd.take() {
         ui.terminal_start_custom_cwd = normalize_terminal_start_custom_cwd(cwd);
     }
+    if let Some(behavior) = ui.terminal_split_behavior.take() {
+        ui.terminal_split_behavior = Some(normalize_terminal_split_behavior(&behavior)?);
+    }
 
     Ok(())
 }
@@ -7604,6 +7696,19 @@ fn normalize_terminal_start_directory(value: &str) -> Result<String, DesktopHost
             ErrorCode::InvalidRequest,
             format!(
                 "Config ui.terminal_start_directory must be 'home', 'workspace', or 'custom'; got '{other}'."
+            ),
+        ))),
+    }
+}
+
+fn normalize_terminal_split_behavior(value: &str) -> Result<String, DesktopHostError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "clone_current" => Ok("clone_current".to_string()),
+        "empty" => Ok("empty".to_string()),
+        other => Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Config ui.terminal_split_behavior must be 'clone_current' or 'empty'; got '{other}'."
             ),
         ))),
     }
@@ -8415,6 +8520,9 @@ fn merge_app_config_ui(ui: &mut AppConfigUi, overrides: AppConfigUi) {
     }
     if overrides.terminal_start_custom_cwd.is_some() {
         ui.terminal_start_custom_cwd = overrides.terminal_start_custom_cwd;
+    }
+    if overrides.terminal_split_behavior.is_some() {
+        ui.terminal_split_behavior = overrides.terminal_split_behavior;
     }
 }
 
@@ -10597,6 +10705,7 @@ fn persisted_session_summary(session: &PersistedSession) -> SessionSummaryResult
         state: session.state.clone(),
         exit_code: session.exit_code,
         backend_native_id: session.backend_native_id.clone(),
+        cwd: session.cwd.clone(),
     }
 }
 
@@ -10916,6 +11025,31 @@ fn normalized_path_text(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_probably_home_directory(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(home) = default_windows_shell_cwd() {
+        let translated = translate_wsl_path(trimmed);
+        if paths_equivalent(Path::new(&translated), Path::new(&home)) {
+            return true;
+        }
+    }
+
+    let normalized = trimmed
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if normalized == "~" {
+        return true;
+    }
+    env::var("USERNAME")
+        .ok()
+        .map(|user| normalized == format!("/home/{}", user.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
 fn default_windows_shell_cwd() -> Option<String> {
     env::var_os("USERPROFILE")
         .map(PathBuf::from)
@@ -11199,6 +11333,21 @@ fn restored_agent_launch_line(
     normalized_restored_agent_command_label(state)
 }
 
+fn restored_spawn_command_for_session(
+    session: &PersistedSession,
+    state: Option<&PersistedAgentState>,
+) -> Vec<String> {
+    if !persisted_command_already_launches_agent(&session.command) {
+        return session.command.clone();
+    }
+    state
+        .and_then(normalized_restored_agent_command_label)
+        .or_else(|| normalize_restored_agent_launch(&join_command_tokens(&session.command)))
+        .and_then(|command_line| split_command_line(&command_line))
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| session.command.clone())
+}
+
 fn normalized_restored_agent_command_label(state: &PersistedAgentState) -> Option<String> {
     let command_line = restored_agent_command_label(state)?;
     normalize_restored_agent_launch(&command_line)
@@ -11277,30 +11426,94 @@ fn normalize_claude_restore_args(tokens: &[String]) -> String {
 fn normalize_codex_restore_args(tokens: &[String]) -> String {
     let mut restored = vec!["codex".to_string()];
     let mut index = 1;
+    let mut resume_index = None;
+    let has_no_alt_screen = tokens.iter().any(|token| token == "--no-alt-screen");
     while index < tokens.len() {
         let token = tokens[index].as_str();
         if token.eq_ignore_ascii_case("resume") || token.eq_ignore_ascii_case("continue") {
+            resume_index = Some(index);
+            break;
+        }
+        if token.starts_with('-') {
+            restored.push(tokens[index].clone());
             index += 1;
-            while index < tokens.len() && !tokens[index].starts_with('-') {
+            if codex_option_takes_value(token) && index < tokens.len() {
+                restored.push(tokens[index].clone());
                 index += 1;
             }
-            continue;
+        } else {
+            // A plain `codex "prompt"` launch creates a new session. On app
+            // restore, resume the most recent saved session instead of replaying
+            // the initial prompt and creating another conversation.
+            break;
         }
-        if is_resume_selector_flag(token) {
-            index += 1;
-            if index < tokens.len() && !tokens[index].starts_with('-') {
-                index += 1;
-            }
-            continue;
-        }
-        if is_resume_selector_assignment(token) {
-            index += 1;
-            continue;
-        }
-        restored.push(tokens[index].clone());
-        index += 1;
     }
+    if !has_no_alt_screen {
+        restored.push("--no-alt-screen".to_string());
+    }
+    restored.push("resume".to_string());
+
+    if let Some(mut index) = resume_index.map(|value| value + 1) {
+        let mut has_selector = false;
+        let mut has_last = false;
+        while index < tokens.len() {
+            let token = tokens[index].as_str();
+            if token == "--last" {
+                has_last = true;
+                restored.push(tokens[index].clone());
+                index += 1;
+                continue;
+            }
+            if token.starts_with('-') {
+                restored.push(tokens[index].clone());
+                index += 1;
+                if codex_option_takes_value(token) && index < tokens.len() {
+                    restored.push(tokens[index].clone());
+                    index += 1;
+                }
+                continue;
+            }
+            if !has_selector {
+                restored.push(tokens[index].clone());
+                has_selector = true;
+            }
+            index += 1;
+        }
+        if !has_selector && !has_last {
+            restored.push("--last".to_string());
+        }
+    } else {
+        restored.push("--last".to_string());
+    }
+
     join_command_tokens(&restored)
+}
+
+fn codex_option_takes_value(token: &str) -> bool {
+    if token.contains('=') {
+        return false;
+    }
+    let token = token.split_once('=').map(|(name, _)| name).unwrap_or(token);
+    matches!(
+        token,
+        "-c" | "--config"
+            | "--remote"
+            | "--remote-auth-token-env"
+            | "-i"
+            | "--image"
+            | "-m"
+            | "--model"
+            | "--local-provider"
+            | "-p"
+            | "--profile"
+            | "-s"
+            | "--sandbox"
+            | "-C"
+            | "--cd"
+            | "--add-dir"
+            | "-a"
+            | "--ask-for-approval"
+    )
 }
 
 fn is_resume_selector_flag(token: &str) -> bool {
@@ -14301,6 +14514,7 @@ mod tests {
             state: "running".to_string(),
             exit_code: None,
             backend_native_id: Some("agentmux_tmux".to_string()),
+            cwd: Some("/tmp".to_string()),
         };
 
         let session =
@@ -14468,7 +14682,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_agent_launch_line_strips_codex_resume_subcommand() {
+    fn restored_agent_launch_line_preserves_codex_resume_session_selector() {
         let session = PersistedSession {
             session_id: "ses_shell".to_string(),
             workspace_id: "ws_agent".to_string(),
@@ -14498,7 +14712,81 @@ mod tests {
 
         assert_eq!(
             restored_agent_launch_line(&session, &state).as_deref(),
-            Some("codex")
+            Some("codex --no-alt-screen resume abc123")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_resumes_last_codex_session_for_plain_codex() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["bash".to_string(), "-l".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: codex".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"codex"}"#.to_string()),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("codex --no-alt-screen resume --last")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_resumes_last_codex_session_without_replaying_prompt() {
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: codex -m gpt-5 \"summarize recent commits\"".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"codex -m gpt-5 \"summarize recent commits\""}"#
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            normalized_restored_agent_command_label(&state).as_deref(),
+            Some("codex -m gpt-5 --no-alt-screen resume --last")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_keeps_codex_assignment_options() {
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some(r#"Agent started: codex --model=gpt-5 "new task""#.to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"codex --model=gpt-5 \"new task\""}"#.to_string(),
+            ),
+        };
+
+        assert_eq!(
+            normalized_restored_agent_command_label(&state).as_deref(),
+            Some("codex --model=gpt-5 --no-alt-screen resume --last")
         );
     }
 
@@ -14530,6 +14818,63 @@ mod tests {
         };
 
         assert_eq!(restored_agent_launch_line(&session, &state), None);
+    }
+
+    #[test]
+    fn restored_spawn_command_resumes_codex_when_persisted_command_launches_agent() {
+        let session = PersistedSession {
+            session_id: "ses_agent".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["codex".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_agent".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: codex".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"codex"}"#.to_string()),
+        };
+
+        assert_eq!(
+            restored_spawn_command_for_session(&session, Some(&state)),
+            vec!["codex", "--no-alt-screen", "resume", "--last"]
+        );
+    }
+
+    #[test]
+    fn restored_spawn_command_resumes_codex_without_agent_state() {
+        let session = PersistedSession {
+            session_id: "ses_agent".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["codex".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+
+        assert_eq!(
+            restored_spawn_command_for_session(&session, None),
+            vec!["codex", "--no-alt-screen", "resume", "--last"]
+        );
     }
 
     #[test]
@@ -14669,6 +15014,84 @@ mod tests {
         assert!(state
             .completed_terminal_input_lines("ses_cancel", "\r")
             .is_empty());
+    }
+
+    #[test]
+    fn agent_action_cwd_falls_back_to_active_terminal_cwd_when_project_root_is_empty() {
+        let state = DesktopControlState::new();
+        {
+            let mut bundle = workspace_bundle_with_unmounted_surface();
+            bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+            bundle.sessions[0].cwd = Some("/mnt/d/projects/agentmux".to_string());
+            state
+                .store
+                .lock()
+                .unwrap()
+                .save_workspace_bundle(&bundle)
+                .unwrap();
+        }
+        let workspace = {
+            let store = state.store.lock().unwrap();
+            let bundle = store.load_workspace_bundle("ws_surface").unwrap().unwrap();
+            workspace_summary(&bundle.workspace)
+        };
+
+        assert_eq!(
+            state.agent_action_cwd(&workspace).unwrap().as_deref(),
+            Some("/mnt/d/projects/agentmux")
+        );
+    }
+
+    #[test]
+    fn restore_cwd_for_agent_session_uses_workspace_context_when_saved_cwd_is_home() {
+        let state = DesktopControlState::new();
+        let agent_session = {
+            let mut bundle = workspace_bundle_with_unmounted_surface();
+            bundle.workspace.active_pane_id = "pane_right".to_string();
+            bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+            bundle.panes[2].mounted_surface_id = Some("surf_context".to_string());
+            bundle.sessions[0].cwd = Some("~".to_string());
+            bundle.sessions[0].command = vec!["codex".to_string()];
+            let agent_session = bundle.sessions[0].clone();
+            bundle.surfaces.push(PersistedSurface {
+                surface_id: "surf_context".to_string(),
+                workspace_id: "ws_surface".to_string(),
+                surface_type: "terminal".to_string(),
+                title: "Context terminal".to_string(),
+                session_id: Some("ses_context".to_string()),
+                browser_id: None,
+                created_at: "before".to_string(),
+                last_visible_at: None,
+                updated_at: "before".to_string(),
+            });
+            bundle.sessions.push(PersistedSession {
+                session_id: "ses_context".to_string(),
+                workspace_id: "ws_surface".to_string(),
+                backend_kind: "wsl-direct".to_string(),
+                backend_attachment_id: None,
+                backend_native_id: None,
+                cwd: Some("/mnt/d/projects/chore".to_string()),
+                command: vec!["bash".to_string(), "-l".to_string()],
+                state: "running".to_string(),
+                exit_code: None,
+                durability: "ephemeral".to_string(),
+                created_at: "before".to_string(),
+                last_seen_at: None,
+                updated_at: "before".to_string(),
+            });
+            state
+                .store
+                .lock()
+                .unwrap()
+                .save_workspace_bundle(&bundle)
+                .unwrap();
+            agent_session
+        };
+
+        assert_eq!(
+            state.restore_cwd_for_session(&agent_session).as_deref(),
+            Some("/mnt/d/projects/chore")
+        );
     }
 
     #[test]
@@ -14816,6 +15239,7 @@ mod tests {
             state: "running".to_string(),
             exit_code: None,
             backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
         };
         let existing = WorkspaceBundle {
             workspace: PersistedWorkspace {

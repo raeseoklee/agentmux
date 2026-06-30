@@ -913,6 +913,7 @@ pub struct SessionSummaryResult {
     pub state: String,
     pub exit_code: Option<i32>,
     pub backend_native_id: Option<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1497,6 +1498,8 @@ pub struct AppConfigUi {
     pub terminal_start_directory: Option<String>,
     #[serde(default)]
     pub terminal_start_custom_cwd: Option<String>,
+    #[serde(default)]
+    pub terminal_split_behavior: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1671,6 +1674,7 @@ pub struct AppConfigUiUpdate {
     pub terminal_inner_margin: Option<u8>,
     pub terminal_start_directory: Option<String>,
     pub terminal_start_custom_cwd: Option<String>,
+    pub terminal_split_behavior: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

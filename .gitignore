@@ -24,6 +24,7 @@ docs/implementation/evidence/**/runtime/
 # Tool/agent state and local test artifacts (not part of the project)
 .omc/
 .codexus/
+.agentmux-dev-isolated/
 test-results/
 tauri-dev.log
 

@@ -223,6 +223,7 @@ interface LiveTerminalProps {
   client: ControlClient;
   sessionId: string;
   active: boolean;
+  agentKind?: "claude" | "codex" | null;
   innerMargin?: number;
   fontSize?: number;
   onFocus?: () => void;
@@ -364,6 +365,7 @@ export function LiveTerminal({
   client,
   sessionId,
   active,
+  agentKind,
   innerMargin = 0,
   fontSize = 12.5,
   onFocus,
@@ -374,6 +376,7 @@ export function LiveTerminal({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
   const activeRef = useRef(active);
+  const agentKindRef = useRef(agentKind ?? null);
   const onOpenLinkRef = useRef(onOpenLink);
   const onExitIntentRef = useRef(onExitIntent);
   const inputLineRef = useRef("");
@@ -446,6 +449,9 @@ export function LiveTerminal({
       host,
       { columns: 120, rows: 30, bytes: encoder.encode("") },
       { fontSize, lineHeight: TERMINAL_LINE_HEIGHT },
+    );
+    renderer.setAlternateWheelMode(
+      agentKindRef.current === "codex" ? "page" : "auto",
     );
     const unsubscribeOpenLink = renderer.onOpenLink((url, event) => {
       onOpenLinkRef.current?.(url, event);
@@ -1282,6 +1288,14 @@ export function LiveTerminal({
   useEffect(() => {
     onExitIntentRef.current = onExitIntent;
   }, [onExitIntent]);
+
+  useEffect(() => {
+    const normalized = agentKind ?? null;
+    agentKindRef.current = normalized;
+    rendererRef.current?.setAlternateWheelMode(
+      normalized === "codex" ? "page" : "auto",
+    );
+  }, [agentKind]);
 
   useEffect(() => {
     activeRef.current = active;

@@ -3,6 +3,112 @@ export interface TerminalSession {
   state: string;
   backendKind: string;
   backendNativeId?: string | null;
+  cwd?: string | null;
+}
+
+const POWERSHELL_CWD_TRACKING_SCRIPT = [
+  "$global:__AgentMuxEmitCwd = {",
+  "try {",
+  "$location = Get-Location -PSProvider FileSystem -ErrorAction Stop",
+  "$path = $location.ProviderPath",
+  "if ($path) {",
+  "$uriPath = $path.Replace([string][char]92, '/')",
+  '[Console]::Write("$([char]27)]7;file://localhost/$uriPath$([char]7)")',
+  "}",
+  "} catch {}",
+  "}",
+  "$global:__AgentMuxPrompt = (Get-Command prompt -CommandType Function -ErrorAction SilentlyContinue).ScriptBlock",
+  "function global:prompt {",
+  "& $global:__AgentMuxEmitCwd",
+  "if ($global:__AgentMuxPrompt) {",
+  "& $global:__AgentMuxPrompt",
+  "} else {",
+  '"PS $($executionContext.SessionState.Path.CurrentLocation)> "',
+  "}",
+  "}",
+  "& $global:__AgentMuxEmitCwd",
+].join("; ");
+
+const WSL_LOGIN_SHELL_WITH_CWD_TRACKING = [
+  'agentmux_user="$(id -un)";',
+  'agentmux_shell="$(getent passwd "$agentmux_user" 2>/dev/null | cut -d: -f7)";',
+  'agentmux_shell="${agentmux_shell:-${SHELL:-/bin/bash}}";',
+  'agentmux_osc7=\'printf "\\033]7;file://localhost%s\\007" "$PWD"\';',
+  'case "$agentmux_shell" in',
+  '*/bash) export PROMPT_COMMAND="$agentmux_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; eval "$agentmux_osc7"; exec "$agentmux_shell" -l ;;',
+  [
+    '*/zsh) agentmux_orig_zdotdir="${ZDOTDIR:-$HOME}"',
+    'agentmux_tmp="${XDG_RUNTIME_DIR:-/tmp}/agentmux-zdotdir-$$"',
+    'mkdir -p "$agentmux_tmp"',
+    "printf '%s\\n' '[ -r \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zprofile\" ] && . \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zprofile\"' > \"$agentmux_tmp/.zprofile\"",
+    "printf '%s\\n' '[ -r \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zshrc\"' '_agentmux_emit_cwd(){ printf \"\\\\033]7;file://localhost%s\\\\007\" \"$PWD\"; }' 'autoload -Uz add-zsh-hook' 'add-zsh-hook precmd _agentmux_emit_cwd' '_agentmux_emit_cwd' > \"$agentmux_tmp/.zshrc\"",
+    'export AGENTMUX_ORIG_ZDOTDIR="$agentmux_orig_zdotdir"',
+    'export ZDOTDIR="$agentmux_tmp"',
+    'exec "$agentmux_shell" -l ;;',
+  ].join("; "),
+  '*) eval "$agentmux_osc7"; exec "$agentmux_shell" -l ;;',
+  "esac",
+].join(" ");
+
+function shellExecutableName(command: string[]): string {
+  const executable = command[0]?.trim() ?? "";
+  const basename = executable.split(/[\\/]/).pop() ?? executable;
+  return basename.toLowerCase();
+}
+
+function hasAnyShellArgument(command: string[], names: string[]): boolean {
+  const lowerNames = names.map((name) => name.toLowerCase());
+  return command
+    .slice(1)
+    .some((arg) => lowerNames.includes(arg.trim().toLowerCase()));
+}
+
+function commandWithNativeCwdTracking(command: string[]): string[] {
+  if (command.length === 0) {
+    return command;
+  }
+
+  const executable = shellExecutableName(command);
+  if (
+    executable === "powershell.exe" ||
+    executable === "powershell" ||
+    executable === "pwsh.exe" ||
+    executable === "pwsh"
+  ) {
+    if (
+      hasAnyShellArgument(command, [
+        "-command",
+        "-encodedcommand",
+        "-file",
+        "-c",
+        "-ec",
+        "-f",
+      ])
+    ) {
+      return command;
+    }
+
+    const args = command.slice(1);
+    if (!hasAnyShellArgument(command, ["-noexit"])) {
+      args.push("-NoExit");
+    }
+    args.push("-Command", POWERSHELL_CWD_TRACKING_SCRIPT);
+    return [command[0], ...args];
+  }
+
+  if (executable === "cmd.exe" || executable === "cmd") {
+    if (hasAnyShellArgument(command, ["/c", "-c", "/k", "-k"])) {
+      return command;
+    }
+    return [
+      command[0],
+      ...command.slice(1),
+      "/k",
+      "prompt $E]7;file://localhost/$P$E\\$P$G",
+    ];
+  }
+
+  return command;
 }
 
 export class ControlClientError extends Error {
@@ -277,6 +383,7 @@ export interface AppConfigUpdates {
 }
 
 export type TerminalStartDirectory = "home" | "workspace" | "custom";
+export type TerminalSplitBehavior = "clone_current" | "empty";
 
 export type ShortcutBindingValue = string | [string, string] | null;
 
@@ -307,6 +414,7 @@ export interface AppConfigUi {
   terminalInnerMargin?: number | null;
   terminalStartDirectory?: TerminalStartDirectory | null;
   terminalStartCustomCwd?: string | null;
+  terminalSplitBehavior?: TerminalSplitBehavior | null;
 }
 
 export interface AppConfigNotificationAction {
@@ -1596,6 +1704,7 @@ class TauriControlClient implements ControlClient {
             terminal_inner_margin: update.ui.terminalInnerMargin,
             terminal_start_directory: update.ui.terminalStartDirectory,
             terminal_start_custom_cwd: update.ui.terminalStartCustomCwd,
+            terminal_split_behavior: update.ui.terminalSplitBehavior,
           }
         : undefined,
     });
@@ -1722,7 +1831,7 @@ class TauriControlClient implements ControlClient {
     const result = await this.call<{ session_id: string }>("session.spawn", {
       workspace_id: workspaceId,
       backend: "conpty",
-      command,
+      command: commandWithNativeCwdTracking(command),
       cwd: cwd ?? null,
       columns: 120,
       rows: 30,
@@ -1755,7 +1864,7 @@ class TauriControlClient implements ControlClient {
       command: [
         "sh",
         "-c",
-        'login_shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; exec "${login_shell:-${SHELL:-/bin/bash}}" -l',
+        WSL_LOGIN_SHELL_WITH_CWD_TRACKING,
       ],
       cwd,
       columns: 120,
@@ -1793,7 +1902,7 @@ class TauriControlClient implements ControlClient {
       command: [
         "sh",
         "-c",
-        'u=$(id -un); s=$(getent passwd "$u" 2>/dev/null | cut -d: -f7); exec "${s:-${SHELL:-/bin/bash}}" -l',
+        WSL_LOGIN_SHELL_WITH_CWD_TRACKING,
       ],
       cwd,
       columns: 120,
@@ -5860,6 +5969,7 @@ interface SessionSummaryWire {
   backend_kind: string;
   state: string;
   backend_native_id?: string | null;
+  cwd?: string | null;
 }
 
 interface AgentStateWire {
@@ -6004,6 +6114,7 @@ interface AppConfigWire {
     terminal_inner_margin?: number | null;
     terminal_start_directory?: string | null;
     terminal_start_custom_cwd?: string | null;
+    terminal_split_behavior?: string | null;
   };
   notifications?: {
     actions?: AppConfigNotificationActionWire[];
@@ -6236,6 +6347,7 @@ function mapSession(value: SessionSummaryWire): TerminalSession {
     backendKind: value.backend_kind,
     state: value.state,
     backendNativeId: value.backend_native_id,
+    cwd: value.cwd ?? null,
   };
 }
 
@@ -6402,6 +6514,9 @@ function mapAppConfig(value: AppConfigWire): AppConfig {
       terminalStartCustomCwd: sanitizeTerminalStartCustomCwd(
         value.ui?.terminal_start_custom_cwd,
       ),
+      terminalSplitBehavior: normalizeTerminalSplitBehavior(
+        value.ui?.terminal_split_behavior,
+      ),
     }),
     notifications: {
       actions: sanitizeNotificationActions(
@@ -6467,6 +6582,7 @@ function appConfigExportSnapshot(
       terminal_inner_margin: config.ui.terminalInnerMargin ?? null,
       terminal_start_directory: config.ui.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config.ui.terminalStartCustomCwd ?? null,
+      terminal_split_behavior: config.ui.terminalSplitBehavior ?? null,
     },
     notifications: {
       actions: config.notifications.actions.map((action) => ({
@@ -6512,6 +6628,7 @@ function previewProjectConfigExportSnapshot(
       terminal_inner_margin: config?.ui?.terminalInnerMargin ?? null,
       terminal_start_directory: config?.ui?.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config?.ui?.terminalStartCustomCwd ?? null,
+      terminal_split_behavior: config?.ui?.terminalSplitBehavior ?? null,
     },
     notifications: {
       actions: (config?.notifications?.actions ?? []).map((action) => ({
@@ -6568,6 +6685,10 @@ function mergePreviewProjectConfig(
         project.ui?.terminalStartCustomCwd ??
         base.ui.terminalStartCustomCwd ??
         null,
+      terminalSplitBehavior:
+        project.ui?.terminalSplitBehavior ??
+        base.ui.terminalSplitBehavior ??
+        "clone_current",
     },
     notifications: {
       actions: mergePreviewNotificationActions(
@@ -6717,6 +6838,11 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
       terminalStartCustomCwd: sanitizeTerminalStartCustomCwd(
         typeof ui.terminal_start_custom_cwd === "string"
           ? ui.terminal_start_custom_cwd
+          : null,
+      ),
+      terminalSplitBehavior: normalizeTerminalSplitBehavior(
+        typeof ui.terminal_split_behavior === "string"
+          ? ui.terminal_split_behavior
           : null,
       ),
     },
@@ -7345,6 +7471,13 @@ function normalizeTerminalStartDirectory(
   return "home";
 }
 
+function normalizeTerminalSplitBehavior(
+  value: unknown,
+): TerminalSplitBehavior {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return normalized === "empty" ? "empty" : "clone_current";
+}
+
 function sanitizeTerminalStartCustomCwd(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -7369,6 +7502,9 @@ function sanitizeAppConfigUi(
     ),
     terminalStartCustomCwd: sanitizeTerminalStartCustomCwd(
       value?.terminalStartCustomCwd,
+    ),
+    terminalSplitBehavior: normalizeTerminalSplitBehavior(
+      value?.terminalSplitBehavior,
     ),
   };
 }

@@ -10,6 +10,7 @@ import type { LigaturesAddon } from "@xterm/addon-ligatures";
 import type { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import type {
+  AlternateWheelMode,
   TerminalRenderer,
   TerminalSnapshot,
   TerminalTypography,
@@ -56,6 +57,7 @@ const WHEEL_PIXEL_LINE_HEIGHT = 24;
 const WHEEL_MIN_LINES = 1;
 const WHEEL_MAX_LINES = 12;
 const TRANSIENT_SCROLLBAR_MS = 800;
+const TERMINAL_CLIPBOARD_FALLBACK_MS = 30_000;
 const PAGE_UP_SEQUENCE = "\x1b[5~";
 const PAGE_DOWN_SEQUENCE = "\x1b[6~";
 type WebglAddonModule = typeof import("@xterm/addon-webgl");
@@ -66,6 +68,8 @@ type TerminalLinkOpenHandler = (url: string, event: MouseEvent) => void;
 let webglAddonModulePromise: Promise<WebglAddonModule> | undefined;
 let ligaturesAddonModulePromise: Promise<LigaturesAddonModule> | undefined;
 let tauriClipboardModulePromise: Promise<TauriClipboardModule> | undefined;
+let lastTerminalClipboardText = "";
+let lastTerminalClipboardAt = 0;
 
 const TERMINAL_URL_PATTERN = /\bhttps?:\/\/[^\s<>"'`]+/gi;
 const TERMINAL_URL_TRAILING_PUNCTUATION = /[),.;:!?\]}]+$/;
@@ -197,6 +201,21 @@ function fallbackWriteClipboardText(text: string): boolean {
   return copied;
 }
 
+function rememberTerminalClipboardText(text: string): void {
+  lastTerminalClipboardText = text;
+  lastTerminalClipboardAt = Date.now();
+}
+
+function recentTerminalClipboardText(): string {
+  if (
+    lastTerminalClipboardText &&
+    Date.now() - lastTerminalClipboardAt <= TERMINAL_CLIPBOARD_FALLBACK_MS
+  ) {
+    return lastTerminalClipboardText;
+  }
+  return "";
+}
+
 async function writeClipboardText(text: string): Promise<void> {
   if (!text) {
     return;
@@ -206,7 +225,8 @@ async function writeClipboardText(text: string): Promise<void> {
       const clipboard = await loadTauriClipboardModule();
       await clipboard.writeText(text);
       return;
-    } catch {
+    } catch (error) {
+      console.warn("[agentmux] tauri clipboard write failed", { error });
       // Fall through to browser clipboard paths for preview or plugin errors.
     }
   }
@@ -215,7 +235,8 @@ async function writeClipboardText(text: string): Promise<void> {
       await navigator.clipboard.writeText(text);
       return;
     }
-  } catch {
+  } catch (error) {
+    console.warn("[agentmux] navigator clipboard write failed", { error });
     // Fall through to the hidden-textarea path used by older WebViews.
   }
   if (!fallbackWriteClipboardText(text)) {
@@ -228,7 +249,8 @@ async function readClipboardText(): Promise<string> {
     try {
       const clipboard = await loadTauriClipboardModule();
       return await clipboard.readText();
-    } catch {
+    } catch (error) {
+      console.warn("[agentmux] tauri clipboard read failed", { error });
       // Fall through to browser clipboard paths for preview or plugin errors.
     }
   }
@@ -236,7 +258,8 @@ async function readClipboardText(): Promise<string> {
     if (navigator.clipboard?.readText) {
       return await navigator.clipboard.readText();
     }
-  } catch {
+  } catch (error) {
+    console.warn("[agentmux] navigator clipboard read failed", { error });
     // Clipboard read can be denied by the host; keep the terminal focused.
   }
   return "";
@@ -268,6 +291,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private fontReadyPromise?: Promise<void>;
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
+  private alternateWheelMode: AlternateWheelMode = "auto";
 
   mount(
     element: HTMLElement,
@@ -456,6 +480,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.fitAddon?.fit();
     terminal.refresh(0, terminal.rows - 1);
     this.fontReadyPromise = this.ensureFontsThenRemeasure(terminal, nextFontSize);
+  }
+
+  setAlternateWheelMode(mode: AlternateWheelMode): void {
+    this.alternateWheelMode = mode;
   }
 
   onData(handler: (data: string) => void): () => void {
@@ -713,7 +741,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return false;
     }
 
-    if (terminal.modes.mouseTrackingMode !== "none") {
+    if (
+      this.alternateWheelMode !== "page" &&
+      terminal.modes.mouseTrackingMode !== "none"
+    ) {
       return true;
     }
 
@@ -816,6 +847,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     }
     event.preventDefault();
     event.stopPropagation();
+    rememberTerminalClipboardText(selected);
     event.clipboardData?.setData("text/plain", selected);
     terminal.focus();
   }
@@ -841,8 +873,11 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       terminal.focus();
       return;
     }
+    rememberTerminalClipboardText(selected);
     void writeClipboardText(selected)
-      .catch(() => {})
+      .catch((error) => {
+        console.warn("[agentmux] terminal copy failed", { error });
+      })
       .finally(() => {
         if (this.terminal === terminal) {
           terminal.focus();
@@ -853,11 +888,14 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private pasteFromClipboard(terminal: Terminal): void {
     void readClipboardText()
       .then((text) => {
-        if (this.terminal === terminal && text) {
-          this.emitPaste(text);
+        const pasteText = text || recentTerminalClipboardText();
+        if (this.terminal === terminal && pasteText) {
+          this.emitPaste(pasteText);
         }
       })
-      .catch(() => {})
+      .catch((error) => {
+        console.warn("[agentmux] terminal paste failed", { error });
+      })
       .finally(() => {
         if (this.terminal === terminal) {
           terminal.focus();

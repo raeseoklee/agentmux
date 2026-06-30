@@ -82,6 +82,10 @@ export type I18nKey =
   | "settings.terminalStartDirectory.custom"
   | "settings.terminalStartCustomCwd"
   | "settings.terminalStartCustomCwdPlaceholder"
+  | "settings.terminalSplitBehavior"
+  | "settings.terminalSplitBehaviorHint"
+  | "settings.terminalSplitBehavior.cloneCurrent"
+  | "settings.terminalSplitBehavior.empty"
   | "settings.terminalLinkOpen"
   | "settings.terminalLinkOpenHint"
   | "settings.terminalLinkOpen.system"
@@ -234,6 +238,11 @@ const en: Record<I18nKey, string> = {
   "settings.terminalStartDirectory.custom": "Custom path",
   "settings.terminalStartCustomCwd": "Custom terminal start path",
   "settings.terminalStartCustomCwdPlaceholder": "D:\\Workspace\\project or /mnt/d/Workspace/project",
+  "settings.terminalSplitBehavior": "Split pane behavior",
+  "settings.terminalSplitBehaviorHint":
+    "Choose whether split commands open a matching terminal immediately or leave an empty pane.",
+  "settings.terminalSplitBehavior.cloneCurrent": "Clone current terminal",
+  "settings.terminalSplitBehavior.empty": "Create empty pane",
   "settings.terminalLinkOpen": "Open terminal links in",
   "settings.terminalLinkOpenHint":
     "System browser is required for OAuth/login flows (e.g. Claude Code) to complete their localhost callback.",
@@ -412,6 +421,11 @@ const ko: Record<I18nKey, string> = {
   "settings.terminalStartDirectory.custom": "사용자 지정 경로",
   "settings.terminalStartCustomCwd": "사용자 지정 터미널 시작 경로",
   "settings.terminalStartCustomCwdPlaceholder": "D:\\Workspace\\project 또는 /mnt/d/Workspace/project",
+  "settings.terminalSplitBehavior": "분할창 동작",
+  "settings.terminalSplitBehaviorHint":
+    "분할 명령에서 현재 터미널을 같은 위치로 바로 열지, 빈 pane을 만들지 선택합니다.",
+  "settings.terminalSplitBehavior.cloneCurrent": "현재 터미널 복제",
+  "settings.terminalSplitBehavior.empty": "빈 pane 만들기",
   "session.status.attention": "입력 대기",
   "session.status.running": "실행 중",
   "session.status.starting": "시작 중",

@@ -365,6 +365,7 @@ pub struct RuntimeSessionSummary {
     pub state: SessionState,
     pub exit_code: Option<i32>,
     pub backend_native_id: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// An atomic snapshot of a session's recent output ring plus the absolute byte
@@ -599,6 +600,7 @@ where
                 state: session.state.clone(),
                 exit_code: session.exit_code,
                 backend_native_id: session.backend_native_id.clone(),
+                cwd: session.cwd.clone(),
             })
     }
 
@@ -620,6 +622,7 @@ where
                 state: session.state.clone(),
                 exit_code: session.exit_code,
                 backend_native_id: session.backend_native_id.clone(),
+                cwd: session.cwd.clone(),
             })
             .collect()
     }
@@ -2226,7 +2229,23 @@ fn parse_osc7_cwd(bytes: &[u8]) -> Option<String> {
     // Drop the host component (everything up to the first '/' of the path).
     let path_start = after_scheme.find('/')?;
     let decoded = percent_decode(&after_scheme[path_start..]);
-    (!decoded.is_empty()).then_some(decoded)
+    (!decoded.is_empty()).then(|| normalize_osc7_cwd_path(&decoded))
+}
+
+fn normalize_osc7_cwd_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        let mut normalized = format!("{}:", (bytes[1] as char).to_ascii_uppercase());
+        let rest = &path[3..];
+        if rest.is_empty() {
+            normalized.push('\\');
+        } else {
+            normalized.push_str(&rest.replace('/', "\\"));
+        }
+        return normalized;
+    }
+
+    path.to_string()
 }
 
 /// Minimal percent-decoder for OSC 7 file-URI paths (e.g. `%20` → space). Leaves
@@ -2365,6 +2384,7 @@ fn session_summary_result(summary: RuntimeSessionSummary) -> SessionSummaryResul
         state: session_state_label(&summary.state),
         exit_code: summary.exit_code,
         backend_native_id: summary.backend_native_id,
+        cwd: summary.cwd,
     }
 }
 
@@ -2437,6 +2457,21 @@ mod tests {
         assert_eq!(
             parse_osc7_cwd(bytes),
             Some("/home/dev/my project".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_osc7_cwd_normalizes_windows_file_uri_paths() {
+        let slash = b"\x1b]7;file://localhost/C:/Workspace/agentmux\x07";
+        assert_eq!(
+            parse_osc7_cwd(slash),
+            Some(r"C:\Workspace\agentmux".to_string())
+        );
+
+        let backslash = b"\x1b]7;file://localhost/C:\\Workspace\\agentmux\x07";
+        assert_eq!(
+            parse_osc7_cwd(backslash),
+            Some(r"C:\Workspace\agentmux".to_string())
         );
     }
 

@@ -9,6 +9,8 @@ export interface TerminalTypography {
   lineHeight: number;
 }
 
+export type AlternateWheelMode = "auto" | "page";
+
 export interface TerminalRenderer {
   mount(
     element: HTMLElement,
@@ -20,6 +22,7 @@ export interface TerminalRenderer {
   resize(columns: number, rows: number): void;
   size(): { columns: number; rows: number } | null;
   setTypography(typography: Partial<TerminalTypography>): void;
+  setAlternateWheelMode?(mode: AlternateWheelMode): void;
   onData(handler: (data: string) => void): () => void;
   onPaste(handler: (text: string) => void): () => void;
   onResize(handler: (columns: number, rows: number) => void): () => void;
