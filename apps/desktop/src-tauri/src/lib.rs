@@ -357,6 +357,12 @@ impl DesktopControlState {
         Self::new_in_memory().expect("failed to initialize in-memory desktop state")
     }
 
+    /// Open a store with the well-known bootstrap token. Only available in
+    /// tests; production callers must use [`open_with_token`] with a randomly
+    /// generated token so the footgun cannot be hit silently.
+    ///
+    /// [`open_with_token`]: DesktopControlState::open_with_token
+    #[cfg(test)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DesktopHostError> {
         Self::open_with_token(path, DESKTOP_CONTROL_TOKEN)
     }
@@ -7081,7 +7087,7 @@ fn builtin_action_results() -> Vec<ActionSummaryResult> {
             "agent",
             "agent",
             &["codex", "--no-alt-screen"],
-            &["codex", "tmux", "no-alt-screen"],
+            &["codex", "tmux", "--no-alt-screen"],
         ),
         builtin_action(
             "agent.launchCustom",
@@ -9421,7 +9427,7 @@ fn validate_desktop_request(
         ));
     }
 
-    if request.auth.token != expected_token {
+    if !constant_time_eq(request.auth.token.as_bytes(), expected_token.as_bytes()) {
         return Err(ControlError::new(
             ErrorCode::Unauthorized,
             "Invalid local control token.",
@@ -9429,6 +9435,16 @@ fn validate_desktop_request(
     }
 
     Ok(())
+}
+
+/// Constant-time byte-slice equality. Returns `true` iff `a == b` in all
+/// bytes, without short-circuiting on the first mismatch. This prevents a
+/// local timing oracle from recovering the control token one byte at a time.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn control_error_from_host(error: DesktopHostError) -> ControlError {
@@ -11082,7 +11098,9 @@ fn is_probably_home_directory(path: &str) -> bool {
     if normalized == "~" {
         return true;
     }
-    env::var("USERNAME")
+    // Try POSIX `USER` first (WSL/Linux), then fall back to Windows `USERNAME`.
+    env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
         .ok()
         .map(|user| normalized == format!("/home/{}", user.to_ascii_lowercase()))
         .unwrap_or(false)
@@ -11531,7 +11549,6 @@ fn codex_option_takes_value(token: &str) -> bool {
     if token.contains('=') {
         return false;
     }
-    let token = token.split_once('=').map(|(name, _)| name).unwrap_or(token);
     matches!(
         token,
         "-c" | "--config"
