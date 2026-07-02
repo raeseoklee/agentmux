@@ -60,6 +60,13 @@ const TRANSIENT_SCROLLBAR_MS = 800;
 const TERMINAL_CLIPBOARD_FALLBACK_MS = 30_000;
 const PAGE_UP_SEQUENCE = "\x1b[5~";
 const PAGE_DOWN_SEQUENCE = "\x1b[6~";
+// Screen-interactive heuristic: treat the terminal as running a full-screen TUI
+// when at least this many absolute cursor-repositioning sequences (CUP/HVP/CUU)
+// are observed within SCREEN_INTERACTIVE_WINDOW_MS.  A single `cls`/clear
+// emits one CUP(1;1); requiring three events already filters that out.
+const SCREEN_INTERACTIVE_MIN_EVENTS = 3;
+const SCREEN_INTERACTIVE_WINDOW_MS = 2000;
+const SCREEN_INTERACTIVE_RING_SIZE = 8; // power-of-two, keeps allocation fixed
 type WebglAddonModule = typeof import("@xterm/addon-webgl");
 type LigaturesAddonModule = typeof import("@xterm/addon-ligatures");
 type TauriClipboardModule = typeof import("@tauri-apps/plugin-clipboard-manager");
@@ -292,6 +299,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
   private alternateWheelMode: AlternateWheelMode = "auto";
+  // Fixed-size ring buffer of timestamps (ms) for recent absolute
+  // cursor-repositioning sequences.  Used by screenInteractiveActive().
+  private readonly _siRing: number[] = new Array<number>(SCREEN_INTERACTIVE_RING_SIZE).fill(0);
+  private _siHead = 0; // next write index (wraps mod SCREEN_INTERACTIVE_RING_SIZE)
 
   mount(
     element: HTMLElement,
@@ -330,6 +341,38 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     element.dataset.agentmuxTerminalFontFeatureSettings = TERMINAL_FONT_FEATURE_SETTINGS;
     terminal.loadAddon(fitAddon);
     terminal.open(element);
+
+    // Reset repaint-observation state for this fresh terminal.
+    this._siRing.fill(0);
+    this._siHead = 0;
+
+    // Register non-consuming CSI observers for absolute cursor-repositioning
+    // sequences emitted heavily by full-screen TUIs (CUP ESC[row;colH,
+    // HVP ESC[row;colf, and CUU ESC[nA).  Returning false keeps the handler
+    // chain running so xterm still processes the sequence normally.
+    // These disposables live until terminal.dispose() — no manual cleanup
+    // needed because the terminal itself owns them after registration.
+    terminal.parser.registerCsiHandler({ final: "H" }, (params) => {
+      // CUP — filter trivial cls/clear (row=1, col=1 or no params) to reduce
+      // false positives, but the >=3 threshold is the primary gate.
+      const row = Array.isArray(params[0]) ? params[0][0] : (params[0] ?? 1);
+      const col = Array.isArray(params[1]) ? params[1][0] : (params[1] ?? 1);
+      if (row !== 1 || col !== 1) {
+        this._siRecordEvent();
+      }
+      return false;
+    });
+    terminal.parser.registerCsiHandler({ final: "f" }, (_params) => {
+      // HVP — same semantics as CUP, used by some TUIs.
+      this._siRecordEvent();
+      return false;
+    });
+    terminal.parser.registerCsiHandler({ final: "A" }, (_params) => {
+      // CUU (cursor up) — emitted by TUI differential repaints.
+      this._siRecordEvent();
+      return false;
+    });
+
     this.ligaturesReadyPromise = this.enableLigatures(terminal, element);
     terminal.attachCustomKeyEventHandler((event) =>
       this.handleClipboardKey(terminal, event)
@@ -710,6 +753,30 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     handler(url, event);
   }
 
+  // Record a cursor-repositioning event into the ring buffer.
+  private _siRecordEvent(): void {
+    this._siRing[this._siHead] = Date.now();
+    this._siHead = (this._siHead + 1) % SCREEN_INTERACTIVE_RING_SIZE;
+  }
+
+  // Returns true when a full-screen TUI appears to be active in the terminal.
+  // Heuristic: >= SCREEN_INTERACTIVE_MIN_EVENTS absolute cursor-repositioning
+  // sequences were observed within the last SCREEN_INTERACTIVE_WINDOW_MS ms.
+  // When the TUI exits, repaints stop, and this decays to false within 2 s.
+  private screenInteractiveActive(): boolean {
+    const cutoff = Date.now() - SCREEN_INTERACTIVE_WINDOW_MS;
+    let count = 0;
+    for (let i = 0; i < SCREEN_INTERACTIVE_RING_SIZE; i++) {
+      if (this._siRing[i] > cutoff) {
+        count++;
+        if (count >= SCREEN_INTERACTIVE_MIN_EVENTS) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   private handleWheelEvent(
     terminal: Terminal,
     element: HTMLElement,
@@ -727,6 +794,33 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const direction = event.deltaY > 0 ? 1 : -1;
     const buffer = terminal.buffer.active;
     if (buffer.type === "normal") {
+      // Screen-interactive heuristic: while a full-screen TUI (e.g. codex) is
+      // live under ConPTY, xterm's buffer type stays "normal" because ConPTY
+      // swallows all DECSET mode changes (1049/1047 alt-screen, 1007 alt-scroll)
+      // before they reach us.  The xterm scrollback in this state contains only
+      // stale pre-TUI frames, so scrolling it is useless.  Instead, detect an
+      // active TUI by counting absolute cursor-repositioning sequences (CUP/HVP/
+      // CUU) that TUIs emit on every repaint, and synthesize DECCKM-aware cursor
+      // keys — the same input that actually moves the TUI's selection.  Users
+      // who chose the "page" wheel mode get paging keys here instead, matching
+      // the alt-buffer override.  When the TUI exits, repaints stop and the
+      // heuristic decays within 2 s, restoring normal scrollback behaviour
+      // (including for "page" mode, which never repurposes shell scrollback).
+      if (this.screenInteractiveActive()) {
+        if (this.alternateWheelMode === "page") {
+          terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
+        } else {
+          const app = terminal.modes.applicationCursorKeysMode;
+          const key =
+            direction < 0 ? (app ? "\x1bOA" : "\x1b[A") : (app ? "\x1bOB" : "\x1b[B");
+          terminal.input(key.repeat(lines), true);
+        }
+        // No scrollbar: nothing moves in the viewport; showing it would mislead.
+        event.preventDefault();
+        event.stopPropagation();
+        return false;
+      }
+
       const hasScrollback = buffer.baseY > 0;
       const canScrollUp = hasScrollback && direction < 0 && buffer.viewportY > 0;
       const canScrollDown =
@@ -753,13 +847,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     } else {
       // Alternate-scroll semantics: synthesize cursor keys per wheel line
       // (honoring DECCKM), matching what conhost does for alt-screen apps.
-      // TUIs like codex request this via DECSET 1007, but the mode is not
-      // reliably observable host-side — ConPTY virtualizes the app's mode
-      // changes and re-synthesizes its own output stream, so 1007 never
-      // reaches us for native (PowerShell/cmd) sessions. xterm.js 6.0.0 does
-      // not implement 1007 either, and PageUp/PageDown is ignored by these
-      // apps, so cursor keys are the fallback for every alt-screen app that
-      // did not take over the mouse.
+      // Note: ConPTY strips DECSET mode changes (including 1007 alt-scroll and
+      // 1049 alt-screen) before they reach us, so for native PowerShell/cmd
+      // sessions the buffer type stays "normal" even inside a TUI — that case
+      // is handled above by screenInteractiveActive().  This branch fires only
+      // for tmux-control sessions (raw bytes pass through, alt-screen is
+      // visible) and similar transparent backends.  PageUp/PageDown is ignored
+      // by most TUIs, so cursor keys are the right synthesised input here too.
       const app = terminal.modes.applicationCursorKeysMode;
       const key =
         direction < 0 ? (app ? "\x1bOA" : "\x1b[A") : (app ? "\x1bOB" : "\x1b[B");
