@@ -2320,3 +2320,163 @@ test("DD-7: pane drag-over indicator appears and clears", async ({ page }) => {
   // assertion path and manual verification.
   void secondPaneId;
 });
+
+// Status surface audit tests — verify that per-workspace / per-tab status
+// indicators follow the selected-pane-of-selected-tab rule.
+
+test("workspace card attention badge reflects aggregate attention across all sessions in the workspace", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Open a terminal to create a session.
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+
+  // The workspace card should start with no attention.
+  const card = page.locator(".agentmux-workspace-card").first();
+  await expect(card).toHaveAttribute("data-agentmux-attention", "false");
+
+  // Inject synthetic attention for the session (uses lastSessionId).
+  await page.evaluate(() => {
+    (window as any).__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      state: "waiting_for_input",
+    });
+  });
+
+  // The workspace card attention badge must appear.
+  await expect(card).toHaveAttribute("data-agentmux-attention", "true");
+});
+
+test("tab attention dot shows when the tab-representative surface session needs attention", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Open a terminal (Tab 1) so a session exists.
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+
+  // No attention yet.
+  const tab = page.locator(".agentmux-surface-tab").first();
+  await expect(tab).toHaveAttribute("data-agentmux-tab-attention", "false");
+
+  // Inject attention on the session.
+  await page.evaluate(() => {
+    (window as any).__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      state: "waiting_for_input",
+    });
+  });
+
+  // Tab attention dot must appear.
+  await expect(tab).toHaveAttribute("data-agentmux-tab-attention", "true");
+});
+
+test("tab attention dot shows when a SPLIT pane session (not the representative surface) needs attention", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Open Tab 1 (first pane / representative surface).
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+
+  // Split Tab 1 to add a second pane inside the same tab.
+  await page.locator(".agentmux-top-split-vertical").click();
+  const mountedPanes = page.locator(
+    '[data-agentmux-pane][data-agentmux-mounted="true"]',
+  );
+  await expect(mountedPanes).toHaveCount(1);
+
+  // Open a terminal in the second (empty) pane — this becomes lastSessionId.
+  const emptyPanes = page.locator(
+    '[data-agentmux-pane][data-agentmux-mounted="false"]',
+  );
+  if ((await emptyPanes.count()) > 0) {
+    await page.getByRole("button", { name: "Open terminal" }).last().click();
+  }
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+
+  const tab = page.locator(".agentmux-surface-tab").first();
+  await expect(tab).toHaveAttribute("data-agentmux-tab-attention", "false");
+
+  // Inject attention on the SECOND pane's session (lastSessionId after the
+  // second terminal was created — this is the split-pane session, NOT the
+  // representative surface's session).
+  await page.evaluate(() => {
+    (window as any).__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      state: "waiting_for_input",
+    });
+  });
+
+  // The tab chip must show the attention dot even though the attention is on
+  // the split pane, not the representative (first) surface.
+  await expect(tab).toHaveAttribute("data-agentmux-tab-attention", "true");
+});
+
+test("tab attention dot is absent on a different tab when only the other tab's session has attention", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Open Tab 1.
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+
+  // Open Tab 2.
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
+
+  // Inject attention on Tab 2's session (lastSessionId is Tab 2's session).
+  await page.evaluate(() => {
+    (window as any).__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      state: "waiting_for_input",
+    });
+  });
+
+  const tabs = page.locator(".agentmux-surface-tab");
+  // Tab 2 (last) should have attention.
+  await expect(tabs.last()).toHaveAttribute("data-agentmux-tab-attention", "true");
+  // Tab 1 (first) must NOT show the attention dot.
+  await expect(tabs.first()).toHaveAttribute("data-agentmux-tab-attention", "false");
+});

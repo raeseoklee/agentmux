@@ -7045,14 +7045,31 @@ export function AgentmuxTerminalApp() {
                 const session = surface.sessionId
                   ? sessionById.get(surface.sessionId)
                   : undefined;
-                const att = session
-                  ? Boolean(attentionBySession.get(session.sessionId))
-                  : false;
+                // A tab may be split into multiple panes, each with its own
+                // session. The attention dot must fire when ANY session in
+                // the tab's pane tree needs input — not only the
+                // representative (first) surface's session.
+                const att = tabRoot
+                  ? panes.some((pane) => {
+                      if (!pane.mountedSurfaceId) return false;
+                      const paneRoot = rootPaneForPane(pane);
+                      if (paneRoot.paneId !== tabRoot.paneId) return false;
+                      const paneSurface = surfaceById.get(pane.mountedSurfaceId);
+                      return paneSurface?.sessionId
+                        ? Boolean(
+                            attentionBySession.get(paneSurface.sessionId),
+                          )
+                        : false;
+                    })
+                  : session
+                    ? Boolean(attentionBySession.get(session.sessionId))
+                    : false;
                 return (
                   <Hov
                     key={surface.surfaceId}
                     className="agentmux-surface-tab"
                     data-agentmux-surface-tab={surface.surfaceId}
+                    data-agentmux-tab-attention={att ? "true" : "false"}
                     draggable
                     onDragStart={(event) => beginSurfaceTabDrag(event, surface)}
                     onDragEnd={clearDragFeedback}
