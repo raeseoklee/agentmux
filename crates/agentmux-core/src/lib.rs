@@ -721,15 +721,10 @@ where
                 }
             }
             BackendEvent::Resized {
-                session_id,
-                columns,
-                rows,
-            } => Some(CoreEvent::SessionStateChanged {
-                session_id: SessionId::from_string(session_id),
-                from: SessionState::Running,
-                to: SessionState::Running,
-            })
-            .filter(|_| columns > 0 && rows > 0),
+                session_id: _,
+                columns: _,
+                rows: _,
+            } => None,
             BackendEvent::Exited { session_id, code } => {
                 let session_id = SessionId::from_string(session_id);
                 let session = self.sessions.get_mut(&session_id)?;
