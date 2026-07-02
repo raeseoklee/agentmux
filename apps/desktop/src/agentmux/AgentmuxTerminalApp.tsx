@@ -3858,11 +3858,15 @@ export function AgentmuxTerminalApp() {
         const session = surface.sessionId
           ? sessionById.get(surface.sessionId)
           : undefined;
+        // undefined (not null) when the session never reported a cwd, so the
+        // spawn wrappers fall back to the workspace start directory instead of
+        // the shell's home.
+        const sourceCwd = session?.cwd ?? undefined;
         const agentCommand = surface.sessionId
           ? agentCommandFromTelemetry(agentBySession.get(surface.sessionId))
           : [];
         if (agentCommand.length > 0) {
-          await runTerminalLaunch(() => ctl.spawnAgent(agentCommand));
+          await runTerminalLaunch(() => ctl.spawnAgent(agentCommand, sourceCwd));
           return;
         }
 
@@ -3873,7 +3877,7 @@ export function AgentmuxTerminalApp() {
           null;
         if (session?.backendKind === "wsl-direct") {
           await runTerminalLaunch(() =>
-            ctl.spawnTerminalProfile("wsl", fallbackDistribution),
+            ctl.spawnTerminalProfile("wsl", fallbackDistribution, sourceCwd),
           );
           return;
         }
@@ -3886,7 +3890,7 @@ export function AgentmuxTerminalApp() {
             await client.spawnDurableWslTerminal(
               activeWorkspaceId,
               fallbackDistribution,
-              activeWorkspace?.projectRoot ?? null,
+              sourceCwd ?? activeWorkspace?.projectRoot ?? null,
               "new_tab",
             );
             await ctl.refresh();
@@ -3899,7 +3903,10 @@ export function AgentmuxTerminalApp() {
           title.includes("cmd") && !title.includes("powershell")
             ? "cmd"
             : "powershell";
-        await runTerminalLaunch(() => ctl.spawnTerminalProfile(profile));
+        // Native terminals (PowerShell/cmd): only pass cwd if it's a Windows
+        // path. Linux paths from WSL OSC 7 must not be forwarded here.
+        const nativeCwd = sourceCwd && !sourceCwd.startsWith("/") ? sourceCwd : undefined;
+        await runTerminalLaunch(() => ctl.spawnTerminalProfile(profile, null, nativeCwd));
       } catch (error) {
         console.warn("[agentmux] failed to duplicate tab", {
           error,

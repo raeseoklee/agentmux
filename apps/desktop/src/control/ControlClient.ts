@@ -826,6 +826,7 @@ export interface ControlClient {
     distribution: string | null,
     placement?: TerminalPlacement,
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession>;
   getSession(sessionId: string): Promise<TerminalSession>;
   readRecent(sessionId: string, maxBytes: number): Promise<string>;
@@ -1980,13 +1981,14 @@ class TauriControlClient implements ControlClient {
     distribution: string | null,
     placement?: TerminalPlacement,
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession> {
     const result = await this.call<{ session_id: string }>("session.spawn", {
       workspace_id: workspaceId,
       backend: "wsl-tmux-control",
       backend_profile: distribution,
       command,
-      cwd: null,
+      cwd: cwd ?? null,
       columns: 120,
       rows: 30,
       durability: "durable",
@@ -3841,6 +3843,7 @@ class BrowserPreviewControlClient implements ControlClient {
     distribution: string | null,
     placement: TerminalPlacement = "active_pane",
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession> {
     const label = command.join(" ").trim() || "agent";
     const session = await this.createPreviewTerminal(
@@ -3853,6 +3856,7 @@ class BrowserPreviewControlClient implements ControlClient {
           "   (durable tmux · " +
           (distribution ?? "WSL") +
           ")",
+        cwd ? "\r\ncwd: " + cwd : "",
         "\r\nagentmux 에이전트 세션 preview — 실제 실행/durable 복원은 Tauri에서 동작",
         "\r\n",
       ].join(""),
@@ -5321,13 +5325,14 @@ class ServerControlClient extends BrowserPreviewControlClient {
     distribution: string | null,
     placement: TerminalPlacement = "active_pane",
     paneId?: string | null,
+    cwd?: string | null,
   ): Promise<TerminalSession> {
     return this.spawnServerTerminal({
       workspaceId,
       backend: "wsl-tmux-control",
       backendProfile: distribution ?? this.serverDefaults.backend_profile ?? null,
       command,
-      cwd: this.serverDefaults.cwd ?? null,
+      cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
       paneId,
       title: command.join(" ") || "Agent",

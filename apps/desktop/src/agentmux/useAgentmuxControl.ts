@@ -394,7 +394,8 @@ export interface AgentmuxControl {
   spawnDefaultTerminal: () => Promise<void>;
   spawnTerminalProfile: (
     profile: TerminalProfile,
-    distribution?: string | null
+    distribution?: string | null,
+    cwd?: string | null,
   ) => Promise<void>;
   spawnTerminalProfileInPane: (
     paneId: string,
@@ -404,7 +405,7 @@ export interface AgentmuxControl {
   spawnDefaultTerminalInPane: (paneId: string) => Promise<void>;
   spawnDurableTerminalInPane: (paneId: string) => Promise<void>;
   spawnWslTerminal: (distribution: string) => Promise<void>;
-  spawnAgent: (command: string[]) => Promise<void>;
+  spawnAgent: (command: string[], cwd?: string | null) => Promise<void>;
   spawnDockControl: (control: DockControl) => Promise<TerminalSession | null>;
   splitActivePane: (axis: "horizontal" | "vertical") => Promise<void>;
   resizePane: (paneId: string, ratio: number) => void;
@@ -703,10 +704,11 @@ export function useAgentmuxControl(): AgentmuxControl {
   }, [client]);
 
   // RT-1/RT-2: Subscribe to host-pushed sidebar-changed signals so a `cd` in
-  // a terminal reflects in the footer within ~200 ms instead of up to 5 s.
+  // a terminal reflects in the footer immediately instead of up to 5 s.
   // Only active under Tauri; in plain-browser preview the event never fires so
-  // this is a no-op. Coalesces rapid cd sequences with a 200 ms debounce so
-  // back-to-back OSC 7 bursts produce a single getSidebarState call.
+  // this is a no-op. Leading-edge fire: the first signal refreshes right away,
+  // and signals arriving during the cooldown coalesce into one trailing
+  // refresh, so rapid cd bursts produce at most two getSidebarState calls.
   useEffect(() => {
     const eventApi = (
       window as Window & {
@@ -723,13 +725,24 @@ export function useAgentmuxControl(): AgentmuxControl {
     if (!eventApi?.listen) {
       return;
     }
+    const COALESCE_MS = 150;
     let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    let lastFireAt = 0;
     let unlisten: (() => void) | undefined;
     const handler = () => {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
+      const now = Date.now();
+      if (debounceTimer === undefined && now - lastFireAt >= COALESCE_MS) {
+        lastFireAt = now;
         void refreshSidebar();
-      }, 200);
+        return;
+      }
+      if (debounceTimer === undefined) {
+        debounceTimer = setTimeout(() => {
+          debounceTimer = undefined;
+          lastFireAt = Date.now();
+          void refreshSidebar();
+        }, COALESCE_MS);
+      }
     };
     eventApi
       .listen("agentmux://sidebar-changed", handler)
@@ -1164,7 +1177,7 @@ export function useAgentmuxControl(): AgentmuxControl {
       workspaceId: string,
       placement: "new_tab" | "active_pane",
       paneId?: string | null,
-      override?: { profile: TerminalProfile; distribution?: string | null }
+      override?: { profile: TerminalProfile; distribution?: string | null; cwd?: string | null }
     ) => {
       const profile = override?.profile ?? defaultTerminalProfile(workspaceId);
       if (profile === "wsl") {
@@ -1174,7 +1187,7 @@ export function useAgentmuxControl(): AgentmuxControl {
           notifyWslRequired();
           throw new Error(WSL_REQUIRED_MESSAGE);
         }
-        const cwd = await terminalStartCwd(workspaceId);
+        const cwd = override?.cwd !== undefined ? override.cwd : await terminalStartCwd(workspaceId);
         return client.spawnWslTerminal(
           workspaceId,
           distribution,
@@ -1184,13 +1197,20 @@ export function useAgentmuxControl(): AgentmuxControl {
         );
       }
 
-      const cwd = await terminalStartCwd(workspaceId);
+      // Only pass a cwd override to native terminals if it looks like a Windows
+      // path. Linux paths (start with "/") from WSL OSC 7 must not be forwarded
+      // to PowerShell/cmd — fall back to the workspace default in that case.
+      const overrideCwdIsWindows =
+        override?.cwd != null && !override.cwd.startsWith("/");
+      const nativeCwd = overrideCwdIsWindows
+        ? override!.cwd!
+        : await terminalStartCwd(workspaceId);
       return client.spawnNativeTerminal(
         workspaceId,
         NATIVE_TERMINAL_COMMANDS[profile],
         placement,
         paneId,
-        cwd
+        nativeCwd
       );
     },
     [
@@ -1211,13 +1231,13 @@ export function useAgentmuxControl(): AgentmuxControl {
   );
 
   const spawnTerminalProfile = useCallback(
-    (profile: TerminalProfile, distribution?: string | null) =>
+    (profile: TerminalProfile, distribution?: string | null, cwd?: string | null) =>
       withActive(async (workspaceId) => {
         return spawnTerminalForWorkspace(
           workspaceId,
           "new_tab",
           null,
-          { profile, distribution }
+          { profile, distribution, cwd }
         );
       }),
     [spawnTerminalForWorkspace, withActive]
@@ -1326,7 +1346,7 @@ export function useAgentmuxControl(): AgentmuxControl {
   ]);
 
   const spawnAgent = useCallback(
-    (command: string[]) =>
+    (command: string[], cwd?: string | null) =>
       withActive(async (workspaceId) => {
         // Launch the agent CLI in a durable WSL-tmux session so it survives
         // detach/restart. Uses the default WSL distribution.
@@ -1342,7 +1362,7 @@ export function useAgentmuxControl(): AgentmuxControl {
           throw new Error(tmux.message || TMUX_REQUIRED_MESSAGE);
         }
 
-        return client.spawnAgentTerminal(workspaceId, command, distribution, "new_tab");
+        return client.spawnAgentTerminal(workspaceId, command, distribution, "new_tab", null, cwd);
       }),
     [client, defaultWslDistribution, notifyTmuxRequired, notifyWslRequired, withActive]
   );
