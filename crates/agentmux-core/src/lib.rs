@@ -721,12 +721,6 @@ where
                 }
             }
             BackendEvent::Resized {
-<<<<<<< HEAD
-                session_id: _,
-                columns: _,
-                rows: _,
-            } => None,
-=======
                 session_id,
                 columns,
                 rows,
@@ -743,7 +737,6 @@ where
                     })
                 }
             }
->>>>>>> origin/main
             BackendEvent::Exited { session_id, code } => {
                 let session_id = SessionId::from_string(session_id);
                 let session = self.sessions.get_mut(&session_id)?;
