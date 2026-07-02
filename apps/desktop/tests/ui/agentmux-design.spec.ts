@@ -2019,3 +2019,161 @@ test("command palette opens over a focused terminal", async ({ page }) => {
   await page.keyboard.up("Control");
   await expect(page.locator(".agentmux-palette-item").first()).toBeVisible();
 });
+
+// DD-1: surface tab drag reorder
+test("surface tabs can be drag reordered within their workspace", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  // Create two tabs
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  const firstId = await tabs.nth(0).getAttribute("data-agentmux-surface-tab");
+  const secondId = await tabs.nth(1).getAttribute("data-agentmux-surface-tab");
+  expect(firstId).toBeTruthy();
+  expect(secondId).toBeTruthy();
+
+  // Drag second tab onto first tab — targetPosition y:4 is above vertical
+  // midpoint so dropPlacementFromEvent returns "before", placing second before first.
+  await tabs.nth(1).dragTo(tabs.nth(0), { targetPosition: { x: 16, y: 4 } });
+
+  // After reorder: what was second is now first
+  await expect(tabs.nth(0)).toHaveAttribute(
+    "data-agentmux-surface-tab",
+    secondId ?? "",
+  );
+  await expect(tabs.nth(1)).toHaveAttribute(
+    "data-agentmux-surface-tab",
+    firstId ?? "",
+  );
+});
+
+// DD-3: ungrouped workspace card drag reorder
+test("ungrouped workspace cards can be drag reordered in the sidebar", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  // Create a second workspace
+  await page.locator(".agentmux-workspace-plus").click();
+  const nameInput = page.locator(".agentmux-workspace-inline-name-input");
+  if (await nameInput.isVisible().catch(() => false)) {
+    await nameInput.press("Enter");
+  }
+  const cards = page.locator(".agentmux-workspace-card");
+  await expect(cards).toHaveCount(2);
+
+  const firstId = await cards.nth(0).getAttribute("data-agentmux-workspace");
+  const secondId = await cards.nth(1).getAttribute("data-agentmux-workspace");
+  expect(firstId).toBeTruthy();
+  expect(secondId).toBeTruthy();
+
+  // Drag second card onto first card — y:4 is above midpoint → "before"
+  await cards.nth(1).dragTo(cards.nth(0), { targetPosition: { x: 16, y: 4 } });
+
+  // After reorder: what was second is now first
+  await expect(cards.nth(0)).toHaveAttribute(
+    "data-agentmux-workspace",
+    secondId ?? "",
+  );
+  await expect(cards.nth(1)).toHaveAttribute(
+    "data-agentmux-workspace",
+    firstId ?? "",
+  );
+});
+
+// DD-4: pane surface swap via header drag
+test("pane surfaces can be swapped by dragging one pane header onto another", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Create first terminal tab then split
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+  await page.locator(".agentmux-top-split-vertical").click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+
+  // Mount a terminal in the second pane
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  const mountedPanes = page.locator(
+    '[data-agentmux-pane][data-agentmux-mounted="true"]',
+  );
+  await expect(mountedPanes).toHaveCount(2);
+
+  const firstSurfaceId = await mountedPanes
+    .nth(0)
+    .getAttribute("data-agentmux-mounted-surface");
+  const secondSurfaceId = await mountedPanes
+    .nth(1)
+    .getAttribute("data-agentmux-mounted-surface");
+  expect(firstSurfaceId).toBeTruthy();
+  expect(secondSurfaceId).toBeTruthy();
+
+  // Pane header is the first div child of [data-agentmux-pane] — it is
+  // draggable when a surface is mounted (surface.surfaceId truthy).
+  const firstPaneHeader = mountedPanes.nth(0).locator("> div").first();
+  const secondPaneHeader = mountedPanes.nth(1).locator("> div").first();
+
+  await firstPaneHeader.dragTo(secondPaneHeader, {
+    targetPosition: { x: 16, y: 4 },
+  });
+
+  // Surfaces should have swapped
+  await expect(mountedPanes.nth(0)).toHaveAttribute(
+    "data-agentmux-mounted-surface",
+    secondSurfaceId ?? "",
+  );
+  await expect(mountedPanes.nth(1)).toHaveAttribute(
+    "data-agentmux-mounted-surface",
+    firstSurfaceId ?? "",
+  );
+});
+
+// DD-2: tab drag onto workspace card moves surface to that workspace
+test("surface tab can be dragged onto a workspace card to move it", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  // Create second workspace
+  await page.locator(".agentmux-workspace-plus").click();
+  const nameInput = page.locator(".agentmux-workspace-inline-name-input");
+  if (await nameInput.isVisible().catch(() => false)) {
+    await nameInput.press("Enter");
+  }
+  const cards = page.locator(".agentmux-workspace-card");
+  await expect(cards).toHaveCount(2);
+
+  // Select workspace 1 and open two terminals there
+  await cards.filter({ hasText: "Workspace 1" }).click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  // Drag the second tab onto the Workspace 2 card
+  const ws2Card = cards.filter({ hasText: "Workspace 2" });
+  await tabs.nth(1).dragTo(ws2Card, { targetPosition: { x: 16, y: 4 } });
+
+  // Active workspace should have switched to Workspace 2
+  await expect(
+    page.locator('.agentmux-workspace-card[data-agentmux-active="true"]'),
+  ).toContainText("Workspace 2");
+  // Workspace 2 should now have exactly 1 tab
+  await expect(tabs).toHaveCount(1);
+});
