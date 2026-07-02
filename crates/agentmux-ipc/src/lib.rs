@@ -1847,9 +1847,7 @@ mod transport {
         writeln!(file, "{request_json}")?;
         file.flush()?;
 
-        let mut reader = BufReader::new(file);
-        let mut response_json = String::new();
-        reader.read_line(&mut response_json)?;
+        let response_json = read_line_with_timeout(file, timeout)?;
         if response_json.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1873,9 +1871,10 @@ mod transport {
         writeln!(file, "{request_json}")?;
         file.flush()?;
 
-        let mut reader = BufReader::new(file);
-        let mut response_json = String::new();
-        reader.read_line(&mut response_json)?;
+        // Apply a read timeout only to the initial handshake response. The
+        // returned NamedPipeEventStream performs long-lived blocking reads for
+        // subsequent events and must NOT inherit a deadline.
+        let (response_json, reader) = read_line_with_timeout_returning_reader(file, timeout)?;
         if response_json.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1885,6 +1884,66 @@ mod transport {
         let response = serde_json::from_str(response_json.trim_end())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         Ok((response, NamedPipeEventStream { reader }))
+    }
+
+    /// Read one line from `file` with a deadline equal to `timeout`.
+    ///
+    /// Spawns a thread that owns the blocking `read_line` call and sends the
+    /// result back over a channel.  The caller keeps a duplicate handle
+    /// (`File::try_clone`) and waits on the channel with `recv_timeout`.  On
+    /// success the duplicate is dropped immediately.  On timeout the duplicate
+    /// is dropped, which closes that handle; Windows sees the last client
+    /// handle close and returns `ERROR_BROKEN_PIPE` to the thread's blocked
+    /// `ReadFile`, letting the thread exit promptly without leaking a handle
+    /// or blocking indefinitely.
+    fn read_line_with_timeout(file: File, timeout: Duration) -> io::Result<String> {
+        // Duplicate the handle: caller keeps `_cancel`, thread owns `file`.
+        // Dropping `_cancel` on timeout unblocks the thread's ReadFile.
+        let _cancel = file.try_clone()?;
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<String>>();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+            let result = reader.read_line(&mut line).map(|_| line);
+            let _ = tx.send(result);
+        });
+        // `_cancel` is dropped here on timeout, unblocking the thread.
+        rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "AgentMux control pipe response timed out",
+            ))
+        })
+    }
+
+    /// Like `read_line_with_timeout` but also returns the `BufReader` so the
+    /// caller can continue reading from the same pipe after the handshake.
+    ///
+    /// Uses the same duplicate-handle cancellation strategy as
+    /// `read_line_with_timeout`: a clone of `file` is kept in the caller; on
+    /// timeout it is dropped, causing the thread's blocked `ReadFile` to
+    /// return `ERROR_BROKEN_PIPE` and the thread to exit without leaking
+    /// handles or blocking indefinitely.
+    fn read_line_with_timeout_returning_reader(
+        file: File,
+        timeout: Duration,
+    ) -> io::Result<(String, BufReader<File>)> {
+        // Duplicate the handle: caller keeps `_cancel`, thread owns `file`.
+        let _cancel = file.try_clone()?;
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<(String, BufReader<File>)>>();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+            let result = reader.read_line(&mut line).map(|_| (line, reader));
+            let _ = tx.send(result);
+        });
+        // `_cancel` is dropped here on timeout, unblocking the thread.
+        rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "AgentMux control pipe subscription response timed out",
+            ))
+        })
     }
 
     pub fn serve_named_pipe_requests<F>(pipe_name: &str, handler: F) -> io::Result<()>

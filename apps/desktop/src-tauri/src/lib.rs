@@ -692,7 +692,12 @@ impl DesktopControlState {
         // holding the lock, then release the lock before calling channel.send().
         // This prevents a blocking send from stalling register_output_channel /
         // unregister_output_channel, which also need the same lock.
-        let to_send: Vec<(String, String, Channel<OutputStreamFrame>, OutputStreamFrame)> = {
+        let to_send: Vec<(
+            String,
+            String,
+            Channel<OutputStreamFrame>,
+            OutputStreamFrame,
+        )> = {
             let Ok(channels) = self.output_channels.lock() else {
                 self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
                 return had_activity;
