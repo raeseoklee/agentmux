@@ -23,18 +23,6 @@ if (-not $cargoPath -and (Test-Path $localCargo)) {
   $cargoPath = $localCargo
 }
 
-# Warn if the active Rust toolchain is not MSVC. The windows-link crate used by
-# Tauri generates raw-dylib API Set imports that the GNU/MinGW linker cannot
-# resolve at load time (STATUS_ENTRYPOINT_NOT_FOUND / 0xc0000139). The repo
-# root rust-toolchain.toml pins to MSVC, but an explicit RUSTUP_TOOLCHAIN env
-# var or a user-level default can still override it.
-# This check runs after the vendored toolchain override so that developers using
-# .toolchains/ (which is always MSVC) do not see a false-positive warning.
-$activeToolchain = & rustup show active-toolchain 2>$null
-if ($activeToolchain -and $activeToolchain -notmatch "msvc") {
-  Write-Warning "Active Rust toolchain '$activeToolchain' is not MSVC. Tests may crash with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139). Set RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-msvc or let rust-toolchain.toml take effect."
-}
-
 if ($cargoPath) {
   & $cargoPath fmt --all -- --check
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -152,9 +152,7 @@ function bytesToBase64(bytes: Uint8Array): string {
   const chunkSize = 0x8000;
   for (let index = 0; index < bytes.length; index += chunkSize) {
     const chunk = bytes.subarray(index, index + chunkSize);
-    for (let i = 0; i < chunk.length; i++) {
-      binary += String.fromCharCode(chunk[i]);
-    }
+    binary += String.fromCharCode(...chunk);
   }
   return window.btoa(binary);
 }

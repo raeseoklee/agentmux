@@ -173,15 +173,11 @@ impl SessionBackend for PipeBackend {
                 self.send_input(session_id, InputEvent::Control(ControlCode::Interrupt))
             }
             TerminationMode::Soft => {
-                let session = self
+                let mut session = self
                     .sessions
-                    .get_mut(session_id)
+                    .remove(session_id)
                     .ok_or_else(|| BackendError::session_not_found(session_id))?;
-                // Close stdin so the child (tmux control client) receives EOF and
-                // detaches cleanly. The session stays in the map so that
-                // `poll_exits` can call `try_wait`, reap the child (avoiding a
-                // zombie on Unix/WSL), and emit `BackendEvent::Exited` with the
-                // real exit code — matching ConptyBackend lifecycle semantics.
+                // Closing stdin lets the child (tmux control client) detach cleanly.
                 drop(session.stdin.take());
                 Ok(())
             }
@@ -191,10 +187,6 @@ impl SessionBackend for PipeBackend {
                     .remove(session_id)
                     .ok_or_else(|| BackendError::session_not_found(session_id))?;
                 let _ = session.child.kill();
-                // Reap the child immediately to avoid a zombie PID on Unix/WSL.
-                // On Windows this is a no-op in terms of zombie semantics but
-                // ensures the OS handle is released promptly.
-                let _ = session.child.wait();
                 Ok(())
             }
         }
@@ -220,13 +212,15 @@ fn spawn_output_reader<R: Read + Send + 'static>(
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
-                    // EOF: child process has exited cleanly. Do not push an
-                    // error event — `poll_exits` will call `child.try_wait()`
-                    // in `drain_events` and emit `BackendEvent::Exited` with
-                    // the real exit code, consistent with ConptyBackend
-                    // behavior (which breaks silently on ERROR_BROKEN_PIPE /
-                    // ERROR_HANDLE_EOF and relies on `poll_exits` for the exit
-                    // signal).
+                    if let Ok(mut events) = events.lock() {
+                        events.push(BackendEvent::Error {
+                            session_id: Some(session_id.clone()),
+                            error: BackendError::new(
+                                "output_read_ended",
+                                "pipe stdout reached end of stream",
+                            ),
+                        });
+                    }
                     break;
                 }
                 Ok(read) => {
