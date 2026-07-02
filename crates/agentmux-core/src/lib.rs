@@ -729,11 +729,7 @@ where
                     None
                 } else {
                     let session_id = SessionId::from_string(session_id);
-                    let state = self
-                        .sessions
-                        .get(&session_id)
-                        .map(|s| s.state.clone())
-                        .unwrap_or(SessionState::Running);
+                    let state = self.sessions.get(&session_id)?.state.clone();
                     Some(CoreEvent::SessionStateChanged {
                         session_id,
                         from: state.clone(),
@@ -783,10 +779,13 @@ where
                         }
                     } else {
                         // Session is already in a terminal state; do not overwrite it.
-                        // Emit a health event so the caller still learns about the error.
-                        CoreEvent::BackendHealthChanged {
-                            attachment_id: BackendAttachmentId::from_string("unknown"),
-                            state: error.message,
+                        // Emit a session-scoped state-changed event (from == to, no
+                        // mutation) so session-filtered event subscribers still see the
+                        // error notification with the correct session_id.
+                        CoreEvent::SessionStateChanged {
+                            session_id,
+                            from: from.clone(),
+                            to: from,
                         }
                     }
                 } else {
@@ -945,9 +944,7 @@ where
                         debug_assert_eq!(
                             delta.from_offset + delta.bytes.len() as u64,
                             *from_offset,
-                            "non-contiguous output batches for session {session_id}: \
-                             expected offset {expected} but got {from_offset}",
-                            expected = delta.from_offset + delta.bytes.len() as u64,
+                            "non-contiguous output batches for session {session_id}",
                         );
                         delta.bytes.extend_from_slice(bytes);
                     }
