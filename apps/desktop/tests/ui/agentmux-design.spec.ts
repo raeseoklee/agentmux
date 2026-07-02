@@ -825,6 +825,16 @@ test("new WSL terminal adds a separate top tab without changing the split layout
 });
 
 test("split panes stay scoped to their top tab", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
   await bootPreview(page);
 
   await page.getByRole("button", { name: "Open terminal" }).last().click();
