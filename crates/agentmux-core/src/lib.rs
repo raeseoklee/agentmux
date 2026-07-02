@@ -771,7 +771,7 @@ where
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     let failed = SessionState::Failed {
                         code: error.code,
-                        message: error.message,
+                        message: error.message.clone(),
                     };
                     let from = session.state.clone();
                     if from.can_transition_to(&failed) {
@@ -784,14 +784,9 @@ where
                     } else {
                         // Session is already in a terminal state; do not overwrite it.
                         // Emit a health event so the caller still learns about the error.
-                        let msg = if let SessionState::Failed { ref message, .. } = failed {
-                            message.clone()
-                        } else {
-                            String::new()
-                        };
                         CoreEvent::BackendHealthChanged {
                             attachment_id: BackendAttachmentId::from_string("unknown"),
-                            state: msg,
+                            state: error.message,
                         }
                     }
                 } else {
@@ -951,8 +946,8 @@ where
                             delta.from_offset + delta.bytes.len() as u64,
                             *from_offset,
                             "non-contiguous output batches for session {session_id}: \
-                             expected offset {} but got {from_offset}",
-                            delta.from_offset + delta.bytes.len() as u64,
+                             expected offset {expected} but got {from_offset}",
+                            expected = delta.from_offset + delta.bytes.len() as u64,
                         );
                         delta.bytes.extend_from_slice(bytes);
                     }

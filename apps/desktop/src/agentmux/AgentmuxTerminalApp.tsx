@@ -4455,6 +4455,21 @@ export function AgentmuxTerminalApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [ctl.closeSurface],
   );
+  // PR-2: stable wrappers so the PaneView memo identity holds across poll ticks.
+  const onPaneDropStable = useCallback(
+    (event: import("react").DragEvent<HTMLElement>, targetPane: PaneSummary) => {
+      void dropPaneSurface(event, targetPane);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dropPaneSurface],
+  );
+  const onMovePaneSurfaceStable = useCallback(
+    (paneId: string, direction: -1 | 1) => {
+      void swapPaneSurfaceByDirection(paneId, direction);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [swapPaneSurfaceByDirection],
+  );
   const queueTerminalExitRefresh = useCallback((sessionId: string) => {
     exitIntentSessionIdsRef.current.add(sessionId);
     for (const delayMs of [150, 300, 700, 1200, 2500, 5000]) {
@@ -5390,12 +5405,8 @@ export function AgentmuxTerminalApp() {
         onTerminalExitIntent={queueTerminalExitRefresh}
         onPaneDragStart={beginPaneSurfaceDrag}
         onPaneDragOver={allowPaneSurfaceDrop}
-        onPaneDrop={(event, targetPane) => {
-          void dropPaneSurface(event, targetPane);
-        }}
-        onMovePaneSurface={(paneId, direction) => {
-          void swapPaneSurfaceByDirection(paneId, direction);
-        }}
+        onPaneDrop={onPaneDropStable}
+        onMovePaneSurface={onMovePaneSurfaceStable}
         onTerminalError={refreshStable}
       />
     );
