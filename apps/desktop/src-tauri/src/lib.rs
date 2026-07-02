@@ -341,10 +341,15 @@ pub trait DesktopNotificationAdapter: Send + Sync {
     fn notify(&self, notification: DesktopNotification);
 }
 
+const MAX_DELIVERED_NOTIFICATION_IDS: usize = 1000;
+
 #[derive(Default)]
 struct DesktopNotificationState {
     adapter: Option<Arc<dyn DesktopNotificationAdapter>>,
+    /// Tracks recently delivered OS notification IDs to prevent duplicate toasts.
+    /// Capped at MAX_DELIVERED_NOTIFICATION_IDS; oldest entries are evicted first.
     delivered_notification_ids: HashSet<String>,
+    delivered_notification_order: VecDeque<String>,
 }
 
 impl DesktopControlState {
@@ -460,6 +465,9 @@ impl DesktopControlState {
         }
         if let Ok(mut pressure) = self.output_pressure.lock() {
             pressure.remove(session_id);
+        }
+        if let Ok(mut buffers) = self.input_command_buffers.lock() {
+            buffers.remove(session_id);
         }
     }
 
@@ -674,34 +682,50 @@ impl DesktopControlState {
             self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
             return had_activity;
         }
-        let Ok(channels) = self.output_channels.lock() else {
-            self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
-            return had_activity;
-        };
+        // Snapshot (session_id, subscription_id, channel, frame) tuples while
+        // holding the lock, then release the lock before calling channel.send().
+        // This prevents a blocking send from stalling register_output_channel /
+        // unregister_output_channel, which also need the same lock.
+        let to_send: Vec<(String, String, Channel<OutputStreamFrame>, OutputStreamFrame)> = {
+            let Ok(channels) = self.output_channels.lock() else {
+                self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
+                return had_activity;
+            };
+            let mut snapshot = Vec::new();
+            for delta in &deltas {
+                let session_id = delta.session_id.to_string();
+                let Some(session_channels) = channels.get(&session_id) else {
+                    continue;
+                };
+                let frame = OutputStreamFrame {
+                    from_offset: delta.from_offset,
+                    bytes_base64: BASE64_STANDARD.encode(&delta.bytes),
+                };
+                for (subscription_id, channel) in session_channels {
+                    snapshot.push((
+                        session_id.clone(),
+                        subscription_id.clone(),
+                        channel.clone(),
+                        frame.clone(),
+                    ));
+                }
+            }
+            snapshot
+        }; // lock released here
         let mut closed: Vec<(String, String)> = Vec::new();
         let mut frames_sent = 0_u64;
         let mut bytes_sent = 0_u64;
         let mut send_failures = 0_u64;
-        for delta in &deltas {
-            let session_id = delta.session_id.to_string();
-            let Some(session_channels) = channels.get(&session_id) else {
-                continue;
-            };
-            let frame = OutputStreamFrame {
-                from_offset: delta.from_offset,
-                bytes_base64: BASE64_STANDARD.encode(&delta.bytes),
-            };
-            for (subscription_id, channel) in session_channels {
-                if channel.send(frame.clone()).is_err() {
-                    send_failures = send_failures.saturating_add(1);
-                    closed.push((session_id.clone(), subscription_id.clone()));
-                } else {
-                    frames_sent = frames_sent.saturating_add(1);
-                    bytes_sent = bytes_sent.saturating_add(delta.bytes.len() as u64);
-                }
+        for (session_id, subscription_id, channel, frame) in to_send {
+            let byte_len = frame.bytes_base64.len() as u64;
+            if channel.send(frame).is_err() {
+                send_failures = send_failures.saturating_add(1);
+                closed.push((session_id, subscription_id));
+            } else {
+                frames_sent = frames_sent.saturating_add(1);
+                bytes_sent = bytes_sent.saturating_add(byte_len);
             }
         }
-        drop(channels);
         let closed_channels = closed.len() as u64;
         if !closed.is_empty() {
             if let Ok(mut channels) = self.output_channels.lock() {
@@ -715,6 +739,11 @@ impl DesktopControlState {
                         .unwrap_or(false);
                     if should_remove_session {
                         channels.remove(&session_id);
+                        // Also clear the stale pressure record so a future session
+                        // with the same id is not incorrectly flow-controlled.
+                        if let Ok(mut pressure) = self.output_pressure.lock() {
+                            pressure.remove(&session_id);
+                        }
                     }
                 }
             }
@@ -2015,6 +2044,15 @@ impl DesktopControlState {
             state
                 .delivered_notification_ids
                 .insert(notification.notification_id.clone());
+            state
+                .delivered_notification_order
+                .push_back(notification.notification_id.clone());
+            // Evict oldest entry when the cap is exceeded.
+            if state.delivered_notification_order.len() > MAX_DELIVERED_NOTIFICATION_IDS {
+                if let Some(oldest) = state.delivered_notification_order.pop_front() {
+                    state.delivered_notification_ids.remove(&oldest);
+                }
+            }
             adapter
         };
 
