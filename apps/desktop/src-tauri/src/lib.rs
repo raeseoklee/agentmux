@@ -88,6 +88,7 @@ use agentmux_store::{
 };
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use tauri::ipc::Channel;
+use tauri::Emitter as _;
 
 pub const DESKTOP_CONTROL_TOKEN: &str = DEFAULT_LOCAL_CONTROL_TOKEN;
 const MAX_BROWSER_FAILURES: usize = 100;
@@ -257,6 +258,9 @@ pub struct DesktopControlState {
     config_path: PathBuf,
     control_token: String,
     desktop_notifications: Mutex<DesktopNotificationState>,
+    // AppHandle is set once in .setup() so the background pump can emit Tauri
+    // events (e.g. sidebar-changed) without requiring an Arc<Mutex<…>> dance.
+    app_handle: OnceLock<tauri::AppHandle>,
     // Per-session live-output Tauri channels for the stream-first renderer.
     // Subscriptions are keyed independently so a late unsubscribe from an old
     // remount cannot remove the current renderer's channel.
@@ -390,6 +394,7 @@ impl DesktopControlState {
             config_path: config_path.into(),
             control_token: token,
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
+            app_handle: OnceLock::new(),
             output_channels: Mutex::new(HashMap::new()),
             output_pump_hot_until: Mutex::new(None),
             output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
@@ -419,6 +424,7 @@ impl DesktopControlState {
             config_path: unique_temp_config_path(),
             control_token: token,
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
+            app_handle: OnceLock::new(),
             output_channels: Mutex::new(HashMap::new()),
             output_pump_hot_until: Mutex::new(None),
             output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
@@ -436,6 +442,12 @@ impl DesktopControlState {
         if let Ok(mut state) = self.desktop_notifications.lock() {
             state.adapter = Some(adapter);
         }
+    }
+
+    /// Store the Tauri AppHandle so the background pump can emit UI events.
+    /// Called once from `.setup()` in main.rs before any pump ticks fire.
+    pub fn set_app_handle(&self, handle: tauri::AppHandle) {
+        let _ = self.app_handle.set(handle);
     }
 
     /// Registers a live-output channel for one renderer subscription.
@@ -682,6 +694,11 @@ impl DesktopControlState {
                 for (session_id, cwd) in &cwd_updates {
                     let _ = store.update_session_cwd(session_id, Some(cwd), &now);
                 }
+            }
+            // Push a lightweight signal so the UI refreshes the footer
+            // immediately instead of waiting for the next 5 s sidebar poll.
+            if let Some(handle) = self.app_handle.get() {
+                let _ = handle.emit("agentmux://sidebar-changed", ());
             }
         }
         if deltas.is_empty() {

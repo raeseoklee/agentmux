@@ -241,6 +241,7 @@ fn main() {
                     app: app.handle().clone(),
                 },
             ));
+            notification_state.set_app_handle(app.handle().clone());
             Ok(())
         })
         .manage(state)

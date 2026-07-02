@@ -702,6 +702,49 @@ export function useAgentmuxControl(): AgentmuxControl {
     }
   }, [client]);
 
+  // RT-1/RT-2: Subscribe to host-pushed sidebar-changed signals so a `cd` in
+  // a terminal reflects in the footer within ~200 ms instead of up to 5 s.
+  // Only active under Tauri; in plain-browser preview the event never fires so
+  // this is a no-op. Coalesces rapid cd sequences with a 200 ms debounce so
+  // back-to-back OSC 7 bursts produce a single getSidebarState call.
+  useEffect(() => {
+    const eventApi = (
+      window as Window & {
+        __TAURI__?: {
+          event?: {
+            listen?: (
+              event: string,
+              handler: () => void
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+    if (!eventApi?.listen) {
+      return;
+    }
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    let unlisten: (() => void) | undefined;
+    const handler = () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        void refreshSidebar();
+      }, 200);
+    };
+    eventApi
+      .listen("agentmux://sidebar-changed", handler)
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        /* non-fatal: falls back to the 5 s poll */
+      });
+    return () => {
+      clearTimeout(debounceTimer);
+      unlisten?.();
+    };
+  }, [refreshSidebar]);
+
   const refreshTeamCollaboration = useCallback(async () => {
     const workspaceId = activeRef.current;
     if (!workspaceId) {
