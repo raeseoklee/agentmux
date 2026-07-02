@@ -20,6 +20,7 @@ interface HovProps {
   onContextMenu?: MouseEventHandler<HTMLElement>;
   onDragStart?: DragEventHandler<HTMLElement>;
   onDragOver?: DragEventHandler<HTMLElement>;
+  onDragLeave?: DragEventHandler<HTMLElement>;
   onDrop?: DragEventHandler<HTMLElement>;
   onDragEnd?: DragEventHandler<HTMLElement>;
   children?: ReactNode;
@@ -40,6 +41,7 @@ export function Hov({
   onContextMenu,
   onDragStart,
   onDragOver,
+  onDragLeave,
   onDrop,
   onDragEnd,
   children,
@@ -58,6 +60,7 @@ export function Hov({
     onContextMenu,
     onDragStart,
     onDragOver,
+    onDragLeave,
     onDrop,
     onDragEnd,
     onMouseEnter: () => setHovered(true),

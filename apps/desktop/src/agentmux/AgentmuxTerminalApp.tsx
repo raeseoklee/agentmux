@@ -1394,12 +1394,17 @@ interface PaneViewProps {
   openDurableTerminalInPane: (paneId: string) => void;
   onOpenTerminalLink: (url: string, paneId: string) => void;
   onTerminalExitIntent: (sessionId: string) => void;
+  isDragOver: boolean;
   onPaneDragStart: (
     event: ReactDragEvent<HTMLElement>,
     paneId: string,
     surfaceId?: string | null,
   ) => void;
-  onPaneDragOver: (event: ReactDragEvent<HTMLElement>) => void;
+  onPaneDragOver: (
+    event: ReactDragEvent<HTMLElement>,
+    paneId: string,
+  ) => void;
+  onPaneDragLeave: (event: ReactDragEvent<HTMLElement>) => void;
   onPaneDrop: (
     event: ReactDragEvent<HTMLElement>,
     pane: PaneSummary,
@@ -1427,6 +1432,7 @@ const PaneView = memo(function PaneView({
   fontSize,
   terminalLaunchPending,
   t,
+  isDragOver,
   focusPane,
   splitPaneBy,
   closePane,
@@ -1438,6 +1444,7 @@ const PaneView = memo(function PaneView({
   onTerminalExitIntent,
   onPaneDragStart,
   onPaneDragOver,
+  onPaneDragLeave,
   onPaneDrop,
   onMovePaneSurface,
   onTerminalError,
@@ -1492,14 +1499,15 @@ const PaneView = memo(function PaneView({
       data-agentmux-mounted-surface={surface?.surfaceId ?? ""}
       data-agentmux-active={active ? "true" : "false"}
       data-agentmux-attention={hasAttention ? "true" : "false"}
-      onDragOver={onPaneDragOver}
+      data-agentmux-drag-over={isDragOver ? "true" : undefined}
+      onDragOver={(event) => onPaneDragOver(event, pane.paneId)}
+      onDragLeave={onPaneDragLeave}
       onDrop={(event) => onPaneDrop(event, pane)}
       onMouseDown={() => focusPane(pane.paneId)}
       style={{
         minHeight: 0,
         minWidth: 0,
         flex: "1 1 0",
-        background: "var(--term)",
         // Active highlight is a 1px accent border — same thickness as the
         // inactive 1px border, so focus never shifts layout. No extra inset
         // shadow: that doubled the edge to 2px, which showed through on empty
@@ -1508,9 +1516,13 @@ const PaneView = memo(function PaneView({
           hasAttention ? "var(--accent)" : active ? "var(--accent)" : "var(--border)"
         }`,
         borderRadius: 7,
-        boxShadow: hasAttention
-          ? "0 0 0 1px rgba(88, 166, 255, 0.58), 0 0 0 4px rgba(88, 166, 255, 0.16)"
-          : "none",
+        // DD-7: pane swap target highlight — inset accent ring + tinted bg.
+        boxShadow: isDragOver
+          ? "inset 0 0 0 1px var(--accent), 0 0 0 3px rgba(88, 166, 255, 0.18)"
+          : hasAttention
+            ? "0 0 0 1px rgba(88, 166, 255, 0.58), 0 0 0 4px rgba(88, 166, 255, 0.16)"
+            : "none",
+        background: isDragOver ? "var(--accent-soft)" : "var(--term)",
         display: "flex",
         flexDirection: "column",
         overflow: "hidden",
@@ -1931,6 +1943,29 @@ export function AgentmuxTerminalApp() {
   const [confirmDialog, setConfirmDialog] = useState<AppConfirmDialog | null>(
     null,
   );
+  // DD-7: drag-and-drop visual feedback state.
+  // dragSourceId: the surfaceId / workspaceId / groupId / paneId being dragged.
+  // dragFeedback: the current drop target and its computed placement.
+  type DragFeedbackKind =
+    | "tab"
+    | "card"
+    | "group"
+    | "member"
+    | "pane-swap"
+    | "card-over";
+  interface DragFeedbackState {
+    kind: DragFeedbackKind;
+    id: string;
+    placement: "before" | "after";
+  }
+  const [dragSourceId, setDragSourceId] = useState<string | null>(null);
+  const [dragFeedback, setDragFeedback] = useState<DragFeedbackState | null>(
+    null,
+  );
+  const clearDragFeedback = useCallback(() => {
+    setDragSourceId(null);
+    setDragFeedback(null);
+  }, []);
   const terminalLaunchPendingRef = useRef(false);
   const autoUpdateCheckStartedRef = useRef(false);
   const updateResourceRef = useRef<TauriUpdate | null>(null);
@@ -3295,13 +3330,35 @@ export function AgentmuxTerminalApp() {
           groupId: group.groupId,
         } satisfies WorkspaceGroupDragPayload),
       );
+      // DD-7: record drag source.
+      setDragSourceId(group.groupId);
     },
     [],
   );
   const allowWorkspaceGroupDrop = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
+    (event: ReactDragEvent<HTMLElement>, targetGroupId: string) => {
       event.preventDefault();
       event.dataTransfer.dropEffect = "move";
+      // DD-7: compute insertion placement and update feedback only when changed.
+      const rect = event.currentTarget.getBoundingClientRect();
+      const placement: "before" | "after" =
+        event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+      setDragFeedback((prev) =>
+        prev?.kind === "group" &&
+        prev.id === targetGroupId &&
+        prev.placement === placement
+          ? prev
+          : { kind: "group", id: targetGroupId, placement },
+      );
+    },
+    [],
+  );
+  const leaveWorkspaceGroupDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+        return;
+      }
+      setDragFeedback((prev) => (prev?.kind === "group" ? null : prev));
     },
     [],
   );
@@ -3315,6 +3372,9 @@ export function AgentmuxTerminalApp() {
         return;
       }
       event.preventDefault();
+      // DD-7: clear feedback on drop.
+      setDragFeedback(null);
+      setDragSourceId(null);
       void reorderWorkspaceGroup(
         payload.groupId,
         targetGroup.groupId,
@@ -3338,14 +3398,36 @@ export function AgentmuxTerminalApp() {
           workspaceId,
         } satisfies WorkspaceMemberDragPayload),
       );
+      // DD-7: record drag source.
+      setDragSourceId(workspaceId);
     },
     [],
   );
   const allowWorkspaceMemberDrop = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
+    (event: ReactDragEvent<HTMLElement>, targetWorkspaceId: string) => {
       event.preventDefault();
       event.stopPropagation();
       event.dataTransfer.dropEffect = "move";
+      // DD-7: compute insertion placement and update feedback only when changed.
+      const rect = event.currentTarget.getBoundingClientRect();
+      const placement: "before" | "after" =
+        event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+      setDragFeedback((prev) =>
+        prev?.kind === "member" &&
+        prev.id === targetWorkspaceId &&
+        prev.placement === placement
+          ? prev
+          : { kind: "member", id: targetWorkspaceId, placement },
+      );
+    },
+    [],
+  );
+  const leaveWorkspaceMemberDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+        return;
+      }
+      setDragFeedback((prev) => (prev?.kind === "member" ? null : prev));
     },
     [],
   );
@@ -3364,6 +3446,9 @@ export function AgentmuxTerminalApp() {
       }
       event.preventDefault();
       event.stopPropagation();
+      // DD-7: clear feedback on drop.
+      setDragFeedback(null);
+      setDragSourceId(null);
       void reorderWorkspaceInGroup(
         targetGroup,
         payload.workspaceId,
@@ -3429,24 +3514,59 @@ export function AgentmuxTerminalApp() {
         WORKSPACE_CARD_DRAG_TYPE,
         JSON.stringify({ workspaceId } satisfies WorkspaceCardDragPayload),
       );
+      // DD-7: record drag source.
+      setDragSourceId(workspaceId);
     },
     [],
   );
   const allowWorkspaceCardDrop = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
-      if (
-        event.dataTransfer.types.includes(WORKSPACE_CARD_DRAG_TYPE) ||
-        event.dataTransfer.types.includes(SURFACE_TAB_DRAG_TYPE)
-      ) {
+    (event: ReactDragEvent<HTMLElement>, targetWorkspaceId: string) => {
+      const hasCard = event.dataTransfer.types.includes(WORKSPACE_CARD_DRAG_TYPE);
+      const hasTab = event.dataTransfer.types.includes(SURFACE_TAB_DRAG_TYPE);
+      if (hasCard || hasTab) {
         event.preventDefault();
         event.stopPropagation();
         event.dataTransfer.dropEffect = "move";
+        // DD-7: tab-onto-card is a "move to workspace" (whole-card highlight);
+        // card-onto-card is a reorder (insertion line).
+        if (hasTab) {
+          setDragFeedback((prev) =>
+            prev?.kind === "card-over" && prev.id === targetWorkspaceId
+              ? prev
+              : { kind: "card-over", id: targetWorkspaceId, placement: "before" },
+          );
+        } else {
+          const rect = event.currentTarget.getBoundingClientRect();
+          const placement: "before" | "after" =
+            event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+          setDragFeedback((prev) =>
+            prev?.kind === "card" &&
+            prev.id === targetWorkspaceId &&
+            prev.placement === placement
+              ? prev
+              : { kind: "card", id: targetWorkspaceId, placement },
+          );
+        }
       }
+    },
+    [],
+  );
+  const leaveWorkspaceCardDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+        return;
+      }
+      setDragFeedback((prev) =>
+        prev?.kind === "card" || prev?.kind === "card-over" ? null : prev,
+      );
     },
     [],
   );
   const dropWorkspaceCard = useCallback(
     (event: ReactDragEvent<HTMLElement>, targetWorkspaceId: string) => {
+      // DD-7: clear feedback on drop.
+      setDragFeedback(null);
+      setDragSourceId(null);
       const surfacePayload = parseDragPayload<SurfaceTabDragPayload>(
         event,
         SURFACE_TAB_DRAG_TYPE,
@@ -3563,16 +3683,40 @@ export function AgentmuxTerminalApp() {
           surfaceId: surface.surfaceId,
         } satisfies SurfaceTabDragPayload),
       );
+      setDragSourceId(surface.surfaceId);
     },
     [activeWorkspaceId],
   );
   const allowSurfaceTabDrop = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
+    (event: ReactDragEvent<HTMLElement>, targetSurfaceId: string) => {
       if (event.dataTransfer.types.includes(SURFACE_TAB_DRAG_TYPE)) {
         event.preventDefault();
         event.stopPropagation();
         event.dataTransfer.dropEffect = "move";
+        // DD-7: compute placement and update feedback only when changed.
+        const rect = event.currentTarget.getBoundingClientRect();
+        const placement: "before" | "after" =
+          event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+        setDragFeedback((prev) =>
+          prev?.kind === "tab" &&
+          prev.id === targetSurfaceId &&
+          prev.placement === placement
+            ? prev
+            : { kind: "tab", id: targetSurfaceId, placement },
+        );
       }
+    },
+    [],
+  );
+  const leaveSurfaceTabDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      // Only clear when truly leaving the element (not entering a child).
+      if (
+        event.currentTarget.contains(event.relatedTarget as Node | null)
+      ) {
+        return;
+      }
+      setDragFeedback((prev) => (prev?.kind === "tab" ? null : prev));
     },
     [],
   );
@@ -3586,6 +3730,9 @@ export function AgentmuxTerminalApp() {
       if (!payload) return;
       event.preventDefault();
       event.stopPropagation();
+      // DD-7: clear feedback on drop.
+      setDragFeedback(null);
+      setDragSourceId(null);
       if (payload.workspaceId !== activeWorkspaceId) {
         void client
           .moveSurfaceToWorkspace(
@@ -3632,16 +3779,33 @@ export function AgentmuxTerminalApp() {
           surfaceId,
         } satisfies PaneSurfaceDragPayload),
       );
+      // DD-7: record drag source pane.
+      setDragSourceId(paneId);
     },
     [activeWorkspaceId],
   );
   const allowPaneSurfaceDrop = useCallback(
-    (event: ReactDragEvent<HTMLElement>) => {
+    (event: ReactDragEvent<HTMLElement>, targetPaneId: string) => {
       if (event.dataTransfer.types.includes(PANE_SURFACE_DRAG_TYPE)) {
         event.preventDefault();
         event.stopPropagation();
         event.dataTransfer.dropEffect = "move";
+        // DD-7: mark the target pane as hovered.
+        setDragFeedback((prev) =>
+          prev?.kind === "pane-swap" && prev.id === targetPaneId
+            ? prev
+            : { kind: "pane-swap", id: targetPaneId, placement: "before" },
+        );
       }
+    },
+    [],
+  );
+  const leavePaneSurfaceDrag = useCallback(
+    (event: ReactDragEvent<HTMLElement>) => {
+      if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+        return;
+      }
+      setDragFeedback((prev) => (prev?.kind === "pane-swap" ? null : prev));
     },
     [],
   );
@@ -3662,6 +3826,9 @@ export function AgentmuxTerminalApp() {
       }
       event.preventDefault();
       event.stopPropagation();
+      // DD-7: clear feedback on drop.
+      setDragFeedback(null);
+      setDragSourceId(null);
       const targetSurfaceId = targetPane.mountedSurfaceId ?? null;
       await ctl.mountSurface(payload.surfaceId, targetPane.paneId);
       if (targetSurfaceId) {
@@ -3741,6 +3908,17 @@ export function AgentmuxTerminalApp() {
   useEffect(() => {
     setTextBoxDraft(readTextBoxDraft(textBoxDraftKey));
   }, [textBoxDraftKey]);
+
+  // DD-7: clear drag feedback when the browser fires dragend on the window
+  // (covers cancelled drags, drops outside the app, and Escape-key cancels).
+  useEffect(() => {
+    const handler = () => {
+      setDragSourceId(null);
+      setDragFeedback(null);
+    };
+    window.addEventListener("dragend", handler);
+    return () => window.removeEventListener("dragend", handler);
+  }, []);
 
   // ---- actions ----
   const runTerminalLaunch = useCallback(async (launch: () => Promise<void>) => {
@@ -4476,6 +4654,21 @@ export function AgentmuxTerminalApp() {
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [swapPaneSurfaceByDirection],
+  );
+  // DD-7: stable wrappers for pane drag-over / drag-leave so PaneView memo holds.
+  const onPaneDragOverStable = useCallback(
+    (event: import("react").DragEvent<HTMLElement>, paneId: string) => {
+      allowPaneSurfaceDrop(event, paneId);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [allowPaneSurfaceDrop],
+  );
+  const onPaneDragLeaveStable = useCallback(
+    (event: import("react").DragEvent<HTMLElement>) => {
+      leavePaneSurfaceDrag(event);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [leavePaneSurfaceDrag],
   );
   const queueTerminalExitRefresh = useCallback((sessionId: string) => {
     exitIntentSessionIdsRef.current.add(sessionId);
@@ -5417,8 +5610,13 @@ export function AgentmuxTerminalApp() {
         openDurableTerminalInPane={openDurableTerminalInPane}
         onOpenTerminalLink={openTerminalLinkInBrowserSplit}
         onTerminalExitIntent={queueTerminalExitRefresh}
+        isDragOver={
+          dragFeedback?.kind === "pane-swap" &&
+          dragFeedback.id === pane.paneId
+        }
         onPaneDragStart={beginPaneSurfaceDrag}
-        onPaneDragOver={allowPaneSurfaceDrop}
+        onPaneDragOver={onPaneDragOverStable}
+        onPaneDragLeave={onPaneDragLeaveStable}
         onPaneDrop={onPaneDropStable}
         onMovePaneSurface={onMovePaneSurfaceStable}
         onTerminalError={refreshStable}
@@ -5857,9 +6055,26 @@ export function AgentmuxTerminalApp() {
                     onDragStart={(event) =>
                       beginWorkspaceGroupDrag(event, group)
                     }
-                    onDragOver={allowWorkspaceGroupDrop}
+                    onDragOver={(event) =>
+                      allowWorkspaceGroupDrop(event, group.groupId)
+                    }
+                    onDragLeave={leaveWorkspaceGroupDrag}
+                    onDragEnd={clearDragFeedback}
                     onDrop={(event) => dropWorkspaceGroup(event, group)}
-                    style={{ margin: "4px 0 7px" }}
+                    style={{
+                      margin: "4px 0 7px",
+                      // DD-7: insertion line above/below the group row.
+                      boxShadow:
+                        dragFeedback?.kind === "group" &&
+                        dragFeedback.id === group.groupId
+                          ? dragFeedback.placement === "before"
+                            ? "inset 0 2px 0 var(--accent)"
+                            : "inset 0 -2px 0 var(--accent)"
+                          : undefined,
+                      opacity:
+                        dragSourceId === group.groupId ? 0.5 : undefined,
+                      transition: "box-shadow 0.08s ease",
+                    }}
                   >
                     <div
                       onContextMenu={(event) =>
@@ -6120,6 +6335,20 @@ export function AgentmuxTerminalApp() {
                                 : undefined
                             }
                             draggable={!workspaceFilterActive}
+                            dragInsertPlacement={
+                              dragFeedback?.kind === "member" &&
+                              dragFeedback.id === ws.workspaceId
+                                ? dragFeedback.placement
+                                : dragFeedback?.kind === "card" &&
+                                    dragFeedback.id === ws.workspaceId
+                                  ? dragFeedback.placement
+                                  : undefined
+                            }
+                            isDragOver={
+                              dragFeedback?.kind === "card-over" &&
+                              dragFeedback.id === ws.workspaceId
+                            }
+                            isDragSource={dragSourceId === ws.workspaceId}
                             onDragStart={(event) =>
                               beginWorkspaceMemberDrag(
                                 event,
@@ -6128,8 +6357,12 @@ export function AgentmuxTerminalApp() {
                               )
                             }
                             onDragOver={(event) => {
-                              allowWorkspaceMemberDrop(event);
-                              allowWorkspaceCardDrop(event);
+                              allowWorkspaceMemberDrop(event, ws.workspaceId);
+                              allowWorkspaceCardDrop(event, ws.workspaceId);
+                            }}
+                            onDragLeave={(event) => {
+                              leaveWorkspaceMemberDrag(event);
+                              leaveWorkspaceCardDrag(event);
                             }}
                             onDrop={(event) => {
                               dropWorkspaceMember(event, group, ws.workspaceId);
@@ -6185,10 +6418,24 @@ export function AgentmuxTerminalApp() {
                       : undefined
                   }
                   draggable={!workspaceFilterActive}
+                  dragInsertPlacement={
+                    dragFeedback?.kind === "card" &&
+                    dragFeedback.id === ws.workspaceId
+                      ? dragFeedback.placement
+                      : undefined
+                  }
+                  isDragOver={
+                    dragFeedback?.kind === "card-over" &&
+                    dragFeedback.id === ws.workspaceId
+                  }
+                  isDragSource={dragSourceId === ws.workspaceId}
                   onDragStart={(event) =>
                     beginWorkspaceCardDrag(event, ws.workspaceId)
                   }
-                  onDragOver={allowWorkspaceCardDrop}
+                  onDragOver={(event) =>
+                    allowWorkspaceCardDrop(event, ws.workspaceId)
+                  }
+                  onDragLeave={leaveWorkspaceCardDrag}
                   onDrop={(event) => dropWorkspaceCard(event, ws.workspaceId)}
                   onStartRename={() => startWorkspaceRename(ws)}
                   onCommitRename={commitWorkspaceRename}
@@ -6785,21 +7032,47 @@ export function AgentmuxTerminalApp() {
                     data-agentmux-surface-tab={surface.surfaceId}
                     draggable
                     onDragStart={(event) => beginSurfaceTabDrag(event, surface)}
-                    onDragOver={allowSurfaceTabDrop}
+                    onDragEnd={clearDragFeedback}
+                    onDragOver={(event) =>
+                      allowSurfaceTabDrop(event, surface.surfaceId)
+                    }
+                    onDragLeave={leaveSurfaceTabDrag}
                     onDrop={(event) => dropSurfaceTab(event, surface.surfaceId)}
                     onContextMenu={(event) => openSurfaceTabMenu(event, surface)}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 7,
-                      padding: "0 11px 0 13px",
-                      minWidth: 220,
-                      maxWidth: 240,
-                      borderRight: "1px solid var(--border-subtle)",
-                      cursor: "pointer",
-                      background: on ? "var(--canvas)" : "transparent",
-                      boxShadow: on ? "inset 0 2px 0 var(--accent)" : "none",
-                    }}
+                    style={(() => {
+                      const isTabDragTarget =
+                        dragFeedback?.kind === "tab" &&
+                        dragFeedback.id === surface.surfaceId;
+                      const isDragSource = dragSourceId === surface.surfaceId;
+                      // DD-7: 2px accent insertion line via inset box-shadow on
+                      // the left ("before") or right ("after") edge — no layout
+                      // shift. Tabs sit in a horizontal strip so left/right edges
+                      // are the meaningful insertion points.
+                      const insertShadow = isTabDragTarget
+                        ? dragFeedback?.placement === "before"
+                          ? "inset 2px 0 0 var(--accent)"
+                          : "inset -2px 0 0 var(--accent)"
+                        : null;
+                      const activeShadow = on
+                        ? "inset 0 2px 0 var(--accent)"
+                        : null;
+                      const combinedShadow = [insertShadow, activeShadow]
+                        .filter(Boolean)
+                        .join(", ") || "none";
+                      return {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 7,
+                        padding: "0 11px 0 13px",
+                        minWidth: 220,
+                        maxWidth: 240,
+                        borderRight: "1px solid var(--border-subtle)",
+                        cursor: "pointer",
+                        background: on ? "var(--canvas)" : "transparent",
+                        boxShadow: combinedShadow,
+                        opacity: isDragSource ? 0.5 : 1,
+                      } satisfies import("react").CSSProperties;
+                    })()}
                     hover={on ? {} : { background: "var(--s2)" }}
                     onClick={() => {
                       if (host) void ctl.focusPane(host.paneId);
@@ -7661,8 +7934,12 @@ function WorkspaceCard({
   onMoveUp,
   onMoveDown,
   draggable,
+  dragInsertPlacement,
+  isDragOver,
+  isDragSource,
   onDragStart,
   onDragOver,
+  onDragLeave,
   onDrop,
   onContextMenu,
   onStartRename,
@@ -7685,8 +7962,15 @@ function WorkspaceCard({
   onMoveUp?: () => void;
   onMoveDown?: () => void;
   draggable?: boolean;
+  /** DD-7: "before" | "after" when this card is the reorder insertion target. */
+  dragInsertPlacement?: "before" | "after";
+  /** DD-7: true when a tab is being dragged over this card (whole-card highlight). */
+  isDragOver?: boolean;
+  /** DD-7: true when this card is the item being dragged (reduce opacity). */
+  isDragSource?: boolean;
   onDragStart?: (event: ReactDragEvent<HTMLElement>) => void;
   onDragOver?: (event: ReactDragEvent<HTMLElement>) => void;
+  onDragLeave?: (event: ReactDragEvent<HTMLElement>) => void;
   onDrop?: (event: ReactDragEvent<HTMLElement>) => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLElement>) => void;
   onStartRename: () => void;
@@ -7735,19 +8019,50 @@ function WorkspaceCard({
       draggable={draggable}
       onDragStart={onDragStart}
       onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
       onDrop={onDrop}
       onContextMenu={onContextMenu}
-      style={{
-        margin: "3px 0",
-        padding: "10px 11px",
-        borderRadius: 9,
-        cursor: editing ? "default" : draggable ? "grab" : "pointer",
-        background: active ? "var(--s2)" : "transparent",
-        border: `1px solid ${
-          needsInput ? "var(--accent)" : active ? workspaceColor : "var(--border-subtle)"
-        }`,
-        boxShadow: needsInput ? "0 0 0 3px rgba(88, 166, 255, 0.14)" : "none",
-      }}
+      style={(() => {
+        // DD-7: insertion line (card reorder) or whole-card highlight (tab→card).
+        const insertShadow = dragInsertPlacement === "before"
+          ? "inset 0 2px 0 var(--accent)"
+          : dragInsertPlacement === "after"
+            ? "inset 0 -2px 0 var(--accent)"
+            : null;
+        const overShadow = isDragOver
+          ? "inset 0 0 0 1px var(--accent)"
+          : null;
+        const attentionShadow = needsInput
+          ? "0 0 0 3px rgba(88, 166, 255, 0.14)"
+          : null;
+        const combinedShadow =
+          [insertShadow, overShadow, attentionShadow]
+            .filter(Boolean)
+            .join(", ") || "none";
+        return {
+          margin: "3px 0",
+          padding: "10px 11px",
+          borderRadius: 9,
+          cursor: editing ? "default" : draggable ? "grab" : "pointer",
+          background: isDragOver
+            ? "var(--accent-soft)"
+            : active
+              ? "var(--s2)"
+              : "transparent",
+          border: `1px solid ${
+            isDragOver
+              ? "var(--accent)"
+              : needsInput
+                ? "var(--accent)"
+                : active
+                  ? workspaceColor
+                  : "var(--border-subtle)"
+          }`,
+          boxShadow: combinedShadow,
+          opacity: isDragSource ? 0.5 : 1,
+          transition: "box-shadow 0.08s ease, background 0.08s ease",
+        } satisfies CSSProperties;
+      })()}
       hover={active || editing ? {} : { background: "var(--s2)" }}
       onClick={editing ? undefined : onClick}
     >

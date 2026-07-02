@@ -27,6 +27,7 @@ Two user-reported UX gaps:
 | DD-4 | Dragging a pane header onto another leaf pane SHALL swap the two panes' mounted surfaces (or move into an empty pane). Sessions must keep running through the swap. | Playwright test: 2 panes, drag one header onto the other, assert surfaces swapped. |
 | DD-5 | Existing group/member drag behavior SHALL remain unchanged. | Existing tests stay green. |
 | DD-6 | Any defect found while adding DD-1..DD-4 coverage SHALL be fixed in the same change set. | Tests green. |
+| DD-7 | Drags SHALL give visual feedback: the current drop target is highlighted, tab/card reorder targets show a before/after insertion indicator matching `dropPlacementFromEvent`, and pane swap targets show a target-pane highlight. Indicators clear on drop, dragleave, and dragend. | Playwright where feasible (indicator class appears during dragover); otherwise manual. |
 
 ### 2.2 Real-time footer (cwd + git)
 
