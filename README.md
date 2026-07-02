@@ -56,8 +56,8 @@ and uploads the assets to GitHub Releases.
 After downloading an installer:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.3_x64-setup.exe
-gh attestation verify .\AgentMux_0.1.3_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.6_x64-setup.exe
+gh attestation verify .\AgentMux_0.1.6_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 GitHub Artifact Attestation is release provenance, not Windows Authenticode
