@@ -433,12 +433,9 @@ fn strip_terminal_prefix_before_control_line(line: &[u8]) -> &[u8] {
     // This prevents a '%' that appears inside a terminal escape sequence payload
     // (e.g. an OSC window-title containing "%user") from being mistaken for the
     // start of a control line.
-    let bytes = line;
-    for i in 0..bytes.len() {
-        if bytes[i] == b'%'
-            && bytes.get(i + 1).is_some_and(|b| b.is_ascii_lowercase())
-        {
-            return &bytes[i..];
+    for i in 0..line.len() {
+        if line[i] == b'%' && line.get(i + 1).is_some_and(|b| b.is_ascii_lowercase()) {
+            return &line[i..];
         }
     }
     line
