@@ -1014,6 +1014,69 @@ test("shows WSL install guidance when no distribution is available", async ({
   ).toBeVisible();
 });
 
+test("tab switch focuses the remembered pane within the tab, not the root pane", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Create Tab A with a horizontal split.
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+  await page.locator(".agentmux-top-split-vertical").click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  const mountedPanes = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(mountedPanes).toHaveCount(2);
+
+  // Focus the SECOND pane in Tab A by clicking it.
+  await mountedPanes.nth(1).click();
+  await expect(mountedPanes.nth(1)).toHaveAttribute("data-agentmux-active", "true");
+  await expect(mountedPanes.nth(0)).toHaveAttribute("data-agentmux-active", "false");
+
+  // Create Tab B (a simple single-pane tab).
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
+
+  // Switch to Tab B — the single pane in Tab B should become active.
+  await page.locator(".agentmux-surface-tab").last().click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(
+    page.locator('[data-agentmux-pane][data-agentmux-active="true"]'),
+  ).toHaveCount(1);
+
+  // Inject a distinct sidebar state for Tab B to confirm the footer reflects
+  // the now-active Tab B pane, not a stale Tab A pane.
+  await page.evaluate(() => {
+    (window as any).__AGENTMUX_PREVIEW__?.sidebarState({
+      gitBranch: "tab-b-branch",
+      gitHash: "bbb0001",
+    });
+  });
+  await expect(page.locator(".agentmux-status-git")).toHaveText(
+    "tab-b-branch @ bbb0001",
+  );
+
+  // Switch back to Tab A — the second pane (the one last focused) should be
+  // restored as active, not the first pane.
+  await page.locator(".agentmux-surface-tab").first().click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  const panesAfterReturn = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(panesAfterReturn).toHaveCount(2);
+  // The second pane should be active again (remembered from before Tab B).
+  await expect(panesAfterReturn.nth(1)).toHaveAttribute("data-agentmux-active", "true");
+  await expect(panesAfterReturn.nth(0)).toHaveAttribute("data-agentmux-active", "false");
+});
+
 test("setup wizard saves workspace defaults and probes tmux", async ({
   page,
 }) => {

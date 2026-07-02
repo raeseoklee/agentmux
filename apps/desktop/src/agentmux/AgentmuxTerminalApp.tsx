@@ -2435,6 +2435,14 @@ export function AgentmuxTerminalApp() {
   const surfaces = useMemo(() => detail?.surfaces ?? [], [detail]);
   const sessions = useMemo(() => detail?.sessions ?? [], [detail]);
   const activePaneId = detail?.workspace.activePaneId ?? null;
+  // Per-tab last-active-pane memory: maps a tab's root pane ID to the leaf
+  // pane the user most recently focused within that tab. Pane IDs are globally
+  // unique, so entries recorded in other workspaces are inert here — lookups
+  // only use the current workspace's tab roots, and entries for closed panes
+  // fall back to the tab's host pane at click time.
+  const [lastActivePaneByRootId, setLastActivePaneByRootId] = useState<
+    Map<string, string>
+  >(() => new Map());
 
   useEffect(() => {
     // Footer git reflects the active pane's session cwd (computed backend-side
@@ -2653,6 +2661,21 @@ export function AgentmuxTerminalApp() {
     },
     [paneById],
   );
+  // Track the last-focused leaf pane per tab (keyed by root pane ID) so that
+  // switching back to a tab restores the pane the user was in, not just the
+  // tab's representative (first) pane.
+  useEffect(() => {
+    if (!activePaneId) return;
+    const activePane = paneById.get(activePaneId);
+    if (!activePane || activePane.kind !== "leaf") return;
+    const root = rootPaneForPane(activePane);
+    setLastActivePaneByRootId((prev) => {
+      if (prev.get(root.paneId) === activePaneId) return prev;
+      const next = new Map(prev);
+      next.set(root.paneId, activePaneId);
+      return next;
+    });
+  }, [activePaneId, paneById, rootPaneForPane]);
   const tabSurfaces = useMemo(() => {
     const firstSurfaceByRoot = new Map<string, string>();
     const hostedSurfaceIds = new Set<string>();
@@ -7075,8 +7098,26 @@ export function AgentmuxTerminalApp() {
                     })()}
                     hover={on ? {} : { background: "var(--s2)" }}
                     onClick={() => {
-                      if (host) void ctl.focusPane(host.paneId);
-                      else void ctl.mountSurface(surface.surfaceId);
+                      if (host) {
+                        // On tab switch, restore the last-focused pane within
+                        // this tab's tree rather than always jumping to the
+                        // tab's representative (root) pane. Falls back to the
+                        // host pane when no prior focus has been recorded.
+                        const tabRoot = rootPaneForPane(host);
+                        const rememberedPaneId = lastActivePaneByRootId.get(
+                          tabRoot.paneId,
+                        );
+                        const rememberedPane = rememberedPaneId
+                          ? paneById.get(rememberedPaneId)
+                          : undefined;
+                        const targetPaneId =
+                          rememberedPane?.kind === "leaf"
+                            ? rememberedPane.paneId
+                            : host.paneId;
+                        void ctl.focusPane(targetPaneId);
+                      } else {
+                        void ctl.mountSurface(surface.surfaceId);
+                      }
                     }}
                   >
                     <span
