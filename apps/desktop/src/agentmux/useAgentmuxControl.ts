@@ -203,6 +203,12 @@ function detailEqual(
   if (a.workspace.workspaceId !== b.workspace.workspaceId) return false;
   if (a.workspace.activePaneId !== b.workspace.activePaneId) return false;
   if (a.workspace.rootPaneId !== b.workspace.rootPaneId) return false;
+  if (a.workspace.name !== b.workspace.name) return false;
+  if (a.workspace.projectRoot !== b.workspace.projectRoot) return false;
+  if (a.workspace.color !== b.workspace.color) return false;
+  if (a.workspace.icon !== b.workspace.icon) return false;
+  if (a.workspace.defaultWslDistribution !== b.workspace.defaultWslDistribution) return false;
+  if (a.workspace.defaultTerminalProfile !== b.workspace.defaultTerminalProfile) return false;
   if (a.panes.length !== b.panes.length) return false;
   if (a.surfaces.length !== b.surfaces.length) return false;
   if (a.sessions.length !== b.sessions.length) return false;
@@ -238,7 +244,8 @@ function detailEqual(
     if (
       left.sessionId !== right.sessionId ||
       left.state !== right.state ||
-      left.backendKind !== right.backendKind
+      left.backendKind !== right.backendKind ||
+      left.cwd !== right.cwd
     ) {
       return false;
     }
@@ -269,7 +276,9 @@ function sidebarStateEqual(
       left.key !== right.key ||
       left.label !== right.label ||
       left.priority !== right.priority ||
-      left.updatedAt !== right.updatedAt
+      left.updatedAt !== right.updatedAt ||
+      left.icon !== right.icon ||
+      left.color !== right.color
     ) {
       return false;
     }
@@ -495,6 +504,7 @@ export function useAgentmuxControl(): AgentmuxControl {
   const lastDetailRefreshAtRef = useRef(0);
   const lastSidebarRefreshAtRef = useRef(0);
   const signalRefreshInFlightRef = useRef(false);
+  const fullRefreshInFlightRef = useRef(false);
   activeRef.current = activeWorkspaceId;
 
   const pushLocalNotification = useCallback(
@@ -581,9 +591,10 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const refresh = useCallback(async () => {
     const workspaceId = activeRef.current;
-    if (!workspaceId) {
+    if (!workspaceId || fullRefreshInFlightRef.current) {
       return;
     }
+    fullRefreshInFlightRef.current = true;
     try {
       // PR-5: profiles and workspace groups change only on explicit user
       // mutation; they are hydrated once and reloaded by their mutators, so the
@@ -619,6 +630,8 @@ export function useAgentmuxControl(): AgentmuxControl {
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Control plane request failed.");
+    } finally {
+      fullRefreshInFlightRef.current = false;
     }
   }, [client, loadDetail, mergeNotifications]);
 
@@ -897,11 +910,13 @@ export function useAgentmuxControl(): AgentmuxControl {
       await client.closeWorkspace(workspaceId, policy);
       const listed = await reloadWorkspaces();
       const next = listed[0]?.workspaceId ?? null;
-      setActiveWorkspaceId(next);
+      // Update the ref first so any concurrent poll-tick reads the new target,
+      // but defer the React state update and persistence until after the detail
+      // fetch completes — that way the UI transitions directly to the loaded
+      // state rather than briefly showing stale data for `next`.
       activeRef.current = next;
       lastDetailRefreshAtRef.current = 0;
       lastSidebarRefreshAtRef.current = 0;
-      persistLastActiveWorkspaceId(next);
       if (next) {
         await loadDetail(next);
       } else {
@@ -909,6 +924,8 @@ export function useAgentmuxControl(): AgentmuxControl {
         setDetail(null);
         setSidebarState(null);
       }
+      setActiveWorkspaceId(next);
+      persistLastActiveWorkspaceId(next);
     },
     [client, loadDetail, reloadWorkspaces]
   );
