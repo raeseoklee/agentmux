@@ -721,10 +721,29 @@ where
                 }
             }
             BackendEvent::Resized {
+<<<<<<< HEAD
                 session_id: _,
                 columns: _,
                 rows: _,
             } => None,
+=======
+                session_id,
+                columns,
+                rows,
+            } => {
+                if columns == 0 || rows == 0 {
+                    None
+                } else {
+                    let session_id = SessionId::from_string(session_id);
+                    let state = self.sessions.get(&session_id)?.state.clone();
+                    Some(CoreEvent::SessionStateChanged {
+                        session_id,
+                        from: state.clone(),
+                        to: state,
+                    })
+                }
+            }
+>>>>>>> origin/main
             BackendEvent::Exited { session_id, code } => {
                 let session_id = SessionId::from_string(session_id);
                 let session = self.sessions.get_mut(&session_id)?;
@@ -755,14 +774,26 @@ where
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     let failed = SessionState::Failed {
                         code: error.code,
-                        message: error.message,
+                        message: error.message.clone(),
                     };
                     let from = session.state.clone();
-                    session.state = failed.clone();
-                    CoreEvent::SessionStateChanged {
-                        session_id,
-                        from,
-                        to: failed,
+                    if from.can_transition_to(&failed) {
+                        session.state = failed.clone();
+                        CoreEvent::SessionStateChanged {
+                            session_id,
+                            from,
+                            to: failed,
+                        }
+                    } else {
+                        // Session is already in a terminal state; do not overwrite it.
+                        // Emit a session-scoped state-changed event (from == to, no
+                        // mutation) so session-filtered event subscribers still see the
+                        // error notification with the correct session_id.
+                        CoreEvent::SessionStateChanged {
+                            session_id,
+                            from: from.clone(),
+                            to: from,
+                        }
                     }
                 } else {
                     CoreEvent::BackendHealthChanged {
@@ -783,12 +814,12 @@ where
     auth_token: String,
     agent_states: HashMap<String, AgentStateRecord>,
     agent_heuristics_enabled: bool,
-    notifications: Vec<NotificationRecord>,
+    notifications: VecDeque<NotificationRecord>,
     next_notification_id: u64,
     notification_limit: usize,
     agent_heuristic_next_scan_offset: HashMap<SessionId, u64>,
-    events: Vec<EventFrame>,
-    event_history: Vec<EventFrame>,
+    events: VecDeque<EventFrame>,
+    event_history: VecDeque<EventFrame>,
     next_event_id: u64,
     dropped_event_count: usize,
     event_backlog_limit: usize,
@@ -812,12 +843,12 @@ where
             auth_token: auth_token.into(),
             agent_states: HashMap::new(),
             agent_heuristics_enabled: false,
-            notifications: Vec::new(),
+            notifications: VecDeque::new(),
             next_notification_id: 1,
             notification_limit: 256,
             agent_heuristic_next_scan_offset: HashMap::new(),
-            events: Vec::new(),
-            event_history: Vec::new(),
+            events: VecDeque::new(),
+            event_history: VecDeque::new(),
             next_event_id: 1,
             dropped_event_count: 0,
             event_backlog_limit: 1024,
@@ -908,15 +939,22 @@ where
                     // Tap raw output bytes for the live stream, coalescing
                     // contiguous batches per session (separate from the
                     // byte-less EventFrame pushed below).
-                    self.pending_output
-                        .entry(session_id.clone())
-                        .or_insert_with(|| OutputDelta {
-                            session_id: session_id.clone(),
-                            from_offset: *from_offset,
-                            bytes: Vec::new(),
-                        })
-                        .bytes
-                        .extend_from_slice(bytes);
+                    {
+                        let delta = self
+                            .pending_output
+                            .entry(session_id.clone())
+                            .or_insert_with(|| OutputDelta {
+                                session_id: session_id.clone(),
+                                from_offset: *from_offset,
+                                bytes: Vec::new(),
+                            });
+                        debug_assert_eq!(
+                            delta.from_offset + delta.bytes.len() as u64,
+                            *from_offset,
+                            "non-contiguous output batches for session {session_id}",
+                        );
+                        delta.bytes.extend_from_slice(bytes);
+                    }
                     let mut signals = detect_agent_signals(bytes);
                     if signals.is_empty()
                         && self.agent_heuristics_enabled
@@ -1387,13 +1425,13 @@ where
             .unwrap_or(256)
             .min(self.event_backlog_limit);
         let mut events = Vec::new();
-        let mut retained = Vec::new();
+        let mut retained = VecDeque::new();
 
         for event in self.events.drain(..) {
             if event_matches_poll(&event, &params) && events.len() < max_events {
                 events.push(event);
             } else {
-                retained.push(event);
+                retained.push_back(event);
             }
         }
         self.events = retained;
@@ -1687,14 +1725,14 @@ where
 
     fn push_event(&mut self, event: EventFrame) {
         if self.event_history.len() >= self.event_backlog_limit {
-            self.event_history.remove(0);
+            self.event_history.pop_front();
             self.dropped_event_count += 1;
         }
         if self.events.len() >= self.event_backlog_limit {
-            self.events.remove(0);
+            self.events.pop_front();
         }
-        self.events.push(event.clone());
-        self.event_history.push(event);
+        self.events.push_back(event.clone());
+        self.event_history.push_back(event);
     }
 
     fn push_core_event(&mut self, event: CoreEvent) {
@@ -1705,9 +1743,9 @@ where
 
     fn push_notification(&mut self, notification: NotificationRecord) {
         if self.notifications.len() >= self.notification_limit {
-            self.notifications.remove(0);
+            self.notifications.pop_front();
         }
-        self.notifications.push(notification.clone());
+        self.notifications.push_back(notification.clone());
         self.push_core_event(CoreEvent::NotificationCreated { notification });
     }
 
