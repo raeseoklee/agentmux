@@ -292,6 +292,12 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
   private alternateWheelMode: AlternateWheelMode = "auto";
+  // Tracks DECSET/DECRST 1007 (alternate scroll). TUIs like codex enable it to
+  // ask the terminal to turn wheel events into cursor-key input. xterm.js
+  // (6.0.0) does not implement the mode, so the wheel handler synthesizes the
+  // cursor keys itself instead of injecting PageUp/PageDown (which such apps
+  // ignore).
+  private alternateScrollEnabled = false;
 
   mount(
     element: HTMLElement,
@@ -337,6 +343,23 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     terminal.attachCustomWheelEventHandler((event) =>
       this.handleWheelEvent(terminal, element, event)
     );
+    // Observe DECSET/DECRST 1007 so handleWheelEvent knows whether the app
+    // asked for alternate-scroll (wheel -> cursor keys). Handlers return false
+    // so the sequences stay visible to any other consumer; they die with the
+    // terminal on dispose.
+    this.alternateScrollEnabled = false;
+    terminal.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
+      if (params.some((param) => param === 1007)) {
+        this.alternateScrollEnabled = true;
+      }
+      return false;
+    });
+    terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
+      if (params.some((param) => param === 1007)) {
+        this.alternateScrollEnabled = false;
+      }
+      return false;
+    });
     const inputEventAbort = new AbortController();
     element.addEventListener(
       "copy",
@@ -746,6 +769,21 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       terminal.modes.mouseTrackingMode !== "none"
     ) {
       return true;
+    }
+
+    if (this.alternateWheelMode !== "page" && this.alternateScrollEnabled) {
+      // The app enabled DECSET 1007 (alternate scroll) — codex and similar
+      // TUIs scroll their transcript via the cursor keys the terminal is
+      // expected to synthesize per wheel line. xterm.js (6.0.0) does not
+      // implement the mode itself, and PageUp/PageDown is ignored by these
+      // apps, so synthesize the cursor keys here (honoring DECCKM).
+      const app = terminal.modes.applicationCursorKeysMode;
+      const key =
+        direction < 0 ? (app ? "\x1bOA" : "\x1b[A") : (app ? "\x1bOB" : "\x1b[B");
+      terminal.input(key.repeat(lines), true);
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
     }
 
     terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
