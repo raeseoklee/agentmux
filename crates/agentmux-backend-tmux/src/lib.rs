@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use agentmux_backend::{
     AttachRequest, BackendError, BackendEvent, BackendHealth, BackendKind, BackendResult,
@@ -176,14 +176,29 @@ pub fn tmux_control_quote(value: &str) -> String {
     {
         value.to_string()
     } else {
-        format!(
-            "\"{}\"",
-            value
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\r', "\\r")
-                .replace('\n', "\\n")
-        )
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('"');
+        for byte in value.bytes() {
+            match byte {
+                b'\\' => out.push_str("\\\\"),
+                b'"' => out.push_str("\\\""),
+                b'\r' => out.push_str("\\r"),
+                b'\n' => out.push_str("\\n"),
+                b'\t' => out.push_str("\\t"),
+                // NUL and other ASCII control characters must be escaped so they
+                // cannot corrupt the tmux control-mode framing.
+                b if b < 0x20 => {
+                    out.push('\\');
+                    // Octal escape: three digits, zero-padded.
+                    out.push((b'0' + (b >> 6)) as char);
+                    out.push((b'0' + ((b >> 3) & 0o7)) as char);
+                    out.push((b'0' + (b & 0o7)) as char);
+                }
+                b => out.push(b as char),
+            }
+        }
+        out.push('"');
+        out
     }
 }
 
@@ -412,10 +427,21 @@ fn strip_terminal_prefix_before_control_line(line: &[u8]) -> &[u8] {
         return line;
     }
 
-    line.iter()
-        .position(|byte| *byte == b'%')
-        .map(|position| &line[position..])
-        .unwrap_or(line)
+    // Only treat a '%' as the start of a tmux control line if it is immediately
+    // followed by a lowercase ASCII letter — all real tmux control verbs begin
+    // with '%' + [a-z] (e.g. %begin, %end, %output, %exit, %pane-add …).
+    // This prevents a '%' that appears inside a terminal escape sequence payload
+    // (e.g. an OSC window-title containing "%user") from being mistaken for the
+    // start of a control line.
+    let bytes = line;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'%'
+            && bytes.get(i + 1).is_some_and(|b| b.is_ascii_lowercase())
+        {
+            return &bytes[i..];
+        }
+    }
+    line
 }
 
 fn parse_control_line_bytes(line: &[u8], active_command_id: Option<&str>) -> TmuxControlMessage {
@@ -704,6 +730,13 @@ where
             ));
         }
 
+        if self.sessions.contains_key(&request.session_id) {
+            return Err(BackendError::invalid_request(format!(
+                "Session '{}' is already registered in the tmux-control backend.",
+                request.session_id
+            )));
+        }
+
         let session_name = Self::session_name_for_spawn(&request);
         request.command = tmux_control_spawn_command(&session_name, request.command);
         request.backend = Some(BackendKind::WslDirect);
@@ -732,6 +765,13 @@ where
     }
 
     fn attach(&mut self, request: AttachRequest) -> BackendResult<SessionHandle> {
+        if self.sessions.contains_key(&request.session_id) {
+            return Err(BackendError::invalid_request(format!(
+                "Session '{}' is already registered in the tmux-control backend.",
+                request.session_id
+            )));
+        }
+
         let session_name = request.backend_ref;
         let mut handle = self
             .transport
@@ -788,24 +828,26 @@ where
                 InputEvent::Control(agentmux_backend::ControlCode::Interrupt),
             ),
             TerminationMode::Soft => {
-                self.send_control_line(session_id, tmux_detach_control_line())?;
-                self.transport
-                    .terminate(session_id, mode)
-                    .map_err(tmux_control_transport_error)?;
+                // Remove tracking state unconditionally before any fallible operation so
+                // that a pipe-write failure cannot leave stale map entries behind.
                 self.sessions.remove(session_id);
                 self.parsers.remove(session_id);
-                Ok(())
+                let _ = self.send_control_line(session_id, tmux_detach_control_line());
+                self.transport
+                    .terminate(session_id, mode)
+                    .map_err(tmux_control_transport_error)
             }
             TerminationMode::Kill => {
                 let target = self.session_name_for_session(session_id)?;
-                self.send_control_line(session_id, tmux_kill_session_control_line(&target))?;
-                std::thread::sleep(Duration::from_millis(50));
-                self.transport
-                    .terminate(session_id, mode)
-                    .map_err(tmux_control_transport_error)?;
+                // Remove tracking state unconditionally before any fallible operation.
                 self.sessions.remove(session_id);
                 self.parsers.remove(session_id);
-                Ok(())
+                // Best-effort: send kill-session then immediately close the transport.
+                // The OS flushes the pipe buffer on close, so no sleep is needed.
+                let _ = self.send_control_line(session_id, tmux_kill_session_control_line(&target));
+                self.transport
+                    .terminate(session_id, mode)
+                    .map_err(tmux_control_transport_error)
             }
         }
     }
