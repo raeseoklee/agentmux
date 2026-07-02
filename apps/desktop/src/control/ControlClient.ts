@@ -44,6 +44,7 @@ const WSL_LOGIN_SHELL_WITH_CWD_TRACKING = [
     "printf '%s\\n' '[ -r \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zshrc\"' '_agentmux_emit_cwd(){ printf \"\\\\033]7;file://localhost%s\\\\007\" \"$PWD\"; }' 'autoload -Uz add-zsh-hook' 'add-zsh-hook precmd _agentmux_emit_cwd' '_agentmux_emit_cwd' > \"$agentmux_tmp/.zshrc\"",
     'export AGENTMUX_ORIG_ZDOTDIR="$agentmux_orig_zdotdir"',
     'export ZDOTDIR="$agentmux_tmp"',
+    'trap \'rm -rf "$agentmux_tmp"\' EXIT',
     'exec "$agentmux_shell" -l ;;',
   ].join("; "),
   '*) eval "$agentmux_osc7"; exec "$agentmux_shell" -l ;;',

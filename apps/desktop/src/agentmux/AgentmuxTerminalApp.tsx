@@ -4484,7 +4484,14 @@ export function AgentmuxTerminalApp() {
               error && typeof error === "object" && "code" in error
                 ? String((error as { code?: unknown }).code ?? "")
                 : "";
-            if (code && code !== "session_not_found") {
+            if (code === "session_not_found") {
+              // Session is fully gone — clean up the intent entry so the
+              // auto-close loop does not act on it, and skip the refresh
+              // (there is nothing new to observe).
+              exitIntentSessionIdsRef.current.delete(sessionId);
+              return;
+            }
+            if (code) {
               console.warn("[agentmux] failed to refresh exited terminal state", {
                 error,
                 sessionId,
