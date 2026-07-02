@@ -444,6 +444,27 @@ impl DesktopControlState {
         }
     }
 
+    /// Deliver a one-off desktop notification directly, bypassing the
+    /// notification store and deduplication table.  Used for transient
+    /// startup events (e.g. durable-session respawn) that are not persisted
+    /// as `PersistedNotification` rows.
+    fn notify_direct(&self, notification_id: &str, notification_type: &str, title: &str, body: &str) {
+        let adapter = {
+            let Ok(state) = self.desktop_notifications.lock() else {
+                return;
+            };
+            state.adapter.clone()
+        };
+        let Some(adapter) = adapter else { return };
+        adapter.notify(DesktopNotification {
+            notification_id: notification_id.to_string(),
+            notification_type: notification_type.to_string(),
+            severity: "info".to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+        });
+    }
+
     /// Store the Tauri AppHandle so the background pump can emit UI events.
     /// Called once from `.setup()` in main.rs before any pump ticks fire.
     pub fn set_app_handle(&self, handle: tauri::AppHandle) {
@@ -1104,6 +1125,17 @@ impl DesktopControlState {
                             Some("running"),
                         );
                     }
+                    // Notify the user that the durable session could not be
+                    // re-attached and was restarted fresh.
+                    let cmd_label = session.command.first().map(String::as_str).unwrap_or("세션");
+                    self.notify_direct(
+                        &format!("durable_session_respawned_{}", result.session_id),
+                        "session.respawned",
+                        "세션 재시작",
+                        &format!(
+                            "durable 세션을 복원할 수 없어 '{cmd_label}' 명령을 새로 실행했습니다."
+                        ),
+                    );
                     self.delete_superseded_terminal(surface_id, &session.session_id);
                 } else {
                     self.terminate_runtime_session(&result.session_id, TerminationMode::Kill);
@@ -9064,6 +9096,16 @@ pub fn run_wsl_prewarm_keepalive() {
         return;
     }
 
+    // Spawn a fully-detached keepalive that survives app restart.  This is the
+    // primary fix for durable-session loss: the in-process `cat` anchor below
+    // dies when the app exits, which lets the WSL VM idle-shutdown and takes
+    // the tmux server with it.  The detached sleeper holds the VM resident
+    // across app restarts.  We guard against accumulation: if one is already
+    // running (detected via a CIM process query), we skip the spawn.
+    if !wsl_detached_keepalive_is_running() {
+        spawn_detached_wsl_keepalive();
+    }
+
     loop {
         let mut command = Command::new("wsl.exe");
         hide_console_window(&mut command);
@@ -9098,6 +9140,97 @@ pub fn run_wsl_prewarm_keepalive() {
 
 #[cfg(not(windows))]
 pub fn run_wsl_prewarm_keepalive() {}
+
+/// Return `true` if a detached `agentmux-wsl-keepalive` process is already
+/// running so we do not accumulate duplicate sleepers across app restarts.
+///
+/// Queries the Win32_Process CIM table for wsl.exe entries whose command line
+/// contains the sentinel string.  On any error the function returns `false` so
+/// the caller spawns a new keepalive — one extra sleeper on a rare failure is
+/// acceptable; skipping the spawn on a false positive is not.
+#[cfg(windows)]
+fn wsl_detached_keepalive_is_running() -> bool {
+    // PowerShell + Get-CimInstance rather than wmic: wmic is deprecated and
+    // already absent from newer Windows 11 builds, and a guard that always
+    // errors would respawn one sleeper per app launch.
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-CimInstance Win32_Process -Filter \"Name='wsl.exe'\").CommandLine",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags_hidden()
+        .output();
+    match output {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .any(|line| line.contains("agentmux-wsl-keepalive"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Extension trait used internally to attach `CREATE_NO_WINDOW` to any
+/// `Command` without needing a full `use` import at every call site.
+#[cfg(windows)]
+trait CommandHideExt {
+    fn creation_flags_hidden(&mut self) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl CommandHideExt for Command {
+    fn creation_flags_hidden(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NO_WINDOW);
+        self
+    }
+}
+
+/// Spawn a fully-detached WSL sleeper that outlives the app process.
+///
+/// The process runs `sh -c ': agentmux-wsl-keepalive; exec sleep infinity'`
+/// inside WSL. The `:` no-op carries the sentinel purely so it appears in the
+/// Windows-side wsl.exe command line, which is what the singleton guard scans
+/// — bash-only `exec -a` must be avoided because /bin/sh is dash on Ubuntu
+/// and rejects `-a`, which would kill the keepalive instantly.
+/// Creation flags used:
+///   - `DETACHED_PROCESS`       (0x0000_0008) — detaches from the calling
+///     console/process group so it is not killed when our console window
+///     closes.
+///   - `CREATE_NEW_PROCESS_GROUP` (0x0000_0200) — puts the child in its own
+///     process group so Ctrl-C from our session does not reach it.
+///   - `CREATE_NO_WINDOW`       (0x0800_0000) — suppresses any console window.
+///
+/// stdin/stdout/stderr are all null so the child holds no references back to
+/// our process handles.
+#[cfg(windows)]
+fn spawn_detached_wsl_keepalive() {
+    use std::os::windows::process::CommandExt;
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args([
+        "-e",
+        "sh",
+        "-c",
+        ": agentmux-wsl-keepalive; exec sleep infinity",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+
+    // Best-effort: ignore spawn errors (WSL not installed, etc.).
+    let _ = cmd.spawn();
+}
 
 fn workspace_bundle_from_spawn(
     params: &SessionSpawnParams,
@@ -16042,6 +16175,71 @@ mod tests {
         fn notify(&self, notification: DesktopNotification) {
             self.delivered.lock().unwrap().push(notification);
         }
+    }
+
+    // ── detached-keepalive singleton detection ──────────────────────────────
+
+    /// Parse a synthetic wmic output and assert whether the sentinel is found.
+    /// This tests the line-scanning logic of `wsl_detached_keepalive_is_running`
+    /// without requiring a real wsl.exe.
+    #[test]
+    fn wsl_keepalive_detection_finds_sentinel_in_wmic_output() {
+        let wmic_with_sentinel = "\r\nwsl.exe -e sh -c \": agentmux-wsl-keepalive; exec sleep infinity\"\r\n\r\n";
+        let found = wmic_with_sentinel
+            .lines()
+            .any(|line| line.contains("agentmux-wsl-keepalive"));
+        assert!(found, "sentinel should be detected in wmic output");
+    }
+
+    #[test]
+    fn wsl_keepalive_detection_returns_false_when_sentinel_absent() {
+        let wmic_without_sentinel =
+            "\r\nCommandLine=wsl.exe --distribution Ubuntu -- bash\r\n\r\n";
+        let found = wmic_without_sentinel
+            .lines()
+            .any(|line| line.contains("agentmux-wsl-keepalive"));
+        assert!(!found, "sentinel must not be found when absent");
+    }
+
+    #[test]
+    fn wsl_keepalive_detection_handles_empty_output() {
+        let found = "".lines().any(|line| line.contains("agentmux-wsl-keepalive"));
+        assert!(!found, "empty output must not trigger sentinel detection");
+    }
+
+    // ── respawn-fallback notification ───────────────────────────────────────
+
+    /// notify_direct delivers a DesktopNotification through a registered adapter
+    /// without going through the notification store pipeline.
+    #[test]
+    fn notify_direct_delivers_notification_to_adapter() {
+        let state = DesktopControlState::new();
+        let adapter = Arc::new(RecordingDesktopNotificationAdapter::default());
+        state.set_desktop_notification_adapter(adapter.clone());
+
+        state.notify_direct(
+            "test_notif_id",
+            "session.respawned",
+            "세션 재시작",
+            "durable 세션을 복원할 수 없어 'claude' 명령을 새로 실행했습니다.",
+        );
+
+        let delivered = adapter.delivered();
+        assert_eq!(delivered.len(), 1);
+        let n = &delivered[0];
+        assert_eq!(n.notification_id, "test_notif_id");
+        assert_eq!(n.notification_type, "session.respawned");
+        assert_eq!(n.severity, "info");
+        assert_eq!(n.title, "세션 재시작");
+        assert!(n.body.contains("claude"));
+    }
+
+    /// notify_direct is a no-op when no adapter is registered (no panic).
+    #[test]
+    fn notify_direct_is_noop_without_adapter() {
+        let state = DesktopControlState::new();
+        // No adapter registered — must not panic.
+        state.notify_direct("noop_id", "session.respawned", "title", "body");
     }
 
     fn workspace_bundle_with_unmounted_surface() -> WorkspaceBundle {
