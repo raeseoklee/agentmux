@@ -7087,7 +7087,7 @@ fn builtin_action_results() -> Vec<ActionSummaryResult> {
             "agent",
             "agent",
             &["codex", "--no-alt-screen"],
-            &["codex", "tmux", "no-alt-screen"],
+            &["codex", "tmux", "--no-alt-screen"],
         ),
         builtin_action(
             "agent.launchCustom",
@@ -11098,7 +11098,9 @@ fn is_probably_home_directory(path: &str) -> bool {
     if normalized == "~" {
         return true;
     }
-    env::var("USERNAME")
+    // Try POSIX `USER` first (WSL/Linux), then fall back to Windows `USERNAME`.
+    env::var("USER")
+        .or_else(|_| env::var("USERNAME"))
         .ok()
         .map(|user| normalized == format!("/home/{}", user.to_ascii_lowercase()))
         .unwrap_or(false)
@@ -11547,7 +11549,6 @@ fn codex_option_takes_value(token: &str) -> bool {
     if token.contains('=') {
         return false;
     }
-    let token = token.split_once('=').map(|(name, _)| name).unwrap_or(token);
     matches!(
         token,
         "-c" | "--config"
