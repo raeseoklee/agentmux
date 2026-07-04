@@ -9215,38 +9215,45 @@ fn spawn_detached_wsl_keepalive() {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    let build = |flags: u32| {
-        let mut cmd = Command::new("wsl.exe");
-        cmd.args([
-            "-e",
-            "sh",
-            "-c",
-            ": agentmux-wsl-keepalive; exec sleep infinity",
+    // Spawn through WMI (Win32_Process.Create) so the sleeper is parented to
+    // WmiPrvSE and therefore belongs to NONE of our job objects. A direct
+    // child — even with DETACHED_PROCESS or CREATE_BREAKAWAY_FROM_JOB — still
+    // dies with a kill-on-close ancestor job (dev harnesses, some launchers),
+    // which lets the WSL VM idle out and take the tmux server with it.
+    // Breakaway also cannot escape nested ancestor jobs that forbid it.
+    let wmi_spawn = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'wsl.exe -e sh -c \": agentmux-wsl-keepalive; exec sleep infinity\"' } | Out-Null",
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(flags);
-        cmd
-    };
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
 
-    // DETACHED_PROCESS only detaches the console. If the app itself runs
-    // inside a Job Object with kill-on-close (dev harnesses, some launchers),
-    // the sleeper dies with the job and the WSL VM idles out anyway — so try
-    // to break away from the job first. CreateProcess fails with access
-    // denied when the job forbids breakaway; fall back to a plain detached
-    // spawn, which is sufficient for normally-launched (non-job) installs.
-    // Best-effort either way: ignore spawn errors (WSL not installed, etc.).
-    if build(
-        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
-    )
-    .spawn()
-    .is_err()
-    {
-        let _ = build(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).spawn();
+    if wmi_spawn.map(|status| status.success()).unwrap_or(false) {
+        return;
     }
+
+    // Fallback: plain detached spawn. Sufficient for normally-launched
+    // (job-free) installs when WMI is unavailable. Best-effort: ignore spawn
+    // errors (WSL not installed, etc.).
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args([
+        "-e",
+        "sh",
+        "-c",
+        ": agentmux-wsl-keepalive; exec sleep infinity",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let _ = cmd.spawn();
 }
 
 fn workspace_bundle_from_spawn(
