@@ -9215,21 +9215,38 @@ fn spawn_detached_wsl_keepalive() {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    let mut cmd = Command::new("wsl.exe");
-    cmd.args([
-        "-e",
-        "sh",
-        "-c",
-        ": agentmux-wsl-keepalive; exec sleep infinity",
-    ])
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let build = |flags: u32| {
+        let mut cmd = Command::new("wsl.exe");
+        cmd.args([
+            "-e",
+            "sh",
+            "-c",
+            ": agentmux-wsl-keepalive; exec sleep infinity",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(flags);
+        cmd
+    };
 
-    // Best-effort: ignore spawn errors (WSL not installed, etc.).
-    let _ = cmd.spawn();
+    // DETACHED_PROCESS only detaches the console. If the app itself runs
+    // inside a Job Object with kill-on-close (dev harnesses, some launchers),
+    // the sleeper dies with the job and the WSL VM idles out anyway — so try
+    // to break away from the job first. CreateProcess fails with access
+    // denied when the job forbids breakaway; fall back to a plain detached
+    // spawn, which is sufficient for normally-launched (non-job) installs.
+    // Best-effort either way: ignore spawn errors (WSL not installed, etc.).
+    if build(
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+    )
+    .spawn()
+    .is_err()
+    {
+        let _ = build(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).spawn();
+    }
 }
 
 fn workspace_bundle_from_spawn(
