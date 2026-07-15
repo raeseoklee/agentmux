@@ -5,16 +5,24 @@ import {
   type ILinkProvider,
 } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import type { LigaturesAddon } from "@xterm/addon-ligatures";
 import type { WebglAddon } from "@xterm/addon-webgl";
-import "@xterm/xterm/css/xterm.css";
 import type {
   AlternateWheelMode,
   TerminalRenderer,
   TerminalSnapshot,
   TerminalTypography,
 } from "./TerminalRenderer";
+import "@xterm/xterm/css/xterm.css";
+
+// TS-11: module-level escape hatch — set to false to disable multi-line paste
+// confirmation (e.g. when wiring a settings toggle later).
+let _multilinePasteGuardEnabled = true;
+export function setMultilinePasteGuard(enabled: boolean): void {
+  _multilinePasteGuardEnabled = enabled;
+}
 
 export const XTERM_THEME = {
   background: "#0e1116",
@@ -290,10 +298,13 @@ async function readClipboardText(): Promise<ClipboardReadResult> {
 export class XtermTerminalRenderer implements TerminalRenderer {
   private terminal?: Terminal;
   private fitAddon?: FitAddon;
+  private searchAddon?: SearchAddon;
   private unicodeAddon?: Unicode11Addon;
   private ligaturesAddon?: LigaturesAddon;
   private mountedElement?: HTMLElement;
   private inputEventAbort?: AbortController;
+  // TS-9: last search term so F3 / Shift+F3 repeat without needing a UI.
+  private _lastSearchTerm = "";
   private pasteHandlers = new Set<(text: string) => void>();
   private openLinkHandler?: TerminalLinkOpenHandler;
   private linkProviderDisposable?: { dispose(): void };
@@ -360,6 +371,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     element.dataset.agentmuxTerminalLigatures = "loading";
     element.dataset.agentmuxTerminalFontFeatureSettings = TERMINAL_FONT_FEATURE_SETTINGS;
     terminal.loadAddon(fitAddon);
+    // TS-9: in-buffer search addon — loaded before open() so the addon is ready
+    // when the terminal begins rendering.
+    const searchAddon = new SearchAddon();
+    terminal.loadAddon(searchAddon);
     terminal.open(element);
 
     // Reset repaint-observation state for this fresh terminal.
@@ -422,6 +437,30 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       },
       { signal: inputEventAbort.signal }
     );
+    // TS-10: middle-click paste. Use primary-selection semantics: paste the
+    // current terminal selection if non-empty, else fall back to system clipboard.
+    // When xterm is in mouse-tracking mode the middle click belongs to the app.
+    element.addEventListener(
+      "mousedown",
+      (event: MouseEvent) => {
+        if (event.button !== 1 || this.terminal !== terminal) {
+          return;
+        }
+        if (terminal.modes.mouseTrackingMode !== "none") {
+          // App is tracking mouse — forward the event normally.
+          return;
+        }
+        event.preventDefault();
+        const sel = terminal.getSelection();
+        if (sel) {
+          this.emitPaste(sel);
+          terminal.focus();
+        } else {
+          this.pasteFromClipboard(terminal);
+        }
+      },
+      { capture: true, signal: inputEventAbort.signal }
+    );
     // Copy-on-select: when the selection becomes non-empty, debounce 150 ms
     // (drag emits many change events) then write to the clipboard and remember
     // it for the stale-cache fallback.  Does not steal focus.  Skipped when
@@ -469,6 +508,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
     this.terminal = terminal;
     this.fitAddon = fitAddon;
+    this.searchAddon = searchAddon;
     this.unicodeAddon = unicodeAddon;
     this.mountedElement = element;
     this.inputEventAbort = inputEventAbort;
@@ -535,11 +575,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.terminal?.dispose();
     this.terminal = undefined;
     this.fitAddon = undefined;
+    this.searchAddon = undefined;
     this.unicodeAddon = undefined;
     this.ligaturesAddon = undefined;
     this.mountedElement = undefined;
     this.fontReadyPromise = undefined;
     this.ligaturesReadyPromise = undefined;
+    this._lastSearchTerm = "";
   }
 
   write(batch: Uint8Array, callback?: () => void): void {
@@ -1001,6 +1043,84 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return false;
     }
 
+    // TS-1: scrollback paging — normal buffer only; pass through in alt buffer
+    // or while a full-screen TUI is active (screenInteractiveActive).
+    if (
+      !event.altKey &&
+      !event.ctrlKey &&
+      event.shiftKey &&
+      (event.key === "PageUp" || event.key === "PageDown")
+    ) {
+      if (terminal.buffer.active.type === "normal" && !this.screenInteractiveActive()) {
+        event.preventDefault();
+        event.stopPropagation();
+        terminal.scrollPages(event.key === "PageUp" ? -1 : 1);
+        if (this.mountedElement) {
+          this.showTransientScrollbar(this.mountedElement);
+        }
+        return false;
+      }
+      // Alt buffer or TUI active — let xterm forward the key to the PTY.
+      return true;
+    }
+
+    if (
+      !event.altKey &&
+      event.ctrlKey &&
+      !event.shiftKey &&
+      (event.key === "Home" || event.key === "End")
+    ) {
+      if (terminal.buffer.active.type === "normal" && !this.screenInteractiveActive()) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.key === "Home") {
+          terminal.scrollToTop();
+        } else {
+          terminal.scrollToBottom();
+        }
+        if (this.mountedElement) {
+          this.showTransientScrollbar(this.mountedElement);
+        }
+        return false;
+      }
+      return true;
+    }
+
+    // TS-4: Ctrl+Shift+K — clear terminal buffer; never sends to PTY.
+    if (!event.altKey && event.ctrlKey && event.shiftKey && key === "k") {
+      event.preventDefault();
+      event.stopPropagation();
+      terminal.clear();
+      return false;
+    }
+
+    // TS-6: Ctrl+Shift+A — select all; copy-on-select handles the copy.
+    if (!event.altKey && event.ctrlKey && event.shiftKey && key === "a") {
+      event.preventDefault();
+      event.stopPropagation();
+      terminal.selectAll();
+      return false;
+    }
+
+    // TS-9: F3 / Shift+F3 — find next / previous using last search term.
+    if (!event.altKey && !event.ctrlKey && !event.shiftKey && event.key === "F3") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (this._lastSearchTerm) {
+        this.findNext(this._lastSearchTerm);
+      }
+      return false;
+    }
+
+    if (!event.altKey && !event.ctrlKey && event.shiftKey && event.key === "F3") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (this._lastSearchTerm) {
+        this.findPrevious(this._lastSearchTerm);
+      }
+      return false;
+    }
+
     return true;
   }
 
@@ -1093,8 +1213,68 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     if (!text) {
       return;
     }
-    for (const handler of this.pasteHandlers) {
-      handler(text);
+    // TS-12: normalize newlines before handlers see the text.
+    // \r\n → \r, lone \n → \r (matching xterm.paste semantics for PTY input).
+    const normalized = text.replace(/\r\n/g, "\r").replace(/\n/g, "\r");
+
+    // TS-11: multi-line paste guard — confirm before sending >1 line.
+    // Trigger when the normalized text has a \r that is not the sole trailing
+    // character — i.e. there is content on more than one line.  A single
+    // trailing \r (pressing Enter at end) does not count.
+    const hasMultipleLines = /\r[\s\S]/.test(normalized);
+    if (_multilinePasteGuardEnabled && hasMultipleLines) {
+      const preview = text.slice(0, 120);
+      const message = `여러 줄을 붙여넣습니다. 계속할까요?\n\n${preview}`;
+      if (!window.confirm(message)) {
+        return;
+      }
     }
+
+    for (const handler of this.pasteHandlers) {
+      handler(normalized);
+    }
+  }
+
+  // TS-4: clear the terminal buffer. Never sends anything to the PTY.
+  clearBuffer(): void {
+    this.terminal?.clear();
+  }
+
+  // TS-6: select all content in the terminal buffer.
+  selectAll(): void {
+    this.terminal?.selectAll();
+  }
+
+  // TS-9: in-buffer search via SearchAddon.
+  private static readonly _searchOptions: ISearchOptions = {
+    decorations: {
+      matchBackground: "#ffff0040",
+      matchBorder: "#ffff00",
+      matchOverviewRuler: "#ffff00",
+      activeMatchBackground: "#ff800080",
+      activeMatchBorder: "#ff8000",
+      activeMatchColorOverviewRuler: "#ff8000",
+    },
+  };
+
+  findNext(term: string): boolean {
+    if (!term || !this.searchAddon) {
+      return false;
+    }
+    this._lastSearchTerm = term;
+    return this.searchAddon.findNext(term, XtermTerminalRenderer._searchOptions);
+  }
+
+  findPrevious(term: string): boolean {
+    if (!term || !this.searchAddon) {
+      return false;
+    }
+    this._lastSearchTerm = term;
+    return this.searchAddon.findPrevious(term, XtermTerminalRenderer._searchOptions);
+  }
+
+  // Used by the command registry in LiveTerminal.
+  scrollToBottom(): void {
+    this.terminal?.scrollToBottom();
   }
 }

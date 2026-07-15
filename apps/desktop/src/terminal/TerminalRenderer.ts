@@ -28,6 +28,16 @@ export interface TerminalRenderer {
   onResize(handler: (columns: number, rows: number) => void): () => void;
   focus(): void;
   dispose(): void;
+  /** Clear the terminal scrollback and visible buffer (TS-4). Never sends to PTY. */
+  clearBuffer?(): void;
+  /** Select all content in the terminal buffer (TS-6). */
+  selectAll?(): void;
+  /** Find the next match for term in the buffer; returns true when found (TS-9). */
+  findNext?(term: string): boolean;
+  /** Find the previous match for term in the buffer; returns true when found (TS-9). */
+  findPrevious?(term: string): boolean;
+  /** Scroll to the bottom of the terminal buffer (used by command registry). */
+  scrollToBottom?(): void;
 }
 
 export type TerminalInputEvent =

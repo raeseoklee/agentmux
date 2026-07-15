@@ -9,6 +9,29 @@ import {
   XTERM_THEME,
 } from "../terminal/XtermTerminalRenderer";
 
+// ---------------------------------------------------------------------------
+// Command registry (TS-9 / TS-4 / TS-6 wave-2 app integration)
+// ---------------------------------------------------------------------------
+
+/** Public imperative commands exposed per live terminal session. */
+export interface TerminalCommands {
+  clearBuffer(): void;
+  selectAll(): void;
+  findNext(term: string): boolean;
+  findPrevious(term: string): boolean;
+  scrollToBottom(): void;
+}
+
+const _terminalCommandRegistry = new Map<string, TerminalCommands>();
+
+/**
+ * Return the TerminalCommands for the given sessionId, or null when no
+ * LiveTerminal for that session is currently mounted.
+ */
+export function terminalCommandsForSession(sessionId: string): TerminalCommands | null {
+  return _terminalCommandRegistry.get(sessionId) ?? null;
+}
+
 const encoder = new TextEncoder();
 const SNAPSHOT_HOT_POLL_MS = 32;
 const SNAPSHOT_BOOT_POLL_MS = 80;
@@ -590,8 +613,24 @@ export function LiveTerminal({
     const resizeObserver = new ResizeObserver(requestFit);
     resizeObserver.observe(host);
 
+    // Register imperative commands for this session so app-level code can call
+    // clearBuffer / selectAll / findNext / findPrevious / scrollToBottom without
+    // holding a direct renderer reference.
+    const commands: TerminalCommands = {
+      clearBuffer: () => renderer.clearBuffer(),
+      selectAll: () => renderer.selectAll(),
+      findNext: (term: string) => renderer.findNext(term),
+      findPrevious: (term: string) => renderer.findPrevious(term),
+      scrollToBottom: () => renderer.scrollToBottom(),
+    };
+    _terminalCommandRegistry.set(sessionId, commands);
+
     const teardownShared = () => {
       alive = false;
+      // Unregister commands if this instance still owns the slot.
+      if (_terminalCommandRegistry.get(sessionId) === commands) {
+        _terminalCommandRegistry.delete(sessionId);
+      }
       window.clearTimeout(bootingBackstop);
       if (resizeTimer !== null) {
         window.clearTimeout(resizeTimer);
