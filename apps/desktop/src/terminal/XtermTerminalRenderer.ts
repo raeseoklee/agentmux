@@ -251,11 +251,25 @@ async function writeClipboardText(text: string): Promise<void> {
   }
 }
 
-async function readClipboardText(): Promise<string> {
+interface ClipboardReadResult {
+  /** true when a clipboard read succeeded (even if the clipboard is empty). */
+  ok: boolean;
+  text: string;
+}
+
+/**
+ * Read text from the clipboard. Returns { ok: true, text } when any read path
+ * succeeds — text may be an empty string when the clipboard holds non-text
+ * content (image, file, etc.). Returns { ok: false, text: "" } only when every
+ * read path throws (permission denied, plugin failure, etc.) so the caller can
+ * distinguish a legitimate empty clipboard from a read error.
+ */
+async function readClipboardText(): Promise<ClipboardReadResult> {
   if (isTauriRuntime()) {
     try {
       const clipboard = await loadTauriClipboardModule();
-      return await clipboard.readText();
+      const text = await clipboard.readText();
+      return { ok: true, text: text ?? "" };
     } catch (error) {
       console.warn("[agentmux] tauri clipboard read failed", { error });
       // Fall through to browser clipboard paths for preview or plugin errors.
@@ -263,13 +277,14 @@ async function readClipboardText(): Promise<string> {
   }
   try {
     if (navigator.clipboard?.readText) {
-      return await navigator.clipboard.readText();
+      const text = await navigator.clipboard.readText();
+      return { ok: true, text: text ?? "" };
     }
   } catch (error) {
     console.warn("[agentmux] navigator clipboard read failed", { error });
     // Clipboard read can be denied by the host; keep the terminal focused.
   }
-  return "";
+  return { ok: false, text: "" };
 }
 
 export class XtermTerminalRenderer implements TerminalRenderer {
@@ -299,6 +314,11 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
   private alternateWheelMode: AlternateWheelMode = "auto";
+  // Copy-on-select: debounce timer and last-copied value to avoid churn.
+  private _cosTimer?: number;
+  private _cosLast = "";
+  // Disposable for the onSelectionChange subscription.
+  private _cosSub?: { dispose(): void };
   // Fixed-size ring buffer of timestamps (ms) for recent absolute
   // cursor-repositioning sequences.  Used by screenInteractiveActive().
   private readonly _siRing: number[] = new Array<number>(SCREEN_INTERACTIVE_RING_SIZE).fill(0);
@@ -402,6 +422,44 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       },
       { signal: inputEventAbort.signal }
     );
+    // Copy-on-select: when the selection becomes non-empty, debounce 150 ms
+    // (drag emits many change events) then write to the clipboard and remember
+    // it for the stale-cache fallback.  Does not steal focus.  Skipped when
+    // the selection is unchanged from the last copied value to avoid churn.
+    this._cosLast = "";
+    if (this._cosTimer !== undefined) {
+      window.clearTimeout(this._cosTimer);
+      this._cosTimer = undefined;
+    }
+    this._cosSub?.dispose();
+    this._cosSub = terminal.onSelectionChange(() => {
+      if (this.terminal !== terminal) {
+        return;
+      }
+      const sel = terminal.getSelection();
+      if (!sel || sel === this._cosLast) {
+        return;
+      }
+      if (this._cosTimer !== undefined) {
+        window.clearTimeout(this._cosTimer);
+      }
+      this._cosTimer = window.setTimeout(() => {
+        this._cosTimer = undefined;
+        if (this.terminal !== terminal) {
+          return;
+        }
+        const current = terminal.getSelection();
+        if (!current || current === this._cosLast) {
+          return;
+        }
+        this._cosLast = current;
+        rememberTerminalClipboardText(current);
+        void writeClipboardText(current).catch((error) => {
+          console.warn("[agentmux] copy-on-select write failed", { error });
+        });
+      }, 150);
+    });
+
     this.installPlainUrlLinkProvider(terminal);
     fitAddon.fit();
 
@@ -464,6 +522,14 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.linkProviderDisposable?.dispose();
     this.linkProviderDisposable = undefined;
     this.clearTransientScrollbar();
+    // Dispose copy-on-select subscription and any pending debounce timer.
+    this._cosSub?.dispose();
+    this._cosSub = undefined;
+    if (this._cosTimer !== undefined) {
+      window.clearTimeout(this._cosTimer);
+      this._cosTimer = undefined;
+    }
+    this._cosLast = "";
     this.inputEventAbort?.abort();
     this.inputEventAbort = undefined;
     this.terminal?.dispose();
@@ -894,6 +960,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return true;
     }
 
+    // Ctrl+Tab / Ctrl+Shift+Tab are app-level tab-cycling shortcuts.
+    // Return false without preventDefault/stopPropagation so xterm skips PTY
+    // input (\t) while the event still bubbles to the window-level listener.
+    if (event.ctrlKey && !event.altKey && !event.metaKey && event.key === "Tab") {
+      return false;
+    }
+
     const key = event.key.toLowerCase();
     const primaryModifier = event.ctrlKey || event.metaKey;
     if (!event.altKey && primaryModifier && key === "c") {
@@ -997,8 +1070,11 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
   private pasteFromClipboard(terminal: Terminal): void {
     void readClipboardText()
-      .then((text) => {
-        const pasteText = text || recentTerminalClipboardText();
+      .then(({ ok, text }) => {
+        // Only fall back to the 30-s cache when every read path errored.
+        // A successful read with empty text means the clipboard holds
+        // non-text content (image, file…) — pasting nothing is correct.
+        const pasteText = ok ? text : recentTerminalClipboardText();
         if (this.terminal === terminal && pasteText) {
           this.emitPaste(pasteText);
         }

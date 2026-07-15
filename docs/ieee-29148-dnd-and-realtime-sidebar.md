@@ -7,7 +7,7 @@ Conforms to ISO/IEC/IEEE 29148:2018.
 | Document ID | SRS-UX-002 |
 | Status | Draft |
 | Scope | Desktop UI (apps/desktop) + Tauri host (src-tauri) |
-| Related | [ieee-29148-system-design.md](./ieee-29148-system-design.md), [ieee-29148-desktop-performance-optimization.md](./ieee-29148-desktop-performance-optimization.md) |
+| Related | [ieee-29148-system-design.md](./en/ieee-29148-system-design.md), [ieee-29148-desktop-performance-optimization.md](./en/ieee-29148-desktop-performance-optimization.md) |
 
 ## 1. Purpose
 
