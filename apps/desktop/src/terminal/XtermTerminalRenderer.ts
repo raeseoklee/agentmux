@@ -1013,11 +1013,20 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const primaryModifier = event.ctrlKey || event.metaKey;
     if (!event.altKey && primaryModifier && key === "c") {
       const hasSelection = terminal.getSelection().length > 0;
-      if (event.shiftKey || hasSelection) {
+      // Explicit copy: Ctrl+Shift+C always, and Cmd+C with a selection on
+      // macOS-style layouts (metaKey never doubles as SIGINT).
+      if (event.shiftKey || (event.metaKey && !event.ctrlKey && hasSelection)) {
         event.preventDefault();
         event.stopPropagation();
         this.copySelection(terminal);
         return false;
+      }
+      // Ctrl+C always interrupts. Copy-on-select already lifted any selection
+      // to the clipboard, so the old copy-when-selection-exists dual role only
+      // stole SIGINT whenever a stale highlight lingered ("취소가 안 된다").
+      // Clear the highlight so the next Ctrl+C visibly reaches the shell.
+      if (hasSelection) {
+        terminal.clearSelection();
       }
       return true;
     }
