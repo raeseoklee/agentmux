@@ -269,6 +269,10 @@ pub struct DesktopControlState {
     output_stream_metrics: Mutex<OutputStreamMetrics>,
     output_pressure: Mutex<HashMap<String, OutputPressureRecord>>,
     input_command_buffers: Mutex<HashMap<String, String>>,
+    // Restored-agent launch lines waiting for their shell's first prompt
+    // (OSC 7) before being typed; keyed by session id. See
+    // replay_restored_agent_launch_command / flush_pending_agent_launch_lines.
+    pending_agent_launch_lines: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -400,6 +404,7 @@ impl DesktopControlState {
             output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
             output_pressure: Mutex::new(HashMap::new()),
             input_command_buffers: Mutex::new(HashMap::new()),
+            pending_agent_launch_lines: Mutex::new(HashMap::new()),
         };
         // Durable-session recovery is deliberately NOT run here: it probes
         // wsl.exe/tmux and can block for seconds. The desktop host runs it on a
@@ -430,6 +435,7 @@ impl DesktopControlState {
             output_stream_metrics: Mutex::new(OutputStreamMetrics::default()),
             output_pressure: Mutex::new(HashMap::new()),
             input_command_buffers: Mutex::new(HashMap::new()),
+            pending_agent_launch_lines: Mutex::new(HashMap::new()),
         };
         Ok(state)
     }
@@ -728,6 +734,14 @@ impl DesktopControlState {
                 let _ = handle.emit("agentmux://sidebar-changed", ());
             }
         }
+        // Type queued restored-agent launch lines once their shell printed its
+        // first prompt (OSC 7). Runs every tick so the timeout fallback fires
+        // even for sessions that never report a cwd; no-ops when empty.
+        let prompted_sessions: Vec<String> = cwd_updates
+            .iter()
+            .map(|(session_id, _)| session_id.to_string())
+            .collect();
+        self.flush_pending_agent_launch_lines(&prompted_sessions);
         if deltas.is_empty() {
             self.record_output_pump_metrics(had_activity, 0, 0, 0, 0);
             return had_activity;
@@ -1542,17 +1556,51 @@ impl DesktopControlState {
         let Some(command_line) = restored_agent_launch_line(session, previous) else {
             return;
         };
-        let params = serde_json::json!({
-            "session_id": session_id,
-            "text": format!("{command_line}\r"),
-        })
-        .to_string();
-        let _ = self.handle_request(RequestEnvelope::new(
-            "desktop_startup_replay_agent_command",
-            "session.send_text",
-            params,
-            self.control_token.clone(),
-        ));
+        // Do NOT type the command immediately: the freshly respawned login
+        // shell is still initializing, and the scrollback replay pumped into
+        // xterm can contain terminal queries from the old session whose
+        // auto-responses race our keystrokes on the same pty — observed as
+        // mangled launches like `claude --dan[C`. Queue the line instead; the
+        // output pump sends it when the shell's first prompt arrives (our
+        // bootstrap emits OSC 7 from PROMPT_COMMAND/precmd on every prompt),
+        // with a timeout fallback for shells that never report a cwd.
+        if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
+            pending.insert(session_id.to_string(), (command_line, Instant::now()));
+        }
+    }
+
+    /// Send queued agent launch lines once their restored shell is ready.
+    /// Readiness = the session emitted its first OSC 7 cwd report (first
+    /// prompt), or `LAUNCH_LINE_PROMPT_TIMEOUT` elapsed as a fallback.
+    fn flush_pending_agent_launch_lines(&self, prompted_sessions: &[String]) {
+        const LAUNCH_LINE_PROMPT_TIMEOUT: Duration = Duration::from_secs(4);
+        let due: Vec<(String, String)> = {
+            let Ok(mut pending) = self.pending_agent_launch_lines.lock() else {
+                return;
+            };
+            if pending.is_empty() {
+                return;
+            }
+            let mut due = Vec::new();
+            for session_id in prompted_sessions {
+                if let Some((line, _)) = pending.remove(session_id) {
+                    due.push((session_id.clone(), line));
+                }
+            }
+            let now = Instant::now();
+            pending.retain(|session_id, (line, queued_at)| {
+                if now.duration_since(*queued_at) >= LAUNCH_LINE_PROMPT_TIMEOUT {
+                    due.push((session_id.clone(), line.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            due
+        };
+        for (session_id, line) in due {
+            let _ = self.send_text_direct(&session_id, format!("{line}\r"));
+        }
     }
 
     fn delete_superseded_terminal(&self, surface_id: &str, session_id: &str) {
@@ -9232,12 +9280,17 @@ fn spawn_detached_wsl_keepalive() {
     // dies with a kill-on-close ancestor job (dev harnesses, some launchers),
     // which lets the WSL VM idle out and take the tmux server with it.
     // Breakaway also cannot escape nested ancestor jobs that forbid it.
+    // Win32_Process.Create shows the new process's console window by default,
+    // which surfaced as a frozen "wsl.exe" terminal at every app start (users
+    // closed it, killing the keepalive). Pass Win32_ProcessStartup with
+    // ShowWindow=0 (SW_HIDE) so the sleeper's console never appears; verified
+    // live: the process survives with MainWindowHandle 0.
     let wmi_spawn = Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'wsl.exe -e sh -c \": agentmux-wsl-keepalive; exec sleep infinity\"' } | Out-Null",
+            "$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'wsl.exe -e sh -c \": agentmux-wsl-keepalive; exec sleep infinity\"'; ProcessStartupInformation = $si } | Out-Null",
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
