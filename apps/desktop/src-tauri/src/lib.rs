@@ -448,7 +448,13 @@ impl DesktopControlState {
     /// notification store and deduplication table.  Used for transient
     /// startup events (e.g. durable-session respawn) that are not persisted
     /// as `PersistedNotification` rows.
-    fn notify_direct(&self, notification_id: &str, notification_type: &str, title: &str, body: &str) {
+    fn notify_direct(
+        &self,
+        notification_id: &str,
+        notification_type: &str,
+        title: &str,
+        body: &str,
+    ) {
         let adapter = {
             let Ok(state) = self.desktop_notifications.lock() else {
                 return;
@@ -1127,7 +1133,11 @@ impl DesktopControlState {
                     }
                     // Notify the user that the durable session could not be
                     // re-attached and was restarted fresh.
-                    let cmd_label = session.command.first().map(String::as_str).unwrap_or("세션");
+                    let cmd_label = session
+                        .command
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("세션");
                     self.notify_direct(
                         &format!("durable_session_respawned_{}", result.session_id),
                         "session.respawned",
@@ -16208,7 +16218,8 @@ mod tests {
     /// without requiring a real wsl.exe.
     #[test]
     fn wsl_keepalive_detection_finds_sentinel_in_wmic_output() {
-        let wmic_with_sentinel = "\r\nwsl.exe -e sh -c \": agentmux-wsl-keepalive; exec sleep infinity\"\r\n\r\n";
+        let wmic_with_sentinel =
+            "\r\nwsl.exe -e sh -c \": agentmux-wsl-keepalive; exec sleep infinity\"\r\n\r\n";
         let found = wmic_with_sentinel
             .lines()
             .any(|line| line.contains("agentmux-wsl-keepalive"));
@@ -16217,8 +16228,7 @@ mod tests {
 
     #[test]
     fn wsl_keepalive_detection_returns_false_when_sentinel_absent() {
-        let wmic_without_sentinel =
-            "\r\nCommandLine=wsl.exe --distribution Ubuntu -- bash\r\n\r\n";
+        let wmic_without_sentinel = "\r\nCommandLine=wsl.exe --distribution Ubuntu -- bash\r\n\r\n";
         let found = wmic_without_sentinel
             .lines()
             .any(|line| line.contains("agentmux-wsl-keepalive"));
@@ -16227,7 +16237,9 @@ mod tests {
 
     #[test]
     fn wsl_keepalive_detection_handles_empty_output() {
-        let found = "".lines().any(|line| line.contains("agentmux-wsl-keepalive"));
+        let found = ""
+            .lines()
+            .any(|line| line.contains("agentmux-wsl-keepalive"));
         assert!(!found, "empty output must not trigger sentinel detection");
     }
 
