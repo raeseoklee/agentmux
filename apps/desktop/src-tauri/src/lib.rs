@@ -11719,8 +11719,19 @@ fn normalize_claude_restore_args(tokens: &[String]) -> String {
         // The label is scraped from live terminal content, so it can carry
         // mangled fragments of a corrupted echo (observed: `--dan[C`), and a
         // bare token is the original prompt, which must not be replayed as a
-        // new conversation. Keep only plausible flags — and their value token
-        // when the flag takes one — and drop everything else.
+        // new conversation. Repair fragments that unambiguously prefix a known
+        // claude flag (so `--dan[C` heals back to
+        // `--dangerously-skip-permissions` instead of silently dropping the
+        // permission mode the user launched with); keep plausible flags — plus
+        // their value token when the flag takes one — and drop the rest.
+        if let Some(repaired) = repair_known_claude_flag(token) {
+            if repaired == "--continue" {
+                continues = true;
+            }
+            restored.push(repaired);
+            index += 1;
+            continue;
+        }
         if is_plausible_agent_flag(token) {
             if matches!(token, "-c" | "--continue") {
                 continues = true;
@@ -11744,6 +11755,39 @@ fn normalize_claude_restore_args(tokens: &[String]) -> String {
         restored.push("-c".to_string());
     }
     join_command_tokens(&restored)
+}
+
+/// Rebuild a known claude flag from a mangled fragment. Only fires for tokens
+/// that fail the plausibility test, and only when the fragment's clean leading
+/// run (>= 3 chars after `--`) uniquely prefixes one known boolean flag — so
+/// `--dan[C` heals to `--dangerously-skip-permissions` while unrecognizable
+/// fragments still get dropped.
+fn repair_known_claude_flag(token: &str) -> Option<String> {
+    const KNOWN_FLAGS: &[&str] = &[
+        "--dangerously-skip-permissions",
+        "--continue",
+        "--verbose",
+        "--debug",
+    ];
+    if is_plausible_agent_flag(token) {
+        return None;
+    }
+    let rest = token.strip_prefix("--")?;
+    let clean: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || *ch == '-')
+        .collect();
+    if clean.len() < 3 {
+        return None;
+    }
+    let mut matches = KNOWN_FLAGS
+        .iter()
+        .filter(|flag| flag[2..].starts_with(clean.as_str()));
+    let candidate = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((*candidate).to_string())
 }
 
 /// A flag token scraped from terminal content is plausible when it looks like
@@ -15022,10 +15066,12 @@ mod tests {
     }
 
     #[test]
-    fn restored_agent_launch_line_drops_mangled_flag_fragments() {
+    fn restored_agent_launch_line_repairs_mangled_known_flag_fragments() {
         // A corrupted echo once persisted `claude --dan[C` as the agent label
-        // (the tail of an ANSI escape spliced into the flag). Restores must
-        // drop the garbage token instead of typing it back into the shell.
+        // (the tail of an ANSI escape spliced into the flag). The clean prefix
+        // `dan` uniquely identifies --dangerously-skip-permissions, so the
+        // restore heals the flag instead of silently dropping the permission
+        // mode the user launched with.
         let session = PersistedSession {
             session_id: "ses_shell".to_string(),
             workspace_id: "ws_agent".to_string(),
@@ -15053,6 +15099,12 @@ mod tests {
 
         assert_eq!(
             restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
+
+        // Fragments that don't prefix any known flag are still dropped.
+        assert_eq!(
+            normalize_restored_agent_launch("claude --zqx[C").as_deref(),
             Some("claude -c")
         );
     }
