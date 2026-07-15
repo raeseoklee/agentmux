@@ -39,6 +39,7 @@ Priorities: P1 = high-value, low-risk, ship next; P2 = valuable, needs design ca
 | ID | Requirement | Default binding | Notes |
 |----|-------------|-----------------|-------|
 | TS-7 | Directional pane focus | Alt+←↑↓→ | Geometric neighbor search over the split tree; skip when a TUI needs Alt-keys? No — WT precedent: terminal apps rarely need Alt+arrows; rebindable anyway. |
+| TS-17 | Workspace cycling | Ctrl+Alt+↑ / Ctrl+Alt+↓ | Previous/next workspace in sidebar order (wrap-around), matching the vertical sidebar visually (Discord/Slack server-switch convention). Uses the same selection path as clicking a workspace card. |
 | TS-8 | Keyboard pane resize | Ctrl+Alt+Shift+←↑↓→ | Adjusts splitRatio of the parent split (existing resizePane). |
 | TS-9 | In-buffer terminal search | Ctrl+Shift+F, F3 / Shift+F3 next/prev | xterm search addon; the existing Ctrl+F overlay is app-level search — verify and keep both, clearly labeled. |
 | TS-10 | Middle-click paste | mouse middle button | X11 habit for WSL users; paste selection-clipboard (use the last terminal selection, falling back to system clipboard). Setting-gated, default on. |

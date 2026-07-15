@@ -8,6 +8,8 @@ interface TauriWindowApi {
   toggleMaximize(): Promise<void>;
   close(): Promise<void>;
   isMaximized(): Promise<boolean>;
+  isFullscreen(): Promise<boolean>;
+  setFullscreen(fullscreen: boolean): Promise<void>;
   onResized(handler: () => void): Promise<() => void>;
 }
 
@@ -36,6 +38,12 @@ export function toggleMaximizeWindow(): void {
 
 export function closeWindow(): void {
   void currentWindow()?.close();
+}
+
+export function toggleFullscreenWindow(): void {
+  const win = currentWindow();
+  if (!win) return;
+  void win.isFullscreen().then((full) => win.setFullscreen(!full)).catch(() => undefined);
 }
 
 /**

@@ -102,6 +102,7 @@ import {
 import {
   closeWindow,
   minimizeWindow,
+  toggleFullscreenWindow,
   toggleMaximizeWindow,
   watchMaximized,
 } from "./windowControls";
@@ -357,6 +358,11 @@ const SURFACE_TAB_DRAG_TYPE = "application/x-agentmux-surface-tab";
 const PANE_SURFACE_DRAG_TYPE = "application/x-agentmux-pane-surface";
 const WORKSPACE_ORDER_STORAGE_KEY = "agentmux.workspaceOrder.v1";
 const SURFACE_TAB_ORDER_STORAGE_PREFIX = "agentmux.surfaceTabOrder.v1:";
+const SURFACE_TITLE_OVERRIDE_STORAGE_KEY = "agentmux.surfaceTitleOverrides.v1";
+const FONT_SIZE_MIN = 10;
+const FONT_SIZE_MAX = 18;
+const FONT_SIZE_DEFAULT = 12.5;
+const FONT_SIZE_STEP = 0.5;
 
 type DropPlacement = "before" | "after";
 
@@ -409,6 +415,28 @@ function parseDragPayload<T>(
     return JSON.parse(raw) as T;
   } catch {
     return null;
+  }
+}
+
+function readSurfaceTitleOverrides(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(SURFACE_TITLE_OVERRIDE_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return parsed as Record<string, string>;
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function writeSurfaceTitleOverrides(overrides: Record<string, string>): void {
+  try {
+    window.localStorage.setItem(SURFACE_TITLE_OVERRIDE_STORAGE_KEY, JSON.stringify(overrides));
+  } catch {
+    // Storage failures should not block work.
   }
 }
 
@@ -1853,6 +1881,11 @@ export function AgentmuxTerminalApp() {
   const [query, setQuery] = useState("");
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [fontSize, setFontSize] = useState(12.5);
+  const [surfaceTitleOverrides, setSurfaceTitleOverrides] = useState<Record<string, string>>(
+    () => readSurfaceTitleOverrides(),
+  );
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
+  const [renamingTabDraft, setRenamingTabDraft] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [windowMaximized, setWindowMaximized] = useState(false);
   useEffect(() => watchMaximized(setWindowMaximized), []);
@@ -4748,6 +4781,191 @@ export function AgentmuxTerminalApp() {
     },
     [ctl],
   );
+
+  // TS-3: close the current active tab (the tab whose root contains activePaneId)
+  const closeCurrentTab = useCallback(async () => {
+    if (!activePaneId || !activeWorkspaceId) return;
+    const activePane = paneById.get(activePaneId);
+    if (!activePane) return;
+    const tabRoot = rootPaneForPane(activePane);
+    // Find the representative (first) surface for this tab root
+    const order = currentSurfaceTabOrder(activeWorkspaceId);
+    const surfaceId = order.find((sid) => {
+      const host = paneHostingSurface(sid);
+      return host ? rootPaneForPane(host).paneId === tabRoot.paneId : false;
+    });
+    if (surfaceId) {
+      await ctl.closeSurface(surfaceId);
+    }
+  }, [activePaneId, activeWorkspaceId, paneById, paneHostingSurface, rootPaneForPane, currentSurfaceTabOrder, ctl]);
+
+  // TS-5: font size adjustments — clamp to FONT_SIZE_MIN..FONT_SIZE_MAX
+  const adjustFontSize = useCallback((delta: number) => {
+    setFontSize((prev) => {
+      const next = Math.round((prev + delta) / FONT_SIZE_STEP) * FONT_SIZE_STEP;
+      return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, next));
+    });
+  }, []);
+
+  const resetFontSize = useCallback(() => {
+    setFontSize(FONT_SIZE_DEFAULT);
+  }, []);
+
+  // TS-7: directional pane focus using DOM rects
+  const focusPaneInDirection = useCallback((direction: "left" | "right" | "up" | "down") => {
+    if (!activePaneId) return;
+    const allPanes = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    );
+    if (allPanes.length < 2) return;
+    const activeEl = allPanes.find((el) => el.getAttribute("data-agentmux-pane") === activePaneId);
+    if (!activeEl) return;
+    const activeRect = activeEl.getBoundingClientRect();
+    const activeCx = activeRect.left + activeRect.width / 2;
+    const activeCy = activeRect.top + activeRect.height / 2;
+
+    let bestEl: HTMLElement | null = null;
+    let bestScore = Infinity;
+
+    for (const el of allPanes) {
+      if (el === activeEl) continue;
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dx = cx - activeCx;
+      const dy = cy - activeCy;
+
+      // Primary axis must be positive in the requested direction
+      let primary: number;
+      let secondary: number;
+      switch (direction) {
+        case "left":  primary = -dx; secondary = Math.abs(dy); break;
+        case "right": primary = dx;  secondary = Math.abs(dy); break;
+        case "up":    primary = -dy; secondary = Math.abs(dx); break;
+        case "down":  primary = dy;  secondary = Math.abs(dx); break;
+      }
+      if (primary <= 0) continue;
+
+      // Score: primary distance + slight secondary-axis penalty
+      const score = primary + secondary * 0.5;
+      if (score < bestScore) {
+        bestScore = score;
+        bestEl = el;
+      }
+    }
+
+    if (bestEl) {
+      const paneId = bestEl.getAttribute("data-agentmux-pane");
+      if (paneId) void ctl.focusPane(paneId);
+    }
+  }, [activePaneId, ctl]);
+
+  // TS-8: keyboard pane resize — walk up to the ancestor split matching the axis
+  const resizePaneInDirection = useCallback((direction: "left" | "right" | "up" | "down") => {
+    if (!activePaneId) return;
+    const activePane = paneById.get(activePaneId);
+    if (!activePane) return;
+
+    // Determine which splitAxis we need for this direction
+    // splitAxis === "horizontal" → column layout (top/bottom split) → responds to up/down
+    // splitAxis !== "horizontal" (i.e. "vertical") → row layout → responds to left/right
+    const needsHorizontalAxis = direction === "up" || direction === "down";
+
+    // Walk up from active pane to find the nearest ancestor split with the matching axis
+    let current: PaneSummary | undefined = activePane;
+    let splitAncestor: PaneSummary | undefined;
+    let childOfSplit: PaneSummary | undefined;
+    const visited = new Set<string>();
+
+    while (current && current.parentPaneId && !visited.has(current.paneId)) {
+      visited.add(current.paneId);
+      const parent = paneById.get(current.parentPaneId);
+      if (!parent || parent.kind !== "split") break;
+      const parentIsHorizontal = parent.splitAxis === "horizontal";
+      if (parentIsHorizontal === needsHorizontalAxis) {
+        splitAncestor = parent;
+        childOfSplit = current;
+        break;
+      }
+      current = parent;
+    }
+
+    if (!splitAncestor || !childOfSplit) return;
+
+    const currentRatio = splitAncestor.splitRatio ?? 0.5;
+    const children = (childrenByParent.get(splitAncestor.paneId) ?? []);
+    const isFirstChild = children[0]?.paneId === childOfSplit.paneId;
+
+    // Growing left/up means making the first child larger (ratio increases)
+    // Growing right/down means making the second child larger (ratio decreases)
+    let delta: number;
+    if (direction === "right" || direction === "down") {
+      delta = isFirstChild ? -0.05 : 0.05;
+    } else {
+      delta = isFirstChild ? 0.05 : -0.05;
+    }
+
+    const newRatio = Math.min(0.9, Math.max(0.1, currentRatio + delta));
+    ctl.resizePane(splitAncestor.paneId, newRatio);
+  }, [activePaneId, paneById, childrenByParent, ctl]);
+
+  // TS-15: surface title override helpers
+  const setSurfaceTitleOverride = useCallback((surfaceId: string, title: string) => {
+    setSurfaceTitleOverrides((prev) => {
+      const next = { ...prev, [surfaceId]: title };
+      writeSurfaceTitleOverrides(next);
+      return next;
+    });
+  }, []);
+
+  const clearSurfaceTitleOverride = useCallback((surfaceId: string) => {
+    setSurfaceTitleOverrides((prev) => {
+      if (!(surfaceId in prev)) return prev;
+      const next = { ...prev };
+      delete next[surfaceId];
+      writeSurfaceTitleOverrides(next);
+      return next;
+    });
+  }, []);
+
+  const beginTabRename = useCallback((surfaceId: string, currentTitle: string) => {
+    setRenamingTabId(surfaceId);
+    setRenamingTabDraft(surfaceTitleOverrides[surfaceId] ?? currentTitle);
+  }, [surfaceTitleOverrides]);
+
+  const commitTabRename = useCallback((surfaceId: string) => {
+    const trimmed = renamingTabDraft.trim();
+    if (trimmed) {
+      setSurfaceTitleOverride(surfaceId, trimmed);
+    } else {
+      clearSurfaceTitleOverride(surfaceId);
+    }
+    setRenamingTabId(null);
+    setRenamingTabDraft("");
+  }, [renamingTabDraft, setSurfaceTitleOverride, clearSurfaceTitleOverride]);
+
+  const cancelTabRename = useCallback(() => {
+    setRenamingTabId(null);
+    setRenamingTabDraft("");
+  }, []);
+
+  // TS-15: rename current active tab via action
+  const renameCurrentTab = useCallback(() => {
+    if (!activePaneId || !activeWorkspaceId) return;
+    const activePane = paneById.get(activePaneId);
+    if (!activePane) return;
+    const tabRoot = rootPaneForPane(activePane);
+    const order = currentSurfaceTabOrder(activeWorkspaceId);
+    const surfaceId = order.find((sid) => {
+      const host = paneHostingSurface(sid);
+      return host ? rootPaneForPane(host).paneId === tabRoot.paneId : false;
+    });
+    if (!surfaceId) return;
+    const surface = surfaces.find((s) => s.surfaceId === surfaceId);
+    if (!surface) return;
+    beginTabRename(surfaceId, surface.title);
+  }, [activePaneId, activeWorkspaceId, paneById, rootPaneForPane, currentSurfaceTabOrder, paneHostingSurface, surfaces, beginTabRename]);
+
   const runTmuxProbe = useCallback(
     async (distributionOverride?: string | null) => {
       const fallbackDistribution =
@@ -5158,6 +5376,133 @@ export function AgentmuxTerminalApp() {
           selectSurfaceTab(order[prevIdx]);
         },
       },
+      // TS-2: jump to tab by 1-indexed position
+      ...(([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n) => ({
+        id: `surface.jumpTab${n}`,
+        group: "view" as const,
+        title: `${n}번 탭으로 이동`,
+        keywords: ["tab", "jump", String(n)],
+        run: () => {
+          if (!activeWorkspaceId) return;
+          const order = currentSurfaceTabOrder(activeWorkspaceId);
+          const target = order[n - 1];
+          if (target) selectSurfaceTab(target);
+        },
+      }))),
+      // TS-3: close current tab
+      {
+        id: "surface.closeTab",
+        group: "view",
+        title: "현재 탭 닫기",
+        keywords: ["tab", "close"],
+        disabled: activePaneId === null,
+        run: () => { void closeCurrentTab(); },
+      },
+      // TS-5: font size
+      {
+        id: "terminal.fontSizeUp",
+        group: "terminal",
+        title: "글꼴 크기 키우기",
+        keywords: ["font", "size", "zoom", "larger"],
+        run: () => { adjustFontSize(FONT_SIZE_STEP); },
+      },
+      {
+        id: "terminal.fontSizeDown",
+        group: "terminal",
+        title: "글꼴 크기 줄이기",
+        keywords: ["font", "size", "zoom", "smaller"],
+        run: () => { adjustFontSize(-FONT_SIZE_STEP); },
+      },
+      {
+        id: "terminal.fontSizeReset",
+        group: "terminal",
+        title: "글꼴 크기 초기화",
+        keywords: ["font", "size", "reset", "default"],
+        run: resetFontSize,
+      },
+      // TS-7: directional pane focus
+      {
+        id: "pane.focusLeft",
+        group: "terminal",
+        title: "왼쪽 페인 포커스",
+        keywords: ["pane", "focus", "left"],
+        disabled: activePaneId === null,
+        run: () => { focusPaneInDirection("left"); },
+      },
+      {
+        id: "pane.focusRight",
+        group: "terminal",
+        title: "오른쪽 페인 포커스",
+        keywords: ["pane", "focus", "right"],
+        disabled: activePaneId === null,
+        run: () => { focusPaneInDirection("right"); },
+      },
+      {
+        id: "pane.focusUp",
+        group: "terminal",
+        title: "위쪽 페인 포커스",
+        keywords: ["pane", "focus", "up"],
+        disabled: activePaneId === null,
+        run: () => { focusPaneInDirection("up"); },
+      },
+      {
+        id: "pane.focusDown",
+        group: "terminal",
+        title: "아래쪽 페인 포커스",
+        keywords: ["pane", "focus", "down"],
+        disabled: activePaneId === null,
+        run: () => { focusPaneInDirection("down"); },
+      },
+      // TS-8: keyboard pane resize
+      {
+        id: "pane.growLeft",
+        group: "terminal",
+        title: "왼쪽으로 페인 크기 조절",
+        keywords: ["pane", "resize", "grow", "left"],
+        disabled: activePaneId === null,
+        run: () => { resizePaneInDirection("left"); },
+      },
+      {
+        id: "pane.growRight",
+        group: "terminal",
+        title: "오른쪽으로 페인 크기 조절",
+        keywords: ["pane", "resize", "grow", "right"],
+        disabled: activePaneId === null,
+        run: () => { resizePaneInDirection("right"); },
+      },
+      {
+        id: "pane.growUp",
+        group: "terminal",
+        title: "위쪽으로 페인 크기 조절",
+        keywords: ["pane", "resize", "grow", "up"],
+        disabled: activePaneId === null,
+        run: () => { resizePaneInDirection("up"); },
+      },
+      {
+        id: "pane.growDown",
+        group: "terminal",
+        title: "아래쪽으로 페인 크기 조절",
+        keywords: ["pane", "resize", "grow", "down"],
+        disabled: activePaneId === null,
+        run: () => { resizePaneInDirection("down"); },
+      },
+      // TS-15: rename current tab
+      {
+        id: "surface.renameTab",
+        group: "view",
+        title: "탭 이름 바꾸기",
+        keywords: ["tab", "rename", "title"],
+        disabled: activePaneId === null,
+        run: renameCurrentTab,
+      },
+      // TS-16: fullscreen
+      {
+        id: "app.fullscreen",
+        group: "view",
+        title: "전체 화면 전환",
+        keywords: ["fullscreen", "f11"],
+        run: () => { toggleFullscreenWindow(); },
+      },
       ...customActionDescriptors,
       ...workspaceActionDescriptors,
       {
@@ -5205,13 +5550,16 @@ export function AgentmuxTerminalApp() {
       activeTerminalSession,
       activeWorkspaceId,
       addTerminal,
+      adjustFontSize,
       attentionPaneQueue.length,
+      closeCurrentTab,
       closeOverlay,
       createWorkspace,
       currentSurfaceTabOrder,
       ctl.createBrowserSurface,
       ctl.spawnAgent,
       customActionDescriptors,
+      focusPaneInDirection,
       isDark,
       jumpNextAttention,
       openContextLink,
@@ -5219,8 +5567,12 @@ export function AgentmuxTerminalApp() {
       openTerminalInPane,
       openTextBoxComposer,
       paneById,
+      paneHostingSurface,
       panes,
       promptCustomAgent,
+      renameCurrentTab,
+      resizePaneInDirection,
+      resetFontSize,
       rootPaneForPane,
       selectSurfaceTab,
       splitPaneBy,
@@ -5422,21 +5774,33 @@ export function AgentmuxTerminalApp() {
       }
 
       // ⌘/Ctrl +/-/0 — UI zoom (persisted; browser / VS Code convention).
+      // Check the shortcut index first so registered actions (e.g.
+      // terminal.fontSizeUp/Down/Reset on ctrl+=/−/0) take priority over the
+      // default zoom behaviour.
       if ((event.metaKey || event.ctrlKey) && !event.altKey) {
         if (key === "=" || key === "+") {
-          event.preventDefault();
-          nudgeZoom(ZOOM_STEP);
-          return;
+          const zoomStroke = keyboardEventToStroke(event);
+          if (!zoomStroke || !shortcutIndex.single.has(zoomStroke)) {
+            event.preventDefault();
+            nudgeZoom(ZOOM_STEP);
+            return;
+          }
         }
         if (key === "-" || key === "_") {
-          event.preventDefault();
-          nudgeZoom(-ZOOM_STEP);
-          return;
+          const zoomStroke = keyboardEventToStroke(event);
+          if (!zoomStroke || !shortcutIndex.single.has(zoomStroke)) {
+            event.preventDefault();
+            nudgeZoom(-ZOOM_STEP);
+            return;
+          }
         }
         if (key === "0") {
-          event.preventDefault();
-          resetZoom();
-          return;
+          const zoomStroke = keyboardEventToStroke(event);
+          if (!zoomStroke || !shortcutIndex.single.has(zoomStroke)) {
+            event.preventDefault();
+            resetZoom();
+            return;
+          }
         }
       }
 
@@ -7200,19 +7564,49 @@ export function AgentmuxTerminalApp() {
                         <IconShellArrow />
                       )}
                     </span>
-                    <span
-                      style={{
-                        font: `500 12px/1 ${FONT_SANS}`,
-                        color: on ? "var(--fg1)" : "var(--fg3)",
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        flex: 1,
-                        minWidth: 0,
-                      }}
-                    >
-                        {surface.title}
+                    {renamingTabId === surface.surfaceId ? (
+                      <input
+                        className="agentmux-surface-tab-rename-input"
+                        value={renamingTabDraft}
+                        autoFocus
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          font: `500 12px/1 ${FONT_SANS}`,
+                          color: "var(--fg1)",
+                          background: "var(--s3)",
+                          border: "1px solid var(--accent)",
+                          borderRadius: 3,
+                          padding: "1px 4px",
+                          outline: "none",
+                        }}
+                        onChange={(e) => setRenamingTabDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") { e.preventDefault(); commitTabRename(surface.surfaceId); }
+                          if (e.key === "Escape") { e.preventDefault(); cancelTabRename(); }
+                        }}
+                        onBlur={() => commitTabRename(surface.surfaceId)}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    ) : (
+                      <span
+                        style={{
+                          font: `500 12px/1 ${FONT_SANS}`,
+                          color: on ? "var(--fg1)" : "var(--fg3)",
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          flex: 1,
+                          minWidth: 0,
+                        }}
+                        onDoubleClick={(e) => {
+                          e.stopPropagation();
+                          beginTabRename(surface.surfaceId, surface.title);
+                        }}
+                      >
+                        {surfaceTitleOverrides[surface.surfaceId] ?? surface.title}
                       </span>
+                    )}
                     <Hov
                       tag="span"
                       className="agentmux-surface-tab-move-left"

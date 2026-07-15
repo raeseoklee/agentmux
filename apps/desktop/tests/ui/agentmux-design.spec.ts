@@ -2531,3 +2531,207 @@ test("tab attention dot is absent on a different tab when only the other tab's s
   // Tab 1 (first) must NOT show the attention dot.
   await expect(tabs.first()).toHaveAttribute("data-agentmux-tab-attention", "false");
 });
+
+// ---- TS-2: jump to tab N with Ctrl+Alt+1..9 --------------------------------
+
+test("Ctrl+Alt+2 jumps directly to the second tab (TS-2)", async ({ page }) => {
+  await bootPreview(page);
+
+  // Create two terminal tabs.
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  // Start on tab 0.
+  await tabs.nth(0).click();
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "true");
+
+  // Dispatch Ctrl+Alt+2 — same synthetic approach as the Ctrl+Tab test.
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "2",
+        code: "Digit2",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+
+  // Tab 1 (second) should now be active.
+  await expect(tabs.nth(1)).toHaveAttribute("data-agentmux-tab-active", "true");
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "false");
+});
+
+test("Ctrl+Alt+1 is a no-op when only one tab exists (TS-2)", async ({ page }) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(1);
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "true");
+
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "1",
+        code: "Digit1",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+
+  // Still one tab active.
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "true");
+});
+
+// ---- TS-3: close current tab with Ctrl+Shift+W ----------------------------
+
+test("Ctrl+Shift+W closes the current tab (TS-3)", async ({ page }) => {
+  await bootPreview(page);
+
+  // Create two terminal tabs.
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  // Activate the second tab.
+  await tabs.nth(1).click();
+  await expect(tabs.nth(1)).toHaveAttribute("data-agentmux-tab-active", "true");
+
+  // Dispatch Ctrl+Shift+W.
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "w",
+        code: "KeyW",
+        ctrlKey: true,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+
+  // One tab should remain.
+  await expect(tabs).toHaveCount(1);
+});
+
+// ---- TS-5: font size zoom --------------------------------------------------
+
+test("Ctrl+= increases font size and Ctrl+0 resets it (TS-5)", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+
+  // Read the initial font size from the live terminal data attribute.
+  const getStoredFontSize = () =>
+    page.evaluate(() => {
+      const raw = window.localStorage.getItem("agentmux.preview.config.v1");
+      return raw ? (JSON.parse(raw) as { appearance?: { fontSize?: number } }).appearance?.fontSize ?? null : null;
+    });
+
+  // Dispatch Ctrl+= (fontSizeUp).
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "=",
+        code: "Equal",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+
+  // Config should be updated with a larger font size.
+  await expect.poll(getStoredFontSize).toBeGreaterThan(12.5);
+
+  // Dispatch Ctrl+- (fontSizeDown) twice to go below default.
+  for (let i = 0; i < 3; i++) {
+    await page.evaluate(() => {
+      window.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "-",
+          code: "Minus",
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+  }
+  await expect.poll(getStoredFontSize).toBeLessThan(12.5);
+
+  // Dispatch Ctrl+0 (fontSizeReset).
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "0",
+        code: "Digit0",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+
+  await expect.poll(getStoredFontSize).toBe(12.5);
+});
+
+// ---- TS-7: directional pane focus with Alt+Arrow --------------------------
+
+test("Alt+ArrowRight moves focus to the right pane after a vertical split (TS-7)", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
+  await bootPreview(page);
+
+  // Open a terminal and split vertically (side by side).
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+  await page.locator(".agentmux-top-split-vertical").click();
+  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+
+  // Open terminal in the second pane.
+  await page.getByRole("button", { name: "Open terminal" }).last().click();
+  const mountedPanes = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(mountedPanes).toHaveCount(2);
+
+  // Click the first (left) pane to focus it.
+  await mountedPanes.nth(0).click();
+  await expect(mountedPanes.nth(0)).toHaveAttribute("data-agentmux-active", "true");
+  await expect(mountedPanes.nth(1)).toHaveAttribute("data-agentmux-active", "false");
+
+  // Dispatch Alt+ArrowRight.
+  await page.evaluate(() => {
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "ArrowRight",
+        code: "ArrowRight",
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+  });
+
+  // The second (right) pane should now be active.
+  await expect(mountedPanes.nth(1)).toHaveAttribute("data-agentmux-active", "true");
+  await expect(mountedPanes.nth(0)).toHaveAttribute("data-agentmux-active", "false");
+});

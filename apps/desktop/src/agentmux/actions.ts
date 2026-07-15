@@ -57,7 +57,30 @@ export const DEFAULT_SHORTCUT_BINDINGS: ShortcutBindingMap = {
   "pane.splitDown": "ctrl+shift+d",
   "browser.openContextLink": "ctrl+shift+l",
   "surface.nextTab": "ctrl+tab",
-  "surface.prevTab": "ctrl+shift+tab"
+  "surface.prevTab": "ctrl+shift+tab",
+  "surface.jumpTab1": "ctrl+alt+1",
+  "surface.jumpTab2": "ctrl+alt+2",
+  "surface.jumpTab3": "ctrl+alt+3",
+  "surface.jumpTab4": "ctrl+alt+4",
+  "surface.jumpTab5": "ctrl+alt+5",
+  "surface.jumpTab6": "ctrl+alt+6",
+  "surface.jumpTab7": "ctrl+alt+7",
+  "surface.jumpTab8": "ctrl+alt+8",
+  "surface.jumpTab9": "ctrl+alt+9",
+  "surface.closeTab": "ctrl+shift+w",
+  "surface.renameTab": "f2",
+  "terminal.fontSizeUp": "ctrl+=",
+  "terminal.fontSizeDown": "ctrl+-",
+  "terminal.fontSizeReset": "ctrl+0",
+  "pane.focusLeft": "alt+left",
+  "pane.focusRight": "alt+right",
+  "pane.focusUp": "alt+up",
+  "pane.focusDown": "alt+down",
+  "pane.growLeft": "ctrl+alt+shift+left",
+  "pane.growRight": "ctrl+alt+shift+right",
+  "pane.growUp": "ctrl+alt+shift+up",
+  "pane.growDown": "ctrl+alt+shift+down",
+  "app.fullscreen": "f11"
 };
 
 export function buildResolvedShortcutBindings(
