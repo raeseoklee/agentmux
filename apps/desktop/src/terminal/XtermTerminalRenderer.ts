@@ -1021,12 +1021,17 @@ export class XtermTerminalRenderer implements TerminalRenderer {
         this.copySelection(terminal);
         return false;
       }
-      // Ctrl+C always interrupts. Copy-on-select already lifted any selection
-      // to the clipboard, so the old copy-when-selection-exists dual role only
-      // stole SIGINT whenever a stale highlight lingered ("취소가 안 된다").
-      // Clear the highlight so the next Ctrl+C visibly reaches the shell.
+      // Windows Terminal semantics: with a visible selection Ctrl+C copies and
+      // DISMISSES it — no SIGINT alongside the copy. The selection is cleared
+      // so the very next Ctrl+C reaches the shell; without a selection Ctrl+C
+      // interrupts as usual. (Copy-on-select already put the text on the
+      // clipboard, so the copy here is a no-op refresh of the same content.)
       if (hasSelection) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.copySelection(terminal);
         terminal.clearSelection();
+        return false;
       }
       return true;
     }

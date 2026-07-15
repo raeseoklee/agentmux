@@ -11701,6 +11701,7 @@ fn normalize_restored_agent_launch(command_line: &str) -> Option<String> {
 
 fn normalize_claude_restore_args(tokens: &[String]) -> String {
     let mut restored = vec!["claude".to_string()];
+    let mut continues = false;
     let mut index = 1;
     while index < tokens.len() {
         let token = tokens[index].as_str();
@@ -11715,10 +11716,84 @@ fn normalize_claude_restore_args(tokens: &[String]) -> String {
             index += 1;
             continue;
         }
-        restored.push(tokens[index].clone());
+        // The label is scraped from live terminal content, so it can carry
+        // mangled fragments of a corrupted echo (observed: `--dan[C`), and a
+        // bare token is the original prompt, which must not be replayed as a
+        // new conversation. Keep only plausible flags — and their value token
+        // when the flag takes one — and drop everything else.
+        if is_plausible_agent_flag(token) {
+            if matches!(token, "-c" | "--continue") {
+                continues = true;
+            }
+            restored.push(tokens[index].clone());
+            index += 1;
+            if claude_flag_takes_value(token)
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                restored.push(tokens[index].clone());
+                index += 1;
+            }
+            continue;
+        }
         index += 1;
     }
+    // Continue the previous conversation instead of starting a fresh one,
+    // mirroring the codex restore path's `resume --last`.
+    if !continues {
+        restored.push("-c".to_string());
+    }
     join_command_tokens(&restored)
+}
+
+/// A flag token scraped from terminal content is plausible when it looks like
+/// a real CLI option: `-`/`--` prefix followed by ASCII alphanumerics, dashes,
+/// or an inline `=value` limited to path-ish characters. Fragments of mangled
+/// echoes (`--dan[C`) and stray escape remnants fail this test and are dropped
+/// rather than typed back into the restored shell.
+fn is_plausible_agent_flag(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix('-') else {
+        return false;
+    };
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    if rest.is_empty() {
+        return false;
+    }
+    let (name, value) = match rest.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (rest, None),
+    };
+    let name_ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-');
+    let value_ok = match value {
+        None => true,
+        Some(value) => value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '\\')
+        }),
+    };
+    name_ok && value_ok
+}
+
+/// Claude flags that consume the following token as their value. Boolean
+/// switches must be listed out so a scraped prompt after them is not mistaken
+/// for a value.
+fn claude_flag_takes_value(token: &str) -> bool {
+    if token.contains('=') {
+        return false;
+    }
+    !matches!(
+        token,
+        "-c" | "--continue"
+            | "--dangerously-skip-permissions"
+            | "--verbose"
+            | "-d"
+            | "--debug"
+            | "-p"
+            | "--print"
+            | "--fast"
+    )
 }
 
 fn normalize_codex_restore_args(tokens: &[String]) -> String {
@@ -11733,10 +11808,16 @@ fn normalize_codex_restore_args(tokens: &[String]) -> String {
             break;
         }
         if token.starts_with('-') {
-            restored.push(tokens[index].clone());
-            index += 1;
-            if codex_option_takes_value(token) && index < tokens.len() {
+            // Same mangled-fragment guard as the claude path: labels are
+            // scraped from terminal content and may carry corrupted echoes.
+            if is_plausible_agent_flag(token) {
                 restored.push(tokens[index].clone());
+                index += 1;
+                if codex_option_takes_value(token) && index < tokens.len() {
+                    restored.push(tokens[index].clone());
+                    index += 1;
+                }
+            } else {
                 index += 1;
             }
         } else {
@@ -14936,7 +15017,43 @@ mod tests {
 
         assert_eq!(
             restored_agent_launch_line(&session, &state).as_deref(),
-            Some("claude")
+            Some("claude -c")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_drops_mangled_flag_fragments() {
+        // A corrupted echo once persisted `claude --dan[C` as the agent label
+        // (the tail of an ANSI escape spliced into the flag). Restores must
+        // drop the garbage token instead of typing it back into the shell.
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-tmux-control".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["bash".to_string(), "-l".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "durable".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude --dan[C".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude --dan[C"}"#.to_string()),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude -c")
         );
     }
 
@@ -14974,7 +15091,7 @@ mod tests {
 
         assert_eq!(
             restored_agent_launch_line(&session, &state).as_deref(),
-            Some("claude --dangerously-skip-permissions")
+            Some("claude --dangerously-skip-permissions -c")
         );
     }
 
@@ -15463,7 +15580,10 @@ mod tests {
             );
             let restored = store.load_agent_state(&first_session_id).unwrap().unwrap();
             assert_eq!(restored.state, "running");
-            assert_eq!(restored.reason.as_deref(), Some("Agent restored: claude"));
+            assert_eq!(
+                restored.reason.as_deref(),
+                Some("Agent restored: claude -c")
+            );
         }
 
         {
