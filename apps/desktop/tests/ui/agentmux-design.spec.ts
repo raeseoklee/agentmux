@@ -1077,6 +1077,57 @@ test("tab switch focuses the remembered pane within the tab, not the root pane",
   await expect(panesAfterReturn.nth(0)).toHaveAttribute("data-agentmux-active", "false");
 });
 
+test("Ctrl+Tab and Ctrl+Shift+Tab cycle through surface tabs with wrap-around", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  // Create two terminal tabs.
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  // Click tab 0 to make it active.
+  await tabs.nth(0).click();
+
+  // Helper to dispatch a synthetic KeyboardEvent at window level (capture phase).
+  // page.keyboard.press("Control+Tab") may be consumed by headless Chromium itself,
+  // so we dispatch a real KeyboardEvent that the app's capture-phase listener sees.
+  const dispatchTabKey = (shift: boolean) =>
+    page.evaluate((shiftKey) => {
+      const ev = new KeyboardEvent("keydown", {
+        key: "Tab",
+        code: "Tab",
+        ctrlKey: true,
+        shiftKey,
+        bubbles: true,
+        cancelable: true,
+      });
+      window.dispatchEvent(ev);
+    }, shift);
+
+  // Ctrl+Tab from tab 0 → tab 1.
+  await dispatchTabKey(false);
+  await expect(tabs.nth(1)).toHaveAttribute("data-agentmux-tab-active", "true");
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "false");
+
+  // Ctrl+Tab from tab 1 wraps back to tab 0.
+  await dispatchTabKey(false);
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "true");
+  await expect(tabs.nth(1)).toHaveAttribute("data-agentmux-tab-active", "false");
+
+  // Ctrl+Shift+Tab from tab 0 wraps backward to tab 1.
+  await dispatchTabKey(true);
+  await expect(tabs.nth(1)).toHaveAttribute("data-agentmux-tab-active", "true");
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "false");
+
+  // Ctrl+Shift+Tab from tab 1 goes backward to tab 0.
+  await dispatchTabKey(true);
+  await expect(tabs.nth(0)).toHaveAttribute("data-agentmux-tab-active", "true");
+  await expect(tabs.nth(1)).toHaveAttribute("data-agentmux-tab-active", "false");
+});
+
 test("setup wizard saves workspace defaults and probes tmux", async ({
   page,
 }) => {

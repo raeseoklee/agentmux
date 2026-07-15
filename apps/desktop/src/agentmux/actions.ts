@@ -55,7 +55,9 @@ export const DEFAULT_SHORTCUT_BINDINGS: ShortcutBindingMap = {
   "terminal.textBox": "ctrl+alt+i",
   "pane.splitRight": "ctrl+d",
   "pane.splitDown": "ctrl+shift+d",
-  "browser.openContextLink": "ctrl+shift+l"
+  "browser.openContextLink": "ctrl+shift+l",
+  "surface.nextTab": "ctrl+tab",
+  "surface.prevTab": "ctrl+shift+tab"
 };
 
 export function buildResolvedShortcutBindings(

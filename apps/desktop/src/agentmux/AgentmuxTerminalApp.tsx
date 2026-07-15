@@ -4938,6 +4938,26 @@ export function AgentmuxTerminalApp() {
       })),
     [closeOverlay, ctl.spawnWslTerminal, wslDistributions],
   );
+  const selectSurfaceTab = useCallback(
+    (surfaceId: string) => {
+      const host = panes.find((pane) => pane.mountedSurfaceId === surfaceId);
+      if (host) {
+        const tabRoot = rootPaneForPane(host);
+        const rememberedPaneId = lastActivePaneByRootId.get(tabRoot.paneId);
+        const rememberedPane = rememberedPaneId
+          ? paneById.get(rememberedPaneId)
+          : undefined;
+        const targetPaneId =
+          rememberedPane?.kind === "leaf"
+            ? rememberedPane.paneId
+            : host.paneId;
+        void ctl.focusPane(targetPaneId);
+      } else {
+        void ctl.mountSurface(surfaceId);
+      }
+    },
+    [ctl, lastActivePaneByRootId, paneById, panes, rootPaneForPane],
+  );
   const actions = useMemo<ActionDescriptor[]>(
     () => [
       {
@@ -5096,6 +5116,48 @@ export function AgentmuxTerminalApp() {
           void openContextLink();
         },
       },
+      {
+        id: "surface.nextTab",
+        group: "view",
+        title: "다음 탭",
+        keywords: ["tab", "next", "surface", "cycle"],
+        run: () => {
+          if (!activeWorkspaceId) return;
+          const order = currentSurfaceTabOrder(activeWorkspaceId);
+          if (order.length < 2) return;
+          const activePane = activePaneId ? paneById.get(activePaneId) : undefined;
+          const activeRoot = activePane ? rootPaneForPane(activePane) : undefined;
+          const currentIdx = activeRoot
+            ? order.findIndex((sid) => {
+                const h = paneHostingSurface(sid);
+                return h ? rootPaneForPane(h).paneId === activeRoot.paneId : false;
+              })
+            : -1;
+          const nextIdx = (currentIdx + 1) % order.length;
+          selectSurfaceTab(order[nextIdx]);
+        },
+      },
+      {
+        id: "surface.prevTab",
+        group: "view",
+        title: "이전 탭",
+        keywords: ["tab", "prev", "previous", "surface", "cycle"],
+        run: () => {
+          if (!activeWorkspaceId) return;
+          const order = currentSurfaceTabOrder(activeWorkspaceId);
+          if (order.length < 2) return;
+          const activePane = activePaneId ? paneById.get(activePaneId) : undefined;
+          const activeRoot = activePane ? rootPaneForPane(activePane) : undefined;
+          const currentIdx = activeRoot
+            ? order.findIndex((sid) => {
+                const h = paneHostingSurface(sid);
+                return h ? rootPaneForPane(h).paneId === activeRoot.paneId : false;
+              })
+            : -1;
+          const prevIdx = (currentIdx - 1 + order.length) % order.length;
+          selectSurfaceTab(order[prevIdx]);
+        },
+      },
       ...customActionDescriptors,
       ...workspaceActionDescriptors,
       {
@@ -5141,10 +5203,12 @@ export function AgentmuxTerminalApp() {
     [
       activePaneId,
       activeTerminalSession,
+      activeWorkspaceId,
       addTerminal,
       attentionPaneQueue.length,
       closeOverlay,
       createWorkspace,
+      currentSurfaceTabOrder,
       ctl.createBrowserSurface,
       ctl.spawnAgent,
       customActionDescriptors,
@@ -5154,7 +5218,11 @@ export function AgentmuxTerminalApp() {
       openNotificationPanel,
       openTerminalInPane,
       openTextBoxComposer,
+      paneById,
+      panes,
       promptCustomAgent,
+      rootPaneForPane,
+      selectSurfaceTab,
       splitPaneBy,
       t,
       workspaceActionDescriptors,
@@ -7069,6 +7137,7 @@ export function AgentmuxTerminalApp() {
                     key={surface.surfaceId}
                     className="agentmux-surface-tab"
                     data-agentmux-surface-tab={surface.surfaceId}
+                    data-agentmux-tab-active={on ? "true" : "false"}
                     data-agentmux-tab-attention={att ? "true" : "false"}
                     draggable
                     onDragStart={(event) => beginSurfaceTabDrag(event, surface)}
@@ -7115,26 +7184,7 @@ export function AgentmuxTerminalApp() {
                     })()}
                     hover={on ? {} : { background: "var(--s2)" }}
                     onClick={() => {
-                      if (host) {
-                        // On tab switch, restore the last-focused pane within
-                        // this tab's tree rather than always jumping to the
-                        // tab's representative (root) pane. Falls back to the
-                        // host pane when no prior focus has been recorded.
-                        const tabRoot = rootPaneForPane(host);
-                        const rememberedPaneId = lastActivePaneByRootId.get(
-                          tabRoot.paneId,
-                        );
-                        const rememberedPane = rememberedPaneId
-                          ? paneById.get(rememberedPaneId)
-                          : undefined;
-                        const targetPaneId =
-                          rememberedPane?.kind === "leaf"
-                            ? rememberedPane.paneId
-                            : host.paneId;
-                        void ctl.focusPane(targetPaneId);
-                      } else {
-                        void ctl.mountSurface(surface.surfaceId);
-                      }
+                      selectSurfaceTab(surface.surfaceId);
                     }}
                   >
                     <span
