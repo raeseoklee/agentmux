@@ -173,3 +173,33 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* TS-13: pane zoom — CSS-only, no remount.
+   When data-agentmux-zoomed-pane is set on the pane-tree wrapper, all leaf
+   panes become invisible (keeping sessions running and the fit observer idle)
+   while the one with data-agentmux-zoomed="true" is absolutely positioned to
+   fill the entire pane area. display:none would pause the xterm resize observer;
+   visibility:hidden lets it idle cleanly. */
+[data-agentmux-pane-tree][data-agentmux-zoomed-pane] {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Hide every leaf pane while zoom is active. */
+[data-agentmux-pane-tree][data-agentmux-zoomed-pane] [data-agentmux-pane] {
+  visibility: hidden;
+}
+
+/* Reveal and overlay the zoomed pane. */
+[data-agentmux-pane-tree][data-agentmux-zoomed-pane] [data-agentmux-pane][data-agentmux-zoomed="true"] {
+  visibility: visible;
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  flex: none;
+  width: 100%;
+  height: 100%;
+  border-radius: 7px;
+}

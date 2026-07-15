@@ -80,7 +80,10 @@ export const DEFAULT_SHORTCUT_BINDINGS: ShortcutBindingMap = {
   "pane.growRight": "ctrl+alt+shift+right",
   "pane.growUp": "ctrl+alt+shift+up",
   "pane.growDown": "ctrl+alt+shift+down",
-  "app.fullscreen": "f11"
+  "app.fullscreen": "f11",
+  "workspace.next": "ctrl+alt+down",
+  "workspace.prev": "ctrl+alt+up",
+  "pane.zoomToggle": "ctrl+shift+z"
 };
 
 export function buildResolvedShortcutBindings(

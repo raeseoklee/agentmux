@@ -32,6 +32,27 @@ export function terminalCommandsForSession(sessionId: string): TerminalCommands 
   return _terminalCommandRegistry.get(sessionId) ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// Broadcast resolver (TS-14)
+// ---------------------------------------------------------------------------
+
+/**
+ * When set, called with the typing session's ID. Return an array of peer
+ * session IDs that should also receive the same input, or null/empty to
+ * disable broadcast for that session.
+ */
+type BroadcastResolver = (sessionId: string) => string[] | null;
+
+let _broadcastResolver: BroadcastResolver | null = null;
+
+/**
+ * Register (or clear) the broadcast resolver. AgentmuxTerminalApp calls this
+ * once (useEffect) and updates it via a stable ref so closures stay fresh.
+ */
+export function setBroadcastResolver(fn: BroadcastResolver | null): void {
+  _broadcastResolver = fn;
+}
+
 const encoder = new TextEncoder();
 const SNAPSHOT_HOT_POLL_MS = 32;
 const SNAPSHOT_BOOT_POLL_MS = 80;
@@ -988,6 +1009,12 @@ export function LiveTerminal({
       const unsubscribeInput = renderer.onData((data) => {
         notePossibleExitInput(data);
         client.sendText(sessionId, data).catch(() => onError?.());
+        const peers = _broadcastResolver?.(sessionId);
+        if (peers && peers.length > 0) {
+          for (const peerId of peers) {
+            client.sendText(peerId, data).catch(() => {});
+          }
+        }
       });
       const unsubscribePaste = renderer.onPaste((text) => {
         notePossibleExitInput(text);
@@ -995,6 +1022,12 @@ export function LiveTerminal({
           ? client.sendPaste.bind(client)
           : client.sendText.bind(client);
         sendPaste(sessionId, text).catch(() => onError?.());
+        const peers = _broadcastResolver?.(sessionId);
+        if (peers && peers.length > 0) {
+          for (const peerId of peers) {
+            client.sendText(peerId, text).catch(() => {});
+          }
+        }
       });
 
       void client
@@ -1146,6 +1179,12 @@ export function LiveTerminal({
             requestSnapshotPoll();
           })
           .catch(() => onError?.());
+        const peers = _broadcastResolver?.(sessionId);
+        if (peers && peers.length > 0) {
+          for (const peerId of peers) {
+            client.sendText(peerId, data).catch(() => {});
+          }
+        }
       });
       const unsubscribePaste = renderer.onPaste((text) => {
         notePossibleExitInput(text);
@@ -1156,6 +1195,12 @@ export function LiveTerminal({
         sendPaste(sessionId, text)
           .then(requestSnapshotPoll)
           .catch(() => onError?.());
+        const peers = _broadcastResolver?.(sessionId);
+        if (peers && peers.length > 0) {
+          for (const peerId of peers) {
+            client.sendText(peerId, text).catch(() => {});
+          }
+        }
       });
 
       void pollSnapshot();
@@ -1296,6 +1341,12 @@ export function LiveTerminal({
         .sendText(sessionId, data)
         .then(requestFallbackPoll)
         .catch(() => onError?.());
+      const peers = _broadcastResolver?.(sessionId);
+      if (peers && peers.length > 0) {
+        for (const peerId of peers) {
+          client.sendText(peerId, data).catch(() => {});
+        }
+      }
     });
     const unsubscribePaste = renderer.onPaste((text) => {
       notePossibleExitInput(text);
@@ -1306,6 +1357,12 @@ export function LiveTerminal({
       sendPaste(sessionId, text)
         .then(requestFallbackPoll)
         .catch(() => onError?.());
+      const peers = _broadcastResolver?.(sessionId);
+      if (peers && peers.length > 0) {
+        for (const peerId of peers) {
+          client.sendText(peerId, text).catch(() => {});
+        }
+      }
     });
 
     void poll();

@@ -64,7 +64,7 @@ import {
 } from "./actions";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
 import { Hov } from "./Hov";
-import { LiveTerminal, TerminalRestorePreview } from "./LiveTerminal";
+import { LiveTerminal, TerminalRestorePreview, setBroadcastResolver, terminalCommandsForSession } from "./LiveTerminal";
 import { SplitHandle } from "./SplitHandle";
 import { useAgentmuxControl } from "./useAgentmuxControl";
 import {
@@ -1423,6 +1423,8 @@ interface PaneViewProps {
   onOpenTerminalLink: (url: string, paneId: string) => void;
   onTerminalExitIntent: (sessionId: string) => void;
   isDragOver: boolean;
+  isZoomed?: boolean;
+  isBroadcast?: boolean;
   onPaneDragStart: (
     event: ReactDragEvent<HTMLElement>,
     paneId: string,
@@ -1461,6 +1463,8 @@ const PaneView = memo(function PaneView({
   terminalLaunchPending,
   t,
   isDragOver,
+  isZoomed = false,
+  isBroadcast = false,
   focusPane,
   splitPaneBy,
   closePane,
@@ -1527,6 +1531,7 @@ const PaneView = memo(function PaneView({
       data-agentmux-mounted-surface={surface?.surfaceId ?? ""}
       data-agentmux-active={active ? "true" : "false"}
       data-agentmux-attention={hasAttention ? "true" : "false"}
+      data-agentmux-zoomed={isZoomed ? "true" : undefined}
       data-agentmux-drag-over={isDragOver ? "true" : undefined}
       onDragOver={(event) => onPaneDragOver(event, pane.paneId)}
       onDragLeave={onPaneDragLeave}
@@ -1623,6 +1628,40 @@ const PaneView = memo(function PaneView({
             }}
           >
             {session.backendKind}
+          </span>
+        ) : null}
+        {isZoomed ? (
+          <span
+            className="agentmux-pane-zoom-badge"
+            title="페인 확대 중 — Ctrl+Shift+Z로 복원"
+            style={{
+              font: `700 9px/1 ${FONT_SANS}`,
+              color: "#fff",
+              background: "var(--accent)",
+              borderRadius: 4,
+              padding: "3px 6px",
+              flex: "none",
+              letterSpacing: 0.5,
+            }}
+          >
+            ZOOM
+          </span>
+        ) : null}
+        {isBroadcast ? (
+          <span
+            className="agentmux-pane-broadcast-badge"
+            title="브로드캐스트 입력 활성 — 팔레트에서 비활성화"
+            style={{
+              font: `700 9px/1 ${FONT_SANS}`,
+              color: "#fff",
+              background: "#d97706",
+              borderRadius: 4,
+              padding: "3px 6px",
+              flex: "none",
+              letterSpacing: 0.5,
+            }}
+          >
+            BCAST
           </span>
         ) : null}
         <div style={{ flex: 1 }} />
@@ -1999,6 +2038,11 @@ export function AgentmuxTerminalApp() {
     setDragSourceId(null);
     setDragFeedback(null);
   }, []);
+  // TS-13: zoom state — the pane ID being zoomed, or null.
+  const [zoomedPaneId, setZoomedPaneId] = useState<string | null>(null);
+  // TS-14: broadcast state — the root pane ID whose tab is in broadcast mode, or null.
+  const [broadcastRootId, setBroadcastRootId] = useState<string | null>(null);
+  const broadcastRootIdRef = useRef<string | null>(null);
   const terminalLaunchPendingRef = useRef(false);
   const autoUpdateCheckStartedRef = useRef(false);
   const updateResourceRef = useRef<TauriUpdate | null>(null);
@@ -2903,6 +2947,82 @@ export function AgentmuxTerminalApp() {
       ),
     [groupedWorkspaceIds, workspaceOrder, workspaces],
   );
+
+  // TS-17: Compute the visible sidebar workspace order — groups (in their sorted
+  // order) with their member workspaces, then ungrouped workspaces. This mirrors
+  // exactly what the sidebar renders so cycling always matches what the user sees.
+  const sidebarWorkspaceOrder = useMemo<WorkspaceSummary[]>(() => {
+    const ordered: WorkspaceSummary[] = [];
+    for (const { workspaces: members } of workspaceGroupsView) {
+      ordered.push(...members);
+    }
+    // Then ungrouped workspaces in their stored order.
+    ordered.push(...ungroupedWorkspaces);
+    return ordered;
+  }, [workspaceGroupsView, ungroupedWorkspaces]);
+
+  // TS-13: auto-clear zoom when the zoomed pane no longer exists or the active
+  // tab root changes (i.e. user switched to a different tab).
+  useEffect(() => {
+    if (!zoomedPaneId) return;
+    const zoomed = paneById.get(zoomedPaneId);
+    if (!zoomed) {
+      setZoomedPaneId(null);
+      return;
+    }
+    // If the zoomed pane is not in the current tab's tree, clear it.
+    if (rootPaneId) {
+      const zoomedRoot = rootPaneForPane(zoomed);
+      if (zoomedRoot.paneId !== rootPaneId) {
+        setZoomedPaneId(null);
+      }
+    }
+  }, [zoomedPaneId, paneById, rootPaneId, rootPaneForPane]);
+
+  // TS-14: keep broadcastRootIdRef in sync and auto-disable when tab changes or
+  // pane count drops below 2.
+  useEffect(() => {
+    broadcastRootIdRef.current = broadcastRootId;
+  }, [broadcastRootId]);
+
+  useEffect(() => {
+    if (!broadcastRootId) return;
+    // Disable if fewer than 2 leaf panes in the current tab.
+    if (orderedLeafPaneIds.length < 2) {
+      setBroadcastRootId(null);
+      return;
+    }
+    // Disable if the active tab root no longer matches the broadcast root.
+    if (rootPaneId && broadcastRootId !== rootPaneId) {
+      setBroadcastRootId(null);
+    }
+  }, [broadcastRootId, orderedLeafPaneIds.length, rootPaneId]);
+
+  // TS-14: Register/update the broadcast resolver with LiveTerminal whenever
+  // relevant state changes. The resolver reads from the ref so it's always fresh.
+  useEffect(() => {
+    setBroadcastResolver((typingSessionId) => {
+      const rootId = broadcastRootIdRef.current;
+      if (!rootId) return null;
+      // Collect all leaf session IDs in the tab except the typing one.
+      const peers: string[] = [];
+      for (const pane of panes) {
+        if (pane.kind !== "leaf") continue;
+        const surface = pane.mountedSurfaceId
+          ? surfaces.find((s) => s.surfaceId === pane.mountedSurfaceId)
+          : undefined;
+        const sessionId = surface?.sessionId;
+        if (!sessionId || sessionId === typingSessionId) continue;
+        peers.push(sessionId);
+      }
+      return peers.length > 0 ? peers : null;
+    });
+    return () => {
+      setBroadcastResolver(null);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panes, surfaces]);
+
   const normalizedWorkspaceFilter = workspaceFilterText.trim().toLowerCase();
   const workspaceFilterActive = normalizedWorkspaceFilter.length > 0;
   const visibleWorkspaceGroupsView = useMemo(() => {
@@ -5503,6 +5623,91 @@ export function AgentmuxTerminalApp() {
         keywords: ["fullscreen", "f11"],
         run: () => { toggleFullscreenWindow(); },
       },
+      // TS-17: workspace cycling
+      {
+        id: "workspace.next",
+        group: "workspace",
+        title: "다음 워크스페이스",
+        keywords: ["workspace", "next", "cycle"],
+        disabled: sidebarWorkspaceOrder.length < 2,
+        run: () => {
+          if (sidebarWorkspaceOrder.length < 2) return;
+          const idx = sidebarWorkspaceOrder.findIndex(
+            (ws) => ws.workspaceId === activeWorkspaceId,
+          );
+          const nextIdx = (idx + 1) % sidebarWorkspaceOrder.length;
+          void ctl.selectWorkspace(sidebarWorkspaceOrder[nextIdx].workspaceId);
+        },
+      },
+      {
+        id: "workspace.prev",
+        group: "workspace",
+        title: "이전 워크스페이스",
+        keywords: ["workspace", "prev", "previous", "cycle"],
+        disabled: sidebarWorkspaceOrder.length < 2,
+        run: () => {
+          if (sidebarWorkspaceOrder.length < 2) return;
+          const idx = sidebarWorkspaceOrder.findIndex(
+            (ws) => ws.workspaceId === activeWorkspaceId,
+          );
+          const prevIdx = (idx - 1 + sidebarWorkspaceOrder.length) % sidebarWorkspaceOrder.length;
+          void ctl.selectWorkspace(sidebarWorkspaceOrder[prevIdx].workspaceId);
+        },
+      },
+      // TS-13: pane zoom toggle
+      {
+        id: "pane.zoomToggle",
+        group: "terminal",
+        title: "페인 확대/복원",
+        keywords: ["pane", "zoom", "maximize", "restore"],
+        disabled: activePaneId === null || orderedLeafPaneIds.length < 2,
+        run: () => {
+          if (!activePaneId) return;
+          setZoomedPaneId((prev) => (prev === activePaneId ? null : activePaneId));
+        },
+      },
+      // TS-14: broadcast input toggle (palette-only, no default binding)
+      {
+        id: "pane.broadcastToggle",
+        group: "terminal",
+        title: "전체 페인 입력 브로드캐스트",
+        keywords: ["broadcast", "sync", "pane", "input", "all"],
+        disabled: orderedLeafPaneIds.length < 2,
+        run: () => {
+          setBroadcastRootId((prev) => {
+            if (prev !== null && prev === rootPaneId) return null;
+            return rootPaneId ?? null;
+          });
+          closeOverlay();
+        },
+      },
+      // Palette glue: TS-4 / TS-6 — resolve the active pane's session
+      {
+        id: "terminal.clearBuffer",
+        group: "terminal",
+        title: "터미널 버퍼 지우기",
+        keywords: ["clear", "buffer", "terminal"],
+        disabled: !activeTerminalSession,
+        run: () => {
+          if (activeTerminalSession) {
+            terminalCommandsForSession(activeTerminalSession.sessionId)?.clearBuffer();
+          }
+          closeOverlay();
+        },
+      },
+      {
+        id: "terminal.selectAll",
+        group: "terminal",
+        title: "터미널 전체 선택",
+        keywords: ["select", "all", "terminal"],
+        disabled: !activeTerminalSession,
+        run: () => {
+          if (activeTerminalSession) {
+            terminalCommandsForSession(activeTerminalSession.sessionId)?.selectAll();
+          }
+          closeOverlay();
+        },
+      },
       ...customActionDescriptors,
       ...workspaceActionDescriptors,
       {
@@ -5574,9 +5779,12 @@ export function AgentmuxTerminalApp() {
       resizePaneInDirection,
       resetFontSize,
       rootPaneForPane,
+      rootPaneId,
       selectSurfaceTab,
+      sidebarWorkspaceOrder,
       splitPaneBy,
       t,
+      orderedLeafPaneIds,
       workspaceActionDescriptors,
       wslActionDescriptors,
     ],
@@ -6069,6 +6277,8 @@ export function AgentmuxTerminalApp() {
           dragFeedback?.kind === "pane-swap" &&
           dragFeedback.id === pane.paneId
         }
+        isZoomed={zoomedPaneId === pane.paneId}
+        isBroadcast={broadcastRootId === rootPaneId && pane.kind === "leaf"}
         onPaneDragStart={beginPaneSurfaceDrag}
         onPaneDragOver={onPaneDragOverStable}
         onPaneDragLeave={onPaneDragLeaveStable}
@@ -8006,7 +8216,13 @@ export function AgentmuxTerminalApp() {
                   제어 플레인에 연결 중…
                 </div>
               ) : rootPaneId ? (
-                renderPane(rootPaneId)
+                <div
+                  style={{ display: "contents" }}
+                  data-agentmux-pane-tree={rootPaneId}
+                  data-agentmux-zoomed-pane={zoomedPaneId && paneById.get(zoomedPaneId) ? zoomedPaneId : undefined}
+                >
+                  {renderPane(rootPaneId)}
+                </div>
               ) : (
                 <div
                   style={{
