@@ -1749,6 +1749,32 @@ test("terminal GPU acceleration setting persists and reports policy diagnostics"
       visible: true,
       requested: true,
     });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<
+              string,
+              {
+                focused: boolean;
+                renderer: { state: string; canvasAttached: boolean };
+              }
+            >;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        const diagnostic = registry
+          ? Object.values(registry).find((entry) => entry.focused)
+          : undefined;
+        return diagnostic
+          ? {
+              state: diagnostic.renderer.state,
+              canvasAttached: diagnostic.renderer.canvasAttached,
+            }
+          : null;
+      }),
+    )
+    .toEqual({ state: "enabled", canvasAttached: true });
 
   const beforeWake = await page.evaluate(() => {
     const registry = (

@@ -121,6 +121,7 @@ export interface TerminalWebglDiagnostics {
   attachFailures: number;
   attachRetryAt: number;
   contextLossLatched: boolean;
+  canvasAttached: boolean;
   updatedAt: number;
 }
 
@@ -392,6 +393,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     attachFailures: 0,
     attachRetryAt: 0,
     contextLossLatched: false,
+    canvasAttached: false,
     updatedAt: Date.now(),
   };
   private fontReadyPromise?: Promise<void>;
@@ -780,12 +782,18 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     }
     // A repeated request in the same mode does not need another probe.
     if (this.webglAddon && this.webglDiagnostics.mode === mode) {
-      this.updateWebglDiagnostics({
-        state: "enabled",
-        reason: mode === "auto" ? "enabled-auto" : "enabled-on",
-        mode,
-      });
-      return;
+      if (this.hasAttachedWebglCanvas()) {
+        this.updateWebglDiagnostics({
+          state: "enabled",
+          reason: mode === "auto" ? "enabled-auto" : "enabled-on",
+          mode,
+        });
+        return;
+      }
+      // The addon can outlive a renderer swap performed inside xterm. Treat a
+      // detached/zeroed canvas as stale even if the addon object still exists.
+      this.webglGeneration++;
+      this.disposeWebglAddon(true);
     }
     if (this.webglEnablePending) {
       return;
@@ -974,7 +982,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   }
 
   getWebglDiagnostics(): Readonly<TerminalWebglDiagnostics> {
-    return { ...this.webglDiagnostics };
+    return {
+      ...this.webglDiagnostics,
+      canvasAttached: this.hasAttachedWebglCanvas(),
+    };
   }
 
   onWebglStateChange(listener: TerminalWebglStateListener): () => void {
@@ -1092,6 +1103,16 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.webglContext = undefined;
   }
 
+  private hasAttachedWebglCanvas(): boolean {
+    const canvas = this.webglCanvas;
+    return Boolean(
+      this.webglAddon &&
+        canvas?.isConnected &&
+        canvas.width > 0 &&
+        canvas.height > 0,
+    );
+  }
+
   private scheduleWebglFallbackRefresh(terminal: Terminal): void {
     this.cancelWebglFallbackRefresh();
     this.webglFallbackFrame = window.requestAnimationFrame(() => {
@@ -1144,6 +1165,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       attachFailures: this.webglAttachFailures,
       attachRetryAt: this.webglAttachRetryAt,
       contextLossLatched: this.webglContextLossLatched,
+      canvasAttached: this.hasAttachedWebglCanvas(),
       updatedAt: Date.now(),
     };
     const snapshot = this.getWebglDiagnostics();
