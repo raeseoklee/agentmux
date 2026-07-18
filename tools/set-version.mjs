@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { spawnSync } from "node:child_process";
 
 const root = path.resolve(import.meta.dirname, "..");
 const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
@@ -58,6 +59,22 @@ function updateWorkspaceCargoVersion(version) {
   fs.writeFileSync(cargoPath, next, "utf8");
 }
 
+function refreshCargoLock() {
+  const result = spawnSync(
+    "cargo",
+    ["metadata", "--format-version", "1", "--no-deps"],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (result.error) {
+    throw new Error(`Failed to run cargo metadata: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `cargo metadata failed while refreshing Cargo.lock:\n${result.stderr.trim()}`,
+    );
+  }
+}
+
 const version = process.argv[2]?.replace(/^v/, "");
 if (!version || process.argv.length > 3) {
   console.error(usage());
@@ -73,5 +90,6 @@ updateJsonVersion("apps/desktop/package.json", version);
 updateJsonVersion("apps/desktop/src-tauri/tauri.conf.json", version);
 updateDesktopLockVersion(version);
 updateWorkspaceCargoVersion(version);
+refreshCargoLock();
 
 console.log(`AgentMux version set to ${version}`);
