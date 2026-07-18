@@ -1495,6 +1495,8 @@ pub struct AppConfigUi {
     #[serde(default)]
     pub terminal_inner_margin: Option<u8>,
     #[serde(default)]
+    pub terminal_gpu_acceleration: Option<String>,
+    #[serde(default)]
     pub terminal_start_directory: Option<String>,
     #[serde(default)]
     pub terminal_start_custom_cwd: Option<String>,
@@ -1672,6 +1674,7 @@ pub struct AppConfigUiUpdate {
     pub surface_tab_actions: Option<Vec<String>>,
     pub text_box_max_lines: Option<u8>,
     pub terminal_inner_margin: Option<u8>,
+    pub terminal_gpu_acceleration: Option<String>,
     pub terminal_start_directory: Option<String>,
     pub terminal_start_custom_cwd: Option<String>,
     pub terminal_split_behavior: Option<String>,
@@ -2247,6 +2250,25 @@ mod tests {
         let params: AppConfigMigrateProjectParams = request.parse_params().unwrap();
         assert_eq!(params.workspace_id.as_deref(), Some("ws_1"));
         assert_eq!(params.overwrite, Some(true));
+    }
+
+    #[test]
+    fn parses_app_config_terminal_gpu_acceleration_update() {
+        let request = RequestEnvelope::new(
+            "req_config_update",
+            "config.update",
+            r#"{"ui":{"terminal_gpu_acceleration":"on"}}"#,
+            "token",
+        );
+
+        let params: AppConfigUpdateParams = request.parse_params().unwrap();
+        assert_eq!(
+            params
+                .ui
+                .and_then(|ui| ui.terminal_gpu_acceleration)
+                .as_deref(),
+            Some("on")
+        );
     }
 
     #[test]
