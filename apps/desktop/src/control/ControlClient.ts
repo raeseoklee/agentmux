@@ -3892,7 +3892,10 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async sendText(sessionId: string, text: string): Promise<void> {
     let output = this.outputs.get(sessionId) ?? "";
-    output += text;
+    // PTY input uses CR for Enter, while a shell echoes completed lines as
+    // CRLF. Model that distinction in preview so scrollback tests exercise
+    // real terminal rows instead of repeatedly overwriting one row.
+    output += text.replace(/\r(?!\n)/g, "\r\n");
     if (text.includes("\r")) {
       output += "C:\\agentmux> ";
     }

@@ -8,6 +8,13 @@ import {
   XtermTerminalRenderer,
   XTERM_THEME,
 } from "../terminal/XtermTerminalRenderer";
+import {
+  discardTerminalOutput,
+  getTerminalOutputStats,
+  resetTerminalOutput,
+  setTerminalOutputForeground,
+  writeTerminalOutput,
+} from "../terminal/TerminalOutputScheduler";
 
 // ---------------------------------------------------------------------------
 // Command registry (TS-9 / TS-4 / TS-6 wave-2 app integration)
@@ -65,8 +72,6 @@ const FALLBACK_INACTIVE_POLL_MS = 700;
 const ACTIVITY_HOT_POLLS = 12;
 const MAX_PENDING_STREAM_FRAMES = 256;
 const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
-const MAX_RENDER_QUEUE_BYTES = 2 * 1024 * 1024;
-const MAX_RENDER_BATCH_BYTES = 64 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
 const WEBGL_DISABLE_DEBOUNCE_MS = 250;
 const TERMINAL_LINE_HEIGHT = 1.0;
@@ -429,6 +434,7 @@ export function LiveTerminal({
   const bootingRef = useRef(true);
   const pollNowRef = useRef<(() => void) | null>(null);
   const webglDisableTimerRef = useRef<number | null>(null);
+  const [rendererEpoch, setRendererEpoch] = useState(0);
   const margin = Math.min(32, Math.max(0, Math.round(innerMargin)));
   // True until this session's first output byte is rendered. The component is
   // keyed by sessionId upstream, so this resets for every session. It drives a
@@ -477,6 +483,7 @@ export function LiveTerminal({
     // Backstop: never leave the overlay up forever if a session legitimately
     // produces no output. Well clear of the worst-case cold WSL boot.
     bootingRef.current = true;
+    setBooting(true);
     const bootingBackstop = window.setTimeout(() => {
       bootingRef.current = false;
       setBooting(false);
@@ -665,6 +672,7 @@ export function LiveTerminal({
       unsubscribeResize();
       unsubscribeOpenLink();
       resizeObserver.disconnect();
+      discardTerminalOutput(renderer);
       renderer.dispose();
       flushPreviewCache();
       if (rendererRef.current === renderer) {
@@ -689,12 +697,6 @@ export function LiveTerminal({
       let resyncQueued = false;
       let pendingFrames: OutputStreamFrame[] = [];
       let pendingFrameBytes = 0;
-      let renderQueue: Uint8Array[] = [];
-      let renderQueueBytes = 0;
-      let maxRenderQueueBytes = 0;
-      let renderBackpressureEvents = 0;
-      let renderWriteInFlight = false;
-      let renderFlushFrame: number | null = null;
       let pendingDiagnosticFrames = 0;
       let pendingDiagnosticBytes = 0;
       let diagnosticFlushTimer: number | null = null;
@@ -709,13 +711,6 @@ export function LiveTerminal({
         }
       };
 
-      const clearRenderFlush = () => {
-        if (renderFlushFrame !== null) {
-          window.cancelAnimationFrame(renderFlushFrame);
-          renderFlushFrame = null;
-        }
-      };
-
       const flushTransportDiagnostics = () => {
         if (diagnosticFlushTimer !== null) {
           window.clearTimeout(diagnosticFlushTimer);
@@ -726,13 +721,14 @@ export function LiveTerminal({
         }
         const diagnostics =
           terminalDiagnostics().__AGENTMUX_TERMINAL_TRANSPORT__?.[sessionId];
+        const pressure = getTerminalOutputStats(renderer);
         recordTransport(sessionId, liveOutputMode, {
           frames: (diagnostics?.frames ?? 0) + pendingDiagnosticFrames,
           bytes: (diagnostics?.bytes ?? 0) + pendingDiagnosticBytes,
-          queuedBytes: renderQueueBytes,
-          maxQueuedBytes: maxRenderQueueBytes,
-          backpressureEvents: renderBackpressureEvents,
-          writeInFlight: renderWriteInFlight,
+          queuedBytes: pressure.queuedBytes,
+          maxQueuedBytes: pressure.maxQueuedBytes,
+          backpressureEvents: pressure.backpressureEvents,
+          writeInFlight: pressure.writeInFlight,
         });
         pendingDiagnosticFrames = 0;
         pendingDiagnosticBytes = 0;
@@ -750,17 +746,15 @@ export function LiveTerminal({
         );
       };
 
-      const clearRenderQueue = () => {
-        renderQueue = [];
-        renderQueueBytes = 0;
+      const currentPressureReport = (): OutputPressureReport => {
+        const pressure = getTerminalOutputStats(renderer);
+        return {
+          queuedBytes: pressure.queuedBytes,
+          maxQueuedBytes: pressure.maxQueuedBytes,
+          backpressureEvents: pressure.backpressureEvents,
+          writeInFlight: pressure.writeInFlight,
+        };
       };
-
-      const currentPressureReport = (): OutputPressureReport => ({
-        queuedBytes: renderQueueBytes,
-        maxQueuedBytes: maxRenderQueueBytes,
-        backpressureEvents: renderBackpressureEvents,
-        writeInFlight: renderWriteInFlight,
-      });
 
       const flushPressureReport = () => {
         if (pressureReportTimer !== null) {
@@ -787,99 +781,51 @@ export function LiveTerminal({
         );
       };
 
-      const takeRenderBatch = () => {
-        const byteCount = Math.min(renderQueueBytes, MAX_RENDER_BATCH_BYTES);
-        if (byteCount <= 0) {
-          return null;
-        }
-        if (renderQueue.length === 1 && renderQueue[0].length <= byteCount) {
-          const [only] = renderQueue;
-          renderQueue = [];
-          renderQueueBytes = 0;
-          return only;
-        }
-
-        const batch = new Uint8Array(byteCount);
-        let copied = 0;
-        while (copied < byteCount && renderQueue.length > 0) {
-          const head = renderQueue[0];
-          const take = Math.min(head.length, byteCount - copied);
-          batch.set(head.subarray(0, take), copied);
-          copied += take;
-          renderQueueBytes -= take;
-          if (take === head.length) {
-            renderQueue.shift();
-          } else {
-            renderQueue[0] = head.subarray(take);
-          }
-        }
-        return batch;
-      };
-
-      const scheduleRenderFlush = () => {
-        if (!alive || renderWriteInFlight || renderFlushFrame !== null) {
-          return;
-        }
-        renderFlushFrame = window.requestAnimationFrame(() => {
-          renderFlushFrame = null;
-          flushRenderQueue();
-        });
-      };
-
-      function flushRenderQueue() {
-        if (!alive || renderWriteInFlight) {
-          return;
-        }
-        if (resyncQueued) {
-          scheduleResync(0);
-          return;
-        }
-        const batch = takeRenderBatch();
-        if (!batch) {
-          return;
-        }
-
-        renderWriteInFlight = true;
-        renderer.write(batch, () => {
-          renderWriteInFlight = false;
-          if (!alive) {
-            return;
-          }
-          markOutput();
-          queueTransportDiagnostics(batch.length);
-          queuePressureReport();
-          if (resyncQueued) {
-            scheduleResync(0);
-            return;
-          }
-          if (renderQueueBytes > 0) {
-            scheduleRenderFlush();
-          }
-        });
-      }
-
       const enqueueRenderBytes = (bytes: Uint8Array) => {
         if (bytes.length === 0) {
           return;
         }
-        const wasBackpressured = renderWriteInFlight || renderQueueBytes > 0;
-        renderQueue.push(bytes);
-        renderQueueBytes += bytes.length;
-        maxRenderQueueBytes = Math.max(maxRenderQueueBytes, renderQueueBytes);
-        if (wasBackpressured) {
-          renderBackpressureEvents += 1;
-          queuePressureReport();
-        }
-        if (renderQueueBytes > MAX_RENDER_QUEUE_BYTES) {
-          clearRenderQueue();
+        writeTerminalOutput(renderer, bytes, {
+          foreground: activeRef.current,
+          onParsed: (byteCount) => {
+            if (!alive) {
+              return;
+            }
+            markOutput();
+            queueTransportDiagnostics(byteCount);
+            queuePressureReport();
+            if (
+              resyncQueued &&
+              !getTerminalOutputStats(renderer).writeInFlight
+            ) {
+              scheduleResync(0);
+            }
+          },
+          onPressureChange: () => queuePressureReport(),
+          onRecoveryRequired: (reason) => {
+            if (!alive) {
+              return;
+            }
+            if (reason !== "backlog-overflow") {
+              // A stalled or throwing parser is no longer a trustworthy view.
+              // The session survives; React rebuilds the disposable xterm view
+              // and the next subscription restores it from an atomic snapshot.
+              setRendererEpoch((current) => current + 1);
+              return;
+            }
+            // The recent-output ring remains authoritative for recovery. A
+            // bounded scheduler can drop a flood without leaving xterm in a
+            // partially parsed VT state.
+            resyncQueued = true;
+            flushPressureReport();
+            if (!getTerminalOutputStats(renderer).writeInFlight) {
+              scheduleResync(0);
+            }
+          },
+        });
+        if (getTerminalOutputStats(renderer).recovering) {
           resyncQueued = true;
-          flushPressureReport();
-          if (!renderWriteInFlight) {
-            scheduleResync(0);
-          }
-          return;
         }
-        scheduleRenderFlush();
       };
 
       const queueFrame = (fromOffset: number, bytes: Uint8Array) => {
@@ -904,18 +850,18 @@ export function LiveTerminal({
         recordTransport(sessionId, liveOutputMode, {
           resyncs: (diagnostics?.resyncs ?? 0) + 1,
         });
+        resetTerminalOutput(renderer);
         renderer.reset();
-        clearRenderQueue();
         replacePreviewCache(snap.bytes);
+        expected = snap.endOffset;
+        streamReady = true;
         if (snap.bytes.length > 0) {
           enqueueRenderBytes(snap.bytes);
         }
-        expected = snap.endOffset;
-        streamReady = true;
       };
 
       async function resync() {
-        if (renderWriteInFlight) {
+        if (getTerminalOutputStats(renderer).writeInFlight) {
           resyncQueued = true;
           return;
         }
@@ -923,6 +869,10 @@ export function LiveTerminal({
           resyncQueued = true;
           return;
         }
+        // Freeze the renderer queue before awaiting the snapshot. Otherwise a
+        // delayed background drain could start while the snapshot request is
+        // in flight and mutate xterm immediately before reset/replay.
+        resetTerminalOutput(renderer);
         resyncQueued = false;
         resyncInFlight = true;
         clearResyncRetry();
@@ -1048,7 +998,7 @@ export function LiveTerminal({
 
       return () => {
         clearResyncRetry();
-        clearRenderFlush();
+        discardTerminalOutput(renderer);
         flushTransportDiagnostics();
         flushPressureReport();
         unsubscribeInput();
@@ -1377,7 +1327,7 @@ export function LiveTerminal({
       teardownShared();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, sessionId]);
+  }, [client, rendererEpoch, sessionId]);
 
   useEffect(() => {
     onOpenLinkRef.current = onOpenLink;
@@ -1397,8 +1347,12 @@ export function LiveTerminal({
 
   useEffect(() => {
     activeRef.current = active;
+    const renderer = rendererRef.current;
+    if (renderer) {
+      setTerminalOutputForeground(renderer, active);
+    }
     if (active) {
-      rendererRef.current?.focus();
+      renderer?.focus();
       pollNowRef.current?.();
     }
   }, [active]);

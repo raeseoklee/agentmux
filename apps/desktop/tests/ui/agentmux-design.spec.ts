@@ -185,7 +185,18 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".xterm").first()).toBeVisible();
   await page.locator(".xterm").first().click();
+  page.once("dialog", async (dialog) => {
+    await dialog.accept();
+  });
   await page.keyboard.press("Control+V");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__AGENTMUX_PREVIEW__?.terminalOutput(),
+      ),
+    )
+    .toContain("scroll-line-90");
 
   // xterm 6 scrolls via the VS Code ScrollableElement (.xterm-scrollable-element),
   // not the legacy .xterm-viewport. Assert the real scroller is present and that
@@ -206,7 +217,7 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
         const trackRect = (
           (node as HTMLElement).parentElement as HTMLElement
         ).getBoundingClientRect();
-        return rect.height > 0 && rect.height <= trackRect.height;
+        return rect.height > 0 && rect.height < trackRect.height - 1;
       }),
     )
     .toBe(true);
@@ -218,7 +229,7 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
       return matches.length > 0 ? Math.min(...matches) : null;
     });
   await expect
-    .poll(() => page.locator(".xterm").first().textContent())
+    .poll(() => page.locator(".xterm-rows").first().textContent())
     .toContain("scroll-line-89");
   const beforeWheelTop = await visibleTopLine();
   expect(beforeWheelTop).not.toBeNull();
@@ -663,7 +674,6 @@ test("split pane surfaces can be swapped with explicit controls", async ({
 
   await page.locator(".agentmux-pane-split-horizontal").click();
   await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
-  await page.getByRole("button", { name: "Open terminal" }).click();
   const mountedPanes = page.locator(
     '[data-agentmux-pane][data-agentmux-mounted="true"]',
   );
@@ -879,6 +889,16 @@ test("split panes stay scoped to their top tab", async ({ page }) => {
 test("terminal profile picker can launch native shells in split panes", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
   await bootPreview(page);
 
   await page.getByRole("button", { name: "Open terminal" }).last().click();
