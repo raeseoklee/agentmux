@@ -178,6 +178,22 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 32
+        },
+        "terminal_start_directory": {
+          "type": "string",
+          "enum": ["home", "workspace", "custom"]
+        },
+        "terminal_start_custom_cwd": {
+          "type": ["string", "null"]
+        },
+        "terminal_split_behavior": {
+          "type": "string",
+          "enum": ["clone_current", "empty"]
+        },
+        "terminal_gpu_acceleration": {
+          "description": "Terminal renderer policy. Auto uses WebGL only when the Windows renderer passes capability checks and falls back to DOM when needed.",
+          "type": "string",
+          "enum": ["auto", "on", "off"]
         }
       }
     },

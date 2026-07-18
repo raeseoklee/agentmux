@@ -26,8 +26,13 @@ plainly before wider public use.
 - Full-screen terminal UIs depend on font metrics, line height, and pane size.
 - If a TUI appears misaligned, use the bundled terminal font, keep line height
   near the default, and resize the pane once.
-- WebGL rendering is used only where safe; AgentMux falls back when a graphics
-  context is unavailable.
+- Terminal GPU acceleration defaults to `Auto`. It enables WebGL only for a
+  hardware renderer on Windows and falls back to DOM when capability probing,
+  addon attachment, or context recovery fails.
+- `On` can force WebGL on a software renderer, but this can be slower than DOM.
+  Use `Off` if a graphics driver or glyph atlas produces visual artifacts.
+- Only the focused terminal pane keeps a WebGL context. Background panes remain
+  live but use the DOM renderer until focused.
 
 ## Server Mode
 
