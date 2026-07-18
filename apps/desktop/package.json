@@ -11,6 +11,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "test:unit": "vitest run",
     "test:ui": "playwright test",
+    "test:terminal-performance": "playwright test --config playwright.performance.config.ts",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },

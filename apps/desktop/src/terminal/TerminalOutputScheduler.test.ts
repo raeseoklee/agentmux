@@ -52,6 +52,11 @@ describe("TerminalOutputScheduler", () => {
     expect(parsed).not.toHaveBeenCalled();
     terminal.completeNext();
     expect(parsed).toHaveBeenCalledWith(3);
+    expect(getTerminalOutputStats(terminal)).toMatchObject({
+      writeCount: 1,
+      parsedBytes: 3,
+      recoveryCount: 0,
+    });
   });
 
   it("coalesces background output before draining", () => {
@@ -156,6 +161,7 @@ describe("TerminalOutputScheduler", () => {
     expect(getTerminalOutputStats(terminal)).toMatchObject({
       writeInFlight: false,
       recovering: true,
+      recoveryCount: 1,
     });
   });
 

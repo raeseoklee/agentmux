@@ -13,6 +13,12 @@ export interface TerminalOutputSchedulerStats {
   backpressureEvents: number;
   writeInFlight: boolean;
   recovering: boolean;
+  writeCount: number;
+  parsedBytes: number;
+  lastWriteDurationMs: number;
+  maxWriteDurationMs: number;
+  totalWriteDurationMs: number;
+  recoveryCount: number;
 }
 
 export interface TerminalOutputWriteOptions {
@@ -44,6 +50,12 @@ interface QueueEntry {
   foreground: boolean;
   recovering: boolean;
   generation: number;
+  writeCount: number;
+  parsedBytes: number;
+  lastWriteDurationMs: number;
+  maxWriteDurationMs: number;
+  totalWriteDurationMs: number;
+  recoveryCount: number;
   stallTimer: ReturnType<typeof setTimeout> | null;
   onPressureChange?: (stats: TerminalOutputSchedulerStats) => void;
   onRecoveryRequired?: (reason: TerminalOutputRecoveryReason) => void;
@@ -75,6 +87,12 @@ function statsFor(entry: QueueEntry): TerminalOutputSchedulerStats {
     backpressureEvents: entry.backpressureEvents,
     writeInFlight: entry.writeInFlight,
     recovering: entry.recovering,
+    writeCount: entry.writeCount,
+    parsedBytes: entry.parsedBytes,
+    lastWriteDurationMs: entry.lastWriteDurationMs,
+    maxWriteDurationMs: entry.maxWriteDurationMs,
+    totalWriteDurationMs: entry.totalWriteDurationMs,
+    recoveryCount: entry.recoveryCount,
   };
 }
 
@@ -111,6 +129,12 @@ function ensureEntry(
       foreground: options.foreground,
       recovering: false,
       generation: 0,
+      writeCount: 0,
+      parsedBytes: 0,
+      lastWriteDurationMs: 0,
+      maxWriteDurationMs: 0,
+      totalWriteDurationMs: 0,
+      recoveryCount: 0,
       stallTimer: null,
     };
     entries.set(target, entry);
@@ -134,6 +158,7 @@ function requestRecovery(
     return;
   }
   entry.recovering = true;
+  entry.recoveryCount += 1;
   clearQueuedChunks(entry);
   notifyPressure(entry);
   safelyRun(() => entry.onRecoveryRequired?.(reason));
@@ -250,6 +275,7 @@ function writeBatch(
   completions: ParsedCompletion[],
 ) {
   entry.writeInFlight = true;
+  const writeStartedAt = now();
   const generation = entry.generation;
   notifyPressure(entry);
 
@@ -275,6 +301,15 @@ function writeBatch(
       entry.stallTimer = null;
     }
     entry.writeInFlight = false;
+    const writeDurationMs = Math.max(0, now() - writeStartedAt);
+    entry.writeCount += 1;
+    entry.parsedBytes += bytes.length;
+    entry.lastWriteDurationMs = writeDurationMs;
+    entry.maxWriteDurationMs = Math.max(
+      entry.maxWriteDurationMs,
+      writeDurationMs,
+    );
+    entry.totalWriteDurationMs += writeDurationMs;
     for (const completion of completions) {
       safelyRun(() => completion.callback?.(completion.byteCount));
     }
@@ -408,6 +443,12 @@ export function getTerminalOutputStats(
         backpressureEvents: 0,
         writeInFlight: false,
         recovering: false,
+        writeCount: 0,
+        parsedBytes: 0,
+        lastWriteDurationMs: 0,
+        maxWriteDurationMs: 0,
+        totalWriteDurationMs: 0,
+        recoveryCount: 0,
       };
 }
 

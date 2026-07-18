@@ -30,6 +30,7 @@
     "version:set": "node tools/set-version.mjs",
     "desktop:dev": "npm --prefix apps/desktop run dev",
     "desktop:build": "npm --prefix apps/desktop run build",
-    "desktop:test:unit": "npm --prefix apps/desktop run test:unit"
+    "desktop:test:unit": "npm --prefix apps/desktop run test:unit",
+    "desktop:test:terminal-performance": "npm --prefix apps/desktop run test:terminal-performance"
   }
 }
