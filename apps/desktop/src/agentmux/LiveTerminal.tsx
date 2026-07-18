@@ -8,6 +8,9 @@ import {
   XtermTerminalRenderer,
   XTERM_THEME,
 } from "../terminal/XtermTerminalRenderer";
+import type {
+  TerminalWebglMode as TerminalGpuAccelerationMode,
+} from "../terminal/TerminalWebglPolicy";
 import {
   discardTerminalOutput,
   getTerminalOutputStats,
@@ -89,14 +92,6 @@ interface TerminalPreviewCacheEntry {
   updatedAt: number;
 }
 
-function terminalWebglEnabled(): boolean {
-  try {
-    return window.localStorage?.getItem("agentmux.terminal.webgl") === "1";
-  } catch {
-    return false;
-  }
-}
-
 function terminalPreviewCacheEnabled(): boolean {
   try {
     return window.localStorage?.getItem(PREVIEW_CACHE_ENABLED_KEY) === "1";
@@ -129,10 +124,52 @@ interface TerminalTransportDiagnostics {
   updatedAt: string;
 }
 
+interface TerminalWebglDiagnostics {
+  sessionId: string;
+  mode: TerminalGpuAccelerationMode;
+  focused: boolean;
+  visible: boolean;
+  requested: boolean;
+  renderer: ReturnType<XtermTerminalRenderer["getWebglDiagnostics"]>;
+  updatedAt: string;
+}
+
 function terminalDiagnostics() {
   return window as Window & {
     __AGENTMUX_TERMINAL_TRANSPORT__?: Record<string, TerminalTransportDiagnostics>;
+    __AGENTMUX_TERMINAL_WEBGL__?: Record<string, TerminalWebglDiagnostics>;
   };
+}
+
+function recordWebgl(
+  sessionId: string,
+  mode: TerminalGpuAccelerationMode,
+  focused: boolean,
+  visible: boolean,
+  requested: boolean,
+  renderer: XtermTerminalRenderer,
+) {
+  const target = terminalDiagnostics();
+  const registry = target.__AGENTMUX_TERMINAL_WEBGL__ ?? {};
+  registry[sessionId] = {
+    sessionId,
+    mode,
+    focused,
+    visible,
+    requested,
+    renderer: renderer.getWebglDiagnostics(),
+    updatedAt: new Date().toISOString(),
+  };
+  target.__AGENTMUX_TERMINAL_WEBGL__ = registry;
+}
+
+function removeWebglDiagnostics(sessionId: string) {
+  const target = terminalDiagnostics();
+  const registry = target.__AGENTMUX_TERMINAL_WEBGL__;
+  if (!registry) {
+    return;
+  }
+  delete registry[sessionId];
 }
 
 function recordTransport(
@@ -274,6 +311,7 @@ interface LiveTerminalProps {
   client: ControlClient;
   sessionId: string;
   active: boolean;
+  terminalGpuAcceleration: TerminalGpuAccelerationMode;
   agentKind?: "claude" | "codex" | null;
   innerMargin?: number;
   fontSize?: number;
@@ -416,6 +454,7 @@ export function LiveTerminal({
   client,
   sessionId,
   active,
+  terminalGpuAcceleration,
   agentKind,
   innerMargin = 0,
   fontSize = 12.5,
@@ -1370,11 +1409,6 @@ export function LiveTerminal({
     }
   }, [client, fontSize, onError, sessionId]);
 
-  // WebGL remains opt-in because Chromium's glyph atlas can render private-use
-  // Nerd Font fallback symbols as tofu on some Windows/WebView2 stacks. Keep
-  // the default path glyph-faithful; allow explicit perf testing with
-  // localStorage.agentmux.terminal.webgl = "1".
-  //
   // Terminal preview cache is also opt-in because terminal output can contain
   // secrets. Local users can enable it with:
   // localStorage.agentmux.terminal.previewCache = "1".
@@ -1389,27 +1423,93 @@ export function LiveTerminal({
         webglDisableTimerRef.current = null;
       }
     };
-    if (active && terminalWebglEnabled()) {
+
+    const applyWebglPolicy = (recoveryBoundary: boolean) => {
+      const visible = !documentHidden();
+      if (
+        recoveryBoundary &&
+        visible &&
+        activeRef.current &&
+        terminalGpuAcceleration !== "off"
+      ) {
+        renderer.resetWebglRecovery();
+      }
+      const requested =
+        activeRef.current && visible && terminalGpuAcceleration !== "off";
+
+      recordWebgl(
+        sessionId,
+        terminalGpuAcceleration,
+        activeRef.current,
+        visible,
+        requested,
+        renderer,
+      );
+
       clearWebglDisableTimer();
-      renderer.enableWebgl();
-    } else {
-      clearWebglDisableTimer();
+      if (requested) {
+        renderer.enableWebgl(terminalGpuAcceleration);
+        return;
+      }
       webglDisableTimerRef.current = window.setTimeout(() => {
         webglDisableTimerRef.current = null;
         if (rendererRef.current === renderer) {
           renderer.disableWebgl();
+          recordWebgl(
+            sessionId,
+            terminalGpuAcceleration,
+            activeRef.current,
+            !documentHidden(),
+            false,
+            renderer,
+          );
         }
       }, WEBGL_DISABLE_DEBOUNCE_MS);
-    }
+    };
+
+    const recordRendererState = () => {
+      const visible = !documentHidden();
+      const requested =
+        activeRef.current &&
+        visible &&
+        terminalGpuAcceleration !== "off";
+      recordWebgl(
+        sessionId,
+        terminalGpuAcceleration,
+        activeRef.current,
+        visible,
+        requested,
+        renderer,
+      );
+    };
+    const unsubscribeWebglState = renderer.onWebglStateChange(recordRendererState);
+    const onVisibilityChange = () => applyWebglPolicy(!documentHidden());
+    const onWake = () => {
+      if (!documentHidden()) {
+        applyWebglPolicy(true);
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", onWake);
+    window.addEventListener("pageshow", onWake);
+    applyWebglPolicy(false);
+
     return () => {
       clearWebglDisableTimer();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", onWake);
+      window.removeEventListener("pageshow", onWake);
+      unsubscribeWebglState();
+      removeWebglDiagnostics(sessionId);
     };
-  }, [active, sessionId, client]);
+  }, [active, rendererEpoch, sessionId, terminalGpuAcceleration]);
 
   return (
     <div
       onMouseDown={onFocus}
       data-agentmux-terminal-inner-margin={margin}
+      data-agentmux-terminal-gpu-acceleration={terminalGpuAcceleration}
       style={{
         display: "flex",
         flexDirection: "column",

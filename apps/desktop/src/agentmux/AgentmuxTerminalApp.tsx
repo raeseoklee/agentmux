@@ -67,6 +67,9 @@ import { Hov } from "./Hov";
 import { LiveTerminal, TerminalRestorePreview, setBroadcastResolver, terminalCommandsForSession } from "./LiveTerminal";
 import { SplitHandle } from "./SplitHandle";
 import { useAgentmuxControl } from "./useAgentmuxControl";
+import type {
+  TerminalWebglMode as TerminalGpuAccelerationMode,
+} from "../terminal/TerminalWebglPolicy";
 import {
   ACCENTS,
   buildRootVars,
@@ -1407,6 +1410,7 @@ interface PaneViewProps {
   theme: ThemeTokens;
   client: ControlClient;
   terminalInnerMargin: number;
+  terminalGpuAcceleration: TerminalGpuAccelerationMode;
   fontSize: number;
   terminalLaunchPending: boolean;
   t: Translator;
@@ -1459,6 +1463,7 @@ const PaneView = memo(function PaneView({
   theme,
   client,
   terminalInnerMargin,
+  terminalGpuAcceleration,
   fontSize,
   terminalLaunchPending,
   t,
@@ -1775,6 +1780,7 @@ const PaneView = memo(function PaneView({
               active={active}
               agentKind={terminalAgentKind(session, telemetry)}
               innerMargin={terminalInnerMargin}
+              terminalGpuAcceleration={terminalGpuAcceleration}
               fontSize={fontSize}
               onFocus={() => focusPane(pane.paneId)}
               onError={onTerminalError}
@@ -1953,6 +1959,8 @@ export function AgentmuxTerminalApp() {
   const [uiConfig, setUiConfig] = useState<AppConfigUi>({});
   const terminalSplitBehavior: TerminalSplitBehavior =
     uiConfig.terminalSplitBehavior ?? "clone_current";
+  const terminalGpuAcceleration: TerminalGpuAccelerationMode =
+    uiConfig.terminalGpuAcceleration ?? "auto";
   const [terminalLinkOpenMode, setTerminalLinkOpenModeState] =
     useState<TerminalLinkOpenMode>(readTerminalLinkOpenMode);
   const setTerminalLinkOpenMode = useCallback((mode: TerminalLinkOpenMode) => {
@@ -5840,6 +5848,26 @@ export function AgentmuxTerminalApp() {
   const terminalStartDirectory =
     uiConfig.terminalStartDirectory ?? "home";
   const terminalStartCustomCwd = uiConfig.terminalStartCustomCwd ?? "";
+  const updateTerminalGpuAcceleration = useCallback(
+    (value: TerminalGpuAccelerationMode) => {
+      setUiConfig((current) => ({
+        ...current,
+        terminalGpuAcceleration: value,
+      }));
+      void client
+        .updateConfig(
+          {
+            ui: {
+              terminalGpuAcceleration: value,
+            },
+          },
+          activeWorkspaceId,
+        )
+        .then((config) => applyConfig(config))
+        .catch(() => undefined);
+    },
+    [activeWorkspaceId, applyConfig, client],
+  );
   const updateTerminalInnerMargin = useCallback(
     (value: number) => {
       const nextMargin = clampTerminalInnerMargin(value);
@@ -6261,6 +6289,7 @@ export function AgentmuxTerminalApp() {
         theme={T}
         client={client}
         terminalInnerMargin={terminalInnerMargin}
+        terminalGpuAcceleration={terminalGpuAcceleration}
         fontSize={fontSize}
         terminalLaunchPending={terminalLaunchPending}
         t={t}
@@ -8259,6 +8288,7 @@ export function AgentmuxTerminalApp() {
             sessionById={sessionById}
             activeSessionId={activeDockSessionId}
             terminalInnerMargin={terminalInnerMargin}
+            terminalGpuAcceleration={terminalGpuAcceleration}
             fontSize={fontSize}
             onTrust={trustDock}
             onRun={runDockControl}
@@ -8419,6 +8449,7 @@ export function AgentmuxTerminalApp() {
             accentKey={accentKey}
             fontSize={fontSize}
             terminalInnerMargin={terminalInnerMargin}
+            terminalGpuAcceleration={terminalGpuAcceleration}
             terminalStartDirectory={terminalStartDirectory}
             terminalStartCustomCwd={terminalStartCustomCwd}
             terminalSplitBehavior={terminalSplitBehavior}
@@ -8448,6 +8479,7 @@ export function AgentmuxTerminalApp() {
             setAccentKey={setAccentKey}
             setFontSize={setFontSize}
             setTerminalInnerMargin={updateTerminalInnerMargin}
+            setTerminalGpuAcceleration={updateTerminalGpuAcceleration}
             setTerminalStartDirectory={updateTerminalStartDirectory}
             setTerminalStartCustomCwd={updateTerminalStartCustomCwd}
             setTerminalSplitBehavior={updateTerminalSplitBehavior}
@@ -9519,6 +9551,7 @@ function DockPanel({
   sessionById,
   activeSessionId,
   terminalInnerMargin,
+  terminalGpuAcceleration,
   fontSize,
   onTrust,
   onRun,
@@ -9534,6 +9567,7 @@ function DockPanel({
   sessionById: Map<string, TerminalSession>;
   activeSessionId: string | null;
   terminalInnerMargin: number;
+  terminalGpuAcceleration: TerminalGpuAccelerationMode;
   fontSize: number;
   onTrust: () => void;
   onRun: (control: DockControl) => void;
@@ -9894,6 +9928,7 @@ function DockPanel({
                     sessionId={session.sessionId}
                     active={activeSessionId === session.sessionId}
                     innerMargin={terminalInnerMargin}
+                    terminalGpuAcceleration={terminalGpuAcceleration}
                     fontSize={fontSize}
                     onFocus={() => onFocusSession(session.sessionId)}
                   />
@@ -10473,6 +10508,7 @@ interface SettingsModalProps {
   accentKey: string;
   fontSize: number;
   terminalInnerMargin: number;
+  terminalGpuAcceleration: TerminalGpuAccelerationMode;
   terminalStartDirectory: TerminalStartDirectory;
   terminalStartCustomCwd: string;
   terminalSplitBehavior: TerminalSplitBehavior;
@@ -10505,6 +10541,7 @@ interface SettingsModalProps {
   setAccentKey: (key: string) => void;
   setFontSize: (size: number) => void;
   setTerminalInnerMargin: (size: number) => void;
+  setTerminalGpuAcceleration: (mode: TerminalGpuAccelerationMode) => void;
   setTerminalStartDirectory: (value: TerminalStartDirectory) => void;
   setTerminalStartCustomCwd: (value: string) => void;
   setTerminalSplitBehavior: (value: TerminalSplitBehavior) => void;
@@ -11271,6 +11308,7 @@ function SettingsModal(props: SettingsModalProps) {
     accentKey,
     fontSize,
     terminalInnerMargin,
+    terminalGpuAcceleration,
     terminalStartDirectory,
     terminalStartCustomCwd,
     terminalSplitBehavior,
@@ -11301,6 +11339,7 @@ function SettingsModal(props: SettingsModalProps) {
     setAccentKey,
     setFontSize,
     setTerminalInnerMargin,
+    setTerminalGpuAcceleration,
     setTerminalStartDirectory,
     setTerminalStartCustomCwd,
     setTerminalSplitBehavior,
@@ -11823,6 +11862,66 @@ function SettingsModal(props: SettingsModalProps) {
                   marginBottom: 24,
                 }}
               />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 12,
+                  marginBottom: 24,
+                }}
+              >
+                <div style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      font: `600 12px/1 ${FONT_SANS}`,
+                      color: "var(--fg2)",
+                    }}
+                  >
+                    {t("settings.terminalGpuAcceleration")}
+                  </div>
+                  <div
+                    className="agentmux-terminal-gpu-acceleration-hint"
+                    style={{
+                      font: `400 11.5px/1.45 ${FONT_SANS}`,
+                      color: "var(--fg4)",
+                      marginTop: 5,
+                    }}
+                  >
+                    {t("settings.terminalGpuAccelerationHint")}
+                  </div>
+                </div>
+                <select
+                  className="agentmux-terminal-gpu-acceleration"
+                  aria-label={t("settings.terminalGpuAcceleration")}
+                  value={terminalGpuAcceleration}
+                  onChange={(event) => {
+                    const value = event.currentTarget.value;
+                    setTerminalGpuAcceleration(
+                      value === "on" ? "on" : value === "off" ? "off" : "auto",
+                    );
+                  }}
+                  style={{
+                    flex: "none",
+                    background: "var(--bg2)",
+                    color: "var(--fg1)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    padding: "6px 8px",
+                    font: `500 11.5px/1 ${FONT_SANS}`,
+                  }}
+                >
+                  <option value="auto">
+                    {t("settings.terminalGpuAcceleration.auto")}
+                  </option>
+                  <option value="on">
+                    {t("settings.terminalGpuAcceleration.on")}
+                  </option>
+                  <option value="off">
+                    {t("settings.terminalGpuAcceleration.off")}
+                  </option>
+                </select>
+              </div>
               <div
                 style={{
                   display: "flex",

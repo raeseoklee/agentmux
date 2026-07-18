@@ -1657,6 +1657,139 @@ test("terminal inner margin setting applies to live terminals", async ({
   });
 });
 
+test("terminal GPU acceleration setting persists and reports policy diagnostics", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    // The retired opt-in must not override the config-backed selector.
+    window.localStorage.setItem("agentmux.terminal.webgl", "1");
+  });
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+
+  const terminal = page
+    .locator("[data-agentmux-terminal-gpu-acceleration]")
+    .first();
+  await page.locator(".agentmux-settings-open").click();
+  const selector = page.locator(".agentmux-terminal-gpu-acceleration");
+  await expect(selector).toHaveValue("auto");
+  await expect(selector.locator("option")).toHaveText(["Auto", "On", "Off"]);
+  await expect(
+    page.locator(".agentmux-terminal-gpu-acceleration-hint"),
+  ).toContainText("Only the focused terminal");
+
+  await selector.selectOption("off");
+  await expect(terminal).toHaveAttribute(
+    "data-agentmux-terminal-gpu-acceleration",
+    "off",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem("agentmux.preview.config.v1");
+        return raw ? JSON.parse(raw).ui?.terminalGpuAcceleration : null;
+      }),
+    )
+    .toBe("off");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<
+              string,
+              { mode: string; requested: boolean }
+            >;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        const diagnostic = registry ? Object.values(registry)[0] : undefined;
+        return diagnostic
+          ? { mode: diagnostic.mode, requested: diagnostic.requested }
+          : null;
+      }),
+    )
+    .toEqual({ mode: "off", requested: false });
+
+  await selector.selectOption("on");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<
+              string,
+              {
+                sessionId: string;
+                mode: string;
+                focused: boolean;
+                visible: boolean;
+                requested: boolean;
+                updatedAt: string;
+              }
+            >;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        if (!registry) return null;
+        const [sessionId, diagnostic] = Object.entries(registry)[0] ?? [];
+        return diagnostic
+          ? {
+              keyedBySession: sessionId === diagnostic.sessionId,
+              mode: diagnostic.mode,
+              focused: diagnostic.focused,
+              visible: diagnostic.visible,
+              requested: diagnostic.requested,
+            }
+          : null;
+      }),
+    )
+    .toEqual({
+      keyedBySession: true,
+      mode: "on",
+      focused: true,
+      visible: true,
+      requested: true,
+    });
+
+  const beforeWake = await page.evaluate(() => {
+    const registry = (
+      window as unknown as {
+        __AGENTMUX_TERMINAL_WEBGL__?: Record<string, { updatedAt: string }>;
+      }
+    ).__AGENTMUX_TERMINAL_WEBGL__;
+    return registry ? Object.values(registry)[0]?.updatedAt : undefined;
+  });
+  await page.waitForTimeout(10);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<string, { updatedAt: string }>;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        return registry ? Object.values(registry)[0]?.updatedAt : undefined;
+      }),
+    )
+    .not.toBe(beforeWake);
+
+  await page.reload();
+  await waitForPreviewReady(page);
+  await page.locator(".agentmux-settings-open").click();
+  await expect(page.locator(".agentmux-terminal-gpu-acceleration")).toHaveValue(
+    "on",
+  );
+  await page.locator(".agentmux-settings-tab-general").click();
+  await page.locator(".agentmux-language-select").selectOption("ko");
+  await page.locator(".agentmux-settings-tab-appearance").click();
+  await expect(
+    page.locator(".agentmux-terminal-gpu-acceleration option"),
+  ).toHaveText(["자동", "켜기", "끄기"]);
+  await expect(
+    page.locator(".agentmux-terminal-gpu-acceleration-hint"),
+  ).toContainText("포커스된 터미널만");
+});
+
 test("settings reload config applies external changes without restart", async ({
   page,
 }) => {
