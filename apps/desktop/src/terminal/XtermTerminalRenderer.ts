@@ -15,6 +15,19 @@ import type {
   TerminalSnapshot,
   TerminalTypography,
 } from "./TerminalRenderer";
+import {
+  TERMINAL_WEBGL_MAX_ATTACH_FAILURES,
+  decideTerminalWebglPolicy,
+  decideTerminalWebglPreflight,
+  detectTerminalWebglPlatform,
+  probeTerminalWebglCapability,
+  terminalWebglAttachBackoffMs,
+  type TerminalWebglMode,
+  type TerminalWebglPlatform,
+  type TerminalWebglPolicyReason,
+  type TerminalWebglProbeResult,
+  type TerminalWebglRendererKind,
+} from "./TerminalWebglPolicy";
 import "@xterm/xterm/css/xterm.css";
 
 // TS-11: module-level escape hatch — set to false to disable multi-line paste
@@ -79,6 +92,46 @@ type WebglAddonModule = typeof import("@xterm/addon-webgl");
 type LigaturesAddonModule = typeof import("@xterm/addon-ligatures");
 type TauriClipboardModule = typeof import("@tauri-apps/plugin-clipboard-manager");
 type TerminalLinkOpenHandler = (url: string, event: MouseEvent) => void;
+
+export type TerminalWebglRuntimeState =
+  | "idle"
+  | "loading"
+  | "enabled"
+  | "blocked"
+  | "fallback"
+  | "disabled";
+
+export type TerminalWebglRuntimeReason =
+  | TerminalWebglPolicyReason
+  | "not-mounted"
+  | "attach-failed"
+  | "context-lost"
+  | "disabled"
+  | "unmounted"
+  | "recovery-reset";
+
+export interface TerminalWebglDiagnostics {
+  state: TerminalWebglRuntimeState;
+  reason: TerminalWebglRuntimeReason;
+  mode: TerminalWebglMode;
+  platform: TerminalWebglPlatform;
+  webgl2: boolean | null;
+  renderer: string | null;
+  rendererKind: TerminalWebglRendererKind;
+  attachFailures: number;
+  attachRetryAt: number;
+  contextLossLatched: boolean;
+  canvasAttached: boolean;
+  updatedAt: number;
+}
+
+export type TerminalWebglStateListener = (
+  diagnostics: Readonly<TerminalWebglDiagnostics>,
+) => void;
+
+interface WebglLoseContextExtension {
+  loseContext(): void;
+}
 
 let webglAddonModulePromise: Promise<WebglAddonModule> | undefined;
 let ligaturesAddonModulePromise: Promise<LigaturesAddonModule> | undefined;
@@ -312,6 +365,9 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private webglAddon?: WebglAddon;
   // Disposes the onContextLoss subscription tied to the current webglAddon.
   private webglContextLossSub?: { dispose(): void };
+  private webglCanvas?: HTMLCanvasElement;
+  private webglContext?: WebGL2RenderingContext;
+  private webglFallbackFrame?: number;
   // Guards against overlapping enableWebgl() calls while the addon module is
   // being lazily imported (import() is async, so two calls could race).
   private webglEnablePending = false;
@@ -321,6 +377,25 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   // enable -> disable -> enable can let two in-flight imports each loadAddon(),
   // leaking a duplicate WebGL context.
   private webglGeneration = 0;
+  private webglMode: TerminalWebglMode = "off";
+  private webglAttachFailures = 0;
+  private webglAttachRetryAt = 0;
+  private webglContextLossLatched = false;
+  private readonly webglStateListeners = new Set<TerminalWebglStateListener>();
+  private webglDiagnostics: TerminalWebglDiagnostics = {
+    state: "idle",
+    reason: "mode-off",
+    mode: "off",
+    platform: detectTerminalWebglPlatform(),
+    webgl2: null,
+    renderer: null,
+    rendererKind: "unknown",
+    attachFailures: 0,
+    attachRetryAt: 0,
+    contextLossLatched: false,
+    canvasAttached: false,
+    updatedAt: Date.now(),
+  };
   private fontReadyPromise?: Promise<void>;
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
@@ -558,7 +633,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   unmount(): void {
     // WebGL addon must be disposed BEFORE the terminal: disposing the terminal
     // first leaves the addon holding a dangling reference / leaked GL context.
-    this.disposeWebglAddon();
+    this.webglGeneration++;
+    this.webglEnablePending = false;
+    this.cancelWebglFallbackRefresh();
+    this.disposeWebglAddon(false);
     this.linkProviderDisposable?.dispose();
     this.linkProviderDisposable = undefined;
     this.clearTransientScrollbar();
@@ -582,6 +660,12 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.fontReadyPromise = undefined;
     this.ligaturesReadyPromise = undefined;
     this._lastSearchTerm = "";
+    this.webglMode = "off";
+    this.updateWebglDiagnostics({
+      state: "disabled",
+      reason: "unmounted",
+      mode: "off",
+    });
   }
 
   write(batch: Uint8Array, callback?: () => void): void {
@@ -681,16 +765,107 @@ export class XtermTerminalRenderer implements TerminalRenderer {
    * silently falls back to the default DOM renderer — the terminal keeps
    * working, just without hardware acceleration.
    */
-  enableWebgl(): void {
+  enableWebgl(mode: TerminalWebglMode = "on"): void {
+    this.webglMode = mode;
+    if (mode === "off") {
+      this.disableWebgl();
+      return;
+    }
     const terminal = this.terminal;
     if (!terminal) {
+      this.updateWebglDiagnostics({
+        state: "blocked",
+        reason: "not-mounted",
+        mode,
+      });
       return;
     }
-    // Already active, or an enable is mid-flight: do nothing.
-    if (this.webglAddon || this.webglEnablePending) {
+    // A repeated request in the same mode does not need another probe.
+    if (this.webglAddon && this.webglDiagnostics.mode === mode) {
+      if (this.hasAttachedWebglCanvas()) {
+        this.updateWebglDiagnostics({
+          state: "enabled",
+          reason: mode === "auto" ? "enabled-auto" : "enabled-on",
+          mode,
+        });
+        return;
+      }
+      // The addon can outlive a renderer swap performed inside xterm. Treat a
+      // detached/zeroed canvas as stale even if the addon object still exists.
+      this.webglGeneration++;
+      this.disposeWebglAddon(true);
+    }
+    if (this.webglEnablePending) {
       return;
     }
+
+    const platform = detectTerminalWebglPlatform();
+    const now = Date.now();
+    const recovery = {
+      attachRetryAt: this.webglAttachRetryAt,
+      contextLossLatched: this.webglContextLossLatched,
+    };
+    const preflightDecision = decideTerminalWebglPreflight({
+      mode,
+      platform,
+      recovery,
+      now,
+    });
+    if (preflightDecision) {
+      this.disposeWebglAddon(true);
+      this.updateWebglDiagnostics({
+        state:
+          preflightDecision.reason === "mode-off" ? "disabled" : "blocked",
+        reason: preflightDecision.reason,
+        mode,
+        platform,
+      });
+      return;
+    }
+    const probe = probeTerminalWebglCapability();
+    const decision = decideTerminalWebglPolicy({
+      mode,
+      platform,
+      probe,
+      recovery,
+      now,
+    });
+    if (!decision.enable) {
+      this.disposeWebglAddon(true);
+      this.updateWebglDiagnostics({
+        state: decision.reason === "mode-off" ? "disabled" : "blocked",
+        reason: decision.reason,
+        mode,
+        platform,
+        webgl2: probe.webgl2,
+        renderer: probe.renderer,
+        rendererKind: probe.rendererKind,
+      });
+      return;
+    }
+    if (this.webglAddon) {
+      this.updateWebglDiagnostics({
+        state: "enabled",
+        reason: decision.reason,
+        mode,
+        platform,
+        webgl2: probe.webgl2,
+        renderer: probe.renderer,
+        rendererKind: probe.rendererKind,
+      });
+      return;
+    }
+
     this.webglEnablePending = true;
+    this.updateWebglDiagnostics({
+      state: "loading",
+      reason: decision.reason,
+      mode,
+      platform,
+      webgl2: probe.webgl2,
+      renderer: probe.renderer,
+      rendererKind: probe.rendererKind,
+    });
     // Claim a generation for this enable. Any later disable bumps the counter,
     // which invalidates this in-flight import when it resolves.
     const generation = ++this.webglGeneration;
@@ -712,24 +887,62 @@ export class XtermTerminalRenderer implements TerminalRenderer {
         ) {
           return;
         }
+        const existingCanvases = new Set(
+          this.mountedElement?.querySelectorAll("canvas") ?? [],
+        );
         try {
           const addon = new WebglAddon();
+          this.webglAddon = addon;
           // If the GPU context is lost (driver reset, tab backgrounded too
           // long, too many live contexts), dispose the addon and drop back to
           // the DOM renderer instead of leaving a blank/frozen terminal.
           this.webglContextLossSub = addon.onContextLoss(() => {
-            this.disposeWebglAddon();
+            if (this.webglAddon !== addon) {
+              return;
+            }
+            this.webglContextLossLatched = true;
+            this.webglGeneration++;
+            this.webglEnablePending = false;
+            this.updateWebglDiagnostics({
+              state: "fallback",
+              reason: "context-lost",
+              contextLossLatched: true,
+            });
+            this.disposeWebglAddon(true);
           });
           terminal.loadAddon(addon);
-          this.webglAddon = addon;
+          if (this.webglAddon !== addon) {
+            return;
+          }
+          this.captureWebglContext(existingCanvases);
+          this.webglAttachFailures = 0;
+          this.webglAttachRetryAt = 0;
+          this.updateWebglDiagnostics({
+            state: "enabled",
+            reason: decision.reason,
+            attachFailures: 0,
+            attachRetryAt: 0,
+          });
         } catch {
           // WebGL2 unavailable or addon initialization failed — fall back to
           // the default DOM renderer. Clean up any partial subscription.
-          this.disposeWebglAddon();
+          this.captureWebglContext(existingCanvases);
+          this.disposeWebglAddon(true);
+          if (
+            generation === this.webglGeneration &&
+            this.terminal === terminal
+          ) {
+            this.recordWebglAttachFailure(mode, platform, probe);
+          }
         }
       })
       .catch(() => {
-        // Dynamic import itself failed (offline chunk, etc.). Stay on DOM.
+        if (
+          generation === this.webglGeneration &&
+          this.terminal === terminal
+        ) {
+          this.recordWebglAttachFailure(mode, platform, probe);
+        }
       })
       .finally(() => {
         // Only clear the pending flag if we still own the latest generation; a
@@ -751,7 +964,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // clear the pending flag and dispose any live addon.
     this.webglGeneration++;
     this.webglEnablePending = false;
-    this.disposeWebglAddon();
+    this.webglMode = "off";
+    this.disposeWebglAddon(true);
+    this.updateWebglDiagnostics({
+      state: "disabled",
+      reason: "disabled",
+      mode: "off",
+    });
   }
 
   /**
@@ -762,13 +981,203 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     return this.webglAddon !== undefined;
   }
 
-  // Disposes the active WebGL addon and its context-loss subscription, leaving
-  // the terminal on the DOM renderer. Idempotent.
-  private disposeWebglAddon(): void {
+  getWebglDiagnostics(): Readonly<TerminalWebglDiagnostics> {
+    return {
+      ...this.webglDiagnostics,
+      canvasAttached: this.hasAttachedWebglCanvas(),
+    };
+  }
+
+  onWebglStateChange(listener: TerminalWebglStateListener): () => void {
+    this.webglStateListeners.add(listener);
+    listener(this.getWebglDiagnostics());
+    return () => {
+      this.webglStateListeners.delete(listener);
+    };
+  }
+
+  resetWebglRecovery(): void {
+    if (this.webglEnablePending) {
+      this.webglGeneration++;
+      this.webglEnablePending = false;
+    }
+    this.webglAttachFailures = 0;
+    this.webglAttachRetryAt = 0;
+    this.webglContextLossLatched = false;
+    this.updateWebglDiagnostics({
+      state: this.webglAddon
+        ? "enabled"
+        : this.webglMode === "off"
+          ? "disabled"
+          : "idle",
+      reason: "recovery-reset",
+      attachFailures: 0,
+      attachRetryAt: 0,
+      contextLossLatched: false,
+    });
+  }
+
+  // Releases the active context before addon disposal, leaving xterm's default
+  // renderer ready for the scheduled fit and full refresh.
+  private disposeWebglAddon(scheduleFallbackRefresh: boolean): void {
+    const addon = this.webglAddon;
+    const terminal = this.terminal;
     this.webglContextLossSub?.dispose();
     this.webglContextLossSub = undefined;
-    this.webglAddon?.dispose();
+    if (addon && !this.webglContext) {
+      this.captureWebglContext(new Set());
+    }
+    this.releaseWebglContext();
     this.webglAddon = undefined;
+    try {
+      addon?.dispose();
+    } catch (error) {
+      console.warn("[agentmux] terminal WebGL addon dispose failed", {
+        error,
+      });
+    }
+    if (addon && scheduleFallbackRefresh && terminal) {
+      this.scheduleWebglFallbackRefresh(terminal);
+    }
+  }
+
+  private captureWebglContext(
+    existingCanvases: ReadonlySet<HTMLCanvasElement>,
+  ): void {
+    const element = this.mountedElement;
+    if (!element) {
+      return;
+    }
+    const canvases = Array.from(element.querySelectorAll("canvas"));
+    const candidates = [
+      ...canvases.filter((canvas) => !existingCanvases.has(canvas)).reverse(),
+      ...canvases.reverse(),
+    ];
+    const seen = new Set<HTMLCanvasElement>();
+    for (const canvas of candidates) {
+      if (seen.has(canvas)) {
+        continue;
+      }
+      seen.add(canvas);
+      try {
+        const context = canvas.getContext("webgl2");
+        if (context) {
+          this.webglCanvas = canvas;
+          this.webglContext = context;
+          return;
+        }
+      } catch {
+        // A canvas owned by another renderer may reject a second context type.
+      }
+    }
+  }
+
+  private releaseWebglContext(): void {
+    const canvas = this.webglCanvas;
+    let context = this.webglContext;
+    if (!context && canvas) {
+      try {
+        const canvasContext = canvas.getContext("webgl2");
+        if (canvasContext) {
+          context = canvasContext;
+        }
+      } catch {
+        // The canvas is still zeroed below even when the driver is unavailable.
+      }
+    }
+    if (context) {
+      try {
+        const loseContext = context.getExtension(
+          "WEBGL_lose_context",
+        ) as WebglLoseContextExtension | null;
+        loseContext?.loseContext();
+      } catch {
+        // Context loss itself can make extension access throw on some drivers.
+      }
+    }
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    this.webglCanvas = undefined;
+    this.webglContext = undefined;
+  }
+
+  private hasAttachedWebglCanvas(): boolean {
+    const canvas = this.webglCanvas;
+    return Boolean(
+      this.webglAddon &&
+        canvas?.isConnected &&
+        canvas.width > 0 &&
+        canvas.height > 0,
+    );
+  }
+
+  private scheduleWebglFallbackRefresh(terminal: Terminal): void {
+    this.cancelWebglFallbackRefresh();
+    this.webglFallbackFrame = window.requestAnimationFrame(() => {
+      this.webglFallbackFrame = undefined;
+      if (this.terminal !== terminal) {
+        return;
+      }
+      this.fitAddon?.fit();
+      terminal.refresh(0, terminal.rows - 1);
+    });
+  }
+
+  private cancelWebglFallbackRefresh(): void {
+    if (this.webglFallbackFrame === undefined) {
+      return;
+    }
+    window.cancelAnimationFrame(this.webglFallbackFrame);
+    this.webglFallbackFrame = undefined;
+  }
+
+  private recordWebglAttachFailure(
+    mode: TerminalWebglMode,
+    platform: TerminalWebglPlatform,
+    probe: TerminalWebglProbeResult,
+  ): void {
+    this.webglAttachFailures = Math.min(
+      TERMINAL_WEBGL_MAX_ATTACH_FAILURES,
+      this.webglAttachFailures + 1,
+    );
+    this.webglAttachRetryAt =
+      Date.now() + terminalWebglAttachBackoffMs(this.webglAttachFailures);
+    this.updateWebglDiagnostics({
+      state: "fallback",
+      reason: "attach-failed",
+      mode,
+      platform,
+      webgl2: probe.webgl2,
+      renderer: probe.renderer,
+      rendererKind: probe.rendererKind,
+    });
+  }
+
+  private updateWebglDiagnostics(
+    update: Partial<TerminalWebglDiagnostics>,
+  ): void {
+    this.webglDiagnostics = {
+      ...this.webglDiagnostics,
+      ...update,
+      mode: update.mode ?? this.webglMode,
+      attachFailures: this.webglAttachFailures,
+      attachRetryAt: this.webglAttachRetryAt,
+      contextLossLatched: this.webglContextLossLatched,
+      canvasAttached: this.hasAttachedWebglCanvas(),
+      updatedAt: Date.now(),
+    };
+    const snapshot = this.getWebglDiagnostics();
+    for (const listener of this.webglStateListeners) {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        console.warn("[agentmux] terminal WebGL state listener failed", {
+          error,
+        });
+      }
+    }
   }
 
   dispose(): void {

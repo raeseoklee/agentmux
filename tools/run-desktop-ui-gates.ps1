@@ -46,6 +46,17 @@ function Write-JsonFile {
 
 Push-Location $root
 try {
+  $unitStdout = Join-Path $OutputDir "desktop-unit.stdout.txt"
+  $unitStderr = Join-Path $OutputDir "desktop-unit.stderr.txt"
+  $unitExit = Invoke-ProcessCapture `
+    -FilePath "cmd.exe" `
+    -ArgumentList @("/d", "/c", "npm --prefix apps/desktop run test:unit") `
+    -StdoutPath $unitStdout `
+    -StderrPath $unitStderr
+  if ($unitExit -ne 0) {
+    throw "desktop unit tests failed with exit code $unitExit. See $unitStderr"
+  }
+
   $buildStdout = Join-Path $OutputDir "desktop-build.stdout.txt"
   $buildStderr = Join-Path $OutputDir "desktop-build.stderr.txt"
   $buildExit = Invoke-ProcessCapture `
@@ -99,6 +110,8 @@ try {
 
   $summary = [ordered]@{
     generated_at = (Get-Date).ToUniversalTime().ToString("o")
+    unit_command = "npm --prefix apps/desktop run test:unit"
+    unit_exit_code = $unitExit
     build_command = "npm --prefix apps/desktop run build"
     build_exit_code = $buildExit
     ui_smoke_command = "npm --prefix apps/desktop run test:ui"
@@ -108,6 +121,8 @@ try {
     dist_index = "apps/desktop/dist/index.html"
     archived_dist = "dist"
     dist_files = $distFiles
+    unit_stdout = [System.IO.Path]::GetFileName($unitStdout)
+    unit_stderr = [System.IO.Path]::GetFileName($unitStderr)
     build_stdout = [System.IO.Path]::GetFileName($buildStdout)
     build_stderr = [System.IO.Path]::GetFileName($buildStderr)
     ui_stdout = [System.IO.Path]::GetFileName($uiStdout)

@@ -75,6 +75,11 @@ export type I18nKey =
   | "settings.accentColor"
   | "settings.uiFontSize"
   | "settings.terminalInnerMargin"
+  | "settings.terminalGpuAcceleration"
+  | "settings.terminalGpuAccelerationHint"
+  | "settings.terminalGpuAcceleration.auto"
+  | "settings.terminalGpuAcceleration.on"
+  | "settings.terminalGpuAcceleration.off"
   | "settings.terminalStartDirectory"
   | "settings.terminalStartDirectoryHint"
   | "settings.terminalStartDirectory.home"
@@ -230,6 +235,12 @@ const en: Record<I18nKey, string> = {
   "settings.accentColor": "Accent color",
   "settings.uiFontSize": "UI font size",
   "settings.terminalInnerMargin": "Terminal inner margin",
+  "settings.terminalGpuAcceleration": "Terminal GPU acceleration",
+  "settings.terminalGpuAccelerationHint":
+    "Auto uses WebGL when supported and stable. Only the focused terminal uses GPU rendering.",
+  "settings.terminalGpuAcceleration.auto": "Auto",
+  "settings.terminalGpuAcceleration.on": "On",
+  "settings.terminalGpuAcceleration.off": "Off",
   "settings.terminalStartDirectory": "Terminal start directory",
   "settings.terminalStartDirectoryHint":
     "New empty terminals start here. Empty custom paths fall back to the home directory.",
@@ -376,6 +387,12 @@ const ko: Record<I18nKey, string> = {
   "settings.accentColor": "강조 색상",
   "settings.uiFontSize": "UI 글자 크기",
   "settings.terminalInnerMargin": "터미널 내부 여백",
+  "settings.terminalGpuAcceleration": "터미널 GPU 가속",
+  "settings.terminalGpuAccelerationHint":
+    "자동은 WebGL을 사용할 수 있고 안정적인 환경에서 활성화합니다. 포커스된 터미널만 GPU 렌더링을 사용합니다.",
+  "settings.terminalGpuAcceleration.auto": "자동",
+  "settings.terminalGpuAcceleration.on": "켜기",
+  "settings.terminalGpuAcceleration.off": "끄기",
   "settings.terminalLinkOpen": "터미널 링크 열기",
   "settings.terminalLinkOpenHint":
     "OAuth/로그인 흐름(예: Claude Code)이 localhost 콜백을 완료하려면 시스템 브라우저가 필요합니다.",

@@ -118,11 +118,42 @@ shows contextual information such as:
 Use settings to manage:
 
 - Theme and terminal appearance.
-- Terminal font, line height, and padding.
+- Terminal font size, inner margin, and GPU acceleration.
 - Default shell profile.
 - WSL diagnostics and distribution selection.
 - Workspace metadata.
 - Notification behavior.
+
+### Terminal GPU acceleration
+
+AgentMux exposes three terminal renderer policies under **Settings >
+Appearance**:
+
+- `Auto` (default): use WebGL only on Windows when WebGL2 is available and the
+  reported renderer is hardware accelerated. Software and unknown renderers
+  stay on the DOM renderer.
+- `On`: request WebGL even when the renderer is software based. AgentMux still
+  falls back to DOM after an attach failure or context loss.
+- `Off`: always use the DOM renderer.
+
+Only the focused terminal pane owns a WebGL context. Hidden and background
+panes release their contexts, which avoids WebView2 context exhaustion in
+large workspaces.
+
+The same setting can be edited in the global configuration file at
+`%APPDATA%\AgentMux\agentmux.json` or in a project override at
+`.agentmux\agentmux.json`:
+
+```json
+{
+  "ui": {
+    "terminal_gpu_acceleration": "auto"
+  }
+}
+```
+
+Supported values are `auto`, `on`, and `off`. Invalid values are rejected by
+configuration import, update, and diagnostics commands.
 
 ## Server Mode
 

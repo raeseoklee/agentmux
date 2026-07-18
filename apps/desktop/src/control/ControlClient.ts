@@ -384,6 +384,7 @@ export interface AppConfigUpdates {
 
 export type TerminalStartDirectory = "home" | "workspace" | "custom";
 export type TerminalSplitBehavior = "clone_current" | "empty";
+export type TerminalGpuAcceleration = "auto" | "on" | "off";
 
 export type ShortcutBindingValue = string | [string, string] | null;
 
@@ -412,6 +413,7 @@ export interface AppConfigUi {
   surfaceTabActions?: string[] | null;
   textBoxMaxLines?: number | null;
   terminalInnerMargin?: number | null;
+  terminalGpuAcceleration?: TerminalGpuAcceleration | null;
   terminalStartDirectory?: TerminalStartDirectory | null;
   terminalStartCustomCwd?: string | null;
   terminalSplitBehavior?: TerminalSplitBehavior | null;
@@ -1703,6 +1705,7 @@ class TauriControlClient implements ControlClient {
             surface_tab_actions: update.ui.surfaceTabActions,
             text_box_max_lines: update.ui.textBoxMaxLines,
             terminal_inner_margin: update.ui.terminalInnerMargin,
+            terminal_gpu_acceleration: update.ui.terminalGpuAcceleration,
             terminal_start_directory: update.ui.terminalStartDirectory,
             terminal_start_custom_cwd: update.ui.terminalStartCustomCwd,
             terminal_split_behavior: update.ui.terminalSplitBehavior,
@@ -3633,28 +3636,38 @@ class BrowserPreviewControlClient implements ControlClient {
     const projectPath = this.previewProjectConfigPath(workspaceId);
     const projectKey = this.previewProjectConfigStorageKey(workspaceId);
     const cmuxKey = this.previewCmuxProjectConfigStorageKey(workspaceId);
-    const projectExists = Boolean(
-      projectKey && window.localStorage.getItem(projectKey),
-    );
-    const cmuxExists = Boolean(cmuxKey && window.localStorage.getItem(cmuxKey));
+    const globalRaw = window.localStorage.getItem(this.configStorageKey);
+    const projectRaw = projectKey
+      ? window.localStorage.getItem(projectKey)
+      : null;
+    const cmuxRaw = cmuxKey ? window.localStorage.getItem(cmuxKey) : null;
+    const projectExists = projectRaw !== null;
+    const cmuxExists = cmuxRaw !== null;
+    const globalError = previewConfigValidationError(globalRaw);
+    const projectError = previewConfigValidationError(projectRaw);
+    const cmuxError = previewConfigValidationError(cmuxRaw);
     const entries: AppConfigDiagnosticEntry[] = [
       {
         source: "global",
         path: "localStorage://agentmux.preview.config.v1",
-        exists: window.localStorage.getItem(this.configStorageKey) !== null,
-        valid: true,
+        exists: globalRaw !== null,
+        valid: globalError === null,
         active: true,
-        message: "Preview global config is readable.",
+        message: globalError
+          ? `Preview global config is invalid: ${globalError}`
+          : "Preview global config is readable.",
       },
       {
         source: "project",
         path: projectPath,
         exists: projectExists,
-        valid: true,
+        valid: projectError === null,
         active: projectExists,
-        message: projectExists
-          ? "Preview AgentMux project config is readable."
-          : "Preview AgentMux project config is absent.",
+        message: projectError
+          ? `Preview AgentMux project config is invalid: ${projectError}`
+          : projectExists
+            ? "Preview AgentMux project config is readable."
+            : "Preview AgentMux project config is absent.",
       },
     ];
     if (cmuxExists) {
@@ -3662,11 +3675,13 @@ class BrowserPreviewControlClient implements ControlClient {
         source: "cmux_project",
         path: cmuxKey,
         exists: true,
-        valid: true,
+        valid: cmuxError === null,
         active: !projectExists,
-        message: projectExists
-          ? "Preview legacy cmux config is ignored because AgentMux project config exists."
-          : "Preview legacy cmux config is available for migration.",
+        message: cmuxError
+          ? `Preview legacy cmux config is invalid: ${cmuxError}`
+          : projectExists
+            ? "Preview legacy cmux config is ignored because AgentMux project config exists."
+            : "Preview legacy cmux config is available for migration.",
       });
     }
     return entries;
@@ -3892,7 +3907,10 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async sendText(sessionId: string, text: string): Promise<void> {
     let output = this.outputs.get(sessionId) ?? "";
-    output += text;
+    // PTY input uses CR for Enter, while a shell echoes completed lines as
+    // CRLF. Model that distinction in preview so scrollback tests exercise
+    // real terminal rows instead of repeatedly overwriting one row.
+    output += text.replace(/\r(?!\n)/g, "\r\n");
     if (text.includes("\r")) {
       output += "C:\\agentmux> ";
     }
@@ -4605,11 +4623,13 @@ class BrowserPreviewControlClient implements ControlClient {
     if (!raw) {
       return null;
     }
+    let parsed: unknown;
     try {
-      return previewConfigFromImport(JSON.parse(raw));
+      parsed = JSON.parse(raw);
     } catch {
       return null;
     }
+    return previewConfigFromImport(parsed);
   }
 
   private readPreviewConfig(workspaceId?: string | null): AppConfig {
@@ -4642,6 +4662,7 @@ class BrowserPreviewControlClient implements ControlClient {
         surfaceTabActions: null,
         textBoxMaxLines: null,
         terminalInnerMargin: null,
+        terminalGpuAcceleration: "auto",
         terminalStartDirectory: "home",
         terminalStartCustomCwd: null,
       },
@@ -4656,66 +4677,68 @@ class BrowserPreviewControlClient implements ControlClient {
         this.readPreviewProjectConfig(workspaceId),
       );
     }
+    let stored: unknown;
     try {
-      const parsed = JSON.parse(raw) as Partial<AppConfig>;
-      const appearance: Partial<AppConfigAppearance> = parsed.appearance ?? {};
-      const locale: Partial<AppConfigLocale> = parsed.locale ?? {};
-      const updates: Partial<AppConfigUpdates> = parsed.updates ?? {};
-      const shortcuts = parsed.shortcuts ?? fallback.shortcuts;
-      const actions = parsed.actions ?? fallback.actions;
-      const ui = parsed.ui ?? fallback.ui;
-      const notifications = parsed.notifications ?? fallback.notifications;
-      const base: AppConfig = {
-        formatVersion: parsed.formatVersion ?? fallback.formatVersion,
-        configPath: parsed.configPath ?? fallback.configPath,
-        projectConfigPath:
-          projectConfigPath ??
-          parsed.projectConfigPath ??
-          fallback.projectConfigPath,
-        projectConfigLoaded: false,
-        appearance: {
-          theme: appearance.theme === "light" ? "light" : "dark",
-          accentKey:
-            typeof appearance.accentKey === "string" &&
-            appearance.accentKey.trim()
-              ? appearance.accentKey
-              : fallback.appearance.accentKey,
-          fontSize:
-            typeof appearance.fontSize === "number" &&
-            Number.isFinite(appearance.fontSize)
-              ? Math.min(16, Math.max(11, appearance.fontSize))
-              : fallback.appearance.fontSize,
-        },
-        locale: {
-          language: normalizeAppLanguage(locale.language),
-        },
-        updates: {
-          autoCheck:
-            typeof updates.autoCheck === "boolean"
-              ? updates.autoCheck
-              : fallback.updates.autoCheck,
-        },
-        shortcuts: {
-          bindings: sanitizeShortcutBindings(shortcuts.bindings),
-        },
-        actions: {
-          custom: sanitizeCustomActions(actions.custom),
-        },
-        ui: sanitizeAppConfigUi(ui),
-        notifications: {
-          actions: sanitizeNotificationActions(notifications.actions),
-        },
-      };
-      return mergePreviewProjectConfig(
-        base,
-        this.readPreviewProjectConfig(workspaceId),
-      );
+      stored = JSON.parse(raw);
     } catch {
       return mergePreviewProjectConfig(
         fallback,
         this.readPreviewProjectConfig(workspaceId),
       );
     }
+    const parsed = previewConfigFromImport(stored);
+    const appearance: Partial<AppConfigAppearance> = parsed.appearance ?? {};
+    const locale: Partial<AppConfigLocale> = parsed.locale ?? {};
+    const updates: Partial<AppConfigUpdates> = parsed.updates ?? {};
+    const shortcuts = parsed.shortcuts ?? fallback.shortcuts;
+    const actions = parsed.actions ?? fallback.actions;
+    const ui = parsed.ui ?? fallback.ui;
+    const notifications = parsed.notifications ?? fallback.notifications;
+    const base: AppConfig = {
+      formatVersion: parsed.formatVersion ?? fallback.formatVersion,
+      configPath: parsed.configPath ?? fallback.configPath,
+      projectConfigPath:
+        projectConfigPath ??
+        parsed.projectConfigPath ??
+        fallback.projectConfigPath,
+      projectConfigLoaded: false,
+      appearance: {
+        theme: appearance.theme === "light" ? "light" : "dark",
+        accentKey:
+          typeof appearance.accentKey === "string" &&
+          appearance.accentKey.trim()
+            ? appearance.accentKey
+            : fallback.appearance.accentKey,
+        fontSize:
+          typeof appearance.fontSize === "number" &&
+          Number.isFinite(appearance.fontSize)
+            ? Math.min(16, Math.max(11, appearance.fontSize))
+            : fallback.appearance.fontSize,
+      },
+      locale: {
+        language: normalizeAppLanguage(locale.language),
+      },
+      updates: {
+        autoCheck:
+          typeof updates.autoCheck === "boolean"
+            ? updates.autoCheck
+            : fallback.updates.autoCheck,
+      },
+      shortcuts: {
+        bindings: sanitizeShortcutBindings(shortcuts.bindings),
+      },
+      actions: {
+        custom: sanitizeCustomActions(actions.custom),
+      },
+      ui: sanitizeAppConfigUi(ui),
+      notifications: {
+        actions: sanitizeNotificationActions(notifications.actions),
+      },
+    };
+    return mergePreviewProjectConfig(
+      base,
+      this.readPreviewProjectConfig(workspaceId),
+    );
   }
 
   private applySyntheticTeamTask(detail: SyntheticTeamTaskDetail = {}): void {
@@ -6117,6 +6140,7 @@ interface AppConfigWire {
     surface_tab_actions?: string[] | null;
     text_box_max_lines?: number | null;
     terminal_inner_margin?: number | null;
+    terminal_gpu_acceleration?: string | null;
     terminal_start_directory?: string | null;
     terminal_start_custom_cwd?: string | null;
     terminal_split_behavior?: string | null;
@@ -6513,6 +6537,9 @@ function mapAppConfig(value: AppConfigWire): AppConfig {
       surfaceTabActions: value.ui?.surface_tab_actions ?? null,
       textBoxMaxLines: value.ui?.text_box_max_lines ?? null,
       terminalInnerMargin: value.ui?.terminal_inner_margin ?? null,
+      terminalGpuAcceleration: normalizeTerminalGpuAcceleration(
+        value.ui?.terminal_gpu_acceleration,
+      ),
       terminalStartDirectory: normalizeTerminalStartDirectory(
         value.ui?.terminal_start_directory,
       ),
@@ -6585,6 +6612,8 @@ function appConfigExportSnapshot(
       surface_tab_actions: config.ui.surfaceTabActions ?? null,
       text_box_max_lines: config.ui.textBoxMaxLines ?? null,
       terminal_inner_margin: config.ui.terminalInnerMargin ?? null,
+      terminal_gpu_acceleration:
+        config.ui.terminalGpuAcceleration ?? "auto",
       terminal_start_directory: config.ui.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config.ui.terminalStartCustomCwd ?? null,
       terminal_split_behavior: config.ui.terminalSplitBehavior ?? null,
@@ -6631,6 +6660,8 @@ function previewProjectConfigExportSnapshot(
       surface_tab_actions: config?.ui?.surfaceTabActions ?? null,
       text_box_max_lines: config?.ui?.textBoxMaxLines ?? null,
       terminal_inner_margin: config?.ui?.terminalInnerMargin ?? null,
+      terminal_gpu_acceleration:
+        config?.ui?.terminalGpuAcceleration ?? null,
       terminal_start_directory: config?.ui?.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config?.ui?.terminalStartCustomCwd ?? null,
       terminal_split_behavior: config?.ui?.terminalSplitBehavior ?? null,
@@ -6682,6 +6713,10 @@ function mergePreviewProjectConfig(
         project.ui?.textBoxMaxLines ?? base.ui.textBoxMaxLines ?? null,
       terminalInnerMargin:
         project.ui?.terminalInnerMargin ?? base.ui.terminalInnerMargin ?? null,
+      terminalGpuAcceleration:
+        project.ui?.terminalGpuAcceleration ??
+        base.ui.terminalGpuAcceleration ??
+        "auto",
       terminalStartDirectory:
         project.ui?.terminalStartDirectory ??
         base.ui.terminalStartDirectory ??
@@ -6741,6 +6776,20 @@ function mergePreviewNotificationActions(
   return actions;
 }
 
+function previewConfigValidationError(raw: string | null): string | null {
+  if (raw === null) {
+    return null;
+  }
+  try {
+    previewConfigFromImport(JSON.parse(raw));
+    return null;
+  } catch (error) {
+    return error instanceof Error
+      ? error.message
+      : "Config could not be parsed.";
+  }
+}
+
 function previewConfigFromImport(value: unknown): Partial<AppConfig> {
   if (!value || typeof value !== "object") {
     return {};
@@ -6777,9 +6826,23 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
     "surface_tab_plus_action" in ui ||
     "surface_tab_actions" in ui ||
     "text_box_max_lines" in ui ||
-    "terminal_inner_margin" in ui;
+    "terminal_inner_margin" in ui ||
+    "terminal_gpu_acceleration" in ui;
   if (!hasSnakeCase) {
-    return raw as Partial<AppConfig>;
+    const config = raw as Partial<AppConfig>;
+    if (!("terminalGpuAcceleration" in ui)) {
+      return config;
+    }
+    return {
+      ...config,
+      ui: {
+        ...(config.ui ?? {}),
+        terminalGpuAcceleration:
+          ui.terminalGpuAcceleration === null
+            ? null
+            : normalizeTerminalGpuAcceleration(ui.terminalGpuAcceleration),
+      },
+    };
   }
   return {
     formatVersion:
@@ -6835,6 +6898,16 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
         typeof ui.terminal_inner_margin === "number"
           ? ui.terminal_inner_margin
           : null,
+      ...("terminal_gpu_acceleration" in ui
+        ? {
+            terminalGpuAcceleration:
+              ui.terminal_gpu_acceleration === null
+                ? null
+                : normalizeTerminalGpuAcceleration(
+                    ui.terminal_gpu_acceleration,
+                  ),
+          }
+        : {}),
       terminalStartDirectory: normalizeTerminalStartDirectory(
         typeof ui.terminal_start_directory === "string"
           ? ui.terminal_start_directory
@@ -7483,6 +7556,26 @@ function normalizeTerminalSplitBehavior(
   return normalized === "empty" ? "empty" : "clone_current";
 }
 
+function normalizeTerminalGpuAcceleration(
+  value: unknown,
+): TerminalGpuAcceleration {
+  if (value === null || value === undefined) {
+    return "auto";
+  }
+  const normalized =
+    typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (
+    normalized === "auto" ||
+    normalized === "on" ||
+    normalized === "off"
+  ) {
+    return normalized;
+  }
+  throw new Error(
+    `Config ui.terminal_gpu_acceleration must be 'auto', 'on', or 'off'; got '${String(value)}'.`,
+  );
+}
+
 function sanitizeTerminalStartCustomCwd(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -7501,6 +7594,9 @@ function sanitizeAppConfigUi(
     textBoxMaxLines: sanitizeTextBoxMaxLines(value?.textBoxMaxLines),
     terminalInnerMargin: sanitizeTerminalInnerMargin(
       value?.terminalInnerMargin,
+    ),
+    terminalGpuAcceleration: normalizeTerminalGpuAcceleration(
+      value?.terminalGpuAcceleration,
     ),
     terminalStartDirectory: normalizeTerminalStartDirectory(
       value?.terminalStartDirectory,

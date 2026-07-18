@@ -185,7 +185,18 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".xterm").first()).toBeVisible();
   await page.locator(".xterm").first().click();
+  page.once("dialog", async (dialog) => {
+    await dialog.accept();
+  });
   await page.keyboard.press("Control+V");
+
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__AGENTMUX_PREVIEW__?.terminalOutput(),
+      ),
+    )
+    .toContain("scroll-line-90");
 
   // xterm 6 scrolls via the VS Code ScrollableElement (.xterm-scrollable-element),
   // not the legacy .xterm-viewport. Assert the real scroller is present and that
@@ -206,7 +217,7 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
         const trackRect = (
           (node as HTMLElement).parentElement as HTMLElement
         ).getBoundingClientRect();
-        return rect.height > 0 && rect.height <= trackRect.height;
+        return rect.height > 0 && rect.height < trackRect.height - 1;
       }),
     )
     .toBe(true);
@@ -218,7 +229,7 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
       return matches.length > 0 ? Math.min(...matches) : null;
     });
   await expect
-    .poll(() => page.locator(".xterm").first().textContent())
+    .poll(() => page.locator(".xterm-rows").first().textContent())
     .toContain("scroll-line-89");
   const beforeWheelTop = await visibleTopLine();
   expect(beforeWheelTop).not.toBeNull();
@@ -663,7 +674,6 @@ test("split pane surfaces can be swapped with explicit controls", async ({
 
   await page.locator(".agentmux-pane-split-horizontal").click();
   await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
-  await page.getByRole("button", { name: "Open terminal" }).click();
   const mountedPanes = page.locator(
     '[data-agentmux-pane][data-agentmux-mounted="true"]',
   );
@@ -879,6 +889,16 @@ test("split panes stay scoped to their top tab", async ({ page }) => {
 test("terminal profile picker can launch native shells in split panes", async ({
   page,
 }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem(
+      "agentmux.preview.config.v1",
+      JSON.stringify({
+        formatVersion: "agentmux.config.v1",
+        configPath: "localStorage://agentmux.preview.config.v1",
+        ui: { terminalSplitBehavior: "empty" },
+      }),
+    );
+  });
   await bootPreview(page);
 
   await page.getByRole("button", { name: "Open terminal" }).last().click();
@@ -1635,6 +1655,165 @@ test("terminal inner margin setting applies to live terminals", async ({
     const raw = window.localStorage.getItem("agentmux.preview.config.v1");
     return raw ? JSON.parse(raw).ui?.terminalInnerMargin === 12 : false;
   });
+});
+
+test("terminal GPU acceleration setting persists and reports policy diagnostics", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    // The retired opt-in must not override the config-backed selector.
+    window.localStorage.setItem("agentmux.terminal.webgl", "1");
+  });
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+
+  const terminal = page
+    .locator("[data-agentmux-terminal-gpu-acceleration]")
+    .first();
+  await page.locator(".agentmux-settings-open").click();
+  const selector = page.locator(".agentmux-terminal-gpu-acceleration");
+  await expect(selector).toHaveValue("auto");
+  await expect(selector.locator("option")).toHaveText(["Auto", "On", "Off"]);
+  await expect(
+    page.locator(".agentmux-terminal-gpu-acceleration-hint"),
+  ).toContainText("Only the focused terminal");
+
+  await selector.selectOption("off");
+  await expect(terminal).toHaveAttribute(
+    "data-agentmux-terminal-gpu-acceleration",
+    "off",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem("agentmux.preview.config.v1");
+        return raw ? JSON.parse(raw).ui?.terminalGpuAcceleration : null;
+      }),
+    )
+    .toBe("off");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<
+              string,
+              { mode: string; requested: boolean }
+            >;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        const diagnostic = registry ? Object.values(registry)[0] : undefined;
+        return diagnostic
+          ? { mode: diagnostic.mode, requested: diagnostic.requested }
+          : null;
+      }),
+    )
+    .toEqual({ mode: "off", requested: false });
+
+  await selector.selectOption("on");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<
+              string,
+              {
+                sessionId: string;
+                mode: string;
+                focused: boolean;
+                visible: boolean;
+                requested: boolean;
+                updatedAt: string;
+              }
+            >;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        if (!registry) return null;
+        const [sessionId, diagnostic] = Object.entries(registry)[0] ?? [];
+        return diagnostic
+          ? {
+              keyedBySession: sessionId === diagnostic.sessionId,
+              mode: diagnostic.mode,
+              focused: diagnostic.focused,
+              visible: diagnostic.visible,
+              requested: diagnostic.requested,
+            }
+          : null;
+      }),
+    )
+    .toEqual({
+      keyedBySession: true,
+      mode: "on",
+      focused: true,
+      visible: true,
+      requested: true,
+    });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<
+              string,
+              {
+                focused: boolean;
+                renderer: { state: string; canvasAttached: boolean };
+              }
+            >;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        const diagnostic = registry
+          ? Object.values(registry).find((entry) => entry.focused)
+          : undefined;
+        return diagnostic
+          ? {
+              state: diagnostic.renderer.state,
+              canvasAttached: diagnostic.renderer.canvasAttached,
+            }
+          : null;
+      }),
+    )
+    .toEqual({ state: "enabled", canvasAttached: true });
+
+  const beforeWake = await page.evaluate(() => {
+    const registry = (
+      window as unknown as {
+        __AGENTMUX_TERMINAL_WEBGL__?: Record<string, { updatedAt: string }>;
+      }
+    ).__AGENTMUX_TERMINAL_WEBGL__;
+    return registry ? Object.values(registry)[0]?.updatedAt : undefined;
+  });
+  await page.waitForTimeout(10);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const registry = (
+          window as unknown as {
+            __AGENTMUX_TERMINAL_WEBGL__?: Record<string, { updatedAt: string }>;
+          }
+        ).__AGENTMUX_TERMINAL_WEBGL__;
+        return registry ? Object.values(registry)[0]?.updatedAt : undefined;
+      }),
+    )
+    .not.toBe(beforeWake);
+
+  await page.reload();
+  await waitForPreviewReady(page);
+  await page.locator(".agentmux-settings-open").click();
+  await expect(page.locator(".agentmux-terminal-gpu-acceleration")).toHaveValue(
+    "on",
+  );
+  await page.locator(".agentmux-settings-tab-general").click();
+  await page.locator(".agentmux-language-select").selectOption("ko");
+  await page.locator(".agentmux-settings-tab-appearance").click();
+  await expect(
+    page.locator(".agentmux-terminal-gpu-acceleration option"),
+  ).toHaveText(["자동", "켜기", "끄기"]);
+  await expect(
+    page.locator(".agentmux-terminal-gpu-acceleration-hint"),
+  ).toContainText("포커스된 터미널만");
 });
 
 test("settings reload config applies external changes without restart", async ({

@@ -5421,6 +5421,10 @@ impl DesktopControlState {
             if let Some(margin) = ui.terminal_inner_margin {
                 config.ui.terminal_inner_margin = Some(normalize_terminal_inner_margin(margin)?);
             }
+            if let Some(acceleration) = ui.terminal_gpu_acceleration {
+                config.ui.terminal_gpu_acceleration =
+                    Some(normalize_terminal_gpu_acceleration(&acceleration)?);
+            }
             if let Some(directory) = ui.terminal_start_directory {
                 config.ui.terminal_start_directory =
                     Some(normalize_terminal_start_directory(&directory)?);
@@ -6678,7 +6682,10 @@ fn default_app_config() -> AppConfigFile {
         updates: default_app_config_updates(),
         shortcuts: AppConfigShortcuts::default(),
         actions: AppConfigActions::default(),
-        ui: AppConfigUi::default(),
+        ui: AppConfigUi {
+            terminal_gpu_acceleration: Some("auto".to_string()),
+            ..AppConfigUi::default()
+        },
         notifications: AppConfigNotifications::default(),
     }
 }
@@ -6730,6 +6737,9 @@ fn normalize_app_config_file(config: &mut AppConfigFile) -> Result<(), DesktopHo
     normalize_shortcut_bindings(&mut config.shortcuts.bindings)?;
     normalize_custom_actions(&mut config.actions.custom)?;
     normalize_app_config_ui(&mut config.ui)?;
+    if config.ui.terminal_gpu_acceleration.is_none() {
+        config.ui.terminal_gpu_acceleration = Some("auto".to_string());
+    }
     normalize_app_config_notifications(&mut config.notifications)?;
     if config.format_version.trim().is_empty() {
         config.format_version = APP_CONFIG_FORMAT_VERSION.to_string();
@@ -7695,6 +7705,9 @@ fn normalize_app_config_ui(ui: &mut AppConfigUi) -> Result<(), DesktopHostError>
     if let Some(margin) = ui.terminal_inner_margin {
         ui.terminal_inner_margin = Some(normalize_terminal_inner_margin(margin)?);
     }
+    if let Some(acceleration) = ui.terminal_gpu_acceleration.take() {
+        ui.terminal_gpu_acceleration = Some(normalize_terminal_gpu_acceleration(&acceleration)?);
+    }
     if let Some(directory) = ui.terminal_start_directory.take() {
         ui.terminal_start_directory = Some(normalize_terminal_start_directory(&directory)?);
     }
@@ -7841,6 +7854,20 @@ fn invalid_terminal_inner_margin(value: u8) -> DesktopHostError {
             "Config ui.terminal_inner_margin must be between {TERMINAL_INNER_MARGIN_MIN} and {TERMINAL_INNER_MARGIN_MAX}; got {value}."
         ),
     ))
+}
+
+fn normalize_terminal_gpu_acceleration(value: &str) -> Result<String, DesktopHostError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok("auto".to_string()),
+        "on" => Ok("on".to_string()),
+        "off" => Ok("off".to_string()),
+        other => Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Config ui.terminal_gpu_acceleration must be 'auto', 'on', or 'off'; got '{other}'."
+            ),
+        ))),
+    }
 }
 
 fn normalize_terminal_start_directory(value: &str) -> Result<String, DesktopHostError> {
@@ -8670,6 +8697,9 @@ fn merge_app_config_ui(ui: &mut AppConfigUi, overrides: AppConfigUi) {
     }
     if overrides.terminal_inner_margin.is_some() {
         ui.terminal_inner_margin = overrides.terminal_inner_margin;
+    }
+    if overrides.terminal_gpu_acceleration.is_some() {
+        ui.terminal_gpu_acceleration = overrides.terminal_gpu_acceleration;
     }
     if overrides.terminal_start_directory.is_some() {
         ui.terminal_start_directory = overrides.terminal_start_directory;
@@ -12282,13 +12312,17 @@ mod tests {
             response_value(&initial)["shortcuts"]["bindings"],
             serde_json::json!({})
         );
+        assert_eq!(
+            response_value(&initial)["ui"]["terminal_gpu_acceleration"],
+            serde_json::json!("auto")
+        );
 
         let update = agentmux_control(
             &state,
             RequestEnvelope::new(
                 "req_config_update",
                 "config.update",
-                r#"{"appearance":{"theme":"light","accent_key":"blue","font_size":14.5},"shortcuts":{"bindings":{"workspace.new":["ctrl+b","c"],"app.search":null}},"ui":{"terminal_inner_margin":9}}"#,
+                r#"{"appearance":{"theme":"light","accent_key":"blue","font_size":14.5},"shortcuts":{"bindings":{"workspace.new":["ctrl+b","c"],"app.search":null}},"ui":{"terminal_inner_margin":9,"terminal_gpu_acceleration":"on"}}"#,
                 "configured-token",
             ),
         );
@@ -12305,6 +12339,10 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(value["ui"]["terminal_inner_margin"], serde_json::json!(9));
+        assert_eq!(
+            value["ui"]["terminal_gpu_acceleration"],
+            serde_json::json!("on")
+        );
 
         let state = DesktopControlState::open_with_token_and_config(
             &store_path,
@@ -12334,6 +12372,10 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(value["ui"]["terminal_inner_margin"], serde_json::json!(9));
+        assert_eq!(
+            value["ui"]["terminal_gpu_acceleration"],
+            serde_json::json!("on")
+        );
 
         cleanup_temp_db(&store_path);
         let _ = fs::remove_file(config_path);
@@ -12357,7 +12399,7 @@ mod tests {
                 "config.import",
                 serde_json::json!({
                     "scope": "global",
-                    "json": r#"{"format_version":"agentmux.config.v1","appearance":{"theme":"light","accent_key":"blue","font_size":14},"shortcuts":{"bindings":{"workspace.new":"ctrl+j"}},"actions":{"custom":[{"id":"custom.openDocs","title":"Open docs","target":"browser","command":["new-tab","https://example.com/docs"],"keywords":["docs"]}]},"ui":{"workspace_plus_action":"terminal.newWsl","text_box_max_lines":5,"terminal_inner_margin":11},"notifications":{"actions":[{"action":"browser.openNewTab","notification_type":"diagnostics.wsl_required","severity":"warning"}]}}"#
+                    "json": r#"{"format_version":"agentmux.config.v1","appearance":{"theme":"light","accent_key":"blue","font_size":14},"shortcuts":{"bindings":{"workspace.new":"ctrl+j"}},"actions":{"custom":[{"id":"custom.openDocs","title":"Open docs","target":"browser","command":["new-tab","https://example.com/docs"],"keywords":["docs"]}]},"ui":{"workspace_plus_action":"terminal.newWsl","text_box_max_lines":5,"terminal_inner_margin":11,"terminal_gpu_acceleration":"off"},"notifications":{"actions":[{"action":"browser.openNewTab","notification_type":"diagnostics.wsl_required","severity":"warning"}]}}"#
                 })
                 .to_string(),
                 "configured-token",
@@ -12371,6 +12413,10 @@ mod tests {
         );
         assert_eq!(value["ui"]["text_box_max_lines"], serde_json::json!(5));
         assert_eq!(value["ui"]["terminal_inner_margin"], serde_json::json!(11));
+        assert_eq!(
+            value["ui"]["terminal_gpu_acceleration"],
+            serde_json::json!("off")
+        );
         assert_eq!(
             value["notifications"]["actions"][0]["action"],
             serde_json::json!("browser.openNewTab")
@@ -12393,6 +12439,7 @@ mod tests {
         let exported_json = exported_value["json"].as_str().unwrap();
         assert!(exported_json.contains("\"appearance\""));
         assert!(exported_json.contains("\"terminal_inner_margin\""));
+        assert!(exported_json.contains("\"terminal_gpu_acceleration\": \"off\""));
         assert!(!exported_json.contains("config_path"));
 
         let reset = agentmux_control(
@@ -12413,6 +12460,97 @@ mod tests {
     }
 
     #[test]
+    fn desktop_config_rejects_invalid_terminal_gpu_acceleration() {
+        let store_path = unique_temp_db_path("desktop-config-gpu-invalid-store");
+        let config_path = unique_temp_db_path("desktop-config-gpu-invalid").with_extension("json");
+        let state = DesktopControlState::open_with_token_and_config(
+            &store_path,
+            "configured-token",
+            &config_path,
+        )
+        .unwrap();
+
+        let update = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_config_gpu_update_invalid",
+                "config.update",
+                r#"{"ui":{"terminal_gpu_acceleration":"enabled"}}"#,
+                "configured-token",
+            ),
+        );
+        assert_eq!(response_error_code(&update), ErrorCode::InvalidRequest);
+
+        let import = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_config_gpu_import_invalid",
+                "config.import",
+                serde_json::json!({
+                    "scope": "global",
+                    "json": r#"{"ui":{"terminal_gpu_acceleration":"enabled"}}"#
+                })
+                .to_string(),
+                "configured-token",
+            ),
+        );
+        assert_eq!(response_error_code(&import), ErrorCode::InvalidRequest);
+
+        fs::write(
+            &config_path,
+            r#"{"ui":{"terminal_gpu_acceleration":"enabled"}}"#,
+        )
+        .unwrap();
+        let export = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_config_gpu_export_invalid",
+                "config.export",
+                "{}",
+                "configured-token",
+            ),
+        );
+        assert_eq!(response_error_code(&export), ErrorCode::InvalidRequest);
+
+        let diagnostics = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_config_gpu_diagnostics_invalid",
+                "config.diagnostics",
+                "{}",
+                "configured-token",
+            ),
+        );
+        let value = response_value(&diagnostics);
+        let global = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["source"] == serde_json::json!("global"))
+            .unwrap();
+        assert_eq!(global["valid"], false);
+        assert!(global["message"]
+            .as_str()
+            .unwrap()
+            .contains("terminal_gpu_acceleration"));
+
+        cleanup_temp_db(&store_path);
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn terminal_gpu_acceleration_normalization_accepts_only_supported_values() {
+        assert_eq!(
+            normalize_terminal_gpu_acceleration(" AUTO ").unwrap(),
+            "auto"
+        );
+        assert_eq!(normalize_terminal_gpu_acceleration("On").unwrap(), "on");
+        assert_eq!(normalize_terminal_gpu_acceleration("off").unwrap(), "off");
+        assert!(normalize_terminal_gpu_acceleration("").is_err());
+        assert!(normalize_terminal_gpu_acceleration("enabled").is_err());
+    }
+
+    #[test]
     fn desktop_config_get_merges_project_shortcut_overrides() {
         let store_path = unique_temp_db_path("desktop-project-config-store");
         let config_path = unique_temp_db_path("desktop-project-config").with_extension("json");
@@ -12422,7 +12560,7 @@ mod tests {
         let project_config_path = project_config_dir.join(APP_CONFIG_FILE_NAME);
         fs::write(
             &project_config_path,
-            r#"{"shortcuts":{"bindings":{"workspace.new":"ctrl+j","app.search":null}},"actions":{"custom":[{"id":"custom.runTests","title":"Run project tests","target":"agent","command":["npm","test"],"keywords":["verify"]}]},"ui":{"workspace_plus_action":"custom.runTests","surface_tab_plus_action":"browser.openNewTab","surface_tab_actions":["pane.splitRight","custom.runTests"],"text_box_max_lines":4,"terminal_inner_margin":6},"notifications":{"actions":[{"action":"browser.openNewTab","label":"Open details","notification_type":"diagnostics.wsl_required","severity":"warning","dismiss_on_run":true}]}}"#,
+            r#"{"shortcuts":{"bindings":{"workspace.new":"ctrl+j","app.search":null}},"actions":{"custom":[{"id":"custom.runTests","title":"Run project tests","target":"agent","command":["npm","test"],"keywords":["verify"]}]},"ui":{"workspace_plus_action":"custom.runTests","surface_tab_plus_action":"browser.openNewTab","surface_tab_actions":["pane.splitRight","custom.runTests"],"text_box_max_lines":4,"terminal_inner_margin":6,"terminal_gpu_acceleration":"off"},"notifications":{"actions":[{"action":"browser.openNewTab","label":"Open details","notification_type":"diagnostics.wsl_required","severity":"warning","dismiss_on_run":true}]}}"#,
         )
         .unwrap();
 
@@ -12518,6 +12656,10 @@ mod tests {
         );
         assert_eq!(value["ui"]["text_box_max_lines"], serde_json::json!(4));
         assert_eq!(value["ui"]["terminal_inner_margin"], serde_json::json!(6));
+        assert_eq!(
+            value["ui"]["terminal_gpu_acceleration"],
+            serde_json::json!("off")
+        );
         assert_eq!(
             value["notifications"]["actions"][0]["action"],
             serde_json::json!("browser.openNewTab")

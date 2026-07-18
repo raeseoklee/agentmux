@@ -1,7 +1,7 @@
 {
   "name": "agentmux-workspace",
   "private": true,
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Windows desktop terminal multiplexer for AI-agent workflows.",
   "license": "MIT",
   "repository": {
@@ -29,6 +29,8 @@
     "version:check": "node tools/check-version.mjs",
     "version:set": "node tools/set-version.mjs",
     "desktop:dev": "npm --prefix apps/desktop run dev",
-    "desktop:build": "npm --prefix apps/desktop run build"
+    "desktop:build": "npm --prefix apps/desktop run build",
+    "desktop:test:unit": "npm --prefix apps/desktop run test:unit",
+    "desktop:test:terminal-performance": "npm --prefix apps/desktop run test:terminal-performance"
   }
 }

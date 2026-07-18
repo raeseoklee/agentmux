@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { spawnSync } from "node:child_process";
 
 const root = path.resolve(import.meta.dirname, "..");
 const semverPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
@@ -17,6 +18,27 @@ function readWorkspaceCargoVersion() {
     throw new Error("Cargo.toml is missing [workspace.package] version.");
   }
   return match[1];
+}
+
+function readCargoMetadataVersions() {
+  const result = spawnSync(
+    "cargo",
+    ["metadata", "--format-version", "1", "--no-deps", "--locked"],
+    { cwd: root, encoding: "utf8" },
+  );
+  if (result.error) {
+    throw new Error(`Failed to run cargo metadata: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(
+      `Cargo.lock is stale or invalid:\n${result.stderr.trim()}`,
+    );
+  }
+  const metadata = JSON.parse(result.stdout);
+  const workspaceMembers = new Set(metadata.workspace_members ?? []);
+  return (metadata.packages ?? [])
+    .filter((pkg) => workspaceMembers.has(pkg.id))
+    .map((pkg) => [`Cargo.lock package ${pkg.name}`, pkg.version]);
 }
 
 function expectedVersionFromArgs(args) {
@@ -47,6 +69,10 @@ const versions = new Map([
   ["apps/desktop/src-tauri/tauri.conf.json", readJson("apps/desktop/src-tauri/tauri.conf.json").version],
   ["Cargo.toml workspace.package", readWorkspaceCargoVersion()],
 ]);
+
+for (const [source, version] of readCargoMetadataVersions()) {
+  versions.set(source, version);
+}
 
 const lockPath = "apps/desktop/package-lock.json";
 if (fs.existsSync(path.join(root, lockPath))) {
