@@ -1,0 +1,47 @@
+apiVersion: mcp-workbench.dev/v0alpha1
+server:
+  transport: stdio
+  command: target/debug/agentmux.exe
+  args:
+    - mcp
+    - serve
+    - --profile
+    - read
+client:
+  protocolVersion: "2025-11-25"
+tests:
+  - id: read-profile-tools
+    description: Read profile exposes only the monitoring and inspection contract
+    act:
+      method: tools/list
+    assert:
+      - kind: status
+        equals: success
+      - kind: count
+        path: $.tools
+        equals: 14
+      - kind: contains
+        path: $.tools[*].name
+        value: agentmux_context
+      - kind: contains
+        path: $.tools[*].name
+        value: terminal_read
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worker_list
+  - id: read-profile-denies-standard-call
+    description: Dispatch rejects a standard tool even when a client calls it directly
+    act:
+      method: tools/call
+      tool: terminal_open
+      args: {}
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'standard' MCP profile

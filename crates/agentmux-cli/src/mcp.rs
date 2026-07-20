@@ -18,8 +18,10 @@ use super::mcp_config::{
     self, McpClient, McpConfigRequest, McpConfigStatus, McpProfile as McpConfigProfile,
 };
 use super::{
-    invoke_control_with_caller, resolve_control_token, CliError, ControlInvokeOptions,
-    ResponseOutcome,
+    agent_integration_doctor_result_json, agent_integration_install_result_json,
+    ensure_windows_user_path_contains, inspect_agent_integrations, install_agent_integration_shims,
+    invoke_control_with_caller, path_to_wsl_value, resolve_cmuxterm_base_dir,
+    resolve_control_token, AgentIntegrationKind, CliError, ControlInvokeOptions, ResponseOutcome,
 };
 
 const MCP_PROFILE_READ: &str = "read";
@@ -29,6 +31,22 @@ const MAX_TERMINAL_READ_BYTES: usize = 1_048_576;
 const MAX_EVENT_COUNT: usize = 500;
 const DEFAULT_BROWSER_READ_BYTES: usize = 262_144;
 const MAX_BROWSER_READ_BYTES: usize = 1_048_576;
+const READ_TOOL_NAMES: &[&str] = &[
+    "agentmux_context",
+    "workspace_list",
+    "workspace_get",
+    "session_list",
+    "terminal_read",
+    "agent_attention_list",
+    "agent_worker_list",
+    "agent_integration_status",
+    "event_poll",
+    "browser_snapshot",
+    "browser_get",
+    "team_task_list",
+    "team_message_list",
+    "diagnostics_summary",
+];
 const STANDARD_TOOL_NAMES: &[&str] = &[
     "pane_focus",
     "terminal_open",
@@ -44,6 +62,8 @@ const STANDARD_TOOL_NAMES: &[&str] = &[
     "team_task_claim",
     "team_task_complete",
     "agent_set_state",
+    "agent_worker_start",
+    "agent_worker_send",
 ];
 #[cfg(test)]
 const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
@@ -59,6 +79,8 @@ const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
     "team_task_claim",
     "team_task_complete",
     "agent_set_state",
+    "agent_worker_start",
+    "agent_worker_send",
 ];
 #[cfg(test)]
 const STANDARD_ADDITIVE_TOOL_NAMES: &[&str] = &["pane_focus", "team_message_send"];
@@ -71,6 +93,8 @@ const FULL_TOOL_NAMES: &[&str] = &[
     "browser_evaluate",
     "action_run",
     "notification_clear",
+    "agent_worker_stop",
+    "agent_integration_setup",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +130,27 @@ impl McpProfile {
 
     fn allows_full(self) -> bool {
         matches!(self, Self::Full)
+    }
+
+    fn allows_tool(self, name: &str) -> bool {
+        match Self::required_for_tool(name) {
+            Some(Self::Read) => true,
+            Some(Self::Standard) => self.allows_standard(),
+            Some(Self::Full) => self.allows_full(),
+            None => false,
+        }
+    }
+
+    fn required_for_tool(name: &str) -> Option<Self> {
+        if FULL_TOOL_NAMES.contains(&name) {
+            Some(Self::Full)
+        } else if STANDARD_TOOL_NAMES.contains(&name) {
+            Some(Self::Standard)
+        } else if READ_TOOL_NAMES.contains(&name) {
+            Some(Self::Read)
+        } else {
+            None
+        }
     }
 }
 
@@ -540,15 +585,15 @@ impl AgentMuxMcpServer {
 
     fn with_transport(profile: McpProfile, control: Arc<dyn ControlTransport>) -> Self {
         let mut tool_router = Self::tool_router();
-        if !profile.allows_standard() {
-            for name in STANDARD_TOOL_NAMES {
-                tool_router.remove_route(name);
-            }
-        }
-        if !profile.allows_full() {
-            for name in FULL_TOOL_NAMES {
-                tool_router.remove_route(name);
-            }
+        let denied = tool_router
+            .list_all()
+            .into_iter()
+            .filter_map(|tool| {
+                (!profile.allows_tool(tool.name.as_ref())).then(|| tool.name.into_owned())
+            })
+            .collect::<Vec<_>>();
+        for name in denied {
+            tool_router.remove_route(&name);
         }
         Self {
             profile,
@@ -600,6 +645,51 @@ impl AgentMuxMcpServer {
             .map_err(|error| format!("invalid system.identify response: {error}"))
     }
 
+    async fn resolve_agent_integration_distribution_for_workspace(
+        &self,
+        workspace_id: Option<String>,
+        explicit: Option<String>,
+    ) -> Result<Option<String>, String> {
+        if let Some(distribution) = explicit
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(distribution.to_string()));
+        }
+
+        let (workspace_id, workspace_required) = match workspace_id {
+            Some(workspace_id) if !workspace_id.trim().is_empty() => (Some(workspace_id), true),
+            _ => self
+                .resolve_context(None)
+                .await
+                .ok()
+                .and_then(|context| context.workspace_id)
+                .map_or((None, false), |workspace_id| (Some(workspace_id), false)),
+        };
+        if let Some(workspace_id) = workspace_id {
+            match self
+                .invoke_value("workspace.get", json!({ "workspace_id": workspace_id }))
+                .await
+            {
+                Ok(workspace) => {
+                    if let Some(distribution) = workspace
+                        .pointer("/workspace/default_wsl_distribution")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        return Ok(Some(distribution.to_string()));
+                    }
+                }
+                Err(message) if workspace_required => return Err(message),
+                Err(_) => {}
+            }
+        }
+
+        Ok(resolve_agent_integration_distribution(None))
+    }
+
     async fn resolve_workspace_and_pane(
         &self,
         workspace_id: Option<String>,
@@ -631,6 +721,36 @@ impl AgentMuxMcpServer {
             .map_err(|message| control_error_result("system.identify", message))?
             .session_id
             .ok_or_else(|| missing_context_result("session_id"))
+    }
+
+    async fn resolve_worker_session_id(
+        &self,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+    ) -> Result<String, CallToolResult> {
+        let session_id = self
+            .resolve_session_id(workspace_id.clone(), session_id)
+            .await?;
+        let value = self
+            .invoke_value("agent.list", json!({ "workspace_id": workspace_id }))
+            .await
+            .map_err(|message| control_error_result("agent.list", message))?;
+        let is_worker = value
+            .get("sessions")
+            .and_then(Value::as_array)
+            .is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    session.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+                        && is_managed_worker_session(session)
+                })
+            });
+        if !is_worker {
+            return Err(control_error_result(
+                "agent.worker.resolve",
+                format!("session '{session_id}' is not an AgentMux-managed pane worker"),
+            ));
+        }
+        Ok(session_id)
     }
 
     /// Return the caller's current AgentMux workspace, pane, surface, session, cwd, and backend context.
@@ -745,6 +865,99 @@ impl AgentMuxMcpServer {
         Parameters(params): Parameters<WorkspaceFilterParams>,
     ) -> CallToolResult {
         self.call("agent.list_attention", json!(params)).await
+    }
+
+    /// List AgentMux-managed agent workers, including tmux-compatible team panes and direct Codex workers.
+    #[tool(
+        name = "agent_worker_list",
+        annotations(
+            title = "List agent workers",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_worker_list(
+        &self,
+        Parameters(params): Parameters<AgentWorkerListToolParams>,
+    ) -> CallToolResult {
+        let mut value = match self
+            .invoke_value("agent.list", json!({ "workspace_id": params.workspace_id }))
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => return control_error_result("agent.list", message),
+        };
+        let integration = params
+            .integration
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(sessions) = value.get_mut("sessions").and_then(Value::as_array_mut) {
+            sessions.retain(|session| {
+                let worker_name = session
+                    .pointer("/telemetry/session")
+                    .and_then(Value::as_str);
+                if !is_managed_worker_session(session) {
+                    return false;
+                }
+                let Some(integration) = integration else {
+                    return true;
+                };
+                worker_name.is_some_and(|name| {
+                    name == integration || name.starts_with(&format!("{integration}:"))
+                })
+            });
+        }
+        CallToolResult::structured(value)
+    }
+
+    /// Diagnose Claude Teams, OMX, OMC, or OMO tmux-compatible integration readiness without changing files.
+    #[tool(
+        name = "agent_integration_status",
+        annotations(
+            title = "Check agent integration",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_integration_status(
+        &self,
+        Parameters(params): Parameters<AgentIntegrationStatusToolParams>,
+    ) -> CallToolResult {
+        let distribution = match self
+            .resolve_agent_integration_distribution_for_workspace(
+                params.workspace_id.clone(),
+                params.distribution.clone(),
+            )
+            .await
+        {
+            Ok(distribution) => distribution,
+            Err(message) => return control_error_result("workspace.get", message),
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let kind = params
+                .integration
+                .as_deref()
+                .map(AgentIntegrationKind::parse)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let base_dir = resolve_cmuxterm_base_dir(None).map_err(|error| error.to_string())?;
+            let bin_dir = base_dir.join("bin");
+            Ok::<Value, String>(agent_integration_doctor_result_json(
+                &inspect_agent_integrations(&base_dir, &bin_dir, kind, distribution.as_deref()),
+            ))
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => CallToolResult::structured(value),
+            Ok(Err(message)) => control_error_result("agent.integration.status", message),
+            Err(error) => control_error_result(
+                "agent.integration.status",
+                format!("integration status task failed: {error}"),
+            ),
+        }
     }
 
     /// Poll bounded AgentMux events with optional workspace, session, and event-type filters.
@@ -924,7 +1137,7 @@ impl AgentMuxMcpServer {
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn terminal_open(
@@ -980,7 +1193,7 @@ impl AgentMuxMcpServer {
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn terminal_split(
@@ -1022,7 +1235,7 @@ impl AgentMuxMcpServer {
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn terminal_send_text(
@@ -1051,7 +1264,7 @@ impl AgentMuxMcpServer {
             read_only_hint = false,
             destructive_hint = true,
             idempotent_hint = false,
-            open_world_hint = false
+            open_world_hint = true
         )
     )]
     async fn terminal_send_key(
@@ -1424,6 +1637,295 @@ impl AgentMuxMcpServer {
         .await
     }
 
+    /// Start a Claude Teams lead, tmux-compatible integration, or independent Codex worker in a new AgentMux pane.
+    #[tool(
+        name = "agent_worker_start",
+        annotations(
+            title = "Start agent worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_worker_start(
+        &self,
+        Parameters(params): Parameters<AgentWorkerStartToolParams>,
+    ) -> CallToolResult {
+        let context = match self.resolve_context(params.workspace_id.clone()).await {
+            Ok(context) => context,
+            Err(message) => return control_error_result("system.identify", message),
+        };
+        let Some(workspace_id) = params.workspace_id.or(context.workspace_id) else {
+            return missing_context_result("workspace_id");
+        };
+        let placement = params
+            .placement
+            .as_deref()
+            .unwrap_or("split")
+            .to_ascii_lowercase();
+        if !matches!(placement.as_str(), "split" | "new_tab") {
+            return control_error_result(
+                "agent.worker.start",
+                "placement must be 'split' or 'new_tab'".to_string(),
+            );
+        }
+        let kind = AgentWorkerKind::from(params.kind);
+        let command = match build_agent_worker_command(kind, params.args) {
+            Ok(command) => command,
+            Err(message) => return control_error_result("agent.worker.start", message),
+        };
+        let cwd = params.cwd.or(context.cwd);
+        let launch = if placement == "new_tab" {
+            self.invoke_value(
+                "terminal.open",
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "pane_id": Value::Null,
+                    "backend": "wsl-direct",
+                    "backend_profile": params.distribution,
+                    "command": command,
+                    "cwd": cwd,
+                    "env": [],
+                    "columns": params.columns,
+                    "rows": params.rows,
+                    "durability": params.durability.unwrap_or_else(|| "durable".to_string()),
+                    "placement": "new_tab",
+                }),
+            )
+            .await
+        } else {
+            let Some(pane_id) = params.pane_id.or(context.pane_id) else {
+                return missing_context_result("pane_id");
+            };
+            self.invoke_value(
+                "terminal.split",
+                json!({
+                    "workspace_id": workspace_id.clone(),
+                    "pane_id": pane_id,
+                    "axis": params.axis.unwrap_or_else(|| "vertical".to_string()),
+                    "ratio": params.ratio,
+                    "behavior": "clone_current",
+                    "backend": "wsl-direct",
+                    "backend_profile": params.distribution,
+                    "command": command,
+                    "cwd": cwd,
+                    "columns": params.columns,
+                    "rows": params.rows,
+                    "durability": params.durability.unwrap_or_else(|| "durable".to_string()),
+                }),
+            )
+            .await
+        };
+        let launch = match launch {
+            Ok(value) => value,
+            Err(message) => return control_error_result("agent.worker.start", message),
+        };
+        let Some(session_id) = launch
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        else {
+            return control_error_result(
+                "agent.worker.start",
+                "terminal launch returned no session_id".to_string(),
+            );
+        };
+        let pane_id = launch
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let label = kind.label();
+        if let Err(message) = self
+            .invoke_value(
+                "agent.set_state",
+                json!({
+                    "session_id": session_id.clone(),
+                    "state": "running",
+                    "reason": format!("{label} worker started"),
+                    "telemetry": {
+                        "activity": kind.activity(),
+                        "session": format!("{}:worker", kind.key()),
+                        "ctx": pane_id,
+                    },
+                }),
+            )
+            .await
+        {
+            let terminate = self
+                .invoke_value(
+                    "session.terminate",
+                    json!({ "session_id": session_id, "mode": "kill" }),
+                )
+                .await;
+            let close_pane = match pane_id.as_deref() {
+                Some(pane_id) => {
+                    self.invoke_value(
+                        "pane.close",
+                        json!({
+                            "workspace_id": workspace_id,
+                            "pane_id": pane_id,
+                            "surface_policy": "close_surface",
+                        }),
+                    )
+                    .await
+                }
+                None => Ok(json!({ "skipped": true })),
+            };
+            return control_error_result(
+                "agent.worker.start",
+                format!(
+                    "worker metadata registration failed: {message}; compensation: session_terminated={}, pane_closed={}",
+                    terminate.is_ok(),
+                    close_pane.is_ok()
+                ),
+            );
+        }
+        CallToolResult::structured(json!({
+            "kind": kind.key(),
+            "controller": kind.controller(),
+            "workspace_id": workspace_id,
+            "session_id": session_id,
+            "pane_id": launch.get("pane_id"),
+            "surface_id": launch.get("surface_id"),
+            "placement": placement,
+            "agent_state_registered": true,
+        }))
+    }
+
+    /// Send literal instructions to an AgentMux-managed worker and optionally submit them with Enter.
+    #[tool(
+        name = "agent_worker_send",
+        annotations(
+            title = "Send to agent worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_worker_send(
+        &self,
+        Parameters(params): Parameters<AgentWorkerSendToolParams>,
+    ) -> CallToolResult {
+        let session_id = match self
+            .resolve_worker_session_id(params.workspace_id, params.session_id)
+            .await
+        {
+            Ok(session_id) => session_id,
+            Err(result) => return result,
+        };
+        if let Err(message) = self
+            .invoke_value(
+                "session.send_text",
+                json!({ "session_id": session_id, "text": params.text }),
+            )
+            .await
+        {
+            return control_error_result("session.send_text", message);
+        }
+        let submitted = params.submit.unwrap_or(true);
+        if submitted {
+            if let Err(message) = self
+                .invoke_value(
+                    "session.send_key",
+                    json!({ "session_id": session_id, "key": "enter" }),
+                )
+                .await
+            {
+                return control_error_result("session.send_key", message);
+            }
+        }
+        CallToolResult::structured(json!({
+            "session_id": session_id,
+            "submitted": submitted,
+        }))
+    }
+
+    /// Stop an AgentMux-managed pane worker. Full profile only.
+    #[tool(
+        name = "agent_worker_stop",
+        annotations(
+            title = "Stop agent worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_worker_stop(
+        &self,
+        Parameters(params): Parameters<AgentWorkerStopToolParams>,
+    ) -> CallToolResult {
+        let session_id = match self
+            .resolve_worker_session_id(params.workspace_id, params.session_id)
+            .await
+        {
+            Ok(session_id) => session_id,
+            Err(result) => return result,
+        };
+        self.call(
+            "session.terminate",
+            json!({
+                "session_id": session_id,
+                "mode": params.mode.unwrap_or_else(|| "soft".to_string()),
+            }),
+        )
+        .await
+    }
+
+    /// Install AgentMux tmux-compatibility shims and report integration readiness. Full profile only.
+    #[tool(
+        name = "agent_integration_setup",
+        annotations(
+            title = "Set up agent integration",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_integration_setup(
+        &self,
+        Parameters(params): Parameters<AgentIntegrationSetupToolParams>,
+    ) -> CallToolResult {
+        let result = tokio::task::spawn_blocking(move || {
+            let kind = params
+                .integration
+                .as_deref()
+                .map(AgentIntegrationKind::parse)
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let distribution =
+                resolve_agent_integration_distribution(params.distribution.as_deref());
+            let base_dir = resolve_cmuxterm_base_dir(None).map_err(|error| error.to_string())?;
+            let bin_dir = base_dir.join("bin");
+            let mut installed = install_agent_integration_shims(&base_dir, &bin_dir, None, None)
+                .map_err(|error| error.to_string())?;
+            if params.add_to_user_path.unwrap_or(false) {
+                installed.user_path = Some(
+                    ensure_windows_user_path_contains(&bin_dir)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let status =
+                inspect_agent_integrations(&base_dir, &bin_dir, kind, distribution.as_deref());
+            Ok::<Value, String>(json!({
+                "install": agent_integration_install_result_json(&installed),
+                "status": agent_integration_doctor_result_json(&status),
+            }))
+        })
+        .await;
+        match result {
+            Ok(Ok(value)) => CallToolResult::structured(value),
+            Ok(Err(message)) => control_error_result("agent.integration.setup", message),
+            Err(error) => control_error_result(
+                "agent.integration.setup",
+                format!("integration setup task failed: {error}"),
+            ),
+        }
+    }
+
     /// Close a workspace. Full profile only.
     #[tool(
         name = "workspace_close",
@@ -1615,6 +2117,29 @@ impl AgentMuxMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for AgentMuxMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tool_name = request.name.as_ref();
+        if !self.profile.allows_tool(tool_name) {
+            if let Some(required) = McpProfile::required_for_tool(tool_name) {
+                return Ok(control_error_result(
+                    "mcp.profile",
+                    format!(
+                        "tool '{tool_name}' requires the '{}' MCP profile; current profile is '{}'",
+                        required.as_str(),
+                        self.profile.as_str()
+                    ),
+                ));
+            }
+        }
+
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         let profile_boundary = match self.profile {
             McpProfile::Read => "This profile is read-only.",
@@ -1808,6 +2333,7 @@ struct ResolvedContext {
     pane_id: Option<String>,
     surface_id: Option<String>,
     session_id: Option<String>,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
@@ -1946,6 +2472,190 @@ struct AgentTelemetryToolParams {
     cache: Option<String>,
     rate: Option<String>,
     ctx: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentWorkerListToolParams {
+    workspace_id: Option<String>,
+    /// Optional worker kind: codex-pane, claude-teams, omo, omx, or omc.
+    integration: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentIntegrationStatusToolParams {
+    /// Optional workspace whose configured WSL distribution should be diagnosed.
+    workspace_id: Option<String>,
+    /// Optional integration filter: claude-teams, omo, omx, or omc.
+    integration: Option<String>,
+    distribution: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentWorkerStartToolParams {
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+    /// codex-pane starts an independent Codex CLI. Other values start tmux-compatible integrations.
+    kind: AgentWorkerKindParam,
+    distribution: Option<String>,
+    /// split (default) or new_tab.
+    placement: Option<String>,
+    /// horizontal creates top/bottom panes; vertical creates left/right panes.
+    axis: Option<String>,
+    ratio: Option<f64>,
+    cwd: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    columns: Option<u16>,
+    rows: Option<u16>,
+    durability: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentWorkerSendToolParams {
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+    text: String,
+    /// Submit the text with Enter. Defaults to true.
+    submit: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentWorkerStopToolParams {
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+    /// soft (default), graceful, or kill.
+    mode: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentIntegrationSetupToolParams {
+    /// Optional integration to diagnose after installing all shared shims.
+    integration: Option<String>,
+    distribution: Option<String>,
+    /// Add the shim directory to the Windows user PATH. Defaults to false.
+    add_to_user_path: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AgentWorkerKindParam {
+    CodexPane,
+    ClaudeTeams,
+    Omo,
+    Omx,
+    Omc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentWorkerKind {
+    CodexPane,
+    Integration(AgentIntegrationKind),
+}
+
+impl From<AgentWorkerKindParam> for AgentWorkerKind {
+    fn from(value: AgentWorkerKindParam) -> Self {
+        match value {
+            AgentWorkerKindParam::CodexPane => Self::CodexPane,
+            AgentWorkerKindParam::ClaudeTeams => {
+                Self::Integration(AgentIntegrationKind::ClaudeTeams)
+            }
+            AgentWorkerKindParam::Omo => Self::Integration(AgentIntegrationKind::Omo),
+            AgentWorkerKindParam::Omx => Self::Integration(AgentIntegrationKind::Omx),
+            AgentWorkerKindParam::Omc => Self::Integration(AgentIntegrationKind::Omc),
+        }
+    }
+}
+
+impl AgentWorkerKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::CodexPane => "codex-pane",
+            Self::Integration(kind) => kind.command_name(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CodexPane => "Codex pane",
+            Self::Integration(AgentIntegrationKind::ClaudeTeams) => "Claude Teams",
+            Self::Integration(AgentIntegrationKind::Omo) => "OMO",
+            Self::Integration(AgentIntegrationKind::Omx) => "OMX",
+            Self::Integration(AgentIntegrationKind::Omc) => "OMC",
+        }
+    }
+
+    fn controller(self) -> &'static str {
+        match self {
+            Self::CodexPane => "agentmux-pane-worker",
+            Self::Integration(_) => "agentmux-tmux-compat",
+        }
+    }
+
+    fn activity(self) -> &'static str {
+        match self {
+            Self::CodexPane => "agent",
+            Self::Integration(_) => "agent_team",
+        }
+    }
+}
+
+fn is_managed_worker_session(session: &Value) -> bool {
+    let activity = session
+        .pointer("/telemetry/activity")
+        .and_then(Value::as_str);
+    let worker_name = session
+        .pointer("/telemetry/session")
+        .and_then(Value::as_str);
+    activity == Some("agent_team")
+        || worker_name.is_some_and(|name| name.starts_with("codex-pane:"))
+}
+
+fn resolve_agent_integration_distribution(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(super::wsl_distribution_from_env)
+        .or_else(|| {
+            super::discover_wsl_distributions_from_backend()
+                .ok()
+                .and_then(|distributions| {
+                    distributions
+                        .iter()
+                        .find(|distribution| distribution.is_default)
+                        .or_else(|| distributions.first())
+                        .map(|distribution| distribution.name.clone())
+                })
+        })
+}
+
+fn build_agent_worker_command(
+    kind: AgentWorkerKind,
+    mut args: Vec<String>,
+) -> Result<Vec<String>, String> {
+    match kind {
+        AgentWorkerKind::CodexPane => {
+            let mut command = vec!["codex".to_string()];
+            if !args.iter().any(|arg| arg == "--no-alt-screen") {
+                command.push("--no-alt-screen".to_string());
+            }
+            command.append(&mut args);
+            Ok(command)
+        }
+        AgentWorkerKind::Integration(integration) => {
+            let launcher = std::env::current_exe()
+                .map_err(|error| format!("could not locate agentmux executable: {error}"))?;
+            let launcher = path_to_wsl_value(&launcher).map_err(|error| error.to_string())?;
+            let mut command = vec![
+                launcher,
+                "integrations".to_string(),
+                "launch".to_string(),
+                integration.command_name().to_string(),
+            ];
+            command.append(&mut args);
+            Ok(command)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -2148,6 +2858,8 @@ mod tests {
             names,
             vec![
                 "agent_attention_list",
+                "agent_integration_status",
+                "agent_worker_list",
                 "agentmux_context",
                 "browser_get",
                 "browser_snapshot",
@@ -2194,11 +2906,24 @@ mod tests {
         let standard_names = names(&standard);
         let full_names = names(&full);
 
-        assert_eq!(read_names.len(), 12);
-        assert_eq!(standard_names.len(), 12 + STANDARD_TOOL_NAMES.len());
+        let declared_read_names = READ_TOOL_NAMES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            read_names,
+            declared_read_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect()
+        );
+        assert_eq!(
+            standard_names.len(),
+            READ_TOOL_NAMES.len() + STANDARD_TOOL_NAMES.len()
+        );
         assert_eq!(
             full_names.len(),
-            12 + STANDARD_TOOL_NAMES.len() + FULL_TOOL_NAMES.len()
+            READ_TOOL_NAMES.len() + STANDARD_TOOL_NAMES.len() + FULL_TOOL_NAMES.len()
         );
         assert!(read_names.is_subset(&standard_names));
         assert!(standard_names.is_subset(&full_names));
@@ -2295,6 +3020,66 @@ mod tests {
         assert!(full_instructions.contains("destructive lifecycle"));
     }
 
+    #[test]
+    fn profiles_authorize_each_tool_call_independently_of_router_visibility() {
+        assert!(McpProfile::Read.allows_tool("workspace_list"));
+        assert!(!McpProfile::Read.allows_tool("terminal_open"));
+        assert!(!McpProfile::Read.allows_tool("workspace_close"));
+
+        assert!(McpProfile::Standard.allows_tool("workspace_list"));
+        assert!(McpProfile::Standard.allows_tool("terminal_open"));
+        assert!(!McpProfile::Standard.allows_tool("workspace_close"));
+
+        assert!(McpProfile::Full.allows_tool("workspace_list"));
+        assert!(McpProfile::Full.allows_tool("terminal_open"));
+        assert!(McpProfile::Full.allows_tool("workspace_close"));
+        assert!(!McpProfile::Full.allows_tool("unclassified_future_tool"));
+    }
+
+    #[test]
+    fn command_and_external_interaction_tools_are_marked_open_world() {
+        let (full, _) = test_server_for_profile(McpProfile::Full, []);
+        for name in [
+            "terminal_open",
+            "terminal_split",
+            "terminal_send_text",
+            "terminal_send_key",
+            "browser_open",
+            "browser_open_split",
+            "browser_navigate",
+            "browser_click",
+            "browser_fill",
+            "browser_evaluate",
+            "action_run",
+            "agent_worker_start",
+            "agent_worker_send",
+        ] {
+            let tool = full
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert_eq!(
+                tool.annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.open_world_hint),
+                Some(true),
+                "{name} can execute commands or interact with external entities"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_worker_start_schema_exposes_only_explicit_worker_kinds() {
+        let schema = schemars::schema_for!(AgentWorkerStartToolParams);
+        let value = serde_json::to_value(schema).expect("worker start schema");
+        assert_eq!(
+            value.pointer("/$defs/AgentWorkerKindParam/enum"),
+            Some(&json!(["codex-pane", "claude-teams", "omo", "omx", "omc"]))
+        );
+    }
+
     #[tokio::test]
     async fn diagnostics_summary_includes_bounded_control_audit() {
         let (server, transport) = test_server([
@@ -2339,6 +3124,228 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "session.read_recent");
         assert_eq!(calls[0].1["max_bytes"], MAX_TERMINAL_READ_BYTES);
+    }
+
+    #[tokio::test]
+    async fn agent_worker_list_filters_generic_agent_sessions() {
+        let (server, _) = test_server([(
+            "agent.list",
+            json!({
+                "sessions": [
+                    {"session_id": "generic", "telemetry": {"activity": "agent", "session": "claude"}},
+                    {"session_id": "codex", "telemetry": {"activity": "agent", "session": "codex-pane:worker"}},
+                    {"session_id": "team", "telemetry": {"activity": "agent_team", "session": "claude-teams:worker"}},
+                    {"session_id": "shell", "telemetry": {"activity": "terminal"}}
+                ]
+            }),
+        )]);
+        let result = server
+            .agent_worker_list(Parameters(AgentWorkerListToolParams::default()))
+            .await;
+        let sessions = result.structured_content.unwrap()["sessions"]
+            .as_array()
+            .cloned()
+            .expect("worker sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["session_id"], "codex");
+        assert_eq!(sessions[1]["session_id"], "team");
+    }
+
+    #[tokio::test]
+    async fn agent_integration_status_rejects_an_unknown_explicit_workspace() {
+        let (server, transport) = test_server([]);
+        let result = server
+            .agent_integration_status(Parameters(AgentIntegrationStatusToolParams {
+                workspace_id: Some("missing-workspace".to_string()),
+                integration: Some("claude-teams".to_string()),
+                distribution: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "workspace.get");
+        assert_eq!(calls[0].1["workspace_id"], "missing-workspace");
+    }
+
+    #[tokio::test]
+    async fn agent_worker_start_splits_and_registers_typed_metadata() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-source",
+                        "cwd": "/workspace/project"
+                    }),
+                ),
+                (
+                    "terminal.split",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker",
+                        "surface_id": "surface-worker",
+                        "session_id": "session-worker"
+                    }),
+                ),
+                ("agent.set_state", json!({"session_id": "session-worker"})),
+            ],
+        );
+        let result = server
+            .agent_worker_start(Parameters(AgentWorkerStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                kind: AgentWorkerKindParam::ClaudeTeams,
+                distribution: Some("Ubuntu".to_string()),
+                placement: None,
+                axis: None,
+                ratio: Some(0.4),
+                cwd: None,
+                args: vec!["--model".to_string(), "opus".to_string()],
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("worker result");
+        assert_eq!(value["kind"], "claude-teams");
+        assert_eq!(value["controller"], "agentmux-tmux-compat");
+        assert_eq!(value["session_id"], "session-worker");
+
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "system.identify");
+        assert_eq!(calls[1].0, "terminal.split");
+        assert_eq!(calls[1].1["workspace_id"], "workspace-1");
+        assert_eq!(calls[1].1["pane_id"], "pane-source");
+        assert_eq!(calls[1].1["behavior"], "clone_current");
+        assert_eq!(calls[1].1["backend"], "wsl-direct");
+        let command = calls[1].1["command"].as_array().expect("worker command");
+        assert_eq!(command[1], "integrations");
+        assert_eq!(command[2], "launch");
+        assert_eq!(command[3], "claude-teams");
+        assert_eq!(calls[2].0, "agent.set_state");
+        assert_eq!(calls[2].1["telemetry"]["activity"], "agent_team");
+        assert_eq!(calls[2].1["telemetry"]["session"], "claude-teams:worker");
+    }
+
+    #[tokio::test]
+    async fn agent_worker_send_submits_literal_text_and_enter() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "agent.list",
+                    json!({
+                        "sessions": [{
+                            "session_id": "session-worker",
+                            "telemetry": {
+                                "activity": "agent_team",
+                                "session": "claude-teams:worker"
+                            }
+                        }]
+                    }),
+                ),
+                ("session.send_text", json!({"accepted": true})),
+                ("session.send_key", json!({"accepted": true})),
+            ],
+        );
+        let result = server
+            .agent_worker_send(Parameters(AgentWorkerSendToolParams {
+                workspace_id: None,
+                session_id: Some("session-worker".to_string()),
+                text: "Review the failing test".to_string(),
+                submit: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls[0].0, "agent.list");
+        assert_eq!(calls[1].0, "session.send_text");
+        assert_eq!(calls[1].1["text"], "Review the failing test");
+        assert_eq!(calls[2].0, "session.send_key");
+        assert_eq!(calls[2].1["key"], "enter");
+    }
+
+    #[tokio::test]
+    async fn agent_worker_send_rejects_a_generic_terminal_session() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [(
+                "agent.list",
+                json!({
+                    "sessions": [{
+                        "session_id": "session-shell",
+                        "telemetry": {"activity": "terminal"}
+                    }]
+                }),
+            )],
+        );
+        let result = server
+            .agent_worker_send(Parameters(AgentWorkerSendToolParams {
+                workspace_id: None,
+                session_id: Some("session-shell".to_string()),
+                text: "exit".to_string(),
+                submit: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "agent.list");
+    }
+
+    #[tokio::test]
+    async fn agent_worker_start_compensates_when_metadata_registration_fails() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-source",
+                        "cwd": "/workspace/project"
+                    }),
+                ),
+                (
+                    "terminal.split",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker",
+                        "surface_id": "surface-worker",
+                        "session_id": "session-worker"
+                    }),
+                ),
+                ("session.terminate", json!({"terminated": true})),
+                ("pane.close", json!({"closed": true})),
+            ],
+        );
+        let result = server
+            .agent_worker_start(Parameters(AgentWorkerStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                kind: AgentWorkerKindParam::CodexPane,
+                distribution: Some("Ubuntu".to_string()),
+                placement: None,
+                axis: None,
+                ratio: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls[2].0, "agent.set_state");
+        assert_eq!(calls[3].0, "session.terminate");
+        assert_eq!(calls[4].0, "pane.close");
     }
 
     #[tokio::test]
@@ -2413,7 +3420,7 @@ mod tests {
         let listed: Value =
             serde_json::from_str(&read_protocol_message(&mut lines, "tools/list response").await)
                 .expect("parse tools");
-        assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(12));
+        assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(14));
 
         write_protocol_message(
             &mut client_write,
@@ -2433,6 +3440,29 @@ mod tests {
             called["result"]["structuredContent"]["workspaces"],
             json!([])
         );
+
+        write_protocol_message(
+            &mut client_write,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "terminal_open", "arguments": {}}
+            }),
+        )
+        .await;
+        let denied: Value = serde_json::from_str(
+            &read_protocol_message(&mut lines, "profile authorization response").await,
+        )
+        .expect("parse authorization response");
+        assert_eq!(denied["result"]["isError"], true);
+        assert_eq!(
+            denied["result"]["structuredContent"]["error"]["method"],
+            "mcp.profile"
+        );
+        assert!(denied["result"]["structuredContent"]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("requires the 'standard' MCP profile")));
 
         drop(client_write);
         drop(lines);

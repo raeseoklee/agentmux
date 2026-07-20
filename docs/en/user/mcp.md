@@ -14,9 +14,11 @@ agentmux mcp doctor --help
 agentmux mcp setup --help
 ```
 
-`mcp serve` and a successful `mcp doctor` require the AgentMux desktop to be
-running. `mcp help`, command help, and `mcp setup` preview mode do not start or
-require the desktop application.
+`mcp serve` can initialize and answer protocol discovery such as `initialize`
+and `tools/list` without the AgentMux desktop. Tools that inspect or change
+desktop state require the desktop control plane to be running. A successful
+`mcp doctor` also requires that connection. `mcp help`, command help, and
+`mcp setup` preview mode do not start or require the desktop application.
 
 ## Choose the Least-Privilege Profile
 
@@ -24,17 +26,65 @@ Always start with the narrowest profile that can complete the workflow.
 
 | Profile | Capabilities | Recommended use |
 | --- | --- | --- |
-| `read` | Lists workspaces, sessions, agent attention, team messages and tasks; reads terminal output, browser snapshots, events, context, and diagnostics. | Monitoring, status collection, and first-time client setup. |
-| `standard` | Includes `read`, then adds pane focus, terminal open/split/input, browser open/navigation/click/fill, team messaging/task updates, and agent-state updates. This is a trusted write and command-execution profile: terminal tools can run arbitrary commands and browser tools can mutate external systems. | Trusted interactive agent workflows that require command execution or writes. |
-| `full` | Includes `standard`, then adds workspace/pane/surface close, session termination, config updates, browser JavaScript evaluation, action execution, and notification clearing. | Trusted operator automation that genuinely needs destructive or high-impact actions. |
+| `read` | Lists workspaces, sessions, agent attention, pane workers, integration readiness, team messages and tasks; reads terminal output, browser snapshots, events, context, and diagnostics. | Monitoring, status collection, and first-time client setup. |
+| `standard` | Includes `read`, then adds pane focus, terminal open/split/input, pane-worker start/send, browser open/navigation/click/fill, team messaging/task updates, and agent-state updates. This is a trusted write and command-execution profile: terminal tools can run arbitrary commands and browser tools can mutate external systems. | Trusted interactive agent workflows that require command execution or writes. |
+| `full` | Includes `standard`, then adds pane-worker stop, integration shim setup, workspace/pane/surface close, session termination, config updates, browser JavaScript evaluation, action execution, and notification clearing. | Trusted operator automation that genuinely needs destructive or high-impact actions. |
 
 `standard` is not a safe or non-destructive profile. Grant it only to a client
 that may execute commands and change terminal, browser, and shared coordination
-state. Tool annotations mark command/input and potentially destructive external
-mutations accordingly; annotations describe risk and do not provide a sandbox.
-Do not grant `full` merely to avoid choosing tools. MCP calls still use the
-desktop control-plane token, and mutating calls are attributed to their MCP
-profile in control-plane audit diagnostics.
+state. Profiles are enforced on every MCP tool call, but they are tool-surface
+policy, not a security sandbox against another process running as the same
+Windows user. A client that can execute arbitrary terminal commands may invoke
+other programs with that user's authority. Tool annotations describe risk and
+do not provide containment. Do not grant `full` merely to avoid choosing tools.
+
+Desktop control-plane calls use the local token, and mutations sent through
+that control plane are attributed to their MCP profile in audit diagnostics.
+`agent_integration_setup` is an exception: the MCP server performs it directly,
+so it does not appear in desktop control-plane audit records. It writes shims to
+the integration directory selected by `AGENTMUX_CMUXTERM_HOME`, the compatible
+`CMUXTERM_HOME`, or the default user directory. With `add_to_user_path: true`,
+it also modifies the Windows user `PATH`.
+
+## Agent Pane Workers and tmux Integrations
+
+AgentMux exposes typed MCP tools for agent-oriented panes:
+
+| Tool | Profile | Purpose |
+| --- | --- | --- |
+| `agent_worker_list` | `read` | List AgentMux-managed tmux integration workers and independent Codex pane workers. |
+| `agent_integration_status` | `read` | Diagnose Claude Teams, OMO, OMX, or OMC wrapper and WSL readiness, using the selected workspace's default WSL distribution when available. |
+| `agent_worker_start` | `standard` | Split the active pane or create a tab, then start `claude-teams`, `omo`, `omx`, `omc`, or `codex-pane`. |
+| `agent_worker_send` | `standard` | Send literal instructions to a worker and optionally submit Enter. |
+| `agent_worker_stop` | `full` | Terminate a worker session. |
+| `agent_integration_setup` | `full` | Install shared tmux-compatible wrappers and optionally add their directory to the Windows user PATH. |
+
+Use `kind: "claude-teams"` for Claude Code Agent Teams. The lead process gets
+the AgentMux tmux shim, and descendants created by `tmux split-window` inherit
+the integration environment while receiving pane-specific `TMUX` and
+`TMUX_PANE` identities from the desktop host.
+
+Use `kind: "codex-pane"` for an independent Codex CLI process in another
+AgentMux pane. This is not a Codex built-in subagent: Codex owns its internal
+`/agent` threads, and AgentMux cannot move or terminate those threads as panes.
+The explicit name prevents an MCP client from presenting an independent CLI
+process as a native Codex subagent.
+
+`agent_worker_send` and `agent_worker_stop` reject ordinary terminal sessions.
+If worker metadata registration fails after a launch, AgentMux stops the new
+session and closes its pane instead of leaving an untracked worker behind.
+
+Start with `agent_integration_status`, use `agent_integration_setup` only from
+an approved `full` client, and then use `agent_worker_start`. `team_message_send`
+operates AgentMux's shared mailbox; steering an arbitrary terminal TUI is done
+with `agent_worker_send` or the lower-level terminal input tools.
+
+The shim captures the WSL-side `PATH` separately when it crosses into
+`agentmux.exe`; it never copies the Windows process `PATH` into a Linux child.
+The desktop restores the captured WSL path inside each integration child so
+recursive `tmux split-window` calls continue to resolve the AgentMux shim.
+On restart, persisted integration launch settings are reused, while tmux-owned
+ephemeral child workers are not independently respawned alongside their lead.
 
 ## Run a Local stdio Server
 
