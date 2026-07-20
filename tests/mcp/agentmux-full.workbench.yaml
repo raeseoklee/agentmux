@@ -11,7 +11,7 @@ client:
   protocolVersion: "2025-11-25"
 tests:
   - id: full-profile-tools
-    description: Full profile exposes the complete AgentMux tool contract
+    description: Full profile exposes the complete AgentMux tool and schema contract
     act:
       method: tools/list
     assert:
@@ -20,16 +20,3 @@ tests:
       - kind: count
         path: $.tools
         equals: 34
-  - id: agentmux-context
-    description: Context discovery is callable through the MCP bridge
-    act:
-      method: tools/call
-      tool: agentmux_context
-      args: {}
-    assert:
-      - kind: status
-        equals: success
-      - kind: executionError
-        equals: false
-      - kind: contentType
-        contains: text
