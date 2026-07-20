@@ -139,3 +139,25 @@ agentmux server --workspace <workspace-id> --port 8765
 ```
 
 Open `http://127.0.0.1:8765/` in a browser.
+
+Expose the running desktop control plane through authenticated MCP Streamable
+HTTP on a separate port:
+
+```powershell
+agentmux server --desktop-control --port 8765 `
+  --mcp-http --mcp-port 8766 --mcp-profile standard --json
+```
+
+## MCP
+
+AgentMux can expose its authenticated local control plane to MCP clients over
+stdio:
+
+```powershell
+agentmux mcp doctor --profile read --json
+agentmux mcp serve --profile read
+agentmux mcp setup --client codex --profile read --json
+```
+
+See the [MCP control-plane guide](./mcp.md) for profile permissions, Codex and
+Claude configuration, installation safety, and remote transport status.

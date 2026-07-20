@@ -23,6 +23,15 @@ pub struct RequestEnvelope {
     pub method: String,
     pub params_json: String,
     pub auth: Auth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<ControlCaller>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControlCaller {
+    pub source: String,
+    pub profile: Option<String>,
+    pub client_session_id: Option<String>,
 }
 
 impl RequestEnvelope {
@@ -40,7 +49,13 @@ impl RequestEnvelope {
             auth: Auth {
                 token: token.into(),
             },
+            caller: None,
         }
+    }
+
+    pub fn with_caller(mut self, caller: ControlCaller) -> Self {
+        self.caller = Some(caller);
+        self
     }
 
     pub fn parse_params<T>(&self) -> Result<T, ControlError>
@@ -247,6 +262,55 @@ pub struct SessionSpawnParams {
     pub durability: Option<String>,
     pub placement: Option<String>,
     pub pane_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalOpenParams {
+    pub workspace_id: String,
+    pub pane_id: Option<String>,
+    pub backend: Option<String>,
+    pub backend_profile: Option<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVarParam>,
+    pub columns: Option<u16>,
+    pub rows: Option<u16>,
+    pub durability: Option<String>,
+    pub placement: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct TerminalSplitParams {
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub axis: String,
+    pub ratio: Option<f64>,
+    pub behavior: Option<String>,
+    pub backend: Option<String>,
+    pub backend_profile: Option<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    pub cwd: Option<String>,
+    pub columns: Option<u16>,
+    pub rows: Option<u16>,
+    pub durability: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalPlacementResult {
+    pub workspace_id: String,
+    pub source_pane_id: Option<String>,
+    pub pane_id: String,
+    pub surface_id: Option<String>,
+    pub session_id: Option<String>,
+    pub backend: Option<String>,
+    pub backend_profile: Option<String>,
+    pub cwd: Option<String>,
+    pub columns: u16,
+    pub rows: u16,
+    pub rolled_back: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -972,6 +1036,28 @@ pub struct EventSubscribeResult {
     pub subscribed: bool,
     pub cursor: String,
     pub dropped_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControlAuditListParams {
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControlAuditRecord {
+    pub request_id: String,
+    pub method: String,
+    pub source: String,
+    pub profile: Option<String>,
+    pub client_session_id: Option<String>,
+    pub occurred_at: String,
+    pub succeeded: bool,
+    pub error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ControlAuditListResult {
+    pub records: Vec<ControlAuditRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3017,5 +3103,24 @@ mod tests {
             }
             ResponseOutcome::Error(error) => panic!("unexpected error: {error:?}"),
         }
+    }
+
+    #[test]
+    fn request_caller_metadata_round_trips_and_remains_optional() {
+        let request = RequestEnvelope::new("req_caller", "workspace.list", "{}", "token")
+            .with_caller(ControlCaller {
+                source: "mcp-http".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some("mcp-session-1".to_string()),
+            });
+        let encoded = serde_json::to_string(&request).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.caller, request.caller);
+
+        let legacy: RequestEnvelope = serde_json::from_str(
+            r#"{"schema":"agentmux.control.v1","id":"req_legacy","method":"workspace.list","params_json":"{}","auth":{"token":"token"}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.caller, None);
     }
 }

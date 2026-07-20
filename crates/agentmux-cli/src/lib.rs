@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,7 @@ use agentmux_ipc::{
     BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams, BrowserScreenshotResult,
     BrowserScrollParams, BrowserSelectParams, BrowserStorageResult, BrowserSurfaceParams,
     BrowserTypeParams, BrowserWaitForSelectorParams, BrowserWaitForSelectorResult,
-    BrowserZoomParams, ControlError, DiagnosticsExportResult, ErrorCode, EventFrame,
+    BrowserZoomParams, ControlCaller, ControlError, DiagnosticsExportResult, ErrorCode, EventFrame,
     EventPollParams, EventPollResult, EventSubscribeParams, EventSubscribeResult,
     NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
     NotificationCreateParams, NotificationDismissParams, NotificationListParams,
@@ -55,6 +55,10 @@ use agentmux_ipc::{
 };
 use tungstenite::{accept_hdr, Error as WsError, Message as WsMessage};
 
+mod mcp;
+mod mcp_config;
+mod mcp_http;
+
 const AGENTMUX_CONFIG_SCHEMA_JSON: &str =
     include_str!("../../../docs/en/schemas/agentmux.config.schema.json");
 
@@ -70,6 +74,7 @@ pub const COMMAND_FAMILIES: &[&str] = &[
     "notification",
     "events",
     "browser",
+    "mcp",
     "agent",
     "actions",
     "diagnostics",
@@ -117,6 +122,7 @@ const PUBLIC_COMMAND_FAMILIES: &[&str] = &[
     "notification",
     "events",
     "browser",
+    "mcp",
     "agent",
     "actions",
     "diagnostics",
@@ -164,6 +170,8 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} browser zoom <surface-id> 125\n",
             "Try: {program_name} browser wait-for-selector <surface-id> #ready --timeout-ms 5000\n",
             "Try: {program_name} browser evaluate <surface-id> [--frame <frame-id>] -- document.title\n",
+            "Try: {program_name} mcp serve --profile read\n",
+            "Try: {program_name} mcp doctor --json\n",
             "Try: {program_name} ssh deploy@host.example:22 --workspace <id>\n",
             "Try: {program_name} notification list --severity warning\n",
             "Try: {program_name} events watch --workspace <id>\n",
@@ -174,6 +182,7 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} terminal run -- cmd.exe /d /q /c \"echo agentmux\"\n",
             "Try: {program_name} terminal run --backend wsl-direct --distribution Ubuntu --cwd D:\\work\\repo -- bash -lc pwd\n",
             "Try: {program_name} server --workspace <id> --port 8765\n",
+            "Try: {program_name} server --desktop-control --mcp-http --mcp-profile standard\n",
             "Try: {program_name} notify --title \"Build\" --body \"Done\"\n",
             "Try: {program_name} set-status build compiling --priority 80\n",
             "Try: {program_name} set-progress 0.5 --label \"Building\"\n",
@@ -342,6 +351,10 @@ where
         [family, command, rest @ ..] if family == "browser" => {
             run_browser_command(command, rest, &mut output)
         }
+        [family, command, rest @ ..] if family == "mcp" => {
+            mcp::run_command(command, rest, &mut output)
+        }
+        [family] if family == "mcp" => mcp::run_command("help", &[], &mut output),
         [family, rest @ ..] if family == "ssh" => {
             let options = parse_ssh_options(rest)?;
             run_ssh(options, &mut output)
@@ -355,8 +368,13 @@ where
             run_terminal_command(options, &mut output)
         }
         [family, rest @ ..] if family == "server" => {
-            let options = parse_server_options(rest)?;
-            run_server(options, &mut output)
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                writeln!(output, "{}", server_usage())?;
+                Ok(())
+            } else {
+                let options = parse_server_options(rest)?;
+                run_server(options, &mut output)
+            }
         }
         [command, rest @ ..] if command == "notify" => {
             let options = parse_notify_options(rest)?;
@@ -488,6 +506,7 @@ struct ControlInvokeOptions {
     pipe_name: String,
     token: Option<String>,
     token_path: Option<String>,
+    mcp_caller_handle: Option<String>,
 }
 
 impl ControlInvokeOptions {
@@ -499,6 +518,7 @@ impl ControlInvokeOptions {
                 .unwrap_or_else(|_| DEFAULT_CONTROL_PIPE_NAME.to_string()),
             token: std::env::var("AGENTMUX_CONTROL_TOKEN").ok(),
             token_path: std::env::var("AGENTMUX_CONTROL_TOKEN_PATH").ok(),
+            mcp_caller_handle: None,
         }
     }
 }
@@ -826,6 +846,8 @@ struct ServerOptions {
     host: String,
     port: u16,
     allow_remote: bool,
+    allow_insecure_remote_mcp: bool,
+    show_auth_token: bool,
     auth_token: String,
     workspace_id: Option<String>,
     backend: Option<String>,
@@ -835,12 +857,38 @@ struct ServerOptions {
     columns: u16,
     rows: u16,
     max_recent_bytes: usize,
+    mcp_http: bool,
+    mcp_http_port: u16,
+    mcp_http_profile: mcp_http::McpAccessProfile,
+    mcp_allowed_hosts: Vec<String>,
+    mcp_allowed_origins: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerMode {
     Local,
     DesktopBridge,
+}
+
+struct McpHttpBackground {
+    endpoint_url: String,
+    shutdown: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+impl Drop for McpHttpBackground {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("agentmux MCP HTTP shutdown failed: {error}"),
+                Err(_) => eprintln!("agentmux MCP HTTP thread panicked during shutdown"),
+            }
+        }
+    }
 }
 
 impl ServerMode {
@@ -4884,6 +4932,8 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
     let mut host = "127.0.0.1".to_string();
     let mut port = 8765;
     let mut allow_remote = false;
+    let mut allow_insecure_remote_mcp = false;
+    let mut show_auth_token = false;
     let mut workspace_id = workspace_from_env();
     let mut backend = Some("conpty".to_string());
     let mut backend_profile = None;
@@ -4891,6 +4941,11 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
     let mut columns = 120;
     let mut rows = 36;
     let mut max_recent_bytes = 1024 * 1024;
+    let mut mcp_http = false;
+    let mut mcp_http_port = 0;
+    let mut mcp_http_profile = mcp_http::McpAccessProfile::Read;
+    let mut mcp_allowed_hosts = Vec::new();
+    let mut mcp_allowed_origins = Vec::new();
     let mut index = 0;
 
     if args.first().map(String::as_str) == Some("start") {
@@ -4918,6 +4973,14 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
             }
             "--allow-remote" => {
                 allow_remote = true;
+                index += 1;
+            }
+            "--allow-insecure-remote-mcp" => {
+                allow_insecure_remote_mcp = true;
+                index += 1;
+            }
+            "--show-auth-token" => {
+                show_auth_token = true;
                 index += 1;
             }
             "--mode" => {
@@ -4961,6 +5024,43 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
                 )?;
                 index += 2;
             }
+            "--mcp-http" => {
+                mcp_http = true;
+                index += 1;
+            }
+            "--mcp-port" | "--mcp-http-port" => {
+                mcp_http_port = parse_u16_option(
+                    option_value(args, index, args[index].as_str())?,
+                    args[index].as_str(),
+                )?;
+                mcp_http = true;
+                index += 2;
+            }
+            "--mcp-profile" | "--mcp-http-profile" => {
+                let value = option_value(args, index, args[index].as_str())?;
+                mcp_http_profile = match value {
+                    "read" => mcp_http::McpAccessProfile::Read,
+                    "standard" => mcp_http::McpAccessProfile::Standard,
+                    "full" => mcp_http::McpAccessProfile::Full,
+                    other => {
+                        return Err(CliError::InvalidArgs(format!(
+                            "unsupported MCP profile '{other}'; expected read, standard, or full."
+                        )))
+                    }
+                };
+                mcp_http = true;
+                index += 2;
+            }
+            "--mcp-allowed-host" => {
+                mcp_allowed_hosts
+                    .push(option_value(args, index, "--mcp-allowed-host")?.to_string());
+                index += 2;
+            }
+            "--mcp-allowed-origin" => {
+                mcp_allowed_origins
+                    .push(option_value(args, index, "--mcp-allowed-origin")?.to_string());
+                index += 2;
+            }
             value if value.starts_with("--") => {
                 return Err(CliError::InvalidArgs(format!(
                     "unknown server option '{value}'."
@@ -4987,6 +5087,24 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
         ));
     }
 
+    if mcp_http && !is_loopback_host(&host) && mcp_allowed_hosts.is_empty() {
+        return Err(CliError::InvalidArgs(
+            "remote MCP HTTP requires at least one exact --mcp-allowed-host value.".to_string(),
+        ));
+    }
+    if mcp_http && !is_loopback_host(&host) && !allow_insecure_remote_mcp {
+        return Err(CliError::InvalidArgs(
+            "remote MCP uses bearer authentication and is rejected over plain HTTP; terminate TLS in front of a loopback AgentMux MCP endpoint, or explicitly accept the risk with --allow-insecure-remote-mcp."
+                .to_string(),
+        ));
+    }
+    if mcp_http && mode != ServerMode::DesktopBridge {
+        return Err(CliError::InvalidArgs(
+            "MCP HTTP currently requires --desktop-control so tools share the running desktop control plane."
+                .to_string(),
+        ));
+    }
+
     let command = if index < args.len() {
         args[index..].to_vec()
     } else {
@@ -4999,6 +5117,8 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
         host,
         port,
         allow_remote,
+        allow_insecure_remote_mcp,
+        show_auth_token,
         auth_token: generate_server_auth_token(),
         workspace_id,
         backend,
@@ -5008,7 +5128,16 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, CliError> {
         columns,
         rows,
         max_recent_bytes,
+        mcp_http,
+        mcp_http_port,
+        mcp_http_profile,
+        mcp_allowed_hosts,
+        mcp_allowed_origins,
     })
+}
+
+fn server_usage() -> &'static str {
+    "agentmux server [start] [--mode local|desktop-bridge | --desktop-control] [--host <address>] [--port <port>] [--allow-remote] [--show-auth-token] [--workspace <id>] [--backend <kind>] [--backend-profile <name>] [--cwd <path>] [--columns <n>] [--rows <n>] [--max-recent-bytes <n>] [--mcp-http] [--mcp-port <port>] [--mcp-profile read|standard|full] [--mcp-allowed-host <host>]... [--mcp-allowed-origin <origin>]... [--allow-insecure-remote-mcp] [-- <command>...]\n\nMCP HTTP requires --desktop-control. Keep MCP on loopback behind a TLS reverse proxy. A non-loopback plain-HTTP MCP bind additionally requires --allow-remote, an exact --mcp-allowed-host, and the explicit --allow-insecure-remote-mcp risk override. Generated bearer tokens are redacted unless --show-auth-token is supplied."
 }
 
 fn generate_server_auth_token() -> String {
@@ -6620,6 +6749,107 @@ fn response_is_ok(response: &ResponseEnvelope) -> bool {
     matches!(response.outcome, ResponseOutcome::Ok { .. })
 }
 
+fn start_mcp_http_server(
+    options: &ServerOptions,
+    bind_addr: SocketAddr,
+) -> Result<McpHttpBackground, CliError> {
+    let invoke = options.invoke.clone();
+    let bearer_secret = options.auth_token.clone();
+    let profile = options.mcp_http_profile;
+    let mut config =
+        mcp_http::McpHttpConfig::new(SocketAddr::new(bind_addr.ip(), options.mcp_http_port));
+    config.allowed_hosts = options.mcp_allowed_hosts.clone();
+    config.allowed_origins = options.mcp_allowed_origins.clone();
+    config.max_profile = profile;
+    config.allow_insecure_remote_http = options.allow_insecure_remote_mcp;
+
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<String, String>>(1);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    let thread = thread::Builder::new()
+        .name("agentmux-mcp-http".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to create MCP HTTP runtime: {error}"));
+            let runtime = match runtime {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.clone()));
+                    return Err(error);
+                }
+            };
+            runtime.block_on(async move {
+                let bearer = mcp_http::StaticBearerToken::new(
+                    "server",
+                    "agentmux-server",
+                    bearer_secret,
+                    profile,
+                )
+                .map_err(|error| error.to_string());
+                let bearer = match bearer {
+                    Ok(bearer) => bearer,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                };
+                let authorizer = mcp_http::StaticTokenAuthorizer::new(vec![bearer])
+                    .map_err(|error| error.to_string());
+                let authorizer = match authorizer {
+                    Ok(authorizer) => Arc::new(authorizer) as Arc<dyn mcp_http::TokenAuthorizer>,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                };
+                let service_invoke = invoke.clone();
+                let server = mcp_http::spawn_mcp_http_server(config, authorizer, move |profile| {
+                    let mut invoke = service_invoke.clone();
+                    invoke.mcp_caller_handle = mcp_http::current_caller_handle();
+                    Ok(mcp::AgentMuxMcpServer::for_http(invoke, profile))
+                })
+                .await
+                .map_err(|error| error.to_string());
+                let server = match server {
+                    Ok(server) => server,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                };
+                let endpoint_url = server.endpoint_url();
+                if ready_tx.send(Ok(endpoint_url)).is_err() {
+                    return server.shutdown().await.map_err(|error| error.to_string());
+                }
+                let _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()).await;
+                server.shutdown().await.map_err(|error| error.to_string())
+            })
+        })
+        .map_err(CliError::Io)?;
+
+    let endpoint_url = match ready_rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(Ok(endpoint_url)) => endpoint_url,
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            return Err(CliError::Control(error));
+        }
+        Err(error) => {
+            let _ = shutdown_tx.send(());
+            let _ = thread.join();
+            return Err(CliError::Control(format!(
+                "MCP HTTP server did not become ready: {error}"
+            )));
+        }
+    };
+    Ok(McpHttpBackground {
+        endpoint_url,
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    })
+}
+
 fn run_server<W>(options: ServerOptions, output: &mut W) -> Result<(), CliError>
 where
     W: Write,
@@ -6634,23 +6864,15 @@ where
     let local_addr = listener.local_addr()?;
     let url = format_server_url(&options.host, local_addr.port());
     let state = ServerState::new(options);
+    let mcp_http = if state.options.mcp_http {
+        Some(start_mcp_http_server(&state.options, local_addr)?)
+    } else {
+        None
+    };
 
     if state.options.invoke.json {
-        write_json_value(
-            &serde_json::json!({
-                "url": url,
-                "host": state.options.host.clone(),
-                "port": local_addr.port(),
-                "mode": state.options.mode.as_str(),
-                "workspace_id": state.default_workspace_id(),
-                "backend": state.options.backend.clone(),
-                "backend_profile": state.options.backend_profile.clone(),
-                "allow_remote": state.options.allow_remote,
-                "auth_token": state.options.auth_token.clone(),
-                "control_pipe": state.options.invoke.pipe_name.clone(),
-            }),
-            output,
-        )?;
+        let payload = server_startup_payload(&state, &url, local_addr.port(), mcp_http.as_ref());
+        write_json_value(&payload, output)?;
     } else {
         writeln!(output, "AgentMux server listening on {url}")?;
         writeln!(
@@ -6671,6 +6893,31 @@ where
         } else {
             writeln!(output, "Open the URL in a browser.")?;
         }
+        if let Some(server) = mcp_http.as_ref() {
+            writeln!(output, "MCP Streamable HTTP: {}", server.endpoint_url)?;
+            writeln!(
+                output,
+                "MCP profile ceiling: {}",
+                state.options.mcp_http_profile.as_str()
+            )?;
+            writeln!(
+                output,
+                "MCP bearer token source: generated ephemeral server token"
+            )?;
+            if state.options.show_auth_token {
+                writeln!(
+                    output,
+                    "MCP bearer token: {}",
+                    disclosed_auth_token(&state.options)
+                        .expect("token disclosure flag was checked")
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "MCP bearer token: <redacted>; restart with --show-auth-token to disclose it"
+                )?;
+            }
+        }
     }
 
     let shared_state = Arc::new(Mutex::new(state));
@@ -6689,6 +6936,50 @@ where
     }
 
     Ok(())
+}
+
+fn disclosed_auth_token(options: &ServerOptions) -> Option<&str> {
+    options
+        .show_auth_token
+        .then_some(options.auth_token.as_str())
+}
+
+fn server_startup_payload(
+    state: &ServerState,
+    url: &str,
+    port: u16,
+    mcp_http: Option<&McpHttpBackground>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "url": url,
+        "host": state.options.host.clone(),
+        "port": port,
+        "mode": state.options.mode.as_str(),
+        "workspace_id": state.default_workspace_id(),
+        "backend": state.options.backend.clone(),
+        "backend_profile": state.options.backend_profile.clone(),
+        "allow_remote": state.options.allow_remote,
+        "auth": {
+            "token_source": "generated_ephemeral",
+            "token_disclosure": "pass --show-auth-token to include auth_token",
+        },
+        "control_pipe": state.options.invoke.pipe_name.clone(),
+        "mcp_http": mcp_http.map(|server| serde_json::json!({
+            "url": server.endpoint_url,
+            "profile": state.options.mcp_http_profile.as_str(),
+            "authorization": "Bearer <generated_ephemeral_token>",
+            "token_source": "server auth token",
+            "tls": if is_loopback_host(&state.options.host) {
+                "loopback HTTP"
+            } else {
+                "insecure remote HTTP explicitly allowed"
+            },
+        })),
+    });
+    if let Some(token) = disclosed_auth_token(&state.options) {
+        payload["auth_token"] = serde_json::Value::String(token.to_string());
+    }
+    payload
 }
 
 fn format_server_url(host: &str, port: u16) -> String {
@@ -13189,26 +13480,48 @@ fn invoke_control<T>(
 where
     T: serde::Serialize,
 {
+    invoke_control_with_caller(method, params, options, None)
+}
+
+fn invoke_control_with_caller<T>(
+    method: &str,
+    params: &T,
+    options: &ControlInvokeOptions,
+    caller: Option<ControlCaller>,
+) -> Result<ResponseEnvelope, CliError>
+where
+    T: serde::Serialize,
+{
     let params_json = serde_json::to_string(params)
         .map_err(|error| CliError::Control(format!("failed to encode params: {error}")))?;
     let token = resolve_control_token(options)?;
-    let response = agentmux_ipc::send_named_pipe_request(
-        &options.pipe_name,
-        &request(
-            &format!("cli_{}", method.replace('.', "_")),
-            method,
-            &params_json,
-            &token,
-        ),
-        Duration::from_secs(5),
-    )
-    .map_err(|error| {
-        CliError::Control(format!(
-            "failed to reach AgentMux control pipe '{}': {error}",
-            options.pipe_name
-        ))
-    })?;
+    let mut request = request(
+        &format!("cli_{}", method.replace('.', "_")),
+        method,
+        &params_json,
+        &token,
+    );
+    request.caller = resolved_control_caller(options, caller);
+    let response =
+        agentmux_ipc::send_named_pipe_request(&options.pipe_name, &request, Duration::from_secs(5))
+            .map_err(|error| {
+                CliError::Control(format!(
+                    "failed to reach AgentMux control pipe '{}': {error}",
+                    options.pipe_name
+                ))
+            })?;
     Ok(response)
+}
+
+fn resolved_control_caller(
+    options: &ControlInvokeOptions,
+    fallback: Option<ControlCaller>,
+) -> Option<ControlCaller> {
+    options
+        .mcp_caller_handle
+        .as_deref()
+        .and_then(mcp_http::caller_for_handle)
+        .or(fallback)
 }
 
 fn subscribe_control_events(
@@ -14363,6 +14676,18 @@ mod tests {
     }
 
     #[test]
+    fn server_help_documents_mcp_http_without_starting_a_listener() {
+        let mut output = Vec::new();
+        run_cli(["server", "--help"], &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("--mcp-http"));
+        assert!(output.contains("--mcp-profile read|standard|full"));
+        assert!(output.contains("--desktop-control"));
+        assert!(output.contains("--allow-insecure-remote-mcp"));
+        assert!(output.contains("--show-auth-token"));
+    }
+
+    #[test]
     fn agentmux_usage_hides_cmux_compat_surface() {
         let text = usage();
         assert!(!text.contains("Try: cmux "));
@@ -14388,6 +14713,9 @@ mod tests {
         assert_eq!(options.port, 0);
         assert_eq!(options.mode, ServerMode::Local);
         assert!(!options.allow_remote);
+        assert!(!options.allow_insecure_remote_mcp);
+        assert!(!options.show_auth_token);
+        assert!(!options.mcp_http);
         assert_eq!(options.workspace_id.as_deref(), Some("ws_1"));
         assert_eq!(options.backend.as_deref(), Some("conpty"));
         assert!(options.auth_token.starts_with("srv_"));
@@ -14396,6 +14724,118 @@ mod tests {
             options.command,
             vec!["powershell.exe".to_string(), "-NoLogo".to_string()]
         );
+    }
+
+    #[test]
+    fn server_options_enable_scoped_mcp_http_with_remote_host_guard() {
+        let options = parse_server_options(&[
+            "--desktop-control".to_string(),
+            "--mcp-http".to_string(),
+            "--mcp-profile".to_string(),
+            "standard".to_string(),
+            "--mcp-port".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        assert!(options.mcp_http);
+        assert_eq!(options.mcp_http_port, 0);
+        assert_eq!(
+            options.mcp_http_profile,
+            mcp_http::McpAccessProfile::Standard
+        );
+
+        let blocked = parse_server_options(&[
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--allow-remote".to_string(),
+            "--desktop-control".to_string(),
+            "--mcp-http".to_string(),
+        ]);
+        assert!(blocked
+            .unwrap_err()
+            .to_string()
+            .contains("--mcp-allowed-host"));
+
+        let insecure_without_override = parse_server_options(&[
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--allow-remote".to_string(),
+            "--desktop-control".to_string(),
+            "--mcp-http".to_string(),
+            "--mcp-allowed-host".to_string(),
+            "agentmux.example:8766".to_string(),
+        ]);
+        assert!(insecure_without_override
+            .unwrap_err()
+            .to_string()
+            .contains("--allow-insecure-remote-mcp"));
+
+        let allowed = parse_server_options(&[
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--allow-remote".to_string(),
+            "--desktop-control".to_string(),
+            "--mcp-http".to_string(),
+            "--mcp-allowed-host".to_string(),
+            "agentmux.example:8766".to_string(),
+            "--allow-insecure-remote-mcp".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(allowed.mcp_allowed_hosts, vec!["agentmux.example:8766"]);
+        assert!(allowed.allow_insecure_remote_mcp);
+    }
+
+    #[test]
+    fn server_auth_token_is_redacted_unless_explicitly_requested() {
+        let hidden = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        assert_eq!(disclosed_auth_token(&hidden), None);
+        let hidden_token = hidden.auth_token.clone();
+        let hidden_payload = server_startup_payload(
+            &ServerState::new(hidden),
+            "http://127.0.0.1:8765/",
+            8765,
+            None,
+        );
+        assert!(hidden_payload.get("auth_token").is_none());
+        assert!(!hidden_payload.to_string().contains(&hidden_token));
+        assert_eq!(
+            hidden_payload["auth"]["token_source"],
+            "generated_ephemeral"
+        );
+
+        let shown = parse_server_options(&[
+            "--port".to_string(),
+            "0".to_string(),
+            "--show-auth-token".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            disclosed_auth_token(&shown),
+            Some(shown.auth_token.as_str())
+        );
+        let shown_token = shown.auth_token.clone();
+        let shown_payload = server_startup_payload(
+            &ServerState::new(shown),
+            "http://127.0.0.1:8765/",
+            8765,
+            None,
+        );
+        assert_eq!(shown_payload["auth_token"], shown_token);
+    }
+
+    #[test]
+    fn server_mcp_http_background_starts_and_shuts_down() {
+        let options = parse_server_options(&[
+            "--desktop-control".to_string(),
+            "--mcp-http".to_string(),
+            "--mcp-profile".to_string(),
+            "full".to_string(),
+        ])
+        .unwrap();
+        let server = start_mcp_http_server(&options, "127.0.0.1:0".parse().unwrap()).unwrap();
+        assert!(server.endpoint_url.starts_with("http://127.0.0.1:"));
+        assert!(server.endpoint_url.ends_with("/mcp"));
+        drop(server);
     }
 
     #[test]
@@ -16667,11 +17107,85 @@ HKEY_CURRENT_USER\Environment
             pipe_name: DEFAULT_CONTROL_PIPE_NAME.to_string(),
             token: None,
             token_path: Some(path.to_string_lossy().to_string()),
+            mcp_caller_handle: None,
         };
 
         assert_eq!(resolve_control_token(&options).unwrap(), "file-token");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn authenticated_mcp_caller_overrides_transport_generated_identity() {
+        let authenticated = ControlCaller {
+            source: "mcp-http;token_id=server;subject=agentmux-server;peer=127.0.0.1:43127"
+                .to_string(),
+            profile: Some("standard".to_string()),
+            client_session_id: Some("mcp-session-1".to_string()),
+        };
+        let handle = mcp_http::register_caller(authenticated.clone());
+        let mut options = ControlInvokeOptions::from_env();
+        options.mcp_caller_handle = Some(handle);
+        let fallback = ControlCaller {
+            source: "client-supplied".to_string(),
+            profile: Some("full".to_string()),
+            client_session_id: Some("forged".to_string()),
+        };
+
+        assert_eq!(
+            resolved_control_caller(&options, Some(fallback)),
+            Some(authenticated)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn authenticated_mcp_identity_reaches_the_named_pipe_envelope() {
+        let pipe_name = format!(
+            r"\\.\pipe\agentmux-mcp-caller-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let authenticated = ControlCaller {
+            source: "mcp-http;token_id=server;subject=agentmux-server;peer=127.0.0.1:43127"
+                .to_string(),
+            profile: Some("standard".to_string()),
+            client_session_id: Some("mcp-session-actual".to_string()),
+        };
+        let handle = mcp_http::register_caller(authenticated.clone());
+        let mut options = ControlInvokeOptions::from_env();
+        options.pipe_name = pipe_name.clone();
+        options.token = Some("test-control-token".to_string());
+        options.mcp_caller_handle = Some(handle);
+
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server_pipe = pipe_name.clone();
+        let server = std::thread::spawn(move || {
+            agentmux_ipc::serve_one_named_pipe_request(&server_pipe, |request| {
+                request_tx.send(request.clone()).unwrap();
+                ResponseEnvelope::ok(request.id, "{}")
+            })
+            .unwrap();
+        });
+
+        invoke_control_with_caller(
+            "workspace.list",
+            &serde_json::json!({}),
+            &options,
+            Some(ControlCaller {
+                source: "forged".to_string(),
+                profile: Some("full".to_string()),
+                client_session_id: Some("forged-session".to_string()),
+            }),
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        let received = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(received.caller, Some(authenticated));
     }
 
     #[test]

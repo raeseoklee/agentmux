@@ -120,6 +120,13 @@ import {
   SUPPORTED_LANGUAGES,
   type Translator,
 } from "./i18n";
+import {
+  acknowledgeUpdateNotification,
+  createUpdateNotificationSession,
+  notifyUpdateAvailable,
+  shouldUseInAppUpdateFallback,
+  UPDATE_NOTIFICATION_OPEN_EVENT,
+} from "./updateNotifications";
 import desktopPackage from "../../package.json";
 
 type Overlay = "palette" | "search" | "settings" | "setup" | null;
@@ -155,6 +162,12 @@ interface AppUpdateState {
   downloadedBytes?: number;
   contentLength?: number | null;
   lastCheckedAt?: string | null;
+}
+
+interface UpdateNotificationOpenEvent {
+  payload?: {
+    version?: unknown;
+  };
 }
 
 const DEFAULT_UPDATES_CONFIG: AppConfigUpdates = {
@@ -1934,6 +1947,9 @@ export function AgentmuxTerminalApp() {
   const autoClosingExitedSessionsRef = useRef<Set<string>>(new Set());
   const exitIntentSessionIdsRef = useRef<Set<string>>(new Set());
   const exitIntentRefreshTimersRef = useRef<number[]>([]);
+  const updateNotificationSessionRef = useRef(
+    createUpdateNotificationSession(),
+  );
 
   const [theme, setTheme] = useState<ThemeName>("dark");
   const [language, setLanguage] = useState<AppLocaleLanguage>("en");
@@ -2290,7 +2306,45 @@ export function AgentmuxTerminalApp() {
           version: update.version,
           date: update.date ?? null,
           body: update.body ?? null,
+          message: null,
           lastCheckedAt: checkedAt,
+        });
+        const notificationTitle = t("updates.notification.title");
+        const notificationBody = t("updates.notification.body", {
+          version: update.version,
+        });
+        void notifyUpdateAvailable(
+          {
+            currentVersion: update.currentVersion,
+            version: update.version,
+            title: notificationTitle,
+            body: notificationBody,
+            actionLabel: t("updates.notification.action"),
+          },
+          { session: updateNotificationSessionRef.current },
+        ).then((result) => {
+          if (!shouldUseInAppUpdateFallback(result)) {
+            return;
+          }
+          const fallbackMessage = t(
+            result === "unsupported"
+              ? "updates.notification.fallback.unsupported"
+              : "updates.notification.fallback.failed",
+          );
+          setUpdateState((current) =>
+            current.status === "available" &&
+            current.version === update.version
+              ? { ...current, message: fallbackMessage }
+              : current,
+          );
+          void client
+            .createNotification({
+              title: notificationTitle,
+              body: `${notificationBody}\n${fallbackMessage}`,
+              severity: "info",
+              workspaceId: activeWorkspaceId,
+            })
+            .catch(() => undefined);
         });
         return update;
       } catch (cause) {
@@ -2304,7 +2358,7 @@ export function AgentmuxTerminalApp() {
         return null;
       }
     },
-    [],
+    [activeWorkspaceId, client, t],
   );
   const installAvailableUpdate = useCallback(async () => {
     try {
@@ -2366,6 +2420,46 @@ export function AgentmuxTerminalApp() {
     autoUpdateCheckStartedRef.current = true;
     void checkForUpdates({ background: true });
   }, [checkForUpdates, configLoaded, updatesConfig.autoCheck]);
+  useEffect(() => {
+    const eventApi = (
+      window as Window & {
+        __TAURI__?: {
+          event?: {
+            listen?: (
+              event: string,
+              handler: (event: UpdateNotificationOpenEvent) => void,
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+    if (!eventApi?.listen) {
+      return;
+    }
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    eventApi
+      .listen(UPDATE_NOTIFICATION_OPEN_EVENT, (event) => {
+        if (typeof event.payload?.version === "string") {
+          acknowledgeUpdateNotification(event.payload.version);
+        }
+        setSettingsTab("general");
+        setOverlay("settings");
+      })
+      .then((stopListening) => {
+        if (disposed) {
+          stopListening();
+        } else {
+          unlisten = stopListening;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
   const reloadConfig = useCallback(async () => {
     try {
       const config = await client.reloadConfig(activeWorkspaceId);
@@ -11569,9 +11663,9 @@ function SettingsModal(props: SettingsModalProps) {
   const updateProgress = updateProgressText(updateState);
   const updateStatusText =
     updateState.status === "available"
-      ? t("updates.status.available", {
+      ? `${t("updates.status.available", {
           version: updateState.version ?? "",
-        })
+        })}${updateState.message ? ` ${updateState.message}` : ""}`
       : updateState.status === "checking"
         ? t("updates.status.checking")
         : updateState.status === "downloading"

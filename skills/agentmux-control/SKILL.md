@@ -11,11 +11,22 @@ Treat AgentMux as a Windows-only desktop multiplexer whose durable agent work
 runs through WSL and tmux-compatible shims. Prefer AgentMux's existing
 control-plane, CLI, config, and test helpers over ad hoc UI or process hacks.
 
+Use the AgentMux MCP server as the primary control surface when it is available.
+Prefer the least-privileged profile that can complete the task: `read` for
+inspection, `standard` only for a trusted client that may execute arbitrary
+terminal commands and mutate terminal, browser, or shared coordination state,
+and `full` only for explicitly approved lifecycle, configuration, JavaScript,
+or other administrative work. `standard` is a trusted write/command-execution
+profile, not a safe or non-destructive profile. Fall back to the `agentmux` CLI
+when MCP is unavailable, still connecting, or does not expose the required
+capability.
+
 ## Workflow
 
 1. Establish the target workspace, pane, surface, or config scope before
-   running commands. Use `agentmux` when available; use the `cmux` alias only
-   for compatibility checks.
+   taking action. Use AgentMux MCP tools when available, otherwise use the
+   equivalent `agentmux` CLI command. Use the `cmux` alias only for
+   compatibility checks.
 2. Check WSL/tmux state before launching durable agent sessions. Surface WSL
    missing and tmux missing guidance instead of silently falling back to
    PowerShell behavior.
@@ -39,6 +50,8 @@ checklists.
 
 - Do not close workspaces, kill sessions, or terminate panes unless the user
   clearly requested that operation.
+- Do not bypass an MCP profile boundary by dropping to the CLI. If a requested
+  action needs a stronger profile, ask for the appropriate explicit approval.
 - Do not bypass project Dock trust prompts for project-sourced commands.
 - Do not assume Unix socket cmux compatibility. AgentMux uses a Windows named
   pipe and exposes `cmux.exe`, `--socket`, and `CMUX_SOCKET_PATH` as aliases.

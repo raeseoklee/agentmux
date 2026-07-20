@@ -8,6 +8,7 @@ repository READMEs, release notes, and operational runbooks.
 - [Getting started](./user/getting-started.md)
 - [User manual](./user/manual.md)
 - [CLI guide](./user/cli.md)
+- [MCP control plane](./user/mcp.md)
 - [Feature overview](./features.md)
 - [Known limitations](./user/known-limitations.md)
 - [Troubleshooting](./user/troubleshooting.md)

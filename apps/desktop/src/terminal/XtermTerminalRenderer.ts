@@ -28,6 +28,7 @@ import {
   type TerminalWebglProbeResult,
   type TerminalWebglRendererKind,
 } from "./TerminalWebglPolicy";
+import { decideTerminalWheelAction } from "./TerminalWheelPolicy";
 import "@xterm/xterm/css/xterm.css";
 
 // TS-11: module-level escape hatch — set to false to disable multi-line paste
@@ -1344,39 +1345,20 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const direction = event.deltaY > 0 ? 1 : -1;
     const buffer = terminal.buffer.active;
     if (buffer.type === "normal") {
-      // Screen-interactive heuristic: while a full-screen TUI (e.g. codex) is
-      // live under ConPTY, xterm's buffer type stays "normal" because ConPTY
-      // swallows all DECSET mode changes (1049/1047 alt-screen, 1007 alt-scroll)
-      // before they reach us.  The xterm scrollback in this state contains only
-      // stale pre-TUI frames, so scrolling it is useless.  Instead, detect an
-      // active TUI by counting absolute cursor-repositioning sequences (CUP/HVP/
-      // CUU) that TUIs emit on every repaint, and synthesize DECCKM-aware cursor
-      // keys — the same input that actually moves the TUI's selection.  Users
-      // who chose the "page" wheel mode get paging keys here instead, matching
-      // the alt-buffer override.  When the TUI exits, repaints stop and the
-      // heuristic decays within 2 s, restoring normal scrollback behaviour
-      // (including for "page" mode, which never repurposes shell scrollback).
-      if (this.screenInteractiveActive()) {
-        if (this.alternateWheelMode === "page") {
-          terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
-        } else {
-          const app = terminal.modes.applicationCursorKeysMode;
-          const key =
-            direction < 0 ? (app ? "\x1bOA" : "\x1b[A") : (app ? "\x1bOB" : "\x1b[B");
-          terminal.input(key.repeat(lines), true);
-        }
-        // No scrollbar: nothing moves in the viewport; showing it would mislead.
-        event.preventDefault();
-        event.stopPropagation();
-        return false;
-      }
-
+      // Inline agents (notably Codex --no-alt-screen) keep their conversation in
+      // xterm's normal scrollback. Never synthesize PTY keys here: doing so moves
+      // prompt history or TUI selection instead of the visible conversation.
       const hasScrollback = buffer.baseY > 0;
       const canScrollUp = hasScrollback && direction < 0 && buffer.viewportY > 0;
       const canScrollDown =
         hasScrollback && direction > 0 && buffer.viewportY < buffer.baseY;
-      const canScroll = canScrollUp || canScrollDown;
-      if (canScroll) {
+      const action = decideTerminalWheelAction({
+        bufferType: "normal",
+        canScroll: canScrollUp || canScrollDown,
+        alternateWheelMode: this.alternateWheelMode,
+        mouseTracking: terminal.modes.mouseTrackingMode !== "none",
+      });
+      if (action === "scrollback") {
         terminal.scrollLines(direction * lines);
         this.showTransientScrollbar(element);
       }
@@ -1385,31 +1367,28 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return false;
     }
 
-    if (
-      this.alternateWheelMode !== "page" &&
-      terminal.modes.mouseTrackingMode !== "none"
-    ) {
+    const action = decideTerminalWheelAction({
+      bufferType: "alternate",
+      canScroll: false,
+      alternateWheelMode: this.alternateWheelMode,
+      mouseTracking: terminal.modes.mouseTrackingMode !== "none",
+    });
+    if (action === "passthrough") {
       return true;
     }
 
-    if (this.alternateWheelMode === "page") {
+    if (action === "page") {
       terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
-    } else {
+    } else if (action === "cursor") {
       // Alternate-scroll semantics: synthesize cursor keys per wheel line
       // (honoring DECCKM), matching what conhost does for alt-screen apps.
-      // Note: ConPTY strips DECSET mode changes (including 1007 alt-scroll and
-      // 1049 alt-screen) before they reach us, so for native PowerShell/cmd
-      // sessions the buffer type stays "normal" even inside a TUI — that case
-      // is handled above by screenInteractiveActive().  This branch fires only
-      // for tmux-control sessions (raw bytes pass through, alt-screen is
-      // visible) and similar transparent backends.  PageUp/PageDown is ignored
-      // by most TUIs, so cursor keys are the right synthesised input here too.
+      // This branch is limited to a real alternate buffer. Native ConPTY
+      // sessions that expose only a normal buffer stay on local scrollback.
       const app = terminal.modes.applicationCursorKeysMode;
       const key =
         direction < 0 ? (app ? "\x1bOA" : "\x1b[A") : (app ? "\x1bOB" : "\x1b[B");
       terminal.input(key.repeat(lines), true);
     }
-    this.showTransientScrollbar(element);
     event.preventDefault();
     event.stopPropagation();
     return false;

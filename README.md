@@ -85,6 +85,7 @@ See [Known limitations](./docs/en/user/known-limitations.md) and
 - [User manual](./docs/en/user/manual.md)
 - [Feature overview](./docs/en/features.md)
 - [CLI guide](./docs/en/user/cli.md)
+- [MCP control plane](./docs/en/user/mcp.md)
 - [Troubleshooting](./docs/en/user/troubleshooting.md)
 - [Versioning and release verification](./docs/en/release/versioning.md)
 - [Platform backlog](./docs/en/backlog/platform-backlog.md)
