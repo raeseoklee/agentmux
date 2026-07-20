@@ -121,7 +121,10 @@ export type I18nKey =
   | "updates.autoCheckHint"
   | "updates.check"
   | "updates.install"
+  | "updates.notification.action"
   | "updates.notification.body"
+  | "updates.notification.fallback.failed"
+  | "updates.notification.fallback.unsupported"
   | "updates.notification.title"
   | "updates.releaseNotes"
   | "updates.status.available"
@@ -285,7 +288,10 @@ const en: Record<I18nKey, string> = {
   "updates.autoCheckHint": "AgentMux checks GitHub Releases at startup. Installation still requires your approval.",
   "updates.check": "Check for updates",
   "updates.install": "Download and install",
+  "updates.notification.action": "Open update",
   "updates.notification.body": "AgentMux {version} is ready to download from Settings.",
+  "updates.notification.fallback.failed": "Windows could not show the notification. The update remains available here.",
+  "updates.notification.fallback.unsupported": "Native notifications are unavailable. The update remains available here.",
   "updates.notification.title": "AgentMux update available",
   "updates.releaseNotes": "Release notes",
   "updates.status.available": "Version {version} is available.",
@@ -405,7 +411,10 @@ const ko: Record<I18nKey, string> = {
   "updates.autoCheckHint": "AgentMux가 시작될 때 GitHub Release를 확인합니다. 설치는 사용자가 승인해야 진행됩니다.",
   "updates.check": "업데이트 확인",
   "updates.install": "다운로드 및 설치",
+  "updates.notification.action": "업데이트 열기",
   "updates.notification.body": "설정에서 AgentMux {version}을 다운로드할 수 있습니다.",
+  "updates.notification.fallback.failed": "Windows 알림을 표시하지 못했습니다. 여기에서 업데이트를 계속 진행할 수 있습니다.",
+  "updates.notification.fallback.unsupported": "네이티브 알림을 사용할 수 없습니다. 여기에서 업데이트를 계속 진행할 수 있습니다.",
   "updates.notification.title": "AgentMux 업데이트 사용 가능",
   "updates.releaseNotes": "릴리스 노트",
   "updates.status.available": "버전 {version} 업데이트가 있습니다.",

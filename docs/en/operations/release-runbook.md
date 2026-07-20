@@ -80,9 +80,12 @@ The `release` GitHub Actions workflow will:
 4. Install desktop dependencies and build release sidecars.
 5. Merge the updater release config from GitHub variables.
 6. Build the Windows NSIS installer and Tauri updater archive/signature.
-7. Generate a SHA256 file and `latest.json` updater manifest.
-8. Generate and verify GitHub Artifact Attestations for the release assets.
-9. Generate release notes and publish the installer, checksum, updater archive,
+7. Silently install the NSIS package into an isolated CI directory and verify
+   that the packaged `agentmux.exe` exposes MCP help, doctor help, and
+   non-mutating Codex/Claude setup previews without starting the desktop.
+8. Generate a SHA256 file and `latest.json` updater manifest.
+9. Generate and verify GitHub Artifact Attestations for the release assets.
+10. Generate release notes and publish the installer, checksum, updater archive,
    updater signature, and
    `latest.json` to the GitHub Release.
 

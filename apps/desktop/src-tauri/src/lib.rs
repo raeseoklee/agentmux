@@ -51,7 +51,8 @@ use agentmux_ipc::{
     BrowserNavigateParams, BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams,
     BrowserScreenshotResult, BrowserScrollParams, BrowserSelectParams, BrowserStorageEntryResult,
     BrowserStorageResult, BrowserSurfaceParams, BrowserTypeParams, BrowserWaitForSelectorParams,
-    BrowserWaitForSelectorResult, BrowserZoomParams, ControlError, ControlPipeConnection,
+    BrowserWaitForSelectorResult, BrowserZoomParams, ControlAuditListParams,
+    ControlAuditListResult, ControlAuditRecord, ControlError, ControlPipeConnection,
     DiagnosticsBackendHealthResult, DiagnosticsExportResult, DiagnosticsOutputStreamResult,
     DiagnosticsQueuePressureResult, DockConfigResult, DockControlResult, DockGetParams,
     DockTrustParams, EnvVarParam, ErrorCode, EventSubscribeParams, EventSubscribeResult,
@@ -71,8 +72,9 @@ use agentmux_ipc::{
     TeamMessageListParams, TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult,
     TeamMessageSendParams, TeamTaskBlockParams, TeamTaskClaimParams, TeamTaskCreateParams,
     TeamTaskDependencyParams, TeamTaskIdParams, TeamTaskListParams, TeamTaskListResult,
-    TeamTaskResult, TmuxDiagnosticsParams, TmuxDiagnosticsResult, WorkspaceCloseParams,
-    WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
+    TeamTaskResult, TerminalOpenParams, TerminalPlacementResult, TerminalSplitParams,
+    TmuxDiagnosticsParams, TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult,
+    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
     WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
     WorkspaceGroupMemberParams, WorkspaceGroupMemberResult, WorkspaceGroupResult,
     WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams,
@@ -81,10 +83,10 @@ use agentmux_ipc::{
 };
 use agentmux_store::{
     PersistedAgentState, PersistedDockTrust, PersistedNotification, PersistedPane,
-    PersistedProfile, PersistedSession, PersistedSidebarLog, PersistedSidebarProgress,
-    PersistedSidebarStatus, PersistedSurface, PersistedTeamMessage, PersistedTeamTask,
-    PersistedWorkspace, PersistedWorkspaceGroup, PersistedWorkspaceGroupMember, RecoverySnapshot,
-    SqliteStore, StoreError, WorkspaceBundle,
+    PersistedProfile, PersistedSession, PersistedSessionLaunchSpec, PersistedSidebarLog,
+    PersistedSidebarProgress, PersistedSidebarStatus, PersistedSurface, PersistedTeamMessage,
+    PersistedTeamTask, PersistedWorkspace, PersistedWorkspaceGroup, PersistedWorkspaceGroupMember,
+    RecoverySnapshot, SqliteStore, StoreError, WorkspaceBundle,
 };
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use tauri::ipc::Channel;
@@ -92,6 +94,7 @@ use tauri::Emitter as _;
 
 pub const DESKTOP_CONTROL_TOKEN: &str = DEFAULT_LOCAL_CONTROL_TOKEN;
 const MAX_BROWSER_FAILURES: usize = 100;
+const MAX_CONTROL_AUDIT_RECORDS: usize = 1000;
 const APP_CONFIG_FILE_NAME: &str = "agentmux.json";
 const APP_CONFIG_FORMAT_VERSION: &str = "agentmux.config.v1";
 const DOCK_CONFIG_FILE_NAME: &str = "dock.json";
@@ -255,6 +258,7 @@ pub struct DesktopControlState {
     browser: Mutex<Box<dyn BrowserAutomation>>,
     browser_failures: Mutex<VecDeque<BrowserFailureRecord>>,
     browser_failure_counter: Mutex<u64>,
+    control_audit: Mutex<VecDeque<ControlAuditRecord>>,
     config_path: PathBuf,
     control_token: String,
     desktop_notifications: Mutex<DesktopNotificationState>,
@@ -283,6 +287,33 @@ struct BrowserFailureRecord {
     code: String,
     message: String,
     occurred_at: String,
+}
+
+type TerminalSpawnPersistence = fn(
+    &mut SqliteStore,
+    &WorkspaceBundle,
+    &PersistedSessionLaunchSpec,
+) -> Result<(), DesktopHostError>;
+type WorkspaceTopologyRestore =
+    fn(&mut SqliteStore, &WorkspaceBundle) -> Result<(), DesktopHostError>;
+
+#[derive(Debug)]
+struct TerminalPlacementFailure {
+    error: DesktopHostError,
+    spawned_session_id: Option<String>,
+    runtime_terminated: bool,
+    persisted_state_cleaned: bool,
+}
+
+impl TerminalPlacementFailure {
+    fn before_spawn(error: DesktopHostError) -> Self {
+        Self {
+            error,
+            spawned_session_id: None,
+            runtime_terminated: true,
+            persisted_state_cleaned: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -395,6 +426,7 @@ impl DesktopControlState {
             browser: Mutex::new(browser_automation_from_environment()?),
             browser_failures: Mutex::new(VecDeque::new()),
             browser_failure_counter: Mutex::new(0),
+            control_audit: Mutex::new(VecDeque::new()),
             config_path: config_path.into(),
             control_token: token,
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
@@ -426,6 +458,7 @@ impl DesktopControlState {
             browser: Mutex::new(Box::new(InMemoryBrowserAutomation::new())),
             browser_failures: Mutex::new(VecDeque::new()),
             browser_failure_counter: Mutex::new(0),
+            control_audit: Mutex::new(VecDeque::new()),
             config_path: unique_temp_config_path(),
             control_token: token,
             desktop_notifications: Mutex::new(DesktopNotificationState::default()),
@@ -839,6 +872,45 @@ impl DesktopControlState {
     }
 
     pub fn handle_request(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        let audit_context = request.caller.clone().filter(|_| {
+            is_mutating_control_method(&request.method)
+                && request.method != "diagnostics.control_audit"
+        });
+        let request_id = request.id.clone();
+        let method = request.method.clone();
+        let response = self.handle_request_inner(request);
+        if let Some(caller) = audit_context {
+            let (succeeded, error_code) = match &response.outcome {
+                ResponseOutcome::Ok { .. } => (true, None),
+                ResponseOutcome::Error(error) => (false, Some(error.code.as_str().to_string())),
+            };
+            if let Ok(mut records) = self.control_audit.lock() {
+                if records.len() >= MAX_CONTROL_AUDIT_RECORDS {
+                    records.pop_front();
+                }
+                records.push_back(ControlAuditRecord {
+                    request_id,
+                    method,
+                    source: caller.source,
+                    profile: caller.profile,
+                    client_session_id: caller.client_session_id,
+                    occurred_at: timestamp(),
+                    succeeded,
+                    error_code,
+                });
+            }
+        }
+        response
+    }
+
+    fn handle_request_inner(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        if request.method == "terminal.open" {
+            return self.handle_terminal_open_request(request);
+        }
+        if request.method == "terminal.split" {
+            return self.handle_terminal_split_request(request);
+        }
+
         if request.method == "actions.run" {
             return self.handle_actions_run_request(request);
         }
@@ -963,6 +1035,391 @@ impl DesktopControlState {
         }
 
         Ok(PaneId::new().to_string())
+    }
+
+    fn handle_terminal_open_request(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        let id = request.id.clone();
+        if let Err(error) = validate_desktop_request(&request, &self.control_token) {
+            return ResponseEnvelope::error(id, error);
+        }
+        let params: TerminalOpenParams = match request.parse_params() {
+            Ok(params) => params,
+            Err(error) => return ResponseEnvelope::error(id, error),
+        };
+        match self.spawn_terminal_placement(params, None) {
+            Ok(result) => ResponseEnvelope::ok_typed(id, &result),
+            Err(failure) => ResponseEnvelope::error(
+                id,
+                terminal_placement_failure_error(
+                    "terminal open",
+                    &failure,
+                    failure.runtime_terminated && failure.persisted_state_cleaned,
+                    None,
+                ),
+            ),
+        }
+    }
+
+    fn handle_terminal_split_request(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        self.handle_terminal_split_request_with_persistence(
+            request,
+            persist_terminal_spawn_transaction,
+            restore_workspace_topology,
+        )
+    }
+
+    fn handle_terminal_split_request_with_persistence(
+        &self,
+        request: RequestEnvelope,
+        persist_spawn: TerminalSpawnPersistence,
+        restore_topology: WorkspaceTopologyRestore,
+    ) -> ResponseEnvelope {
+        let id = request.id.clone();
+        let result = (|| {
+            validate_desktop_request(&request, &self.control_token)?;
+            let params: TerminalSplitParams = request.parse_params()?;
+            if !matches!(params.axis.as_str(), "horizontal" | "vertical") {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    "terminal.split axis must be 'horizontal' or 'vertical'.",
+                )));
+            }
+            let ratio = params.ratio.unwrap_or(0.5);
+            if !(0.1..=0.9).contains(&ratio) {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    "terminal.split ratio must be between 0.1 and 0.9.",
+                )));
+            }
+            let behavior = params.behavior.as_deref().unwrap_or("clone_current");
+            if !matches!(behavior, "clone_current" | "empty") {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    "terminal.split behavior must be 'clone_current' or 'empty'.",
+                )));
+            }
+
+            let (original, target_pane_id, open_params, columns, rows) = {
+                let Ok(mut store) = self.store.lock() else {
+                    return Err(DesktopHostError::StateUnavailable(
+                        "desktop store state is unavailable".to_string(),
+                    ));
+                };
+                let mut bundle = store
+                    .load_workspace_bundle(&params.workspace_id)?
+                    .ok_or_else(|| workspace_not_found(&params.workspace_id))?;
+                let original = bundle.clone();
+                let source_session = terminal_session_for_pane(&bundle, &params.pane_id).cloned();
+                if behavior == "clone_current" && source_session.is_none() {
+                    return Err(DesktopHostError::Control(ControlError::new(
+                        ErrorCode::SessionNotFound,
+                        "terminal.split clone_current requires a terminal session in the source pane.",
+                    )));
+                }
+                let launch_spec = source_session
+                    .as_ref()
+                    .map(|session| store.load_session_launch_spec(&session.session_id))
+                    .transpose()?
+                    .flatten();
+                let columns = params
+                    .columns
+                    .or_else(|| launch_spec.as_ref().map(|spec| spec.columns))
+                    .unwrap_or(120)
+                    .max(1);
+                let rows = params
+                    .rows
+                    .or_else(|| launch_spec.as_ref().map(|spec| spec.rows))
+                    .unwrap_or(30)
+                    .max(1);
+                let open_params = source_session.as_ref().map(|session| {
+                    let backend = params
+                        .backend
+                        .clone()
+                        .unwrap_or_else(|| session.backend_kind.clone());
+                    TerminalOpenParams {
+                        workspace_id: params.workspace_id.clone(),
+                        pane_id: None,
+                        backend: Some(backend.clone()),
+                        backend_profile: params
+                            .backend_profile
+                            .clone()
+                            .or_else(|| {
+                                launch_spec
+                                    .as_ref()
+                                    .and_then(|spec| spec.backend_profile.clone())
+                            })
+                            .or_else(|| {
+                                default_backend_profile(
+                                    &backend,
+                                    bundle.workspace.default_wsl_distribution.as_deref(),
+                                )
+                            }),
+                        command: if params.command.is_empty() {
+                            session.command.clone()
+                        } else {
+                            params.command.clone()
+                        },
+                        cwd: params.cwd.clone().or_else(|| session.cwd.clone()),
+                        env: launch_spec
+                            .as_ref()
+                            .map(|spec| {
+                                spec.env
+                                    .iter()
+                                    .map(|(key, value)| EnvVarParam {
+                                        key: key.clone(),
+                                        value: value.clone(),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        columns: Some(columns),
+                        rows: Some(rows),
+                        durability: params
+                            .durability
+                            .clone()
+                            .or_else(|| Some(session.durability.clone())),
+                        placement: Some("active_pane".to_string()),
+                    }
+                });
+                let target_pane_id =
+                    split_pane_in_bundle(&mut bundle, &params.pane_id, &params.axis, ratio)?;
+                store.save_workspace_bundle(&bundle)?;
+                (original, target_pane_id, open_params, columns, rows)
+            };
+
+            if behavior == "empty" {
+                return Ok(TerminalPlacementResult {
+                    workspace_id: params.workspace_id,
+                    source_pane_id: Some(params.pane_id),
+                    pane_id: target_pane_id,
+                    surface_id: None,
+                    session_id: None,
+                    backend: None,
+                    backend_profile: None,
+                    cwd: params.cwd,
+                    columns,
+                    rows,
+                    rolled_back: false,
+                });
+            }
+
+            let mut open_params = open_params.expect("clone_current source checked above");
+            open_params.pane_id = Some(target_pane_id);
+            match self.spawn_terminal_placement_with_persistence(
+                open_params,
+                Some(params.pane_id),
+                persist_spawn,
+            ) {
+                Ok(result) => Ok(result),
+                Err(failure) => {
+                    let topology_restored = self
+                        .store
+                        .lock()
+                        .ok()
+                        .and_then(|mut store| restore_topology(&mut store, &original).ok())
+                        .is_some();
+                    let rolled_back = failure.runtime_terminated
+                        && failure.persisted_state_cleaned
+                        && topology_restored;
+                    Err(DesktopHostError::Control(terminal_placement_failure_error(
+                        "terminal split",
+                        &failure,
+                        rolled_back,
+                        Some(topology_restored),
+                    )))
+                }
+            }
+        })();
+        match result {
+            Ok(result) => ResponseEnvelope::ok_typed(id, &result),
+            Err(error) => ResponseEnvelope::error(id, control_error_from_host(error)),
+        }
+    }
+
+    fn spawn_terminal_placement(
+        &self,
+        params: TerminalOpenParams,
+        source_pane_id: Option<String>,
+    ) -> Result<TerminalPlacementResult, TerminalPlacementFailure> {
+        self.spawn_terminal_placement_with_persistence(
+            params,
+            source_pane_id,
+            persist_terminal_spawn_transaction,
+        )
+    }
+
+    fn spawn_terminal_placement_with_persistence(
+        &self,
+        params: TerminalOpenParams,
+        source_pane_id: Option<String>,
+        persist_spawn: TerminalSpawnPersistence,
+    ) -> Result<TerminalPlacementResult, TerminalPlacementFailure> {
+        let bundle = self
+            .load_workspace_or_not_found(&params.workspace_id)
+            .map_err(TerminalPlacementFailure::before_spawn)?;
+        let source_session = params
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| terminal_session_for_pane(&bundle, pane_id));
+        let backend = params
+            .backend
+            .clone()
+            .or_else(|| source_session.map(|session| session.backend_kind.clone()))
+            .unwrap_or_else(|| default_backend_for_workspace(&bundle.workspace));
+        let backend_profile = params.backend_profile.clone().or_else(|| {
+            default_backend_profile(
+                &backend,
+                bundle.workspace.default_wsl_distribution.as_deref(),
+            )
+        });
+        let command = if params.command.is_empty() {
+            default_command_for_backend(
+                &backend,
+                bundle.workspace.default_terminal_profile.as_deref(),
+            )
+            .map_err(TerminalPlacementFailure::before_spawn)?
+        } else {
+            params.command.clone()
+        };
+        let columns = params.columns.unwrap_or(120).max(1);
+        let rows = params.rows.unwrap_or(30).max(1);
+        let cwd = params.cwd.clone();
+        let spawn = SessionSpawnParams {
+            workspace_id: params.workspace_id.clone(),
+            backend: Some(backend.clone()),
+            backend_profile: backend_profile.clone(),
+            command,
+            cwd: cwd.clone(),
+            env: params.env,
+            columns,
+            rows,
+            durability: params.durability.or_else(|| {
+                Some(if backend == "wsl-tmux-control" {
+                    "durable".to_string()
+                } else {
+                    "ephemeral".to_string()
+                })
+            }),
+            placement: params.placement.or_else(|| {
+                Some(if params.pane_id.is_some() {
+                    "active_pane".to_string()
+                } else {
+                    "new_tab".to_string()
+                })
+            }),
+            pane_id: params.pane_id,
+        };
+        let request = RequestEnvelope::new(
+            "desktop_terminal_open_spawn",
+            "session.spawn",
+            serde_json::to_string(&spawn)
+                .map_err(DesktopHostError::from)
+                .map_err(TerminalPlacementFailure::before_spawn)?,
+            self.control_token.clone(),
+        );
+        let prepared_request = self
+            .prepare_runtime_request(request)
+            .map_err(DesktopHostError::from)
+            .map_err(TerminalPlacementFailure::before_spawn)?;
+        let prepared_spawn: SessionSpawnParams = prepared_request
+            .parse_params()
+            .map_err(DesktopHostError::from)
+            .map_err(TerminalPlacementFailure::before_spawn)?;
+        let result = self.spawn_and_persist_terminal(prepared_request, persist_spawn)?;
+        let bundle = self
+            .load_workspace_or_not_found(&prepared_spawn.workspace_id)
+            .map_err(TerminalPlacementFailure::before_spawn)?;
+        let surface = bundle
+            .surfaces
+            .iter()
+            .find(|surface| surface.session_id.as_deref() == Some(result.session_id.as_str()));
+        let surface_id = surface.map(|surface| surface.surface_id.clone());
+        let pane_id = surface_id
+            .as_deref()
+            .and_then(|surface_id| {
+                bundle
+                    .panes
+                    .iter()
+                    .find(|pane| pane.mounted_surface_id.as_deref() == Some(surface_id))
+            })
+            .map(|pane| pane.pane_id.clone())
+            .unwrap_or_else(|| bundle.workspace.active_pane_id.clone());
+        Ok(TerminalPlacementResult {
+            workspace_id: prepared_spawn.workspace_id,
+            source_pane_id,
+            pane_id,
+            surface_id,
+            session_id: Some(result.session_id),
+            backend: Some(backend),
+            backend_profile,
+            cwd,
+            columns,
+            rows,
+            rolled_back: false,
+        })
+    }
+
+    fn spawn_and_persist_terminal(
+        &self,
+        request: RequestEnvelope,
+        persist_spawn: TerminalSpawnPersistence,
+    ) -> Result<SessionSpawnResult, TerminalPlacementFailure> {
+        let Ok(mut control) = self.control.lock() else {
+            return Err(TerminalPlacementFailure::before_spawn(
+                DesktopHostError::StateUnavailable(
+                    "desktop control state is unavailable".to_string(),
+                ),
+            ));
+        };
+        let response = control.handle_request(request.clone());
+        let result: SessionSpawnResult =
+            response_result_json(&response).map_err(TerminalPlacementFailure::before_spawn)?;
+        control.collect_events();
+
+        let persistence_result = self
+            .persist_agent_snapshots_result(&control)
+            .and_then(|()| {
+                self.persist_spawn_with(&mut control, &request, &response, persist_spawn)
+            });
+        if let Err(error) = persistence_result {
+            let (runtime_terminated, persisted_state_cleaned) =
+                self.compensate_terminal_spawn(&mut control, &result.session_id);
+            return Err(TerminalPlacementFailure {
+                error,
+                spawned_session_id: Some(result.session_id),
+                runtime_terminated,
+                persisted_state_cleaned,
+            });
+        }
+        Ok(result)
+    }
+
+    fn compensate_terminal_spawn(
+        &self,
+        control: &mut DesktopRuntimeControl,
+        session_id: &str,
+    ) -> (bool, bool) {
+        let terminate_response = control.handle_request(RequestEnvelope::new(
+            "desktop_terminal_spawn_compensate",
+            "session.terminate",
+            serde_json::json!({ "session_id": session_id, "mode": "kill" }).to_string(),
+            self.control_token.clone(),
+        ));
+        let runtime_terminated = match terminate_response.outcome {
+            ResponseOutcome::Ok { .. } => true,
+            ResponseOutcome::Error(error) => error.code == ErrorCode::SessionNotFound,
+        };
+        control.collect_events();
+        if runtime_terminated {
+            control.discard_session(session_id);
+        }
+        let persisted_state_cleaned = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|mut store| store.delete_session(session_id).ok())
+            .is_some();
+        (runtime_terminated, persisted_state_cleaned)
     }
 
     pub fn handle_pipe_connection(
@@ -1748,6 +2205,7 @@ impl DesktopControlState {
             "dock.trust" => self.handle_dock_trust(&request),
             "diagnostics.browser" => self.handle_browser_diagnostics(&request),
             "diagnostics.export" => self.handle_diagnostics_export(&request),
+            "diagnostics.control_audit" => self.handle_control_audit(&request),
             "diagnostics.recovery" => self.handle_recovery_diagnostics(&request),
             "diagnostics.wsl_distributions" => self.handle_wsl_distributions(&request),
             "diagnostics.tmux" => self.handle_tmux_diagnostics(&request),
@@ -1803,6 +2261,21 @@ impl DesktopControlState {
         request: &RequestEnvelope,
         response: &ResponseEnvelope,
     ) -> Result<(), DesktopHostError> {
+        self.persist_spawn_with(
+            control,
+            request,
+            response,
+            persist_terminal_spawn_transaction,
+        )
+    }
+
+    fn persist_spawn_with(
+        &self,
+        control: &mut DesktopRuntimeControl,
+        request: &RequestEnvelope,
+        response: &ResponseEnvelope,
+        persist_spawn: TerminalSpawnPersistence,
+    ) -> Result<(), DesktopHostError> {
         let params: SessionSpawnParams = request.parse_params()?;
         let result: SessionSpawnResult = response_result_json(response)?;
         let summary = session_summary(control, &result.session_id, &self.control_token)?;
@@ -1813,7 +2286,16 @@ impl DesktopControlState {
         };
         let existing = store.load_workspace_bundle(&params.workspace_id)?;
         let bundle = workspace_bundle_from_spawn(&params, &result, &summary, existing);
-        store.save_workspace_bundle(&bundle)?;
+        let launch_spec = PersistedSessionLaunchSpec {
+            session_id: result.session_id.clone(),
+            workspace_id: params.workspace_id.clone(),
+            backend_profile: params.backend_profile.clone(),
+            env: persisted_launch_environment(&params.env),
+            columns: params.columns,
+            rows: params.rows,
+            updated_at: timestamp(),
+        };
+        persist_spawn(&mut store, &bundle, &launch_spec)?;
         drop(store);
         let command_label = params.command.join(" ");
         if is_known_agent_launch(&command_label) {
@@ -5931,6 +6413,32 @@ impl DesktopControlState {
         ))
     }
 
+    fn handle_control_audit(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: ControlAuditListParams = request.parse_params()?;
+        let limit = params
+            .limit
+            .unwrap_or(100)
+            .clamp(1, MAX_CONTROL_AUDIT_RECORDS);
+        let records = self
+            .control_audit
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("control audit state is unavailable".to_string())
+            })?
+            .iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &ControlAuditListResult { records },
+        ))
+    }
+
     fn handle_recovery_diagnostics(
         &self,
         request: &RequestEnvelope,
@@ -6394,6 +6902,8 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "surface.create_browser",
         "surface.close",
         "surface.move_workspace",
+        "terminal.open",
+        "terminal.split",
         "session.spawn",
         "session.attach",
         "session.list",
@@ -6462,6 +6972,7 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "dock.get",
         "dock.trust",
         "diagnostics.browser",
+        "diagnostics.control_audit",
         "diagnostics.export",
         "diagnostics.recovery",
         "diagnostics.wsl_distributions",
@@ -9594,6 +10105,7 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "surface.create_browser"
             | "surface.close"
             | "surface.move_workspace"
+            | "diagnostics.control_audit"
             | "browser.navigate"
             | "browser.reload"
             | "browser.back"
@@ -9715,6 +10227,75 @@ fn control_error_from_host(error: DesktopHostError) -> ControlError {
             ControlError::new(ErrorCode::Conflict, message)
         }
     }
+}
+
+fn terminal_placement_failure_error(
+    operation: &str,
+    failure: &TerminalPlacementFailure,
+    rolled_back: bool,
+    topology_restored: Option<bool>,
+) -> ControlError {
+    let rollback_status = if rolled_back {
+        "was rolled back"
+    } else {
+        "has an incomplete rollback"
+    };
+    ControlError::new(
+        ErrorCode::SpawnFailed,
+        format!("{operation} failed ({rollback_status}): {}", failure.error),
+    )
+    .with_details(
+        serde_json::json!({
+            "rolled_back": rolled_back,
+            "spawned_session_id": failure.spawned_session_id,
+            "runtime_terminated": failure.runtime_terminated,
+            "persisted_state_cleaned": failure.persisted_state_cleaned,
+            "topology_restored": topology_restored,
+        })
+        .to_string(),
+    )
+}
+
+fn persist_terminal_spawn_transaction(
+    store: &mut SqliteStore,
+    bundle: &WorkspaceBundle,
+    launch_spec: &PersistedSessionLaunchSpec,
+) -> Result<(), DesktopHostError> {
+    store
+        .save_workspace_bundle_and_launch_spec(bundle, launch_spec)
+        .map_err(DesktopHostError::from)
+}
+
+fn restore_workspace_topology(
+    store: &mut SqliteStore,
+    original: &WorkspaceBundle,
+) -> Result<(), DesktopHostError> {
+    store
+        .save_workspace_bundle(original)
+        .map_err(DesktopHostError::from)
+}
+
+fn persisted_launch_environment(env: &[EnvVarParam]) -> Vec<(String, String)> {
+    const MANAGED_KEYS: &[&str] = &[
+        "AGENTMUX_CONTROL_PIPE",
+        "AGENTMUX_CONTROL_TOKEN",
+        "AGENTMUX_WORKSPACE_ID",
+        "AGENTMUX_SURFACE_ID",
+        "AGENTMUX_PANE_ID",
+        "CMUX_SOCKET_PATH",
+        "CMUX_WORKSPACE_ID",
+        "CMUX_SURFACE_ID",
+        "CMUX_PANE_ID",
+    ];
+    let generated_wslenv = env.iter().rposition(|entry| entry.key == "WSLENV");
+    env.iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            !(MANAGED_KEYS.contains(&entry.key.as_str())
+                || entry.key == "WSLENV" && Some(*index) == generated_wslenv)
+        })
+        .map(|(_, entry)| (entry.key.clone(), entry.value.clone()))
+        .collect()
 }
 
 fn browser_automation_from_environment() -> Result<Box<dyn BrowserAutomation>, DesktopHostError> {
@@ -10124,7 +10705,7 @@ fn split_pane_in_bundle(
     pane_id: &str,
     axis: &str,
     ratio: f64,
-) -> Result<(), DesktopHostError> {
+) -> Result<String, DesktopHostError> {
     let now = timestamp();
     let Some(index) = bundle.panes.iter().position(|pane| pane.pane_id == pane_id) else {
         return Err(pane_not_found(pane_id).into());
@@ -10170,7 +10751,7 @@ fn split_pane_in_bundle(
         updated_at: now.clone(),
     });
     bundle.panes.push(PersistedPane {
-        pane_id: second_child_id,
+        pane_id: second_child_id.clone(),
         workspace_id,
         parent_pane_id: Some(pane_id.to_string()),
         kind: "leaf".to_string(),
@@ -10186,7 +10767,7 @@ fn split_pane_in_bundle(
         bundle.workspace.active_pane_id = first_child_id;
     }
     bundle.workspace.updated_at = now;
-    Ok(())
+    Ok(second_child_id)
 }
 
 fn focus_pane_in_bundle(
@@ -11408,6 +11989,131 @@ fn active_session_id(bundle: &WorkspaceBundle) -> Option<String> {
         .find(|surface| surface.surface_id == surface_id)?
         .session_id
         .clone()
+}
+
+fn terminal_session_for_pane<'a>(
+    bundle: &'a WorkspaceBundle,
+    pane_id: &str,
+) -> Option<&'a PersistedSession> {
+    let surface_id = bundle
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)?
+        .mounted_surface_id
+        .as_deref()?;
+    let session_id = bundle
+        .surfaces
+        .iter()
+        .find(|surface| surface.surface_id == surface_id)?
+        .session_id
+        .as_deref()?;
+    bundle
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+}
+
+fn default_backend_for_workspace(workspace: &PersistedWorkspace) -> String {
+    match workspace.default_terminal_profile.as_deref() {
+        Some("powershell" | "cmd") => "conpty".to_string(),
+        _ => "wsl-direct".to_string(),
+    }
+}
+
+fn default_backend_profile(backend: &str, wsl_distribution: Option<&str>) -> Option<String> {
+    matches!(backend, "wsl-direct" | "wsl-tmux-control")
+        .then(|| wsl_distribution.map(str::to_string))
+        .flatten()
+}
+
+fn default_command_for_backend(
+    backend: &str,
+    terminal_profile: Option<&str>,
+) -> Result<Vec<String>, DesktopHostError> {
+    match backend {
+        "wsl-direct" | "wsl-tmux-control" => Ok(vec!["bash".to_string(), "-l".to_string()]),
+        "conpty" if terminal_profile == Some("cmd") => Ok(vec![
+            "cmd.exe".to_string(),
+            "/d".to_string(),
+            "/q".to_string(),
+        ]),
+        "conpty" => Ok(vec!["powershell.exe".to_string(), "-NoLogo".to_string()]),
+        other => Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!("terminal.open requires an explicit command for backend '{other}'."),
+        ))),
+    }
+}
+
+fn is_mutating_control_method(method: &str) -> bool {
+    matches!(
+        method,
+        "workspace.create"
+            | "workspace.rename"
+            | "workspace.update"
+            | "workspace.close"
+            | "workspace_group.create"
+            | "workspace_group.update"
+            | "workspace_group.delete"
+            | "workspace_group.add_workspace"
+            | "workspace_group.remove_workspace"
+            | "pane.split"
+            | "pane.focus"
+            | "pane.close"
+            | "pane.resize_layout"
+            | "pane.mount_surface"
+            | "pane.unmount_surface"
+            | "surface.create_browser"
+            | "surface.close"
+            | "surface.move_workspace"
+            | "terminal.open"
+            | "terminal.split"
+            | "session.spawn"
+            | "session.attach"
+            | "session.send_text"
+            | "session.send_paste"
+            | "session.send_key"
+            | "session.resize"
+            | "session.terminate"
+            | "agent.set_state"
+            | "agent.clear_attention"
+            | "actions.run"
+            | "notification.create"
+            | "notification.dismiss"
+            | "notification.clear"
+            | "team.task.create"
+            | "team.task.claim"
+            | "team.task.complete"
+            | "team.task.block"
+            | "team.task.unblock"
+            | "team.task.set_dependency"
+            | "team.message.send"
+            | "team.message.mark_read"
+            | "browser.navigate"
+            | "browser.reload"
+            | "browser.back"
+            | "browser.forward"
+            | "browser.click"
+            | "browser.type"
+            | "browser.fill"
+            | "browser.press"
+            | "browser.select"
+            | "browser.scroll"
+            | "browser.hover"
+            | "browser.check"
+            | "browser.focus"
+            | "browser.zoom"
+            | "browser.evaluate"
+            | "profile.create"
+            | "profile.update"
+            | "profile.delete"
+            | "config.reload"
+            | "config.update"
+            | "config.import"
+            | "config.reset"
+            | "config.migrate_project"
+            | "dock.trust"
+    )
 }
 
 fn notification_result_from_persisted(
@@ -14030,6 +14736,328 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn terminal_split_clones_launch_spec_audits_and_rolls_back_failed_spawn() {
+        let state = DesktopControlState::new();
+        let create = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_workspace",
+                "workspace.create",
+                r#"{"name":"Terminal split workspace","project_root":"C:\\","backend_profile":null}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let created = response_value(&create);
+        let workspace_id = created["workspace_id"].as_str().unwrap().to_string();
+        let root_pane_id = created["root_pane_id"].as_str().unwrap().to_string();
+
+        let opened = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_open_source",
+                "terminal.open",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "pane_id": root_pane_id,
+                    "backend": "conpty",
+                    "backend_profile": "Windows PowerShell",
+                    "command": ["cmd.exe", "/d", "/q"],
+                    "cwd": "C:\\",
+                    "env": [
+                        {"key": "AGENTMUX_TEST_CLONE", "value": "preserved"},
+                        {"key": "WSLENV", "value": "USER_DEFINED/u"}
+                    ],
+                    "columns": 101,
+                    "rows": 37,
+                    "durability": "ephemeral",
+                    "placement": "active_pane"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let source_pane_id = response_string_field(&opened, "pane_id");
+
+        let split = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_clone",
+                "terminal.split",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "pane_id": source_pane_id,
+                    "axis": "vertical",
+                    "ratio": 0.4,
+                    "behavior": "clone_current"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some("mcp-test-session".to_string()),
+            }),
+        );
+        let split_value = response_value(&split);
+        assert_eq!(split_value["columns"], 101);
+        assert_eq!(split_value["rows"], 37);
+        assert_eq!(split_value["backend"], "conpty");
+        assert_eq!(split_value["backend_profile"], "Windows PowerShell");
+        assert_eq!(split_value["rolled_back"], false);
+        let cloned_session_id = split_value["session_id"].as_str().unwrap();
+        let cloned_pane_id = split_value["pane_id"].as_str().unwrap().to_string();
+        let launch_spec = state
+            .store
+            .lock()
+            .unwrap()
+            .load_session_launch_spec(cloned_session_id)
+            .unwrap()
+            .expect("cloned terminal launch spec");
+        assert_eq!(launch_spec.columns, 101);
+        assert_eq!(launch_spec.rows, 37);
+        assert_eq!(
+            launch_spec.backend_profile.as_deref(),
+            Some("Windows PowerShell")
+        );
+        assert_eq!(
+            launch_spec.env,
+            vec![
+                ("AGENTMUX_TEST_CLONE".to_string(), "preserved".to_string()),
+                ("WSLENV".to_string(), "USER_DEFINED/u".to_string())
+            ]
+        );
+
+        let before = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_before",
+                "workspace.get",
+                serde_json::json!({ "workspace_id": workspace_id }).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let before_panes = response_value(&before)["panes"].clone();
+        let failed = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_failure",
+                "terminal.split",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "pane_id": cloned_pane_id,
+                    "axis": "horizontal",
+                    "ratio": 0.5,
+                    "behavior": "clone_current",
+                    "command": ["agentmux-command-does-not-exist.exe"]
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp-http".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some("remote-test-session".to_string()),
+            }),
+        );
+        assert_eq!(response_error_code(&failed), ErrorCode::SpawnFailed);
+        assert!(response_error_message(&failed).contains("rolled back"));
+        let after = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_after",
+                "workspace.get",
+                serde_json::json!({ "workspace_id": workspace_id }).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&after)["panes"], before_panes);
+
+        let audit = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_audit",
+                "diagnostics.control_audit",
+                r#"{"limit":10}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let audit_records = response_value(&audit)["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(audit_records.len(), 2);
+        assert_eq!(audit_records[0]["method"], "terminal.split");
+        assert_eq!(audit_records[0]["source"], "mcp-http");
+        assert_eq!(audit_records[0]["succeeded"], false);
+        assert_eq!(audit_records[1]["source"], "mcp");
+        assert_eq!(audit_records[1]["succeeded"], true);
+
+        let close = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_cleanup",
+                "workspace.close",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "close_policy": "terminate_sessions"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&close)["closed"], true);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn terminal_split_compensates_post_spawn_persistence_failure() {
+        fn fail_persistence(
+            _store: &mut SqliteStore,
+            _bundle: &WorkspaceBundle,
+            _launch_spec: &PersistedSessionLaunchSpec,
+        ) -> Result<(), DesktopHostError> {
+            Err(DesktopHostError::StateUnavailable(
+                "injected post-spawn persistence failure".to_string(),
+            ))
+        }
+
+        let (state, workspace_id, source_pane_id) = terminal_split_test_state();
+        let original = state
+            .store
+            .lock()
+            .unwrap()
+            .load_workspace_bundle(&workspace_id)
+            .unwrap()
+            .unwrap();
+        let failed = state.handle_terminal_split_request_with_persistence(
+            terminal_split_test_request(&workspace_id, &source_pane_id),
+            fail_persistence,
+            restore_workspace_topology,
+        );
+        let details = response_error_details(&failed);
+        assert_eq!(response_error_code(&failed), ErrorCode::SpawnFailed);
+        assert_eq!(details["rolled_back"], true);
+        assert_eq!(details["runtime_terminated"], true);
+        assert_eq!(details["persisted_state_cleaned"], true);
+        assert_eq!(details["topology_restored"], true);
+        let spawned_session_id = details["spawned_session_id"].as_str().unwrap();
+        assert_runtime_backend_stopped(&state, spawned_session_id);
+        let store = state.store.lock().unwrap();
+        assert_eq!(
+            store.load_workspace_bundle(&workspace_id).unwrap().unwrap(),
+            original
+        );
+        assert!(store
+            .load_session_launch_spec(spawned_session_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn terminal_split_reports_incomplete_rollback_and_recovery_session_id() {
+        fn fail_persistence(
+            _store: &mut SqliteStore,
+            _bundle: &WorkspaceBundle,
+            _launch_spec: &PersistedSessionLaunchSpec,
+        ) -> Result<(), DesktopHostError> {
+            Err(DesktopHostError::StateUnavailable(
+                "injected post-spawn persistence failure".to_string(),
+            ))
+        }
+        fn fail_restore(
+            _store: &mut SqliteStore,
+            _original: &WorkspaceBundle,
+        ) -> Result<(), DesktopHostError> {
+            Err(DesktopHostError::StateUnavailable(
+                "injected topology rollback failure".to_string(),
+            ))
+        }
+
+        let (state, workspace_id, source_pane_id) = terminal_split_test_state();
+        let original = state
+            .store
+            .lock()
+            .unwrap()
+            .load_workspace_bundle(&workspace_id)
+            .unwrap()
+            .unwrap();
+        let failed = state.handle_terminal_split_request_with_persistence(
+            terminal_split_test_request(&workspace_id, &source_pane_id),
+            fail_persistence,
+            fail_restore,
+        );
+        let details = response_error_details(&failed);
+        assert_eq!(details["rolled_back"], false);
+        assert_eq!(details["runtime_terminated"], true);
+        assert_eq!(details["persisted_state_cleaned"], true);
+        assert_eq!(details["topology_restored"], false);
+        let spawned_session_id = details["spawned_session_id"].as_str().unwrap();
+        assert_runtime_backend_stopped(&state, spawned_session_id);
+        {
+            let mut store = state.store.lock().unwrap();
+            let staged = store.load_workspace_bundle(&workspace_id).unwrap().unwrap();
+            assert!(staged.panes.len() > original.panes.len());
+            assert!(staged
+                .sessions
+                .iter()
+                .all(|session| session.session_id != spawned_session_id));
+            store.save_workspace_bundle(&original).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn conpty_terminal_does_not_inherit_workspace_wsl_profile() {
+        let state = DesktopControlState::new();
+        let created = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_conpty_profile_workspace",
+                "workspace.create",
+                r#"{"name":"ConPTY profile workspace","project_root":"C:\\","backend_profile":"Ubuntu"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let created = response_value(&created);
+        let opened = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_conpty_profile_open",
+                "terminal.open",
+                serde_json::json!({
+                    "workspace_id": created["workspace_id"],
+                    "pane_id": created["root_pane_id"],
+                    "backend": "conpty",
+                    "backend_profile": null,
+                    "command": ["cmd.exe", "/d", "/q"],
+                    "cwd": "C:\\",
+                    "env": [],
+                    "columns": 80,
+                    "rows": 24,
+                    "durability": "ephemeral",
+                    "placement": "active_pane"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let opened = response_value(&opened);
+        assert_eq!(opened["backend"], "conpty");
+        assert!(opened["backend_profile"].is_null());
+        let launch_spec = state
+            .store
+            .lock()
+            .unwrap()
+            .load_session_launch_spec(opened["session_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(launch_spec.backend_profile.is_none());
+    }
+
+    #[test]
     fn pane_mount_and_unmount_surface_round_trip_through_desktop_store() {
         let state = DesktopControlState::new();
         {
@@ -16543,6 +17571,107 @@ mod tests {
             }
             ResponseOutcome::Error(error) => error.message.clone(),
         }
+    }
+
+    fn response_error_details(response: &ResponseEnvelope) -> serde_json::Value {
+        match &response.outcome {
+            ResponseOutcome::Ok { result_json } => {
+                panic!("expected control error but got ok response: {result_json}")
+            }
+            ResponseOutcome::Error(error) => serde_json::from_str(
+                error
+                    .details_json
+                    .as_deref()
+                    .expect("control error details"),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminal_split_test_state() -> (DesktopControlState, String, String) {
+        let state = DesktopControlState::new();
+        let created = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_failure_workspace",
+                "workspace.create",
+                r#"{"name":"Split rollback workspace","project_root":"C:\\","backend_profile":null}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let created = response_value(&created);
+        let workspace_id = created["workspace_id"].as_str().unwrap().to_string();
+        let root_pane_id = created["root_pane_id"].as_str().unwrap().to_string();
+        let opened = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_split_failure_source",
+                "terminal.open",
+                serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "pane_id": root_pane_id,
+                    "backend": "conpty",
+                    "backend_profile": null,
+                    "command": ["cmd.exe", "/d", "/q"],
+                    "cwd": "C:\\",
+                    "env": [{"key": "AGENTMUX_TEST_CLONE", "value": "preserved"}],
+                    "columns": 92,
+                    "rows": 28,
+                    "durability": "ephemeral",
+                    "placement": "active_pane"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let source_pane_id = response_string_field(&opened, "pane_id");
+        (state, workspace_id, source_pane_id)
+    }
+
+    #[cfg(windows)]
+    fn terminal_split_test_request(workspace_id: &str, source_pane_id: &str) -> RequestEnvelope {
+        RequestEnvelope::new(
+            "req_terminal_split_injected_failure",
+            "terminal.split",
+            serde_json::json!({
+                "workspace_id": workspace_id,
+                "pane_id": source_pane_id,
+                "axis": "vertical",
+                "ratio": 0.5,
+                "behavior": "clone_current"
+            })
+            .to_string(),
+            DESKTOP_CONTROL_TOKEN,
+        )
+    }
+
+    #[cfg(windows)]
+    fn assert_runtime_backend_stopped(state: &DesktopControlState, session_id: &str) {
+        let listed = {
+            let mut control = state.control.lock().unwrap();
+            control.handle_request(RequestEnvelope::new(
+                "req_verify_compensated_session_list",
+                "session.list",
+                r#"{"workspace_id":null}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ))
+        };
+        assert!(response_value(&listed)["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["session_id"] != session_id));
+        let response = {
+            let mut control = state.control.lock().unwrap();
+            control.handle_request(RequestEnvelope::new(
+                "req_verify_compensated_runtime",
+                "session.terminate",
+                serde_json::json!({ "session_id": session_id, "mode": "kill" }).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ))
+        };
+        assert_eq!(response_error_code(&response), ErrorCode::SessionNotFound);
     }
 
     fn response_value(response: &ResponseEnvelope) -> serde_json::Value {

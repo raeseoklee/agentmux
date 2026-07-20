@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Migration {
@@ -68,6 +68,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   durability TEXT NOT NULL,
   created_at TEXT NOT NULL,
   last_seen_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_launch_specs (
+  session_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  backend_profile TEXT,
+  columns INTEGER NOT NULL,
+  rows INTEGER NOT NULL,
   updated_at TEXT NOT NULL
 );
 
@@ -234,6 +243,18 @@ CREATE TABLE IF NOT EXISTS team_messages (
 );
 "#;
 
+pub const SESSION_LAUNCH_ENV_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS session_launch_specs (
+  session_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  backend_profile TEXT,
+  columns INTEGER NOT NULL,
+  rows INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+ALTER TABLE session_launch_specs ADD COLUMN env_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -284,6 +305,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "team_collaboration_schema",
         sql: TEAM_COLLABORATION_SCHEMA,
+    },
+    Migration {
+        version: 11,
+        name: "session_launch_environment",
+        sql: SESSION_LAUNCH_ENV_SCHEMA,
     },
 ];
 
@@ -381,6 +407,17 @@ pub struct PersistedSession {
     pub durability: String,
     pub created_at: String,
     pub last_seen_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedSessionLaunchSpec {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub backend_profile: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub columns: u16,
+    pub rows: u16,
     pub updated_at: String,
 }
 
@@ -551,62 +588,18 @@ impl SqliteStore {
 
     pub fn save_workspace_bundle(&mut self, bundle: &WorkspaceBundle) -> StoreResult<()> {
         let tx = self.connection.transaction()?;
-        upsert_workspace(&tx, &bundle.workspace)?;
-        delete_missing_workspace_rows(
-            &tx,
-            "panes",
-            "pane_id",
-            &bundle.workspace.workspace_id,
-            &bundle
-                .panes
-                .iter()
-                .map(|pane| pane.pane_id.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        delete_missing_workspace_rows(
-            &tx,
-            "surfaces",
-            "surface_id",
-            &bundle.workspace.workspace_id,
-            &bundle
-                .surfaces
-                .iter()
-                .map(|surface| surface.surface_id.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        delete_missing_workspace_rows(
-            &tx,
-            "sessions",
-            "session_id",
-            &bundle.workspace.workspace_id,
-            &bundle
-                .sessions
-                .iter()
-                .map(|session| session.session_id.as_str())
-                .collect::<Vec<_>>(),
-        )?;
-        delete_missing_workspace_rows(
-            &tx,
-            "agent_states",
-            "session_id",
-            &bundle.workspace.workspace_id,
-            &bundle
-                .sessions
-                .iter()
-                .map(|session| session.session_id.as_str())
-                .collect::<Vec<_>>(),
-        )?;
+        save_workspace_bundle_in_transaction(&tx, bundle)?;
+        tx.commit().map_err(StoreError::from)
+    }
 
-        for pane in &bundle.panes {
-            upsert_pane(&tx, pane)?;
-        }
-        for surface in &bundle.surfaces {
-            upsert_surface(&tx, surface)?;
-        }
-        for session in &bundle.sessions {
-            upsert_session(&tx, session)?;
-        }
-
+    pub fn save_workspace_bundle_and_launch_spec(
+        &mut self,
+        bundle: &WorkspaceBundle,
+        spec: &PersistedSessionLaunchSpec,
+    ) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        save_workspace_bundle_in_transaction(&tx, bundle)?;
+        upsert_session_launch_spec(&tx, spec)?;
         tx.commit().map_err(StoreError::from)
     }
 
@@ -633,6 +626,47 @@ impl SqliteStore {
                  WHERE session_id = ?1",
                 [session_id],
                 session_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn upsert_session_launch_spec(
+        &mut self,
+        spec: &PersistedSessionLaunchSpec,
+    ) -> StoreResult<()> {
+        upsert_session_launch_spec(&self.connection, spec)
+    }
+
+    pub fn load_session_launch_spec(
+        &self,
+        session_id: &str,
+    ) -> StoreResult<Option<PersistedSessionLaunchSpec>> {
+        self.connection
+            .query_row(
+                "SELECT session_id, workspace_id, backend_profile, env_json, columns, rows, updated_at
+                 FROM session_launch_specs
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    let env_json: String = row.get(3)?;
+                    let env = serde_json::from_str(&env_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(PersistedSessionLaunchSpec {
+                        session_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        backend_profile: row.get(2)?,
+                        env,
+                        columns: row.get(4)?,
+                        rows: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
             )
             .optional()
             .map_err(StoreError::from)
@@ -744,6 +778,10 @@ impl SqliteStore {
             params![session_id],
         )?;
         self.connection.execute(
+            "DELETE FROM session_launch_specs WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        self.connection.execute(
             "DELETE FROM sessions WHERE session_id = ?1",
             params![session_id],
         )?;
@@ -810,6 +848,10 @@ impl SqliteStore {
         )?;
         tx.execute(
             "DELETE FROM agent_states WHERE workspace_id = ?1",
+            params![workspace_id],
+        )?;
+        tx.execute(
+            "DELETE FROM session_launch_specs WHERE workspace_id = ?1",
             params![workspace_id],
         )?;
         tx.execute(
@@ -1742,7 +1784,7 @@ pub fn apply_migrations(connection: &Connection, migrations: &[Migration]) -> St
 }
 
 fn delete_missing_workspace_rows(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     table: &str,
     id_column: &str,
     workspace_id: &str,
@@ -1818,6 +1860,108 @@ fn normalize_session_for_recovery(mut session: PersistedSession) -> PersistedSes
         session.backend_native_id = None;
     }
     session
+}
+
+fn save_workspace_bundle_in_transaction(
+    connection: &Connection,
+    bundle: &WorkspaceBundle,
+) -> StoreResult<()> {
+    upsert_workspace(connection, &bundle.workspace)?;
+    delete_missing_workspace_rows(
+        connection,
+        "panes",
+        "pane_id",
+        &bundle.workspace.workspace_id,
+        &bundle
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    delete_missing_workspace_rows(
+        connection,
+        "surfaces",
+        "surface_id",
+        &bundle.workspace.workspace_id,
+        &bundle
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    delete_missing_workspace_rows(
+        connection,
+        "sessions",
+        "session_id",
+        &bundle.workspace.workspace_id,
+        &bundle
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    delete_missing_workspace_rows(
+        connection,
+        "session_launch_specs",
+        "session_id",
+        &bundle.workspace.workspace_id,
+        &bundle
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    delete_missing_workspace_rows(
+        connection,
+        "agent_states",
+        "session_id",
+        &bundle.workspace.workspace_id,
+        &bundle
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+
+    for pane in &bundle.panes {
+        upsert_pane(connection, pane)?;
+    }
+    for surface in &bundle.surfaces {
+        upsert_surface(connection, surface)?;
+    }
+    for session in &bundle.sessions {
+        upsert_session(connection, session)?;
+    }
+    Ok(())
+}
+
+fn upsert_session_launch_spec(
+    connection: &Connection,
+    spec: &PersistedSessionLaunchSpec,
+) -> StoreResult<()> {
+    let env_json = serde_json::to_string(&spec.env)?;
+    connection.execute(
+        "INSERT INTO session_launch_specs (
+            session_id, workspace_id, backend_profile, env_json, columns, rows, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(session_id) DO UPDATE SET
+            workspace_id = excluded.workspace_id,
+            backend_profile = excluded.backend_profile,
+            env_json = excluded.env_json,
+            columns = excluded.columns,
+            rows = excluded.rows,
+            updated_at = excluded.updated_at",
+        params![
+            spec.session_id,
+            spec.workspace_id,
+            spec.backend_profile,
+            env_json,
+            spec.columns,
+            spec.rows,
+            spec.updated_at
+        ],
+    )?;
+    Ok(())
 }
 
 fn upsert_workspace(connection: &Connection, workspace: &PersistedWorkspace) -> StoreResult<()> {
@@ -2201,7 +2345,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
     }
 
     #[test]
@@ -2314,6 +2458,87 @@ mod tests {
 
         assert_eq!(native.state, "exited");
         assert_eq!(native.exit_code, Some(0));
+    }
+
+    #[test]
+    fn session_launch_environment_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[10].version, 11);
+        assert!(MIGRATIONS[10]
+            .sql
+            .contains("ALTER TABLE session_launch_specs ADD COLUMN env_json"));
+    }
+
+    #[test]
+    fn session_launch_spec_round_trips_and_is_removed_with_session() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.save_workspace_bundle(&sample_bundle()).unwrap();
+        let spec = PersistedSessionLaunchSpec {
+            session_id: "ses_native".to_string(),
+            workspace_id: "ws_test".to_string(),
+            backend_profile: Some("PowerShell".to_string()),
+            env: vec![("AGENTMUX_TEST".to_string(), "preserved".to_string())],
+            columns: 132,
+            rows: 41,
+            updated_at: "2026-06-18T00:03:00Z".to_string(),
+        };
+
+        store.upsert_session_launch_spec(&spec).unwrap();
+        assert_eq!(
+            store.load_session_launch_spec("ses_native").unwrap(),
+            Some(spec)
+        );
+
+        store.delete_session("ses_native").unwrap();
+        assert!(store
+            .load_session_launch_spec("ses_native")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn workspace_bundle_and_launch_spec_commit_atomically() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.save_workspace_bundle(&sample_bundle()).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_launch_spec_insert
+                 BEFORE INSERT ON session_launch_specs
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected launch spec failure');
+                 END;",
+            )
+            .unwrap();
+
+        let mut changed = sample_bundle();
+        changed.workspace.name = "Must roll back".to_string();
+        let spec = PersistedSessionLaunchSpec {
+            session_id: "ses_native".to_string(),
+            workspace_id: "ws_test".to_string(),
+            backend_profile: Some("PowerShell".to_string()),
+            env: vec![("TERM".to_string(), "xterm-256color".to_string())],
+            columns: 132,
+            rows: 41,
+            updated_at: "2026-06-18T00:03:00Z".to_string(),
+        };
+
+        let error = store
+            .save_workspace_bundle_and_launch_spec(&changed, &spec)
+            .unwrap_err();
+        assert!(error.to_string().contains("injected launch spec failure"));
+        assert_eq!(
+            store
+                .load_workspace_bundle("ws_test")
+                .unwrap()
+                .unwrap()
+                .workspace
+                .name,
+            "Test workspace"
+        );
+        assert!(store
+            .load_session_launch_spec("ses_native")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

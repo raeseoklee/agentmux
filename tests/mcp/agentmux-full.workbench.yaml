@@ -1,0 +1,22 @@
+apiVersion: mcp-workbench.dev/v0alpha1
+server:
+  transport: stdio
+  command: target/debug/agentmux.exe
+  args:
+    - mcp
+    - serve
+    - --profile
+    - full
+client:
+  protocolVersion: "2025-11-25"
+tests:
+  - id: full-profile-tools
+    description: Full profile exposes the complete AgentMux tool and schema contract
+    act:
+      method: tools/list
+    assert:
+      - kind: status
+        equals: success
+      - kind: count
+        path: $.tools
+        equals: 34

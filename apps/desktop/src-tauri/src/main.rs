@@ -10,6 +10,8 @@ use agentmux_desktop_host::{
     DesktopNotificationAdapter, OutputStreamFrame,
 };
 use agentmux_ipc::{RequestEnvelope, ResponseEnvelope};
+use serde::Serialize;
+use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(windows)]
@@ -20,6 +22,9 @@ mod explorer_file_drop;
 
 #[cfg(windows)]
 const WINDOWS_APP_USER_MODEL_ID: &str = "dev.agentmux.desktop";
+
+const UPDATE_NOTIFICATION_OPEN_EVENT: &str = "agentmux://open-update-settings";
+const UPDATE_NOTIFICATION_ACTION: &str = "open_update";
 
 #[cfg(windows)]
 fn set_windows_app_user_model_id() {
@@ -73,6 +78,101 @@ fn agentmux_control(
 #[tauri::command]
 fn agentmux_control_token(state: tauri::State<'_, Arc<DesktopControlState>>) -> String {
     state.inner().control_token().to_string()
+}
+
+#[derive(Clone, Serialize)]
+struct UpdateNotificationOpenPayload {
+    version: String,
+}
+
+fn validate_update_notification_field(
+    name: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if value.chars().count() > max_chars {
+        return Err(format!("{name} exceeds {max_chars} characters"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{name} contains control characters"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_update_notification_activation(response: &notify_rust::NotificationResponse) -> bool {
+    match response {
+        notify_rust::NotificationResponse::Default => true,
+        notify_rust::NotificationResponse::Action(action) => action == UPDATE_NOTIFICATION_ACTION,
+        _ => false,
+    }
+}
+
+fn open_update_settings(app: &tauri::AppHandle, version: String) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit(
+            UPDATE_NOTIFICATION_OPEN_EVENT,
+            UpdateNotificationOpenPayload { version },
+        );
+    }
+}
+
+#[cfg(windows)]
+struct UpdateNotificationResponseHandler {
+    app: tauri::AppHandle,
+    version: String,
+}
+
+#[cfg(windows)]
+impl notify_rust::ResponseHandler for UpdateNotificationResponseHandler {
+    fn call(self, response: &notify_rust::NotificationResponse) {
+        if is_update_notification_activation(response) {
+            open_update_settings(&self.app, self.version);
+        }
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn show_update_available_notification(
+    app: tauri::AppHandle,
+    version: String,
+    title: String,
+    body: String,
+    action_label: String,
+) -> Result<(), String> {
+    validate_update_notification_field("version", &version, 64)?;
+    validate_update_notification_field("title", &title, 128)?;
+    validate_update_notification_field("body", &body, 512)?;
+    validate_update_notification_field("action_label", &action_label, 64)?;
+
+    #[cfg(windows)]
+    {
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .app_id(WINDOWS_APP_USER_MODEL_ID)
+            .summary(&title)
+            .body(&body)
+            .action(UPDATE_NOTIFICATION_ACTION, &action_label);
+        let handle = notification.show().map_err(|error| error.to_string())?;
+        std::thread::spawn(move || {
+            let _ = handle.wait_for_response(UpdateNotificationResponseHandler { app, version });
+        });
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -280,8 +380,64 @@ fn main() {
             session_send_paste_direct,
             session_report_output_pressure,
             open_external_url,
-            clipboard_materialize_attachments
+            clipboard_materialize_attachments,
+            show_update_available_notification
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AgentMux desktop app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_notification_fields_reject_empty_control_and_oversized_values() {
+        assert!(validate_update_notification_field("title", "Update", 8).is_ok());
+        assert!(validate_update_notification_field("title", "   ", 8).is_err());
+        assert!(validate_update_notification_field("title", "bad\nvalue", 32).is_err());
+        assert!(validate_update_notification_field("title", "too long", 3).is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn update_notification_activation_accepts_body_and_open_action_only() {
+        assert!(is_update_notification_activation(
+            &notify_rust::NotificationResponse::Default
+        ));
+        assert!(is_update_notification_activation(
+            &notify_rust::NotificationResponse::Action(UPDATE_NOTIFICATION_ACTION.to_string())
+        ));
+        assert!(!is_update_notification_activation(
+            &notify_rust::NotificationResponse::Action("dismiss".to_string())
+        ));
+        assert!(!is_update_notification_activation(
+            &notify_rust::NotificationResponse::Closed(notify_rust::CloseReason::Dismissed)
+        ));
+        assert!(!is_update_notification_activation(
+            &notify_rust::NotificationResponse::Closed(notify_rust::CloseReason::Expired)
+        ));
+        assert!(!is_update_notification_activation(
+            &notify_rust::NotificationResponse::Closed(notify_rust::CloseReason::CloseAction)
+        ));
+        assert!(!is_update_notification_activation(
+            &notify_rust::NotificationResponse::Reply("ignored".to_string())
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "shows a real Windows notification; run explicitly for release smoke testing"]
+    fn native_update_notification_toast_smoke() {
+        set_windows_app_user_model_id();
+        let mut notification = notify_rust::Notification::new();
+        notification
+            .app_id(WINDOWS_APP_USER_MODEL_ID)
+            .summary("AgentMux update notification test")
+            .body("Windows native toast delivery verification completed.")
+            .action(UPDATE_NOTIFICATION_ACTION, "Open updates");
+        notification
+            .show()
+            .expect("Windows should accept the AgentMux native update toast");
+    }
 }

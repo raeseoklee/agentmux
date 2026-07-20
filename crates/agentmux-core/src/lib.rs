@@ -578,6 +578,15 @@ where
         self.backend.terminate(session_id.as_str(), mode)
     }
 
+    /// Forget a session whose creation was compensated before it became part
+    /// of the committed workspace model. Normal user termination deliberately
+    /// keeps an exited summary; transactional rollback must not.
+    pub fn discard_session(&mut self, session_id: &SessionId) -> bool {
+        self.recent_output.remove(session_id);
+        self.output_offsets.remove(session_id);
+        self.sessions.remove(session_id).is_some()
+    }
+
     /// Update the in-memory working directory for a session (driven by OSC 7).
     /// Returns true when the session exists and the cwd actually changed.
     pub fn set_session_cwd(&mut self, session_id: &SessionId, cwd: &str) -> bool {
@@ -860,6 +869,17 @@ where
 
     pub fn set_agent_heuristics_enabled(&mut self, enabled: bool) {
         self.agent_heuristics_enabled = enabled;
+    }
+
+    /// Remove every in-memory projection of a session that was rolled back
+    /// after a successful backend spawn.
+    pub fn discard_session(&mut self, session_id: &str) -> bool {
+        let session_id = SessionId::from_string(session_id);
+        self.agent_states.remove(session_id.as_str());
+        self.agent_heuristic_next_scan_offset.remove(&session_id);
+        self.pending_output.remove(&session_id);
+        self.pending_cwd.remove(&session_id);
+        self.runtime.discard_session(&session_id)
     }
 
     fn agent_heuristic_scan_allowed(
