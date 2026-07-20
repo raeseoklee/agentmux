@@ -6480,8 +6480,6 @@ fn managed_terminal_env(
 ) -> Vec<EnvVarParam> {
     let pipe = default_control_pipe_name();
     let wsl_env = managed_wsl_env_value(extra_wsl_env_keys);
-    let tmux_pane = agentmux_pane_to_tmux_pane(pane_id);
-    let tmux = format!("agentmux,{workspace_id},{pane_id}");
     vec![
         EnvVarParam {
             key: "AGENTMUX_CONTROL_PIPE".to_string(),
@@ -6520,14 +6518,6 @@ fn managed_terminal_env(
             value: pane_id.to_string(),
         },
         EnvVarParam {
-            key: "TMUX".to_string(),
-            value: tmux,
-        },
-        EnvVarParam {
-            key: "TMUX_PANE".to_string(),
-            value: tmux_pane,
-        },
-        EnvVarParam {
             key: "WSLENV".to_string(),
             value: wsl_env,
         },
@@ -6545,13 +6535,12 @@ fn managed_wsl_env_value(extra_keys: &[String]) -> String {
         "CMUX_WORKSPACE_ID",
         "CMUX_SURFACE_ID",
         "CMUX_PANE_ID",
-        "TMUX",
-        "TMUX_PANE",
     ];
     let mut parts = std::env::var("WSLENV")
         .unwrap_or_default()
         .split(':')
         .filter(|part| !part.trim().is_empty())
+        .filter(|part| !matches!(part.split('/').next(), Some("TMUX" | "TMUX_PANE")))
         .map(str::to_string)
         .collect::<Vec<_>>();
     for key in required {
@@ -6573,7 +6562,7 @@ fn push_wsl_env_key(parts: &mut Vec<String>, key: &str) {
 
 fn wsl_env_key(key: &str) -> Option<String> {
     let key = key.trim();
-    if key.is_empty() || key == "WSLENV" {
+    if key.is_empty() || matches!(key, "WSLENV" | "TMUX" | "TMUX_PANE") {
         return None;
     }
     let mut chars = key.chars();
@@ -6586,10 +6575,6 @@ fn wsl_env_key(key: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-fn agentmux_pane_to_tmux_pane(pane_id: &str) -> String {
-    format!("%{pane_id}")
 }
 
 #[derive(Debug)]
@@ -9120,7 +9105,7 @@ fn tmux_session_exists(distribution: Option<&str>, session_name: &str) -> Option
         "--exec",
         "sh",
         "-lc",
-        &format!("tmux has-session -t {target} >/dev/null 2>&1"),
+        &format!("unset TMUX TMUX_PANE; tmux has-session -t {target} >/dev/null 2>&1"),
     ]);
     command_status_success_with_timeout(
         command,
@@ -16033,6 +16018,28 @@ mod tests {
         assert!(parts.contains(&"NO_COLOR"));
         assert!(parts.contains(&"AGENTMUX_SURFACE_TITLE"));
         assert!(!parts.contains(&"WSLENV"));
+        assert!(!parts.contains(&"TMUX"));
+        assert!(!parts.contains(&"TMUX_PANE"));
+    }
+
+    #[test]
+    fn managed_terminal_env_does_not_spoof_tmux_identity() {
+        let env = managed_terminal_env(
+            "ws_test",
+            "token",
+            "surf_test",
+            "pane_test",
+            &["TMUX".to_string(), "TMUX_PANE".to_string()],
+        );
+        assert!(!env.iter().any(|item| item.key == "TMUX"));
+        assert!(!env.iter().any(|item| item.key == "TMUX_PANE"));
+        let wslenv = env
+            .iter()
+            .find(|item| item.key == "WSLENV")
+            .map(|item| item.value.as_str())
+            .expect("managed WSLENV");
+        assert!(!wslenv.split(':').any(|item| item == "TMUX"));
+        assert!(!wslenv.split(':').any(|item| item == "TMUX_PANE"));
     }
 
     #[test]
@@ -16069,7 +16076,7 @@ mod tests {
             RequestEnvelope::new(
                 "req_spawn",
                 "session.spawn",
-                r#"{"workspace_id":"ws_desktop","command":["cmd.exe","/d","/q","/c","echo agentmux-desktop-host %AGENTMUX_SURFACE_ID% %CMUX_SURFACE_ID% %AGENTMUX_PANE_ID% %CMUX_PANE_ID% %TMUX_PANE% %TMUX%"],"cwd":null,"columns":120,"rows":30,"durability":"ephemeral"}"#,
+                r#"{"workspace_id":"ws_desktop","command":["cmd.exe","/d","/q","/c","echo agentmux-desktop-host %AGENTMUX_SURFACE_ID% %CMUX_SURFACE_ID% %AGENTMUX_PANE_ID% %CMUX_PANE_ID%"],"cwd":null,"columns":120,"rows":30,"durability":"ephemeral"}"#,
                 DESKTOP_CONTROL_TOKEN,
             ),
         );
@@ -16110,7 +16117,6 @@ mod tests {
         let pane_id = detail["workspace"]["active_pane_id"].as_str().unwrap();
         assert!(text.contains(surface_id));
         assert!(text.contains(pane_id));
-        assert!(text.contains(&format!("%{pane_id}")));
     }
 
     #[test]

@@ -45,7 +45,13 @@ fn tmux_control_launches_in_wsl_and_round_trips_output() {
                 ],
             ),
             cwd: Some("/tmp".to_string()),
-            env: Vec::new(),
+            env: vec![
+                (
+                    "TMUX".to_string(),
+                    "agentmux,legacy-workspace,legacy-pane".to_string(),
+                ),
+                ("TMUX_PANE".to_string(), "%legacy-pane".to_string()),
+            ],
             initial_size: TerminalSize::new(100, 24),
         })
         .unwrap_or_else(|error| panic!("spawn tmux-control session in {distribution}: {error}"));
@@ -144,7 +150,13 @@ fn tmux_control_reattaches_without_duplicating_shell_process() {
                 ],
             ),
             cwd: Some("/tmp".to_string()),
-            env: Vec::new(),
+            env: vec![
+                (
+                    "TMUX".to_string(),
+                    "agentmux,legacy-workspace,legacy-pane".to_string(),
+                ),
+                ("TMUX_PANE".to_string(), "%legacy-pane".to_string()),
+            ],
             initial_size: TerminalSize::new(100, 24),
         })
         .unwrap_or_else(|error| {

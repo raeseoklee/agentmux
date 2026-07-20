@@ -8,6 +8,7 @@ import {
   XtermTerminalRenderer,
   XTERM_THEME,
 } from "../terminal/XtermTerminalRenderer";
+import { TerminalInputScheduler } from "../terminal/TerminalInputScheduler";
 import type {
   TerminalWebglMode as TerminalGpuAccelerationMode,
 } from "../terminal/TerminalWebglPolicy";
@@ -30,6 +31,7 @@ export interface TerminalCommands {
   findNext(term: string): boolean;
   findPrevious(term: string): boolean;
   scrollToBottom(): void;
+  pasteText(text: string): void;
 }
 
 const _terminalCommandRegistry = new Map<string, TerminalCommands>();
@@ -318,6 +320,7 @@ interface LiveTerminalProps {
   onFocus?: () => void;
   onError?: () => void;
   onOpenLink?: (url: string, event: MouseEvent) => void;
+  onPastePaths?: (paths: string[]) => void;
   onExitIntent?: () => void;
 }
 
@@ -461,6 +464,7 @@ export function LiveTerminal({
   onFocus,
   onError,
   onOpenLink,
+  onPastePaths,
   onExitIntent,
 }: LiveTerminalProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -468,6 +472,7 @@ export function LiveTerminal({
   const activeRef = useRef(active);
   const agentKindRef = useRef(agentKind ?? null);
   const onOpenLinkRef = useRef(onOpenLink);
+  const onPastePathsRef = useRef(onPastePaths);
   const onExitIntentRef = useRef(onExitIntent);
   const inputLineRef = useRef("");
   const bootingRef = useRef(true);
@@ -480,6 +485,8 @@ export function LiveTerminal({
   // "starting…" overlay so a slow cold start (notably the first WSL2 VM boot,
   // ~5s, during which the PTY emits nothing) never looks like a broken pane.
   const [booting, setBooting] = useState(true);
+
+  onPastePathsRef.current = onPastePaths;
 
   const notePossibleExitInput = useCallback((data: string) => {
     let shouldRefresh = false;
@@ -548,8 +555,55 @@ export function LiveTerminal({
     const unsubscribeOpenLink = renderer.onOpenLink((url, event) => {
       onOpenLinkRef.current?.(url, event);
     });
+    const unsubscribePastePaths = renderer.onPastePaths((paths) => {
+      onPastePathsRef.current?.(paths);
+    });
     rendererRef.current = renderer;
     let alive = true;
+    const inputSchedulers = new Map<string, TerminalInputScheduler>();
+    const inputSchedulerFor = (targetSessionId: string) => {
+      const current = inputSchedulers.get(targetSessionId);
+      if (current) {
+        return current;
+      }
+      const scheduler = new TerminalInputScheduler(
+        {
+          sendText: (text) => client.sendText(targetSessionId, text),
+          sendPaste: (text) => client.sendPaste(targetSessionId, text),
+        },
+        {
+          onDelivered:
+            targetSessionId === sessionId
+              ? () => pollNowRef.current?.()
+              : undefined,
+          onError:
+            targetSessionId === sessionId
+              ? () => {
+                  if (alive) {
+                    onError?.();
+                  }
+                }
+              : undefined,
+        },
+      );
+      inputSchedulers.set(targetSessionId, scheduler);
+      return scheduler;
+    };
+    const enqueueText = (targetSessionId: string, text: string) => {
+      inputSchedulerFor(targetSessionId).enqueueText(text);
+    };
+    const enqueuePaste = (targetSessionId: string, text: string) => {
+      inputSchedulerFor(targetSessionId).enqueuePaste(text);
+    };
+    const broadcastText = (text: string) => {
+      const peers = _broadcastResolver?.(sessionId);
+      if (!peers || peers.length === 0) {
+        return;
+      }
+      for (const peerId of peers) {
+        enqueueText(peerId, text);
+      }
+    };
     let previewCacheBytes = readTerminalPreviewCache(sessionId) ?? new Uint8Array(0);
     let previewFlushTimer: number | null = null;
 
@@ -689,11 +743,27 @@ export function LiveTerminal({
       findNext: (term: string) => renderer.findNext(term),
       findPrevious: (term: string) => renderer.findPrevious(term),
       scrollToBottom: () => renderer.scrollToBottom(),
+      pasteText: (text: string) => {
+        const trimmed = text.trim();
+        if (!trimmed) {
+          return;
+        }
+        const needsLeadingSpace =
+          inputLineRef.current.length > 0 &&
+          !/\s$/.test(inputLineRef.current);
+        const payload = `${needsLeadingSpace ? " " : ""}${trimmed} `;
+        notePossibleExitInput(payload);
+        renderer.focus();
+        enqueuePaste(sessionId, payload);
+      },
     };
     _terminalCommandRegistry.set(sessionId, commands);
 
     const teardownShared = () => {
       alive = false;
+      for (const scheduler of inputSchedulers.values()) {
+        scheduler.close();
+      }
       // Unregister commands if this instance still owns the slot.
       if (_terminalCommandRegistry.get(sessionId) === commands) {
         _terminalCommandRegistry.delete(sessionId);
@@ -710,6 +780,7 @@ export function LiveTerminal({
       }
       unsubscribeResize();
       unsubscribeOpenLink();
+      unsubscribePastePaths();
       resizeObserver.disconnect();
       discardTerminalOutput(renderer);
       renderer.dispose();
@@ -997,26 +1068,13 @@ export function LiveTerminal({
 
       const unsubscribeInput = renderer.onData((data) => {
         notePossibleExitInput(data);
-        client.sendText(sessionId, data).catch(() => onError?.());
-        const peers = _broadcastResolver?.(sessionId);
-        if (peers && peers.length > 0) {
-          for (const peerId of peers) {
-            client.sendText(peerId, data).catch(() => {});
-          }
-        }
+        enqueueText(sessionId, data);
+        broadcastText(data);
       });
       const unsubscribePaste = renderer.onPaste((text) => {
         notePossibleExitInput(text);
-        const sendPaste = client.sendPaste
-          ? client.sendPaste.bind(client)
-          : client.sendText.bind(client);
-        sendPaste(sessionId, text).catch(() => onError?.());
-        const peers = _broadcastResolver?.(sessionId);
-        if (peers && peers.length > 0) {
-          for (const peerId of peers) {
-            client.sendText(peerId, text).catch(() => {});
-          }
-        }
+        enqueuePaste(sessionId, text);
+        broadcastText(text);
       });
 
       void client
@@ -1161,35 +1219,13 @@ export function LiveTerminal({
 
       const unsubscribeInput = renderer.onData((data) => {
         notePossibleExitInput(data);
-        client
-          .sendText(sessionId, data)
-          .then(() => {
-            // Poll promptly so the echo appears without waiting for the tick.
-            requestSnapshotPoll();
-          })
-          .catch(() => onError?.());
-        const peers = _broadcastResolver?.(sessionId);
-        if (peers && peers.length > 0) {
-          for (const peerId of peers) {
-            client.sendText(peerId, data).catch(() => {});
-          }
-        }
+        enqueueText(sessionId, data);
+        broadcastText(data);
       });
       const unsubscribePaste = renderer.onPaste((text) => {
         notePossibleExitInput(text);
-        const sendPaste = client.sendPaste
-          ? client.sendPaste.bind(client)
-          : client.sendText.bind(client);
-        requestSnapshotPoll();
-        sendPaste(sessionId, text)
-          .then(requestSnapshotPoll)
-          .catch(() => onError?.());
-        const peers = _broadcastResolver?.(sessionId);
-        if (peers && peers.length > 0) {
-          for (const peerId of peers) {
-            client.sendText(peerId, text).catch(() => {});
-          }
-        }
+        enqueuePaste(sessionId, text);
+        broadcastText(text);
       });
 
       void pollSnapshot();
@@ -1325,33 +1361,13 @@ export function LiveTerminal({
 
     const unsubscribeInput = renderer.onData((data) => {
       notePossibleExitInput(data);
-      requestFallbackPoll();
-      client
-        .sendText(sessionId, data)
-        .then(requestFallbackPoll)
-        .catch(() => onError?.());
-      const peers = _broadcastResolver?.(sessionId);
-      if (peers && peers.length > 0) {
-        for (const peerId of peers) {
-          client.sendText(peerId, data).catch(() => {});
-        }
-      }
+      enqueueText(sessionId, data);
+      broadcastText(data);
     });
     const unsubscribePaste = renderer.onPaste((text) => {
       notePossibleExitInput(text);
-      const sendPaste = client.sendPaste
-        ? client.sendPaste.bind(client)
-        : client.sendText.bind(client);
-      requestFallbackPoll();
-      sendPaste(sessionId, text)
-        .then(requestFallbackPoll)
-        .catch(() => onError?.());
-      const peers = _broadcastResolver?.(sessionId);
-      if (peers && peers.length > 0) {
-        for (const peerId of peers) {
-          client.sendText(peerId, text).catch(() => {});
-        }
-      }
+      enqueuePaste(sessionId, text);
+      broadcastText(text);
     });
 
     void poll();
@@ -1508,6 +1524,7 @@ export function LiveTerminal({
   return (
     <div
       onMouseDown={onFocus}
+      data-agentmux-terminal-session={sessionId}
       data-agentmux-terminal-inner-margin={margin}
       data-agentmux-terminal-gpu-acceleration={terminalGpuAcceleration}
       style={{

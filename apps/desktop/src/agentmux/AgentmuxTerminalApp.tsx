@@ -63,6 +63,11 @@ import {
   type ShortcutBindingMap,
 } from "./actions";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
+import {
+  formatDroppedPaths,
+  installExplorerFileDrop,
+  type ExplorerFileDropPayload,
+} from "./explorerFileDrop";
 import { Hov } from "./Hov";
 import { LiveTerminal, TerminalRestorePreview, setBroadcastResolver, terminalCommandsForSession } from "./LiveTerminal";
 import { SplitHandle } from "./SplitHandle";
@@ -1425,6 +1430,7 @@ interface PaneViewProps {
   ) => void;
   openDurableTerminalInPane: (paneId: string) => void;
   onOpenTerminalLink: (url: string, paneId: string) => void;
+  onTerminalPastePaths: (payload: ExplorerFileDropPayload) => void;
   onTerminalExitIntent: (sessionId: string) => void;
   isDragOver: boolean;
   isZoomed?: boolean;
@@ -1478,6 +1484,7 @@ const PaneView = memo(function PaneView({
   openTerminalProfileMenu,
   openDurableTerminalInPane,
   onOpenTerminalLink,
+  onTerminalPastePaths,
   onTerminalExitIntent,
   onPaneDragStart,
   onPaneDragOver,
@@ -1532,6 +1539,9 @@ const PaneView = memo(function PaneView({
     <div
       key={pane.paneId}
       data-agentmux-pane={pane.paneId}
+      data-agentmux-terminal-session={
+        session && !isBrowser ? session.sessionId : undefined
+      }
       data-agentmux-mounted={surface ? "true" : "false"}
       data-agentmux-mounted-surface={surface?.surfaceId ?? ""}
       data-agentmux-active={active ? "true" : "false"}
@@ -1785,6 +1795,13 @@ const PaneView = memo(function PaneView({
               onFocus={() => focusPane(pane.paneId)}
               onError={onTerminalError}
               onOpenLink={(url) => onOpenTerminalLink(url, pane.paneId)}
+              onPastePaths={(paths) =>
+                onTerminalPastePaths({
+                  paths,
+                  targetPaneId: pane.paneId,
+                  targetSessionId: session.sessionId,
+                })
+              }
               onExitIntent={() => onTerminalExitIntent(session.sessionId)}
             />
           ) : isBrowser && surface ? (
@@ -4076,6 +4093,66 @@ export function AgentmuxTerminalApp() {
           : undefined;
       })()
     : undefined;
+  const explorerFileDropContextRef = useRef({
+    activePaneId,
+    activeTerminalSession,
+    panes,
+    sessions,
+    surfaces,
+  });
+  explorerFileDropContextRef.current = {
+    activePaneId,
+    activeTerminalSession,
+    panes,
+    sessions,
+    surfaces,
+  };
+
+  const handleDroppedPaths = useCallback(
+    (payload: ExplorerFileDropPayload) => {
+      const context = explorerFileDropContextRef.current;
+      const targetSessionId =
+        payload.targetSessionId ?? context.activeTerminalSession?.sessionId;
+      const session = context.sessions.find(
+        (candidate) => candidate.sessionId === targetSessionId,
+      );
+      if (!session || payload.paths.length === 0) {
+        return;
+      }
+      const surface = context.surfaces.find(
+        (candidate) => candidate.sessionId === session.sessionId,
+      );
+      const formatted = formatDroppedPaths(
+        payload.paths,
+        session,
+        surface?.title ?? "",
+      );
+      if (!formatted) {
+        return;
+      }
+
+      const targetPaneId =
+        payload.targetPaneId ??
+        context.panes.find(
+          (pane) => pane.mountedSurfaceId === surface?.surfaceId,
+        )?.paneId ??
+        context.activePaneId;
+      if (targetPaneId && targetPaneId !== context.activePaneId) {
+        void ctl.focusPane(targetPaneId);
+      }
+      const terminalCommands = terminalCommandsForSession(session.sessionId);
+      if (terminalCommands) {
+        terminalCommands.pasteText(formatted);
+      } else {
+        void client.sendPaste(session.sessionId, `${formatted} `);
+      }
+    },
+    [client, ctl.focusPane],
+  );
+
+  useEffect(() => {
+    return installExplorerFileDrop(handleDroppedPaths);
+  }, [handleDroppedPaths]);
   const textBoxDraftKey = activeTerminalSession
     ? textBoxDraftStorageKey(activeTerminalSession.sessionId)
     : null;
@@ -6301,6 +6378,7 @@ export function AgentmuxTerminalApp() {
         openTerminalProfileMenu={openTerminalProfileMenu}
         openDurableTerminalInPane={openDurableTerminalInPane}
         onOpenTerminalLink={openTerminalLinkInBrowserSplit}
+        onTerminalPastePaths={handleDroppedPaths}
         onTerminalExitIntent={queueTerminalExitRefresh}
         isDragOver={
           dragFeedback?.kind === "pane-swap" &&

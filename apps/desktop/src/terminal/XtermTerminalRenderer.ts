@@ -318,6 +318,31 @@ interface ClipboardReadResult {
   text: string;
 }
 
+interface ClipboardAttachmentPayload {
+  kind: "none" | "files" | "image";
+  paths: string[];
+}
+
+async function readClipboardAttachmentPaths(): Promise<string[]> {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (!invoke) {
+    return [];
+  }
+  try {
+    const payload = await invoke<ClipboardAttachmentPayload>(
+      "clipboard_materialize_attachments",
+    );
+    return Array.isArray(payload?.paths)
+      ? payload.paths.filter(
+          (path) => typeof path === "string" && path.trim().length > 0,
+        )
+      : [];
+  } catch (error) {
+    console.warn("[agentmux] clipboard attachment read failed", { error });
+    return [];
+  }
+}
+
 /**
  * Read text from the clipboard. Returns { ok: true, text } when any read path
  * succeeds — text may be an empty string when the clipboard holds non-text
@@ -359,6 +384,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   // TS-9: last search term so F3 / Shift+F3 repeat without needing a UI.
   private _lastSearchTerm = "";
   private pasteHandlers = new Set<(text: string) => void>();
+  private pastePathHandlers = new Set<(paths: string[]) => void>();
   private openLinkHandler?: TerminalLinkOpenHandler;
   private linkProviderDisposable?: { dispose(): void };
   // Active WebGL addon, when GPU rendering has been opted into and succeeded.
@@ -730,6 +756,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.pasteHandlers.add(handler);
     return () => {
       this.pasteHandlers.delete(handler);
+    };
+  }
+
+  onPastePaths(handler: (paths: string[]) => void): () => void {
+    this.pastePathHandlers.add(handler);
+    return () => {
+      this.pastePathHandlers.delete(handler);
     };
   }
 
@@ -1584,6 +1617,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     }
     event.preventDefault();
     event.stopPropagation();
+    if (isTauriRuntime()) {
+      this.pasteFromClipboard(terminal);
+      return;
+    }
     const text = event.clipboardData?.getData("text/plain") ?? "";
     if (text) {
       this.emitPaste(text);
@@ -1612,11 +1649,21 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   }
 
   private pasteFromClipboard(terminal: Terminal): void {
-    void readClipboardText()
-      .then(({ ok, text }) => {
+    void readClipboardAttachmentPaths()
+      .then(async (paths) => {
+        if (this.terminal !== terminal) {
+          return;
+        }
+        if (paths.length > 0) {
+          for (const handler of this.pastePathHandlers) {
+            handler(paths);
+          }
+          return;
+        }
+        const { ok, text } = await readClipboardText();
         // Only fall back to the 30-s cache when every read path errored.
-        // A successful read with empty text means the clipboard holds
-        // non-text content (image, file…) — pasting nothing is correct.
+        // A successful empty read means no usable text remains after the
+        // attachment path was checked.
         const pasteText = ok ? text : recentTerminalClipboardText();
         if (this.terminal === terminal && pasteText) {
           this.emitPaste(pasteText);
