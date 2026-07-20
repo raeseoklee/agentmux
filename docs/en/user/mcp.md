@@ -83,8 +83,10 @@ The shim captures the WSL-side `PATH` separately when it crosses into
 `agentmux.exe`; it never copies the Windows process `PATH` into a Linux child.
 The desktop restores the captured WSL path inside each integration child so
 recursive `tmux split-window` calls continue to resolve the AgentMux shim.
-On restart, persisted integration launch settings are reused, while tmux-owned
-ephemeral child workers are not independently respawned alongside their lead.
+On restart, persisted integration launch settings are reused and disconnected
+tmux-owned child workers are respawned into their original panes. Their saved
+command and working directory are restored independently so a lead crash or a
+desktop restart does not leave a permanently empty worker pane.
 
 ## Run a Local stdio Server
 

@@ -81,8 +81,9 @@ shim은 WSL에서 Windows `agentmux.exe`로 넘어갈 때 Linux 쪽 `PATH`를 �
 변수로 캡처하며 Windows 프로세스의 `PATH`를 Linux 자식에 복사하지 않습니다.
 데스크톱은 각 통합 자식 안에서 캡처한 WSL 경로를 복원하므로 중첩된
 `tmux split-window`도 AgentMux shim을 계속 찾을 수 있습니다. 재시작 시에는
-통합 실행 설정을 보존하되 tmux가 만든 임시 하위 워커를 lead와 별도로 중복
-재실행하지 않습니다.
+통합 실행 설정을 재사용하고, 연결이 끊긴 tmux 하위 워커를 원래 페인에 다시
+실행합니다. 저장된 명령과 작업 디렉터리도 각각 복원되므로 빈 워커 페인이
+남지 않습니다.
 
 ## 로컬 stdio 서버 실행
 

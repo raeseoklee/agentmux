@@ -9,6 +9,7 @@ import {
   XTERM_THEME,
 } from "../terminal/XtermTerminalRenderer";
 import { TerminalInputScheduler } from "../terminal/TerminalInputScheduler";
+import { terminalViewStateCache } from "../terminal/TerminalViewStateCache";
 import type {
   TerminalWebglMode as TerminalGpuAccelerationMode,
 } from "../terminal/TerminalWebglPolicy";
@@ -503,7 +504,7 @@ export function LiveTerminal({
       if (char === "\r" || char === "\n") {
         const command = inputLineRef.current.trim().toLowerCase();
         inputLineRef.current = "";
-        if (command === "exit" || command === "logout") {
+        if (/^(?:exit|logout)(?:\s+\d+)?\s*;?$/.test(command)) {
           shouldRefresh = true;
         }
         continue;
@@ -543,12 +544,22 @@ export function LiveTerminal({
       setBooting(false);
     };
 
+    const restoredViewState = terminalViewStateCache.read(sessionId);
     const renderer = new XtermTerminalRenderer();
-    renderer.mount(
+    const initialStateReady = renderer.mount(
       host,
-      { columns: 120, rows: 30, bytes: encoder.encode("") },
+      {
+        columns: 120,
+        rows: 30,
+        bytes: restoredViewState
+          ? encoder.encode(restoredViewState.serialized)
+          : encoder.encode(""),
+      },
       { fontSize, lineHeight: TERMINAL_LINE_HEIGHT },
     );
+    if (restoredViewState) {
+      markOutput();
+    }
     renderer.setAlternateWheelMode(
       agentKindRef.current === "codex" ? "page" : "auto",
     );
@@ -560,6 +571,45 @@ export function LiveTerminal({
     });
     rendererRef.current = renderer;
     let alive = true;
+    let restoredViewReady = restoredViewState === null;
+    void initialStateReady.then(() => {
+      if (alive) {
+        restoredViewReady = true;
+      }
+    });
+    let renderedOutputOffset = restoredViewState?.outputOffset ?? null;
+    let viewCheckpointTimer: number | null = null;
+    const checkpointRendererViewState = (allowDuringTeardown = false) => {
+      if (
+        (!alive && !allowDuringTeardown) ||
+        !restoredViewReady ||
+        renderedOutputOffset === null
+      ) {
+        return;
+      }
+      const outputStats = getTerminalOutputStats(renderer);
+      if (outputStats.writeInFlight || outputStats.queuedBytes > 0) {
+        return;
+      }
+      const serialized = renderer.serialize({ scrollback: 10_000 });
+      if (!serialized) {
+        return;
+      }
+      terminalViewStateCache.write(sessionId, {
+        serialized,
+        outputOffset: renderedOutputOffset,
+        updatedAt: Date.now(),
+      });
+    };
+    const scheduleViewCheckpoint = () => {
+      if (viewCheckpointTimer !== null) {
+        window.clearTimeout(viewCheckpointTimer);
+      }
+      viewCheckpointTimer = window.setTimeout(() => {
+        viewCheckpointTimer = null;
+        checkpointRendererViewState();
+      }, 120);
+    };
     const inputSchedulers = new Map<string, TerminalInputScheduler>();
     const inputSchedulerFor = (targetSessionId: string) => {
       const current = inputSchedulers.get(targetSessionId);
@@ -782,6 +832,13 @@ export function LiveTerminal({
       unsubscribeOpenLink();
       unsubscribePastePaths();
       resizeObserver.disconnect();
+      if (viewCheckpointTimer !== null) {
+        window.clearTimeout(viewCheckpointTimer);
+        viewCheckpointTimer = null;
+      }
+      // Keep the last parsed checkpoint when an output burst is still queued;
+      // replacing it with a partial framebuffer would create an offset gap.
+      checkpointRendererViewState(true);
       discardTerminalOutput(renderer);
       renderer.dispose();
       flushPreviewCache();
@@ -801,8 +858,8 @@ export function LiveTerminal({
       console.info(`[agentmux] terminal output transport: ${liveOutputMode}`, {
         sessionId,
       });
-      let expected = 0;
-      let streamReady = false;
+      let expected = restoredViewState?.outputOffset ?? 0;
+      let streamReady = restoredViewState !== null;
       let resyncInFlight = false;
       let resyncQueued = false;
       let pendingFrames: OutputStreamFrame[] = [];
@@ -902,6 +959,8 @@ export function LiveTerminal({
               return;
             }
             markOutput();
+            renderedOutputOffset = (renderedOutputOffset ?? 0) + byteCount;
+            scheduleViewCheckpoint();
             queueTransportDiagnostics(byteCount);
             queuePressureReport();
             if (
@@ -964,6 +1023,7 @@ export function LiveTerminal({
         renderer.reset();
         replacePreviewCache(snap.bytes);
         expected = snap.endOffset;
+        renderedOutputOffset = snap.baseOffset;
         streamReady = true;
         if (snap.bytes.length > 0) {
           enqueueRenderBytes(snap.bytes);
@@ -987,11 +1047,22 @@ export function LiveTerminal({
         resyncInFlight = true;
         clearResyncRetry();
         try {
-          const snap = await client.snapshot!(sessionId);
+          const snap = await client.snapshot!(
+            sessionId,
+            streamReady ? expected : undefined,
+          );
           if (!alive) {
             return;
           }
-          writeSnapshot(snap);
+          if (streamReady && snap.baseOffset === expected) {
+            if (snap.bytes.length > 0) {
+              appendPreviewCache(snap.bytes);
+              enqueueRenderBytes(snap.bytes);
+            }
+            expected = snap.endOffset;
+          } else {
+            writeSnapshot(snap);
+          }
         } catch {
           if (alive) {
             scheduleResync(activeRef.current ? SNAPSHOT_BOOT_POLL_MS : SNAPSHOT_INACTIVE_POLL_MS);
@@ -1114,7 +1185,7 @@ export function LiveTerminal({
       // Absolute offset already written into xterm. Each poll asks for bytes at
       // or after it and writes the delta. A returned base_offset greater than
       // `expected` means the bounded ring rotated past us — reset and resync.
-      let expected = 0;
+      let expected = restoredViewState?.outputOffset ?? 0;
       let polling = false;
       let queued = false;
       let hotPollsRemaining = ACTIVITY_HOT_POLLS;
@@ -1173,14 +1244,22 @@ export function LiveTerminal({
             if (snap.endOffset === expected) {
               continue; // no new output
             }
-            if (snap.baseOffset > expected) {
+            if (snap.baseOffset !== expected) {
               renderer.reset(); // fell behind the ring; resync from base
               replacePreviewCache(snap.bytes);
+              renderedOutputOffset = snap.baseOffset;
             } else {
               appendPreviewCache(snap.bytes);
             }
             if (snap.bytes.length > 0) {
-              renderer.write(snap.bytes);
+              if (renderedOutputOffset === null) {
+                renderedOutputOffset = snap.baseOffset;
+              }
+              renderer.write(snap.bytes, () => {
+                renderedOutputOffset =
+                  (renderedOutputOffset ?? snap.baseOffset) + snap.bytes.length;
+                scheduleViewCheckpoint();
+              });
               hadOutput = true;
               markOutput();
               const diagnostics =
@@ -1242,6 +1321,13 @@ export function LiveTerminal({
     }
 
     // --- readRecent polling fallback (preview / server clients) ---
+    if (restoredViewState) {
+      // This legacy transport has no absolute cursor with which to deduplicate
+      // the serialized framebuffer. Prefer a clean recent-output replay.
+      renderer.reset();
+      renderedOutputOffset = null;
+      terminalViewStateCache.delete(sessionId);
+    }
     recordTransport(sessionId, "read-recent-poll");
     console.info("[agentmux] terminal output transport: read-recent-poll", {
       sessionId,

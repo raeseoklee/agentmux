@@ -738,8 +738,8 @@ impl SqliteStore {
         state: &str,
         exit_code: Option<i32>,
         updated_at: &str,
-    ) -> StoreResult<()> {
-        self.connection.execute(
+    ) -> StoreResult<bool> {
+        let updated = self.connection.execute(
             "UPDATE sessions
              SET state = ?2,
                  exit_code = ?3,
@@ -748,7 +748,7 @@ impl SqliteStore {
              WHERE session_id = ?1",
             params![session_id, state, exit_code, updated_at],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     /// Update a session's current working directory. Driven by live cwd

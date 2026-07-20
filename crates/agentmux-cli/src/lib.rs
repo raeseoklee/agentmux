@@ -32,9 +32,9 @@ use agentmux_ipc::{
     BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams, BrowserScreenshotResult,
     BrowserScrollParams, BrowserSelectParams, BrowserStorageResult, BrowserSurfaceParams,
     BrowserTypeParams, BrowserWaitForSelectorParams, BrowserWaitForSelectorResult,
-    BrowserZoomParams, ControlCaller, ControlError, DiagnosticsExportResult, ErrorCode, EventFrame,
-    EventPollParams, EventPollResult, EventSubscribeParams, EventSubscribeResult,
-    NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
+    BrowserZoomParams, ControlCaller, ControlError, DiagnosticsExportResult, EnvVarParam,
+    ErrorCode, EventFrame, EventPollParams, EventPollResult, EventSubscribeParams,
+    EventSubscribeResult, NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
     NotificationCreateParams, NotificationDismissParams, NotificationListParams,
     NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
     PaneSplitParams, PaneSummaryResult, ProfileListResult, ProfileSummaryResult,
@@ -159,7 +159,11 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} session spawn --workspace <id> -- cmd.exe /d /q\n",
             "Try: {program_name} session list --workspace <id>\n",
             "Try: {program_name} session terminate <id> --mode soft --yes\n",
+            "Try: {program_name} agent list --workspace <id> --json\n",
             "Try: {program_name} agent set-state <session-id> waiting_for_input --reason \"needs input\"\n",
+            "Try: {program_name} integrations install-shims --user-path\n",
+            "Try: {program_name} integrations doctor claude-teams --distribution Ubuntu --json\n",
+            "Try: {program_name} integrations launch claude-teams\n",
             "Try: {program_name} actions list --workspace <id> --json\n",
             "Try: {program_name} actions run custom.verify --workspace <id> --json\n",
             "Try: {program_name} browser open --workspace <id> --placement new-tab\n",
@@ -293,8 +297,12 @@ where
             run_agent_get_state(options, &mut output)
         }
         [family, command, rest @ ..] if family == "agent" && command == "list-attention" => {
-            let options = parse_agent_list_attention_options(rest)?;
+            let options = parse_agent_list_options(rest, "agent list-attention")?;
             run_agent_list_attention(options, &mut output)
+        }
+        [family, command, rest @ ..] if family == "agent" && command == "list" => {
+            let options = parse_agent_list_options(rest, "agent list")?;
+            run_agent_list(options, &mut output)
         }
         [family, command, rest @ ..] if family == "agent" && command == "clear-attention" => {
             let options = parse_agent_clear_attention_options(rest)?;
@@ -483,6 +491,11 @@ where
         [family, command, rest @ ..] if family == "integrations" && command == "doctor" => {
             let options = parse_agent_integration_doctor_options(rest)?;
             run_agent_integration_doctor(options, &mut output)
+        }
+        [family, command, kind, rest @ ..] if family == "integrations" && command == "launch" => {
+            let kind = AgentIntegrationKind::parse(kind)?;
+            let options = parse_agent_integration_launch_options(kind, rest)?;
+            run_agent_integration_launch(options, &mut output)
         }
         [command, rest @ ..] if command == "__tmux-compat" => {
             let options = parse_tmux_compat_options(rest)?;
@@ -5256,8 +5269,9 @@ fn parse_agent_clear_attention_options(
     })
 }
 
-fn parse_agent_list_attention_options(
+fn parse_agent_list_options(
     args: &[String],
+    command_name: &str,
 ) -> Result<AgentListAttentionOptions, CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = None;
@@ -5274,12 +5288,12 @@ fn parse_agent_list_attention_options(
             }
             value if value.starts_with("--") => {
                 return Err(CliError::InvalidArgs(format!(
-                    "unknown agent list-attention option '{value}'."
+                    "unknown {command_name} option '{value}'."
                 )));
             }
             value => {
                 return Err(CliError::InvalidArgs(format!(
-                    "agent list-attention does not accept argument '{value}'."
+                    "{command_name} does not accept argument '{value}'."
                 )));
             }
         }
@@ -8628,6 +8642,25 @@ where
     Ok(())
 }
 
+fn run_agent_list<W>(options: AgentListAttentionOptions, output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let response = invoke_control("agent.list", &options.params, &options.invoke)?;
+    if options.invoke.json {
+        return write_json_response(&response, output);
+    }
+    let result: AgentAttentionListResult = response_result(&response)?;
+    if result.sessions.is_empty() {
+        writeln!(output, "No agent sessions are registered.")?;
+        return Ok(());
+    }
+    for session in result.sessions {
+        write_agent_state(&session, output)?;
+    }
+    Ok(())
+}
+
 fn run_agent_clear_attention<W>(
     options: AgentClearAttentionOptions,
     output: &mut W,
@@ -10073,7 +10106,7 @@ where
             backend_profile: None,
             command,
             cwd: context.cwd.clone(),
-            env: Vec::new(),
+            env: tmux_integration_child_env(),
             columns: 120,
             rows: 30,
             durability: Some("ephemeral".to_string()),
@@ -10086,14 +10119,14 @@ where
     let detail = load_workspace_detail(&invoke, &workspace_id)?;
     let pane_id = pane_id_for_session(&detail, &result.session_id)
         .unwrap_or_else(|| detail.workspace.active_pane_id.clone());
-    record_tmux_agent_team_metadata(
+    register_tmux_agent_team_metadata(
         &invoke,
         &workspace_id,
         &result.session_id,
         None,
         "new-window",
         Some(&pane_id),
-    );
+    )?;
     if invoke.json {
         return write_json_response(&response, output);
     }
@@ -10148,7 +10181,7 @@ where
     let mut session_id = None;
     let mut surface_id = None;
     if !command.is_empty() {
-        let spawn = invoke_control(
+        let spawn_result = invoke_control(
             "session.spawn",
             &SessionSpawnParams {
                 workspace_id: workspace.workspace_id.clone(),
@@ -10156,7 +10189,7 @@ where
                 backend_profile: None,
                 command,
                 cwd: cwd.clone(),
-                env: Vec::new(),
+                env: tmux_integration_child_env(),
                 columns: 120,
                 rows: 30,
                 durability: Some("ephemeral".to_string()),
@@ -10164,17 +10197,30 @@ where
                 pane_id: Some(workspace.active_pane_id.clone()),
             },
             &invoke,
-        )?;
-        let spawn_result: SessionSpawnResult = response_result(&spawn)?;
+        )
+        .and_then(|response| response_result::<SessionSpawnResult>(&response));
+        let spawn_result = match spawn_result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(rollback_tmux_workspace_after_spawn_failure(
+                    &workspace.workspace_id,
+                    error,
+                    |method, params| {
+                        let response = invoke_control(method, params, &invoke)?;
+                        response_result::<serde_json::Value>(&response).map(|_| ())
+                    },
+                ))
+            }
+        };
         session_id = Some(spawn_result.session_id.clone());
-        record_tmux_agent_team_metadata(
+        register_tmux_agent_team_metadata(
             &invoke,
             &workspace.workspace_id,
             &spawn_result.session_id,
             None,
             "new-session",
             Some(&workspace.active_pane_id),
-        );
+        )?;
         let detail = load_workspace_detail(&invoke, &workspace.workspace_id)?;
         surface_id = detail
             .panes
@@ -10257,7 +10303,7 @@ where
                 backend_profile: None,
                 command,
                 cwd: context.cwd.clone(),
-                env: Vec::new(),
+                env: tmux_integration_child_env(),
                 columns: 120,
                 rows: 30,
                 durability: Some("ephemeral".to_string()),
@@ -10265,18 +10311,35 @@ where
                 pane_id: Some(new_pane_id.clone()),
             },
             &invoke,
-        )?;
-        let result: SessionSpawnResult = response_result(&spawn)?;
-        record_tmux_agent_team_metadata(
+        )
+        .and_then(|response| {
+            let result = response_result::<SessionSpawnResult>(&response)?;
+            Ok((response, result))
+        });
+        let (spawn_response, result) = match spawn {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(rollback_tmux_pane_after_spawn_failure(
+                    &workspace_id,
+                    &new_pane_id,
+                    error,
+                    |method, params| {
+                        let response = invoke_control(method, params, &invoke)?;
+                        response_result::<serde_json::Value>(&response).map(|_| ())
+                    },
+                ))
+            }
+        };
+        register_tmux_agent_team_metadata(
             &invoke,
             &workspace_id,
             &result.session_id,
             Some(&pane_id),
             "split-window",
             Some(&new_pane_id),
-        );
+        )?;
         if invoke.json {
-            return write_json_response(&spawn, output);
+            return write_json_response(&spawn_response, output);
         }
         session_id = Some(result.session_id);
     }
@@ -10301,6 +10364,65 @@ where
         render_tmux_format(format.as_deref(), &context, &new_pane_id)
     )?;
     Ok(())
+}
+
+fn rollback_tmux_workspace_after_spawn_failure<F>(
+    workspace_id: &str,
+    spawn_error: CliError,
+    rollback: F,
+) -> CliError
+where
+    F: FnOnce(&str, &WorkspaceCloseParams) -> Result<(), CliError>,
+{
+    let rollback_result = rollback(
+        "workspace.close",
+        &WorkspaceCloseParams {
+            workspace_id: workspace_id.to_string(),
+            close_policy: "terminate_sessions".to_string(),
+        },
+    );
+    preserve_error_with_tmux_rollback(
+        spawn_error,
+        rollback_result,
+        &format!("newly created workspace '{workspace_id}'"),
+    )
+}
+
+fn rollback_tmux_pane_after_spawn_failure<F>(
+    workspace_id: &str,
+    pane_id: &str,
+    spawn_error: CliError,
+    rollback: F,
+) -> CliError
+where
+    F: FnOnce(&str, &PaneCloseParams) -> Result<(), CliError>,
+{
+    let rollback_result = rollback(
+        "pane.close",
+        &PaneCloseParams {
+            workspace_id: workspace_id.to_string(),
+            pane_id: pane_id.to_string(),
+            surface_policy: "close_surface".to_string(),
+        },
+    );
+    preserve_error_with_tmux_rollback(
+        spawn_error,
+        rollback_result,
+        &format!("newly split pane '{pane_id}'"),
+    )
+}
+
+fn preserve_error_with_tmux_rollback(
+    original_error: CliError,
+    rollback_result: Result<(), CliError>,
+    topology: &str,
+) -> CliError {
+    match rollback_result {
+        Ok(()) => original_error,
+        Err(rollback_error) => CliError::Control(format!(
+            "{original_error}; additionally failed to roll back {topology}: {rollback_error}"
+        )),
+    }
 }
 
 fn tmux_command_or_default_shell(
@@ -10354,16 +10476,16 @@ fn posix_default_shell_command() -> Vec<String> {
         .unwrap_or_else(|| vec!["sh".to_string()])
 }
 
-fn record_tmux_agent_team_metadata(
+fn register_tmux_agent_team_metadata(
     invoke: &ControlInvokeOptions,
     workspace_id: &str,
     session_id: &str,
     parent_pane_id: Option<&str>,
     action: &str,
     pane_id: Option<&str>,
-) {
+) -> Result<(), CliError> {
     let Some(integration) = agent_integration_from_env() else {
-        return;
+        return Ok(());
     };
     let metadata = build_tmux_agent_team_metadata(
         &integration,
@@ -10373,9 +10495,35 @@ fn record_tmux_agent_team_metadata(
         action,
         pane_id,
     );
-    let _ = invoke_control("agent.set_state", &metadata.agent_state, invoke);
+    let registration = invoke_control("agent.set_state", &metadata.agent_state, invoke)
+        .and_then(|response| response_result::<AgentStateResult>(&response));
+    if let Err(error) = registration {
+        let _ = invoke_control(
+            "session.terminate",
+            &SessionTerminateParams {
+                session_id: session_id.to_string(),
+                mode: "kill".to_string(),
+            },
+            invoke,
+        );
+        if let Some(pane_id) = pane_id {
+            let _ = invoke_control(
+                "pane.close",
+                &PaneCloseParams {
+                    workspace_id: workspace_id.to_string(),
+                    pane_id: pane_id.to_string(),
+                    surface_policy: "close_surface".to_string(),
+                },
+                invoke,
+            );
+        }
+        return Err(CliError::Control(format!(
+            "failed to register tmux worker metadata; the spawned session was stopped: {error}"
+        )));
+    }
     let _ = invoke_control("sidebar.set_status", &metadata.sidebar_status, invoke);
     let _ = invoke_control("sidebar.log", &metadata.sidebar_log, invoke);
+    Ok(())
 }
 
 fn agent_integration_from_env() -> Option<String> {
@@ -10384,6 +10532,33 @@ fn agent_integration_from_env() -> Option<String> {
         .or_else(|| std::env::var("CMUX_AGENT_INTEGRATION").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn tmux_integration_child_env() -> Vec<EnvVarParam> {
+    if agent_integration_from_env().is_none() {
+        return Vec::new();
+    }
+    const INHERITED_KEYS: &[&str] = &[
+        "AGENTMUX_AGENT_INTEGRATION",
+        "CMUX_AGENT_INTEGRATION",
+        "AGENTMUX_EXE",
+        "CMUX_EXE",
+        "AGENTMUX_WSL_PATH",
+        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS",
+        "OPENCODE_CONFIG_DIR",
+        "AGENTMUX_ORIGINAL_NODE_OPTIONS",
+        "CMUX_ORIGINAL_NODE_OPTIONS",
+        "NODE_OPTIONS",
+    ];
+    INHERITED_KEYS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key).ok().map(|value| EnvVarParam {
+                key: (*key).to_string(),
+                value,
+            })
+        })
+        .collect()
 }
 
 fn build_tmux_agent_team_metadata(
@@ -11694,14 +11869,14 @@ fn setup_agent_integration_files(
 
 fn write_tmux_shim_files(shim_dir: &Path) -> Result<(), CliError> {
     let script_path = shim_dir.join("tmux");
-    let script = "#!/usr/bin/env sh\nif [ -n \"$CMUX_EXE\" ]; then\n  exec \"$CMUX_EXE\" __tmux-compat \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux __tmux-compat \"$@\"\nfi\nexec cmux.exe __tmux-compat \"$@\"\n";
+    let script = "#!/usr/bin/env sh\nAGENTMUX_WSL_PATH=$PATH\nexport AGENTMUX_WSL_PATH\nfor agentmux_key in AGENTMUX_AGENT_INTEGRATION CMUX_AGENT_INTEGRATION AGENTMUX_EXE CMUX_EXE AGENTMUX_WSL_PATH CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS OPENCODE_CONFIG_DIR AGENTMUX_ORIGINAL_NODE_OPTIONS CMUX_ORIGINAL_NODE_OPTIONS NODE_OPTIONS; do\n  case \":${WSLENV-}:\" in\n    *\":${agentmux_key}:\"*) ;;\n    *) WSLENV=\"${WSLENV:+${WSLENV}:}${agentmux_key}\" ;;\n  esac\ndone\nexport WSLENV\nif [ -n \"$AGENTMUX_EXE\" ]; then\n  exec \"$AGENTMUX_EXE\" __tmux-compat \"$@\"\nfi\nif [ -n \"$CMUX_EXE\" ]; then\n  exec \"$CMUX_EXE\" __tmux-compat \"$@\"\nfi\nif command -v agentmux >/dev/null 2>&1; then\n  exec agentmux __tmux-compat \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux __tmux-compat \"$@\"\nfi\nexec agentmux.exe __tmux-compat \"$@\"\n";
     fs::write(&script_path, script).map_err(CliError::Io)?;
     set_executable_if_supported(&script_path)?;
 
     let cmd_path = shim_dir.join("tmux.cmd");
     fs::write(
         &cmd_path,
-        "@echo off\r\nif not \"%CMUX_EXE%\"==\"\" (\r\n  \"%CMUX_EXE%\" __tmux-compat %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\ncmux.exe __tmux-compat %*\r\n",
+        "@echo off\r\nif not \"%AGENTMUX_EXE%\"==\"\" (\r\n  \"%AGENTMUX_EXE%\" __tmux-compat %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\nif not \"%CMUX_EXE%\"==\"\" (\r\n  \"%CMUX_EXE%\" __tmux-compat %*\r\n  exit /b %ERRORLEVEL%\r\n)\r\nagentmux.exe __tmux-compat %*\r\n",
     )
     .map_err(CliError::Io)?;
     Ok(())
@@ -12143,7 +12318,7 @@ fn inspect_agent_integration(
         name: "persistent-wrapper",
         ok: wrapper_ok,
         detail: format!("{} or {}", posix_wrapper.display(), cmd_wrapper.display()),
-        fix: (!wrapper_ok).then(|| "Run `cmux integrations install-shims`.".to_string()),
+        fix: (!wrapper_ok).then(|| "Run `agentmux integrations install-shims`.".to_string()),
     });
 
     let tmux_shim = shim_dir.join("tmux");
@@ -12154,7 +12329,7 @@ fn inspect_agent_integration(
         ok: tmux_ok,
         detail: format!("{} or {}", tmux_shim.display(), tmux_cmd_shim.display()),
         fix: (!tmux_ok).then(|| {
-            format!("Run `cmux integrations setup {command}` or `cmux integrations install-shims`.")
+            format!("Run `agentmux integrations setup {command}` or `agentmux integrations install-shims`.")
         }),
     });
 
@@ -12207,7 +12382,7 @@ fn inspect_agent_integration(
                 ok: shadow_ok,
                 detail: format!("{} and {}", opencode_config.display(), omo_config.display()),
                 fix: (!shadow_ok).then(|| {
-                    "Run `cmux integrations setup omo` to create the shadow OpenCode config."
+                    "Run `agentmux integrations setup omo` to create the shadow OpenCode config."
                         .to_string()
                 }),
             });
@@ -12235,7 +12410,7 @@ fn inspect_agent_integration(
                     )
                 },
                 fix: node_modules_is_symlink.then(|| {
-                    "Run `cmux integrations setup omo --install-packages` to replace the shadow node_modules symlink with an isolated directory."
+                    "Run `agentmux integrations setup omo --install-packages` to replace the shadow node_modules symlink with an isolated directory."
                         .to_string()
                 }),
             });
@@ -12256,7 +12431,7 @@ fn inspect_agent_integration(
                     package_manager
                 },
                 fix: (!package_ok).then(|| {
-                    "Run `cmux integrations setup omo --install-packages` or launch `cmux omo`."
+                    "Run `agentmux integrations setup omo --install-packages` or launch `agentmux integrations launch omo`."
                         .to_string()
                 }),
             });
@@ -12269,7 +12444,7 @@ fn inspect_agent_integration(
                 ok: restore_ok,
                 detail: restore_module.display().to_string(),
                 fix: (!restore_ok).then(|| {
-                    "Run `cmux integrations setup omc` to create the NODE_OPTIONS restore module."
+                    "Run `agentmux integrations setup omc` to create the NODE_OPTIONS restore module."
                         .to_string()
                 }),
             });
@@ -12313,7 +12488,7 @@ fn push_omo_shadow_config_content_checks(
                     )
                 },
                 fix: (!plugin_ok).then(|| {
-                    "Run `cmux integrations setup omo` to refresh the shadow OpenCode config."
+                    "Run `agentmux integrations setup omo` to refresh the shadow OpenCode config."
                         .to_string()
                 }),
             });
@@ -12323,7 +12498,7 @@ fn push_omo_shadow_config_content_checks(
             ok: false,
             detail,
             fix: Some(
-                "Run `cmux integrations setup omo` to recreate the shadow OpenCode config."
+                "Run `agentmux integrations setup omo` to recreate the shadow OpenCode config."
                     .to_string(),
             ),
         }),
@@ -12341,7 +12516,7 @@ fn push_omo_shadow_config_content_checks(
                     format!("{} does not have tmux.enabled=true", omo_config.display())
                 },
                 fix: (!tmux_ok).then(|| {
-                    "Run `cmux integrations setup omo` to enable tmux mode in the shadow config."
+                    "Run `agentmux integrations setup omo` to enable tmux mode in the shadow config."
                         .to_string()
                 }),
             });
@@ -12351,7 +12526,7 @@ fn push_omo_shadow_config_content_checks(
             ok: false,
             detail,
             fix: Some(
-                "Run `cmux integrations setup omo` to recreate the shadow OpenCode config."
+                "Run `agentmux integrations setup omo` to recreate the shadow OpenCode config."
                     .to_string(),
             ),
         }),
@@ -12435,7 +12610,7 @@ fn push_wsl_agent_integration_checks(
         shim_dir,
         "if test -f \"$1/tmux\"; then printf '%s/tmux' \"$1\"; else printf 'tmux shim was not found at %s/tmux' \"$1\" >&2; exit 1; fi",
         format!(
-            "Run `cmux integrations setup {}` or `cmux integrations install-shims`, then retry from WSL.",
+            "Run `agentmux integrations setup {}` or `agentmux integrations install-shims`, then retry from WSL.",
             kind.command_name()
         ),
     );
@@ -12448,7 +12623,7 @@ fn push_wsl_agent_integration_checks(
                 distribution,
                 &base_dir.join("omo-config"),
                 "if test -f \"$1/opencode.json\" && test -f \"$1/oh-my-opencode.json\"; then printf '%s' \"$1\"; else printf 'OMO shadow config was not found at %s' \"$1\" >&2; exit 1; fi",
-                "Run `cmux integrations setup omo` to create the WSL-visible shadow config."
+                "Run `agentmux integrations setup omo` to create the WSL-visible shadow config."
                     .to_string(),
             );
         }
@@ -12459,7 +12634,7 @@ fn push_wsl_agent_integration_checks(
                 distribution,
                 &base_dir.join("omc-restore-node-options.cjs"),
                 "if test -f \"$1\"; then printf '%s' \"$1\"; else printf 'OMC NODE_OPTIONS restore module was not found at %s' \"$1\" >&2; exit 1; fi",
-                "Run `cmux integrations setup omc` to create the WSL-visible restore module."
+                "Run `agentmux integrations setup omc` to create the WSL-visible restore module."
                     .to_string(),
             );
         }
@@ -12589,13 +12764,16 @@ fn write_agent_integration_entrypoint(
     let command = kind.command_name();
     let posix_path = bin_dir.join(command);
     let posix = format!(
-        "#!/usr/bin/env sh\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux {command} \"$@\"\nfi\nexec cmux.exe {command} \"$@\"\n"
+        "#!/usr/bin/env sh\nif command -v agentmux >/dev/null 2>&1; then\n  exec agentmux integrations launch {command} \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux {command} \"$@\"\nfi\nexec agentmux.exe integrations launch {command} \"$@\"\n"
     );
     fs::write(&posix_path, posix).map_err(CliError::Io)?;
     set_executable_if_supported(&posix_path)?;
 
     let cmd_path = bin_dir.join(format!("{command}.cmd"));
-    let cmd = format!("@echo off\r\n\"{}\" {command} %*\r\n", launcher.display());
+    let cmd = format!(
+        "@echo off\r\n\"{}\" integrations launch {command} %*\r\n",
+        launcher.display()
+    );
     fs::write(&cmd_path, cmd).map_err(CliError::Io)?;
 
     Ok(vec![posix_path, cmd_path])
@@ -12650,15 +12828,65 @@ fn ensure_windows_user_path_contains(bin_dir: &Path) -> Result<WindowsUserPathUp
 
 #[cfg(windows)]
 fn query_windows_user_path() -> Result<Option<String>, CliError> {
-    let output = Command::new("reg.exe")
+    let value_output = Command::new("reg.exe")
         .args(["query", r"HKCU\Environment", "/v", "Path"])
         .output()
         .map_err(|error| CliError::Control(format!("failed to query user PATH: {error}")))?;
-    if !output.status.success() {
-        return Ok(None);
+    let environment_output = if value_output.status.success() {
+        None
+    } else {
+        Some(
+            Command::new("reg.exe")
+                .args(["query", r"HKCU\Environment"])
+                .output()
+                .map_err(|error| {
+                    CliError::Control(format!(
+                        "failed to verify whether the user PATH exists; refusing to modify PATH: {error}"
+                    ))
+                })?,
+        )
+    };
+
+    let value_stdout = String::from_utf8_lossy(&value_output.stdout);
+    let environment_stdout = environment_output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stdout));
+    match classify_windows_user_path_query(
+        value_output.status.success(),
+        &value_stdout,
+        environment_output
+            .as_ref()
+            .zip(environment_stdout.as_deref())
+            .map(|(output, stdout)| (output.status.success(), stdout)),
+    ) {
+        WindowsUserPathQueryResolution::Found(value) => Ok(Some(value)),
+        WindowsUserPathQueryResolution::Missing => Ok(None),
+        WindowsUserPathQueryResolution::MalformedValueOutput => {
+            let malformed_output = if value_output.status.success() {
+                &value_output
+            } else {
+                environment_output
+                    .as_ref()
+                    .expect("malformed fallback output follows a failed value query")
+            };
+            Err(CliError::Control(format!(
+                "user PATH registry output could not be parsed safely; refusing to modify PATH. {}",
+                command_output_excerpt(malformed_output)
+            )))
+        }
+        WindowsUserPathQueryResolution::QueryFailed => {
+            let environment_output = environment_output
+                .as_ref()
+                .expect("failed value query always has an environment query");
+            Err(CliError::Control(format!(
+                "failed to query user PATH and could not verify that the value is missing; refusing to modify PATH. value query status {}: {}; environment query status {}: {}",
+                value_output.status,
+                command_output_excerpt(&value_output),
+                environment_output.status,
+                command_output_excerpt(environment_output)
+            )))
+        }
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_reg_query_value(&stdout, "Path"))
 }
 
 #[cfg(windows)]
@@ -12690,19 +12918,58 @@ fn write_windows_user_path(value: &str) -> Result<(), CliError> {
 
 fn parse_reg_query_value(output: &str, value_name: &str) -> Option<String> {
     output.lines().find_map(|line| {
-        let trimmed = line.trim();
+        let trimmed = line.trim_start();
         let rest = trimmed.strip_prefix(value_name)?.trim_start();
         let rest = rest
             .strip_prefix("REG_EXPAND_SZ")
             .or_else(|| rest.strip_prefix("REG_SZ"))?
             .trim_start();
-        (!rest.is_empty()).then(|| rest.to_string())
+        Some(rest.to_string())
     })
+}
+
+fn reg_query_output_mentions_value(output: &str, value_name: &str) -> bool {
+    output.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(value_name))
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsUserPathQueryResolution {
+    Found(String),
+    Missing,
+    MalformedValueOutput,
+    QueryFailed,
+}
+
+fn classify_windows_user_path_query(
+    value_query_succeeded: bool,
+    value_query_stdout: &str,
+    environment_query: Option<(bool, &str)>,
+) -> WindowsUserPathQueryResolution {
+    if value_query_succeeded {
+        return parse_reg_query_value(value_query_stdout, "Path")
+            .map(WindowsUserPathQueryResolution::Found)
+            .unwrap_or(WindowsUserPathQueryResolution::MalformedValueOutput);
+    }
+
+    match environment_query {
+        Some((true, stdout)) => match parse_reg_query_value(stdout, "Path") {
+            Some(value) => WindowsUserPathQueryResolution::Found(value),
+            None if reg_query_output_mentions_value(stdout, "Path") => {
+                WindowsUserPathQueryResolution::MalformedValueOutput
+            }
+            None => WindowsUserPathQueryResolution::Missing,
+        },
+        Some((false, _)) | None => WindowsUserPathQueryResolution::QueryFailed,
+    }
 }
 
 fn next_windows_user_path_value(current: Option<&str>, bin_dir: &str) -> Option<String> {
     let normalized_bin = normalize_path_segment_for_compare(bin_dir);
-    let current = current.unwrap_or("").trim();
+    let current = current.unwrap_or("");
     let contains = current.split(';').any(|entry| {
         normalize_path_segment_for_compare(entry) == normalized_bin && !entry.trim().is_empty()
     });
@@ -12711,8 +12978,10 @@ fn next_windows_user_path_value(current: Option<&str>, bin_dir: &str) -> Option<
     }
     if current.is_empty() {
         Some(bin_dir.to_string())
+    } else if current.ends_with(';') {
+        Some(format!("{current}{bin_dir}"))
     } else {
-        Some(format!("{};{}", current.trim_end_matches(';'), bin_dir))
+        Some(format!("{current};{bin_dir}"))
     }
 }
 
@@ -14688,15 +14957,45 @@ mod tests {
     }
 
     #[test]
-    fn agentmux_usage_hides_cmux_compat_surface() {
+    fn agentmux_usage_exposes_native_integrations_without_legacy_cmux_commands() {
         let text = usage();
         assert!(!text.contains("Try: cmux "));
         assert!(!text.contains("list-workspaces"));
         assert!(!text.contains("__tmux-compat"));
-        assert!(!text.contains("claude-teams"));
-        assert!(!text.contains("|omo|"));
-        assert!(!text.contains("|omx|"));
-        assert!(!text.contains("|omc"));
+        assert!(text.contains("agent list --workspace <id> --json"));
+        assert!(text.contains("integrations launch claude-teams"));
+        assert!(text.contains("integrations doctor claude-teams"));
+    }
+
+    #[test]
+    fn agent_list_parse_errors_name_agent_list() {
+        let mut output = Vec::new();
+        let unknown_option =
+            run_cli(["agent", "list", "--not-an-option"], &mut output).unwrap_err();
+        assert_eq!(
+            unknown_option.to_string(),
+            "unknown agent list option '--not-an-option'."
+        );
+        assert!(!unknown_option.to_string().contains("list-attention"));
+
+        let unexpected_argument =
+            run_cli(["agent", "list", "unexpected"], &mut output).unwrap_err();
+        assert_eq!(
+            unexpected_argument.to_string(),
+            "agent list does not accept argument 'unexpected'."
+        );
+        assert!(!unexpected_argument.to_string().contains("list-attention"));
+    }
+
+    #[test]
+    fn agent_list_attention_parse_errors_keep_agent_list_attention_name() {
+        let mut output = Vec::new();
+        let error =
+            run_cli(["agent", "list-attention", "--not-an-option"], &mut output).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unknown agent list-attention option '--not-an-option'."
+        );
     }
 
     #[test]
@@ -15185,6 +15484,10 @@ mod tests {
         assert!(runtime.shim_dir.join("tmux").is_file());
         assert!(runtime.shim_dir.join("tmux.cmd").is_file());
         let tmux_shim = std::fs::read_to_string(runtime.shim_dir.join("tmux")).unwrap();
+        assert!(tmux_shim.contains("export WSLENV"));
+        assert!(tmux_shim.contains("AGENTMUX_AGENT_INTEGRATION"));
+        assert!(tmux_shim.contains("AGENTMUX_WSL_PATH=$PATH"));
+        assert!(!tmux_shim.contains("CMUX_EXE PATH CLAUDE_CODE"));
         assert!(tmux_shim.contains("CMUX_EXE"));
         assert!(tmux_shim.contains("exec \"$CMUX_EXE\" __tmux-compat \"$@\""));
         let tmux_cmd_shim = std::fs::read_to_string(runtime.shim_dir.join("tmux.cmd")).unwrap();
@@ -15442,6 +15745,13 @@ mod tests {
             Some(r"C:\Windows;D:\agentmux-cmuxterm\bin".to_string())
         );
         assert_eq!(
+            next_windows_user_path_value(
+                Some(r"C:\Windows;;%USERPROFILE%\tools;"),
+                r"D:\agentmux-cmuxterm\bin"
+            ),
+            Some(r"C:\Windows;;%USERPROFILE%\tools;D:\agentmux-cmuxterm\bin".to_string())
+        );
+        assert_eq!(
             next_windows_user_path_value(None, r"D:\agentmux-cmuxterm\bin"),
             Some(r"D:\agentmux-cmuxterm\bin".to_string())
         );
@@ -15456,6 +15766,76 @@ HKEY_CURRENT_USER\Environment
         assert_eq!(
             parse_reg_query_value(output, "Path").as_deref(),
             Some(r"C:\Users\Test\bin;%USERPROFILE%\tools")
+        );
+
+        let output_with_trailing_space =
+            "HKEY_CURRENT_USER\\Environment\n    Path    REG_SZ    C:\\Windows;  \n";
+        assert_eq!(
+            parse_reg_query_value(output_with_trailing_space, "Path").as_deref(),
+            Some("C:\\Windows;  ")
+        );
+        let empty_output = "HKEY_CURRENT_USER\\Environment\n    Path    REG_SZ\n";
+        assert_eq!(
+            parse_reg_query_value(empty_output, "Path").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn windows_user_path_query_only_treats_confirmed_absence_as_missing() {
+        let environment_without_path = r#"
+HKEY_CURRENT_USER\Environment
+    TEMP    REG_EXPAND_SZ    %USERPROFILE%\AppData\Local\Temp
+"#;
+        assert_eq!(
+            classify_windows_user_path_query(
+                false,
+                "ERROR: The system was unable to find the specified registry value.",
+                Some((true, environment_without_path)),
+            ),
+            WindowsUserPathQueryResolution::Missing
+        );
+
+        assert_eq!(
+            classify_windows_user_path_query(
+                false,
+                "ERROR: Access is denied.",
+                Some((false, "ERROR: Access is denied.")),
+            ),
+            WindowsUserPathQueryResolution::QueryFailed
+        );
+        assert_eq!(
+            classify_windows_user_path_query(true, "unexpected output", None),
+            WindowsUserPathQueryResolution::MalformedValueOutput
+        );
+
+        let environment_with_unexpected_path_type = r#"
+HKEY_CURRENT_USER\Environment
+    Path    REG_MULTI_SZ    C:\Windows
+"#;
+        assert_eq!(
+            classify_windows_user_path_query(
+                false,
+                "ERROR: Access is denied.",
+                Some((true, environment_with_unexpected_path_type)),
+            ),
+            WindowsUserPathQueryResolution::MalformedValueOutput
+        );
+    }
+
+    #[test]
+    fn windows_user_path_query_preserves_fallback_value_exactly() {
+        let environment_with_path = r#"
+HKEY_CURRENT_USER\Environment
+    Path    REG_EXPAND_SZ    C:\Windows;;%USERPROFILE%\tools;
+"#;
+        assert_eq!(
+            classify_windows_user_path_query(
+                false,
+                "ERROR: The system was unable to find the specified registry value.",
+                Some((true, environment_with_path)),
+            ),
+            WindowsUserPathQueryResolution::Found(r"C:\Windows;;%USERPROFILE%\tools;".to_string())
         );
     }
 
@@ -15506,6 +15886,9 @@ HKEY_CURRENT_USER\Environment
             .iter()
             .any(|path| path.ends_with("claude-teams")));
         assert!(bin_dir.join("omc.cmd").is_file());
+        assert!(std::fs::read_to_string(bin_dir.join("claude-teams.cmd"))
+            .unwrap()
+            .contains("integrations launch claude-teams"));
         assert!(base_dir.join("agentmux-integrations.ps1").is_file());
         assert!(base_dir.join("agentmux-integrations.sh").is_file());
         assert!(base_dir.join("omo-bin").join("tmux.cmd").is_file());
@@ -16767,6 +17150,64 @@ HKEY_CURRENT_USER\Environment
     }
 
     #[test]
+    fn tmux_new_session_spawn_failure_rolls_back_workspace_with_terminating_policy() {
+        let mut rollback_called = false;
+        let error = rollback_tmux_workspace_after_spawn_failure(
+            "ws_created",
+            CliError::Control("session spawn failed".to_string()),
+            |method, params| {
+                rollback_called = true;
+                assert_eq!(method, "workspace.close");
+                assert_eq!(params.workspace_id, "ws_created");
+                assert_eq!(params.close_policy, "terminate_sessions");
+                Ok(())
+            },
+        );
+
+        assert!(rollback_called);
+        assert!(
+            matches!(error, CliError::Control(ref message) if message == "session spawn failed")
+        );
+    }
+
+    #[test]
+    fn tmux_split_window_spawn_failure_closes_new_pane_and_surface() {
+        let mut rollback_called = false;
+        let error = rollback_tmux_pane_after_spawn_failure(
+            "ws_1",
+            "pane_created",
+            CliError::Control("session spawn failed".to_string()),
+            |method, params| {
+                rollback_called = true;
+                assert_eq!(method, "pane.close");
+                assert_eq!(params.workspace_id, "ws_1");
+                assert_eq!(params.pane_id, "pane_created");
+                assert_eq!(params.surface_policy, "close_surface");
+                Ok(())
+            },
+        );
+
+        assert!(rollback_called);
+        assert!(
+            matches!(error, CliError::Control(ref message) if message == "session spawn failed")
+        );
+    }
+
+    #[test]
+    fn tmux_spawn_failure_reports_primary_and_rollback_errors() {
+        let error = rollback_tmux_workspace_after_spawn_failure(
+            "ws_created",
+            CliError::Control("session spawn failed".to_string()),
+            |_method, _params| Err(CliError::Control("workspace close failed".to_string())),
+        );
+        let message = error.to_string();
+
+        assert!(message.starts_with("session spawn failed;"));
+        assert!(message.contains("newly created workspace 'ws_created'"));
+        assert!(message.contains("workspace close failed"));
+    }
+
+    #[test]
     fn tmux_compat_default_shell_command_follows_backend_context() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let previous_comspec = std::env::var_os("COMSPEC");
@@ -16814,6 +17255,46 @@ HKEY_CURRENT_USER\Environment
             std::env::set_var("WSL_DISTRO_NAME", previous_wsl);
         } else {
             std::env::remove_var("WSL_DISTRO_NAME");
+        }
+    }
+
+    #[test]
+    fn tmux_integration_child_env_preserves_markers_without_overwriting_wsl_path() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let previous_marker = std::env::var_os("AGENTMUX_AGENT_INTEGRATION");
+        let previous_path = std::env::var_os("PATH");
+        let previous_wsl_path = std::env::var_os("AGENTMUX_WSL_PATH");
+        std::env::set_var("AGENTMUX_AGENT_INTEGRATION", "claude-teams");
+        std::env::set_var("PATH", r"C:\Windows\System32");
+        std::env::set_var(
+            "AGENTMUX_WSL_PATH",
+            "/tmp/agentmux-shim:/usr/local/bin:/usr/bin:/bin",
+        );
+
+        let env = tmux_integration_child_env();
+        assert!(env.iter().any(|entry| {
+            entry.key == "AGENTMUX_AGENT_INTEGRATION" && entry.value == "claude-teams"
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.key == "AGENTMUX_WSL_PATH"
+                && entry.value == "/tmp/agentmux-shim:/usr/local/bin:/usr/bin:/bin"
+        }));
+        assert!(!env.iter().any(|entry| entry.key == "PATH"));
+
+        if let Some(value) = previous_marker {
+            std::env::set_var("AGENTMUX_AGENT_INTEGRATION", value);
+        } else {
+            std::env::remove_var("AGENTMUX_AGENT_INTEGRATION");
+        }
+        if let Some(value) = previous_path {
+            std::env::set_var("PATH", value);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(value) = previous_wsl_path {
+            std::env::set_var("AGENTMUX_WSL_PATH", value);
+        } else {
+            std::env::remove_var("AGENTMUX_WSL_PATH");
         }
     }
 

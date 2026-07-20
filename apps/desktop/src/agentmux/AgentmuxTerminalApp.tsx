@@ -75,6 +75,7 @@ import { useAgentmuxControl } from "./useAgentmuxControl";
 import type {
   TerminalWebglMode as TerminalGpuAccelerationMode,
 } from "../terminal/TerminalWebglPolicy";
+import { terminalViewStateCache } from "../terminal/TerminalViewStateCache";
 import {
   ACCENTS,
   buildRootVars,
@@ -2798,11 +2799,14 @@ export function AgentmuxTerminalApp() {
       void (async () => {
         try {
           if (pane.parentPaneId) {
-            await ctl.closePane(pane.paneId);
+            await client.closePane(activeWorkspaceId, pane.paneId, "close_surface");
           } else {
-            await ctl.closeSurface(surface.surfaceId);
+            await client.closeSurface(activeWorkspaceId, surface.surfaceId);
           }
+          await ctl.refresh();
+          terminalViewStateCache.delete(sessionId);
           exitIntentSessionIdsRef.current.delete(sessionId);
+          autoClosingExitedSessionsRef.current.delete(key);
         } catch (error) {
           console.warn("[agentmux] failed to auto-close exited terminal pane", {
             error,
@@ -2818,8 +2822,8 @@ export function AgentmuxTerminalApp() {
     }
   }, [
     activeWorkspaceId,
-    ctl.closePane,
-    ctl.closeSurface,
+    client,
+    ctl.refresh,
     panes,
     sessionById,
     surfaces,
@@ -5040,10 +5044,10 @@ export function AgentmuxTerminalApp() {
                 ? String((error as { code?: unknown }).code ?? "")
                 : "";
             if (code === "session_not_found") {
-              // Session is fully gone — clean up the intent entry so the
-              // auto-close loop does not act on it, and skip the refresh
-              // (there is nothing new to observe).
-              exitIntentSessionIdsRef.current.delete(sessionId);
+              // The runtime can remove a short-lived session before this poll.
+              // Keep the intent until workspace refresh removes the stale
+              // surface; the auto-close effect then closes its pane.
+              await ctl.refresh();
               return;
             }
             if (code) {
@@ -6381,6 +6385,7 @@ export function AgentmuxTerminalApp() {
         >
           {first ? (
             <div
+              key={first.paneId}
               style={{
                 flex: `${ratio} 1 0`,
                 minWidth: 0,
@@ -6399,6 +6404,7 @@ export function AgentmuxTerminalApp() {
           ) : null}
           {second ? (
             <div
+              key={second.paneId}
               style={{
                 flex: `${1 - ratio} 1 0`,
                 minWidth: 0,

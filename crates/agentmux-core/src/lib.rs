@@ -833,6 +833,9 @@ where
     // output, drained by the host and persisted so the footer git status tracks
     // the directory the shell has cd'd into. Last write per session wins.
     pending_cwd: HashMap<SessionId, String>,
+    // Last runtime state transition per session, drained by desktop hosts so
+    // backend-driven exits are persisted without a follow-up session.get call.
+    pending_session_states: HashMap<SessionId, (String, Option<i32>)>,
 }
 
 impl<B> RuntimeControlPlane<B>
@@ -856,6 +859,7 @@ where
             event_backlog_limit: 1024,
             pending_output: HashMap::new(),
             pending_cwd: HashMap::new(),
+            pending_session_states: HashMap::new(),
         }
     }
 
@@ -879,6 +883,7 @@ where
         self.agent_heuristic_next_scan_offset.remove(&session_id);
         self.pending_output.remove(&session_id);
         self.pending_cwd.remove(&session_id);
+        self.pending_session_states.remove(&session_id);
         self.runtime.discard_session(&session_id)
     }
 
@@ -941,8 +946,31 @@ where
             .collect()
     }
 
+    pub fn drain_session_state_updates(&mut self) -> Vec<(String, String, Option<i32>)> {
+        if self.pending_session_states.is_empty() {
+            return Vec::new();
+        }
+        self.pending_session_states
+            .drain()
+            .map(|(session_id, (state, exit_code))| (session_id.to_string(), state, exit_code))
+            .collect()
+    }
+
     pub fn collect_events(&mut self) {
         for event in self.runtime.drain_events() {
+            if let CoreEvent::SessionStateChanged {
+                session_id,
+                from,
+                to,
+            } = &event
+            {
+                if from != to {
+                    self.pending_session_states.insert(
+                        session_id.clone(),
+                        (session_state_label(to), session_exit_code(to)),
+                    );
+                }
+            }
             let agent_signals = match &event {
                 CoreEvent::SessionOutputBatch {
                     session_id,
@@ -2962,6 +2990,38 @@ mod tests {
                 .as_deref(),
             Some("agent_team")
         );
+    }
+
+    #[test]
+    fn backend_exit_is_available_to_host_state_persistence() {
+        let backend = FakeBackend::default();
+        let runtime = TerminalRuntime::new(backend);
+        let mut control = RuntimeControlPlane::new(runtime, "test-token");
+        let spawn = control.handle_request(request(
+            "req_spawn_state_drain",
+            "session.spawn",
+            r#"{"workspace_id":"ws_state_drain","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+        ));
+        let session_id = ok_json(&spawn)
+            .split("\"session_id\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("session id in spawn result")
+            .to_string();
+        control.collect_events();
+        control.drain_session_state_updates();
+
+        control.runtime.backend.events.push(BackendEvent::Exited {
+            session_id: session_id.clone(),
+            code: Some(7),
+        });
+        control.collect_events();
+
+        assert_eq!(
+            control.drain_session_state_updates(),
+            vec![(session_id, "exited".to_string(), Some(7))]
+        );
+        assert!(control.drain_session_state_updates().is_empty());
     }
 
     #[test]

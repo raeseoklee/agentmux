@@ -252,6 +252,17 @@ struct OutputPressureRecord {
     write_in_flight: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PendingAgentLaunchLine {
+    line: String,
+    queued_at: Instant,
+    next_attempt_at: Instant,
+    attempts: u8,
+    command: Vec<String>,
+    previous: PersistedAgentState,
+    prompt_observed: bool,
+}
+
 pub struct DesktopControlState {
     control: Mutex<DesktopRuntimeControl>,
     store: Mutex<SqliteStore>,
@@ -276,7 +287,11 @@ pub struct DesktopControlState {
     // Restored-agent launch lines waiting for their shell's first prompt
     // (OSC 7) before being typed; keyed by session id. See
     // replay_restored_agent_launch_command / flush_pending_agent_launch_lines.
-    pending_agent_launch_lines: Mutex<HashMap<String, (String, Instant)>>,
+    pending_agent_launch_lines: Mutex<HashMap<String, PendingAgentLaunchLine>>,
+    // State transitions are drained from the runtime once. Keep them here
+    // until SQLite accepts them so an exited session cannot remain persisted
+    // as running after a transient store lock/write failure.
+    pending_session_state_updates: Mutex<HashMap<String, (String, Option<i32>)>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,6 +452,7 @@ impl DesktopControlState {
             output_pressure: Mutex::new(HashMap::new()),
             input_command_buffers: Mutex::new(HashMap::new()),
             pending_agent_launch_lines: Mutex::new(HashMap::new()),
+            pending_session_state_updates: Mutex::new(HashMap::new()),
         };
         // Durable-session recovery is deliberately NOT run here: it probes
         // wsl.exe/tmux and can block for seconds. The desktop host runs it on a
@@ -469,6 +485,7 @@ impl DesktopControlState {
             output_pressure: Mutex::new(HashMap::new()),
             input_command_buffers: Mutex::new(HashMap::new()),
             pending_agent_launch_lines: Mutex::new(HashMap::new()),
+            pending_session_state_updates: Mutex::new(HashMap::new()),
         };
         Ok(state)
     }
@@ -743,15 +760,71 @@ impl DesktopControlState {
     /// needs no output polling. Channels that fail to send (renderer gone) are
     /// dropped.
     pub fn pump_output_stream(&self) -> bool {
-        let (deltas, cwd_updates) = {
+        let (deltas, cwd_updates, session_state_updates) = {
             let Ok(mut control) = self.control.lock() else {
                 self.record_output_pump_metrics(false, 0, 0, 0, 0);
                 return false;
             };
             control.collect_events();
-            (control.drain_output_stream(), control.drain_cwd_updates())
+            (
+                control.drain_output_stream(),
+                control.drain_cwd_updates(),
+                control.drain_session_state_updates(),
+            )
         };
-        let had_activity = !deltas.is_empty() || !cwd_updates.is_empty();
+        if !session_state_updates.is_empty() {
+            if let Ok(mut pending) = self.pending_session_state_updates.lock() {
+                for (session_id, state, exit_code) in &session_state_updates {
+                    pending.insert(session_id.clone(), (state.clone(), *exit_code));
+                }
+            }
+        }
+        let pending_state_snapshot = self
+            .pending_session_state_updates
+            .lock()
+            .map(|pending| {
+                pending
+                    .iter()
+                    .map(|(session_id, (state, exit_code))| {
+                        (session_id.clone(), state.clone(), *exit_code)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut persisted_state_updates = Vec::new();
+        if !pending_state_snapshot.is_empty() {
+            if let Ok(mut store) = self.store.lock() {
+                let now = timestamp();
+                for (session_id, state, exit_code) in &pending_state_snapshot {
+                    if store
+                        .update_session_state(session_id, state, *exit_code, &now)
+                        .is_ok_and(|updated| updated)
+                    {
+                        persisted_state_updates.push((
+                            session_id.clone(),
+                            state.clone(),
+                            *exit_code,
+                        ));
+                    }
+                }
+            }
+        }
+        if !persisted_state_updates.is_empty() {
+            if let Ok(mut pending) = self.pending_session_state_updates.lock() {
+                for (session_id, state, exit_code) in &persisted_state_updates {
+                    if pending.get(session_id) == Some(&(state.clone(), *exit_code)) {
+                        pending.remove(session_id);
+                    }
+                }
+            }
+            if let Some(handle) = self.app_handle.get() {
+                let _ = handle.emit("agentmux://session-state-changed", &persisted_state_updates);
+            }
+        }
+        let had_activity = !deltas.is_empty()
+            || !cwd_updates.is_empty()
+            || !session_state_updates.is_empty()
+            || !persisted_state_updates.is_empty();
         // Persist live cwd updates (OSC 7) so the footer git status tracks the
         // directory the shell has cd'd into. Best-effort; skip on contention.
         if !cwd_updates.is_empty() {
@@ -969,6 +1042,24 @@ impl DesktopControlState {
             params.cwd = default_windows_shell_cwd();
         }
         let mut env = std::mem::take(&mut params.env);
+        let integration_tmux = env.iter().any(|entry| {
+            matches!(
+                entry.key.as_str(),
+                "AGENTMUX_AGENT_INTEGRATION" | "CMUX_AGENT_INTEGRATION"
+            ) && !entry.value.trim().is_empty()
+        });
+        let captured_wsl_path = env
+            .iter()
+            .any(|entry| entry.key == "AGENTMUX_WSL_PATH" && !entry.value.trim().is_empty());
+        if integration_tmux
+            && captured_wsl_path
+            && params
+                .backend
+                .as_deref()
+                .is_some_and(|backend| backend.contains("wsl"))
+        {
+            params.command = command_with_restored_wsl_path(params.command);
+        }
         let extra_wsl_env_keys = env
             .iter()
             .filter_map(|entry| wsl_env_key(&entry.key))
@@ -979,6 +1070,7 @@ impl DesktopControlState {
             &surface_id,
             &pane_id,
             &extra_wsl_env_keys,
+            integration_tmux,
         ));
         params.env = env;
         let params_json = serde_json::to_string(&params).map_err(|error| {
@@ -1590,17 +1682,19 @@ impl DesktopControlState {
                 if self.wait_for_recovered_tmux_attach(&result.session_id) {
                     let _ = self.persist_session_summary_from_id(result.session_id.clone());
                     if let Some(agent_state) = agent_state {
-                        self.replay_restored_agent_launch_command(
+                        let queued = self.replay_restored_agent_launch_command(
                             &result.session_id,
                             session,
                             agent_state,
                         );
-                        self.replay_restored_agent_state(
-                            &result.session_id,
-                            &session.command,
-                            agent_state,
-                            Some("running"),
-                        );
+                        if !queued {
+                            self.replay_restored_agent_state(
+                                &result.session_id,
+                                &session.command,
+                                agent_state,
+                                Some("running"),
+                            );
+                        }
                     }
                     // Notify the user that the durable session could not be
                     // re-attached and was restarted fresh.
@@ -1808,6 +1902,7 @@ impl DesktopControlState {
             }) else {
                 continue;
             };
+            let agent_state = recoverable_agents.get(&session.session_id);
             let backend_profile = workspace_profiles
                 .get(&session.workspace_id)
                 .cloned()
@@ -1818,20 +1913,22 @@ impl DesktopControlState {
                 backend_profile,
                 "ephemeral",
                 "desktop_startup_restore_terminal",
-                recoverable_agents.get(&session.session_id),
+                agent_state,
             ) {
-                if let Some(agent_state) = recoverable_agents.get(&session.session_id) {
-                    self.replay_restored_agent_launch_command(
+                if let Some(agent_state) = agent_state {
+                    let queued = self.replay_restored_agent_launch_command(
                         &result.session_id,
                         session,
                         agent_state,
                     );
-                    self.replay_restored_agent_state(
-                        &result.session_id,
-                        &session.command,
-                        agent_state,
-                        Some("running"),
-                    );
+                    if !queued {
+                        self.replay_restored_agent_state(
+                            &result.session_id,
+                            &session.command,
+                            agent_state,
+                            Some("running"),
+                        );
+                    }
                 }
                 self.delete_superseded_terminal(&surface.surface_id, &session.session_id);
                 restored += 1;
@@ -1935,14 +2032,39 @@ impl DesktopControlState {
         agent_state: Option<&PersistedAgentState>,
     ) -> Option<SessionSpawnResult> {
         let command = restored_spawn_command_for_session(session, agent_state);
+        let launch_spec = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.load_session_launch_spec(&session.session_id).ok())
+            .flatten();
+        let backend_profile = launch_spec
+            .as_ref()
+            .and_then(|spec| spec.backend_profile.clone())
+            .or(backend_profile);
+        let env = launch_spec
+            .as_ref()
+            .map(|spec| {
+                spec.env
+                    .iter()
+                    .map(|(key, value)| EnvVarParam {
+                        key: key.clone(),
+                        value: value.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let columns = launch_spec.as_ref().map(|spec| spec.columns).unwrap_or(120);
+        let rows = launch_spec.as_ref().map(|spec| spec.rows).unwrap_or(30);
         let params = serde_json::json!({
             "workspace_id": session.workspace_id.clone(),
             "backend": session.backend_kind.clone(),
             "backend_profile": backend_profile,
             "command": command,
             "cwd": self.restore_cwd_for_session(session),
-            "columns": 120,
-            "rows": 30,
+            "env": env,
+            "columns": columns,
+            "rows": rows,
             "durability": durability,
             "placement": "active_pane",
             "pane_id": pane_id,
@@ -2009,9 +2131,9 @@ impl DesktopControlState {
         session_id: &str,
         session: &PersistedSession,
         previous: &PersistedAgentState,
-    ) {
+    ) -> bool {
         let Some(command_line) = restored_agent_launch_line(session, previous) else {
-            return;
+            return false;
         };
         // Do NOT type the command immediately: the freshly respawned login
         // shell is still initializing, and the scrollback replay pumped into
@@ -2022,8 +2144,22 @@ impl DesktopControlState {
         // bootstrap emits OSC 7 from PROMPT_COMMAND/precmd on every prompt),
         // with a timeout fallback for shells that never report a cwd.
         if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
-            pending.insert(session_id.to_string(), (command_line, Instant::now()));
+            let now = Instant::now();
+            pending.insert(
+                session_id.to_string(),
+                PendingAgentLaunchLine {
+                    line: command_line,
+                    queued_at: now,
+                    next_attempt_at: now,
+                    attempts: 0,
+                    command: session.command.clone(),
+                    previous: previous.clone(),
+                    prompt_observed: false,
+                },
+            );
+            return true;
         }
+        false
     }
 
     /// Send queued agent launch lines once their restored shell is ready.
@@ -2031,33 +2167,95 @@ impl DesktopControlState {
     /// prompt), or `LAUNCH_LINE_PROMPT_TIMEOUT` elapsed as a fallback.
     fn flush_pending_agent_launch_lines(&self, prompted_sessions: &[String]) {
         const LAUNCH_LINE_PROMPT_TIMEOUT: Duration = Duration::from_secs(4);
-        let due: Vec<(String, String)> = {
+        const MAX_ATTEMPTS: u8 = 5;
+        let due: Vec<(String, PendingAgentLaunchLine)> = {
             let Ok(mut pending) = self.pending_agent_launch_lines.lock() else {
                 return;
             };
             if pending.is_empty() {
                 return;
             }
-            let mut due = Vec::new();
             for session_id in prompted_sessions {
-                if let Some((line, _)) = pending.remove(session_id) {
-                    due.push((session_id.clone(), line));
+                if let Some(entry) = pending.get_mut(session_id) {
+                    entry.prompt_observed = true;
                 }
             }
             let now = Instant::now();
-            pending.retain(|session_id, (line, queued_at)| {
-                if now.duration_since(*queued_at) >= LAUNCH_LINE_PROMPT_TIMEOUT {
-                    due.push((session_id.clone(), line.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
-            due
+            pending
+                .iter()
+                .filter(|(_, entry)| {
+                    (entry.prompt_observed
+                        || now.duration_since(entry.queued_at) >= LAUNCH_LINE_PROMPT_TIMEOUT)
+                        && now >= entry.next_attempt_at
+                })
+                .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+                .collect()
         };
-        for (session_id, line) in due {
-            let _ = self.send_text_direct(&session_id, format!("{line}\r"));
+        for (session_id, candidate) in due {
+            match self.send_text_direct(&session_id, format!("{}\r", candidate.line)) {
+                Ok(()) => {
+                    if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
+                        if pending
+                            .get(&session_id)
+                            .is_some_and(|entry| entry.line == candidate.line)
+                        {
+                            pending.remove(&session_id);
+                        }
+                    }
+                    self.replay_restored_agent_state(
+                        &session_id,
+                        &candidate.command,
+                        &candidate.previous,
+                        Some("running"),
+                    );
+                }
+                Err(error) => {
+                    let mut exhausted = None;
+                    if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
+                        if let Some(entry) = pending.get_mut(&session_id) {
+                            entry.attempts = entry.attempts.saturating_add(1);
+                            if entry.attempts >= MAX_ATTEMPTS {
+                                exhausted = pending.remove(&session_id);
+                            } else {
+                                let delay_ms = 100_u64 << entry.attempts.min(4);
+                                entry.next_attempt_at =
+                                    Instant::now() + Duration::from_millis(delay_ms);
+                            }
+                        }
+                    }
+                    if let Some(entry) = exhausted {
+                        self.replay_restored_agent_failure(
+                            &session_id,
+                            &entry.command,
+                            &entry.previous,
+                            &error.to_string(),
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    fn replay_restored_agent_failure(
+        &self,
+        session_id: &str,
+        command: &[String],
+        previous: &PersistedAgentState,
+        error: &str,
+    ) {
+        self.replay_restored_agent_state(session_id, command, previous, Some("failed"));
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "state": "failed",
+            "reason": format!("Agent restore failed: {error}"),
+        })
+        .to_string();
+        let _ = self.handle_request(RequestEnvelope::new(
+            "desktop_startup_agent_restore_failed",
+            "agent.set_state",
+            params,
+            self.control_token.clone(),
+        ));
     }
 
     fn delete_superseded_terminal(&self, surface_id: &str, session_id: &str) {
@@ -2298,8 +2496,8 @@ impl DesktopControlState {
         persist_spawn(&mut store, &bundle, &launch_spec)?;
         drop(store);
         let command_label = params.command.join(" ");
-        if is_known_agent_launch(&command_label) {
-            let _ = self.apply_detected_agent_launch(control, &result.session_id, &command_label);
+        if let Some(launch) = detect_agent_launch(&command_label) {
+            let _ = self.apply_detected_agent_launch(control, &result.session_id, &launch);
         }
         Ok(())
     }
@@ -2392,8 +2590,8 @@ impl DesktopControlState {
         request: &RequestEnvelope,
     ) -> Result<(), DesktopHostError> {
         let params: SessionSendTextParams = request.parse_params()?;
-        for label in self.completed_terminal_input_lines(&params.session_id, &params.text) {
-            let _ = self.apply_detected_agent_launch(control, &params.session_id, &label);
+        for launch in self.completed_terminal_input_lines(&params.session_id, &params.text) {
+            let _ = self.apply_detected_agent_launch(control, &params.session_id, &launch);
         }
         Ok(())
     }
@@ -2406,12 +2604,16 @@ impl DesktopControlState {
         let Ok(mut control) = self.control.lock() else {
             return;
         };
-        for label in labels {
-            let _ = self.apply_detected_agent_launch(&mut control, session_id, &label);
+        for launch in labels {
+            let _ = self.apply_detected_agent_launch(&mut control, session_id, &launch);
         }
     }
 
-    fn completed_terminal_input_lines(&self, session_id: &str, text: &str) -> Vec<String> {
+    fn completed_terminal_input_lines(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Vec<DetectedAgentLaunch> {
         const MAX_TRACKED_COMMAND_BYTES: usize = 4096;
         let Ok(mut buffers) = self.input_command_buffers.lock() else {
             return Vec::new();
@@ -2427,8 +2629,10 @@ impl DesktopControlState {
                         continue;
                     }
                     let line = buffer.trim();
-                    if !line.is_empty() && is_known_agent_launch(line) {
-                        completed.push(line.to_string());
+                    if !line.is_empty() {
+                        if let Some(launch) = detect_agent_launch(line) {
+                            completed.push(launch);
+                        }
                     }
                     buffer.clear();
                     previous_was_newline = true;
@@ -2470,10 +2674,10 @@ impl DesktopControlState {
         &self,
         control: &mut DesktopRuntimeControl,
         session_id: &str,
-        label: &str,
+        launch: &DetectedAgentLaunch,
     ) -> Result<(), DesktopHostError> {
-        let trimmed = label.trim();
-        if trimmed.is_empty() || !is_known_agent_launch(trimmed) {
+        let trimmed = launch.command_line.trim();
+        if trimmed.is_empty() || !is_direct_agent_launch(trimmed) {
             return Ok(());
         }
         let agent = agent_command_name(first_command_word(trimmed).unwrap_or(trimmed));
@@ -2494,7 +2698,16 @@ impl DesktopControlState {
             params,
             self.control_token.clone(),
         ));
-        self.persist_agent_set_state(control, &response)
+        self.persist_agent_set_state(control, &response)?;
+        if let Some(cwd) = launch.cwd.as_deref() {
+            let Ok(mut store) = self.store.lock() else {
+                return Err(DesktopHostError::StateUnavailable(
+                    "desktop store state is unavailable".to_string(),
+                ));
+            };
+            store.update_session_cwd(session_id, Some(cwd), &timestamp())?;
+        }
+        Ok(())
     }
 
     fn persist_session_summary_from_id(&self, session_id: String) -> Result<(), DesktopHostError> {
@@ -3110,6 +3323,9 @@ impl DesktopControlState {
             )));
         }
 
+        let snapshot = self.load_workspace_or_not_found(&params.workspace_id)?;
+        let expected_target = pane_close_target_fingerprint(&snapshot, &params.pane_id);
+        self.coordinate_pane_close(&snapshot, &params.pane_id, &params.surface_policy)?;
         let Ok(mut store) = self.store.lock() else {
             return Err(DesktopHostError::StateUnavailable(
                 "desktop store state is unavailable".to_string(),
@@ -3118,7 +3334,12 @@ impl DesktopControlState {
         let mut bundle = store
             .load_workspace_bundle(&params.workspace_id)?
             .ok_or_else(|| workspace_not_found(&params.workspace_id))?;
-        self.coordinate_pane_close(&bundle, &params.pane_id, &params.surface_policy)?;
+        if pane_close_target_fingerprint(&bundle, &params.pane_id) != expected_target {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Pane contents changed while close was being coordinated; retry the close.",
+            )));
+        }
         close_pane_in_bundle(&mut bundle, &params.pane_id, &params.surface_policy)?;
         store.save_workspace_bundle(&bundle)?;
 
@@ -3278,16 +3499,9 @@ impl DesktopControlState {
         request: &RequestEnvelope,
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: SurfaceCloseParams = request.parse_params()?;
-        let Ok(mut store) = self.store.lock() else {
-            return Err(DesktopHostError::StateUnavailable(
-                "desktop store state is unavailable".to_string(),
-            ));
-        };
-        let mut bundle = store
-            .load_workspace_bundle(&params.workspace_id)?
-            .ok_or_else(|| workspace_not_found(&params.workspace_id))?;
-        let surface_ids = surface_ids_for_close(&bundle, &params.surface_id)?;
-        let surfaces_to_close = bundle
+        let snapshot = self.load_workspace_or_not_found(&params.workspace_id)?;
+        let surface_ids = surface_ids_for_close(&snapshot, &params.surface_id)?;
+        let surfaces_to_close = snapshot
             .surfaces
             .iter()
             .filter(|surface| surface_ids.contains(&surface.surface_id))
@@ -3296,13 +3510,21 @@ impl DesktopControlState {
 
         for surface in &surfaces_to_close {
             if let Some(session_id) = surface.session_id.as_deref() {
-                self.close_live_surface_session(&bundle, session_id)?;
+                self.close_live_surface_session(&snapshot, session_id)?;
             }
             if surface.surface_type == "browser" {
                 self.close_browser_surface_if_present(&surface.surface_id)?;
             }
         }
 
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let mut bundle = store
+            .load_workspace_bundle(&params.workspace_id)?
+            .ok_or_else(|| workspace_not_found(&params.workspace_id))?;
         close_surface_in_bundle(&mut bundle, &params.surface_id)?;
         store.save_workspace_bundle(&bundle)?;
 
@@ -6988,10 +7210,11 @@ fn managed_terminal_env(
     surface_id: &str,
     pane_id: &str,
     extra_wsl_env_keys: &[String],
+    integration_tmux: bool,
 ) -> Vec<EnvVarParam> {
     let pipe = default_control_pipe_name();
-    let wsl_env = managed_wsl_env_value(extra_wsl_env_keys);
-    vec![
+    let wsl_env = managed_wsl_env_value(extra_wsl_env_keys, integration_tmux);
+    let mut env = vec![
         EnvVarParam {
             key: "AGENTMUX_CONTROL_PIPE".to_string(),
             value: pipe.clone(),
@@ -7032,10 +7255,44 @@ fn managed_terminal_env(
             key: "WSLENV".to_string(),
             value: wsl_env,
         },
-    ]
+    ];
+    if integration_tmux {
+        env.extend([
+            EnvVarParam {
+                key: "TMUX".to_string(),
+                value: format!("agentmux,{workspace_id},{pane_id}"),
+            },
+            EnvVarParam {
+                key: "TMUX_PANE".to_string(),
+                value: format!("%{pane_id}"),
+            },
+        ]);
+    }
+    env
 }
 
-fn managed_wsl_env_value(extra_keys: &[String]) -> String {
+const RESTORE_WSL_PATH_SCRIPT: &str = "PATH=\"$AGENTMUX_WSL_PATH\"; export PATH; exec \"$@\"";
+
+fn command_with_restored_wsl_path(command: Vec<String>) -> Vec<String> {
+    if command.len() >= 4
+        && command[0] == "sh"
+        && command[1] == "-lc"
+        && command[2] == RESTORE_WSL_PATH_SCRIPT
+        && command[3] == "agentmux-wsl-env"
+    {
+        return command;
+    }
+    let mut wrapped = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        RESTORE_WSL_PATH_SCRIPT.to_string(),
+        "agentmux-wsl-env".to_string(),
+    ];
+    wrapped.extend(command);
+    wrapped
+}
+
+fn managed_wsl_env_value(extra_keys: &[String], integration_tmux: bool) -> String {
     let required = [
         "AGENTMUX_CONTROL_PIPE",
         "AGENTMUX_CONTROL_TOKEN",
@@ -7061,6 +7318,10 @@ fn managed_wsl_env_value(extra_keys: &[String]) -> String {
         if let Some(key) = wsl_env_key(key) {
             push_wsl_env_key(&mut parts, &key);
         }
+    }
+    if integration_tmux {
+        push_wsl_env_key(&mut parts, "TMUX");
+        push_wsl_env_key(&mut parts, "TMUX_PANE");
     }
     parts.join(":")
 }
@@ -10286,6 +10547,8 @@ fn persisted_launch_environment(env: &[EnvVarParam]) -> Vec<(String, String)> {
         "CMUX_WORKSPACE_ID",
         "CMUX_SURFACE_ID",
         "CMUX_PANE_ID",
+        "TMUX",
+        "TMUX_PANE",
     ];
     let generated_wslenv = env.iter().rposition(|entry| entry.key == "WSLENV");
     env.iter()
@@ -11201,6 +11464,29 @@ fn close_surface_in_bundle(
     Ok(())
 }
 
+type PaneCloseTargetFingerprint = (String, Option<String>, Option<String>, Option<String>);
+
+fn pane_close_target_fingerprint(
+    bundle: &WorkspaceBundle,
+    pane_id: &str,
+) -> Option<PaneCloseTargetFingerprint> {
+    let pane = bundle.panes.iter().find(|pane| pane.pane_id == pane_id)?;
+    let surface_id = pane.mounted_surface_id.clone();
+    let session_id = surface_id.as_ref().and_then(|surface_id| {
+        bundle
+            .surfaces
+            .iter()
+            .find(|surface| &surface.surface_id == surface_id)
+            .and_then(|surface| surface.session_id.clone())
+    });
+    Some((
+        pane.kind.clone(),
+        pane.parent_pane_id.clone(),
+        surface_id,
+        session_id,
+    ))
+}
+
 fn close_pane_in_bundle(
     bundle: &mut WorkspaceBundle,
     pane_id: &str,
@@ -11224,6 +11510,13 @@ fn close_pane_in_bundle(
 
     let now = timestamp();
     let closed_surface_id = bundle.panes[target_index].mounted_surface_id.clone();
+    let closed_session_id = closed_surface_id.as_deref().and_then(|surface_id| {
+        bundle
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .and_then(|surface| surface.session_id.clone())
+    });
     bundle.panes.remove(target_index);
 
     if matches!(surface_policy, "close_surface" | "fail_if_session_running") {
@@ -11231,6 +11524,11 @@ fn close_pane_in_bundle(
             bundle
                 .surfaces
                 .retain(|surface| surface.surface_id != surface_id);
+        }
+        if let Some(session_id) = closed_session_id {
+            bundle
+                .sessions
+                .retain(|session| session.session_id != session_id);
         }
     }
 
@@ -12400,10 +12698,133 @@ fn persisted_command_already_launches_agent(command: &[String]) -> bool {
         .any(|part| is_known_agent_launch(part.trim()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DetectedAgentLaunch {
+    command_line: String,
+    cwd: Option<String>,
+}
+
 fn is_known_agent_launch(command_line: &str) -> bool {
+    detect_agent_launch(command_line).is_some()
+}
+
+fn is_direct_agent_launch(command_line: &str) -> bool {
     first_command_word(command_line)
         .map(agent_command_name)
         .is_some_and(|name| matches!(name.as_str(), "claude" | "codex"))
+}
+
+/// Extract the agent command from a shell compound line without replaying any
+/// unrelated leading statements. A leading absolute `cd`/`Set-Location` is
+/// retained separately so startup recovery can restore the launch directory.
+fn detect_agent_launch(command_line: &str) -> Option<DetectedAgentLaunch> {
+    let mut cwd = None;
+    for statement in split_shell_statements(command_line)? {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        if let Some(next_cwd) = shell_cd_target(statement) {
+            cwd = Some(next_cwd);
+            continue;
+        }
+        if is_direct_agent_launch(statement) {
+            return Some(DetectedAgentLaunch {
+                command_line: statement.to_string(),
+                cwd,
+            });
+        }
+    }
+    None
+}
+
+fn split_shell_statements(command_line: &str) -> Option<Vec<String>> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut chars = command_line.chars().peekable();
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '`' && quote != Some('\'') {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if quote.is_some_and(|value| value == ch) {
+            quote = None;
+            current.push(ch);
+            continue;
+        }
+        if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            current.push(ch);
+            continue;
+        }
+        if quote.is_none()
+            && (ch == ';'
+                || (matches!(ch, '&' | '|') && chars.peek().is_some_and(|next| *next == ch)))
+        {
+            if ch != ';' {
+                chars.next();
+            }
+            if !current.trim().is_empty() {
+                statements.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if quote.is_some() || escaped {
+        return None;
+    }
+    if !current.trim().is_empty() {
+        statements.push(current);
+    }
+    Some(statements)
+}
+
+fn shell_cd_target(statement: &str) -> Option<String> {
+    let tokens = split_command_line(statement)?;
+    let command = tokens
+        .first()?
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase();
+    if !matches!(command.as_str(), "cd" | "chdir" | "set-location" | "sl") {
+        return None;
+    }
+    let values = tokens
+        .iter()
+        .skip(1)
+        .filter(|token| {
+            !matches!(
+                token.to_ascii_lowercase().as_str(),
+                "--" | "-path" | "-literalpath"
+            )
+        })
+        .collect::<Vec<_>>();
+    if values.len() != 1 || !is_absolute_shell_path(values[0]) {
+        return None;
+    }
+    Some(values[0].to_string())
+}
+
+fn is_absolute_shell_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || value.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 fn normalize_restored_agent_launch(command_line: &str) -> Option<String> {
@@ -12423,17 +12844,33 @@ fn normalize_restored_agent_launch(command_line: &str) -> Option<String> {
 fn normalize_claude_restore_args(tokens: &[String]) -> String {
     let mut restored = vec!["claude".to_string()];
     let mut continues = false;
+    let mut has_resume_selector = false;
     let mut index = 1;
     while index < tokens.len() {
         let token = tokens[index].as_str();
-        if is_resume_selector_flag(token) {
+        if matches!(token, "--continue" | "-c") {
+            continues = true;
             index += 1;
-            if index < tokens.len() && !tokens[index].starts_with('-') {
+            continue;
+        }
+        if matches!(token, "--resume" | "-r") {
+            index += 1;
+            if index < tokens.len() && is_safe_agent_session_selector(&tokens[index]) {
+                restored.push("--resume".to_string());
+                restored.push(tokens[index].clone());
+                has_resume_selector = true;
                 index += 1;
             }
             continue;
         }
         if is_resume_selector_assignment(token) {
+            if let Some((_, selector)) = token.split_once('=') {
+                if is_safe_agent_session_selector(selector) {
+                    restored.push("--resume".to_string());
+                    restored.push(selector.to_string());
+                    has_resume_selector = true;
+                }
+            }
             index += 1;
             continue;
         }
@@ -12472,7 +12909,7 @@ fn normalize_claude_restore_args(tokens: &[String]) -> String {
     }
     // Continue the previous conversation instead of starting a fresh one,
     // mirroring the codex restore path's `resume --last`.
-    if !continues {
+    if !continues && !has_resume_selector {
         restored.push("-c".to_string());
     }
     join_command_tokens(&restored)
@@ -12659,12 +13096,16 @@ fn codex_option_takes_value(token: &str) -> bool {
     )
 }
 
-fn is_resume_selector_flag(token: &str) -> bool {
-    matches!(token, "--resume" | "-r" | "--continue" | "-c")
+fn is_resume_selector_assignment(token: &str) -> bool {
+    token.starts_with("--resume=")
 }
 
-fn is_resume_selector_assignment(token: &str) -> bool {
-    token.starts_with("--resume=") || token.starts_with("--continue=")
+fn is_safe_agent_session_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
 }
 
 fn split_command_line(command_line: &str) -> Option<Vec<String>> {
@@ -15149,6 +15590,28 @@ mod tests {
     }
 
     #[test]
+    fn split_pane_close_removes_its_surface_and_session() {
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle
+            .panes
+            .iter_mut()
+            .find(|pane| pane.pane_id == "pane_right")
+            .unwrap()
+            .mounted_surface_id = Some("surf_terminal".to_string());
+
+        close_pane_in_bundle(&mut bundle, "pane_right", "close_surface").unwrap();
+
+        assert!(bundle
+            .surfaces
+            .iter()
+            .all(|surface| surface.surface_id != "surf_terminal"));
+        assert!(bundle
+            .sessions
+            .iter()
+            .all(|session| session.session_id != "ses_surface"));
+    }
+
+    #[test]
     fn browser_surface_and_commands_round_trip_through_desktop_control() {
         let state = DesktopControlState::new();
         let workspace = agentmux_control(
@@ -16303,6 +16766,48 @@ mod tests {
     }
 
     #[test]
+    fn restored_agent_launch_line_preserves_explicit_claude_resume_selector() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "conpty".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some(
+                "C:\\Users\\lkj\\development\\worktrees\\report6-fix-timeseries-indexsearch-flush"
+                    .to_string(),
+            ),
+            command: vec!["powershell.exe".to_string(), "-NoLogo".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some(
+                "Agent started: claude --resume 8ada3a1b-b538-4cdc-a852-ea7885c6f894"
+                    .to_string(),
+            ),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"claude --resume 8ada3a1b-b538-4cdc-a852-ea7885c6f894"}"#
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude --resume 8ada3a1b-b538-4cdc-a852-ea7885c6f894")
+        );
+    }
+
+    #[test]
     fn restored_agent_launch_line_preserves_codex_resume_session_selector() {
         let session = PersistedSession {
             session_id: "ses_shell".to_string(),
@@ -16439,6 +16944,84 @@ mod tests {
         };
 
         assert_eq!(restored_agent_launch_line(&session, &state), None);
+    }
+
+    #[test]
+    fn restored_agent_launch_delivery_failure_stays_queued_for_retry() {
+        let host = DesktopControlState::new();
+        let session = PersistedSession {
+            session_id: "ses_old".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("/tmp".to_string()),
+            command: vec!["bash".to_string(), "-l".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let agent = PersistedAgentState {
+            session_id: "ses_old".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude"}"#.to_string()),
+        };
+
+        assert!(host.replay_restored_agent_launch_command("ses_missing_runtime", &session, &agent,));
+        host.flush_pending_agent_launch_lines(&["ses_missing_runtime".to_string()]);
+
+        let pending = host.pending_agent_launch_lines.lock().unwrap();
+        let queued = pending
+            .get("ses_missing_runtime")
+            .expect("failed delivery remains queued");
+        assert_eq!(queued.attempts, 1);
+        assert!(queued.prompt_observed);
+        assert!(queued.next_attempt_at > queued.queued_at);
+    }
+
+    #[test]
+    fn session_state_persistence_retries_until_the_store_accepts_update() {
+        let host = DesktopControlState::new();
+        host.pending_session_state_updates
+            .lock()
+            .unwrap()
+            .insert("ses_surface".to_string(), ("exited".to_string(), Some(0)));
+
+        host.pump_output_stream();
+        assert!(host
+            .pending_session_state_updates
+            .lock()
+            .unwrap()
+            .contains_key("ses_surface"));
+
+        host.store
+            .lock()
+            .unwrap()
+            .save_workspace_bundle(&workspace_bundle_with_unmounted_surface())
+            .unwrap();
+        host.pump_output_stream();
+
+        assert!(!host
+            .pending_session_state_updates
+            .lock()
+            .unwrap()
+            .contains_key("ses_surface"));
+        let restored = host
+            .recovery_snapshot()
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == "ses_surface")
+            .expect("persisted session");
+        assert_eq!(restored.state, "exited");
+        assert_eq!(restored.exit_code, Some(0));
     }
 
     #[test]
@@ -16600,7 +17183,10 @@ mod tests {
                 "ses_manual",
                 "ude --dangerously-skip-permissions\r"
             ),
-            vec!["claude --dangerously-skip-permissions".to_string()]
+            vec![DetectedAgentLaunch {
+                command_line: "claude --dangerously-skip-permissions".to_string(),
+                cwd: None,
+            }]
         );
         assert!(state
             .completed_terminal_input_lines("ses_manual", "ls\r")
@@ -16610,7 +17196,43 @@ mod tests {
             .is_empty());
         assert_eq!(
             state.completed_terminal_input_lines("ses_manual", "dex resume abc123\n"),
-            vec!["codex resume abc123".to_string()]
+            vec![DetectedAgentLaunch {
+                command_line: "codex resume abc123".to_string(),
+                cwd: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn terminal_input_buffer_extracts_compound_agent_launch_and_cwd() {
+        let state = DesktopControlState::new();
+        let command = concat!(
+            "cd 'C:\\Users\\lkj\\development\\worktrees\\",
+            "report6-fix-timeseries-indexsearch-flush' ; ",
+            "claude --resume 8ada3a1b-b538-4cdc-a852-ea7885c6f894\r"
+        );
+
+        assert_eq!(
+            state.completed_terminal_input_lines("ses_compound", command),
+            vec![DetectedAgentLaunch {
+                command_line:
+                    "claude --resume 8ada3a1b-b538-4cdc-a852-ea7885c6f894".to_string(),
+                cwd: Some(
+                    "C:\\Users\\lkj\\development\\worktrees\\report6-fix-timeseries-indexsearch-flush"
+                        .to_string(),
+                ),
+            }]
+        );
+        assert_eq!(
+            detect_agent_launch("Write-Output 'claude --resume fake'"),
+            None
+        );
+        assert_eq!(
+            detect_agent_launch("cd 'C:\\work;trees\\repo'; claude --resume=abc-123"),
+            Some(DetectedAgentLaunch {
+                command_line: "claude --resume=abc-123".to_string(),
+                cwd: Some("C:\\work;trees\\repo".to_string()),
+            })
         );
     }
 
@@ -16623,7 +17245,10 @@ mod tests {
             .is_empty());
         assert_eq!(
             state.completed_terminal_input_lines("ses_edit", "\u{7f}ude\r\n"),
-            vec!["claude".to_string()]
+            vec![DetectedAgentLaunch {
+                command_line: "claude".to_string(),
+                cwd: None,
+            }]
         );
 
         assert!(state
@@ -16729,15 +17354,26 @@ mod tests {
             bundle.sessions[0].cwd = env::current_dir()
                 .ok()
                 .map(|path| path.to_string_lossy().to_string());
-            bundle.sessions[0].command = vec![
-                "cmd.exe".to_string(),
-                "/d".to_string(),
-                "/q".to_string(),
-                "/c".to_string(),
-                "ping -n 4 127.0.0.1 >nul".to_string(),
-            ];
+            bundle.sessions[0].command =
+                vec!["cmd.exe".to_string(), "/d".to_string(), "/q".to_string()];
             let mut store = state.store.lock().unwrap();
-            store.save_workspace_bundle(&bundle).unwrap();
+            store
+                .save_workspace_bundle_and_launch_spec(
+                    &bundle,
+                    &PersistedSessionLaunchSpec {
+                        session_id: "ses_surface".to_string(),
+                        workspace_id: "ws_surface".to_string(),
+                        backend_profile: Some("Ubuntu".to_string()),
+                        env: vec![(
+                            "AGENTMUX_AGENT_INTEGRATION".to_string(),
+                            "claude-teams".to_string(),
+                        )],
+                        columns: 101,
+                        rows: 37,
+                        updated_at: "before".to_string(),
+                    },
+                )
+                .unwrap();
             store
                 .upsert_agent_state(&PersistedAgentState {
                     session_id: "ses_surface".to_string(),
@@ -16763,6 +17399,7 @@ mod tests {
         assert_ne!(terminal_surfaces[0].surface_id, "surf_terminal");
         let first_session_id = terminal_surfaces[0].session_id.as_ref().unwrap().clone();
         assert_ne!(first_session_id, "ses_surface");
+        state.flush_pending_agent_launch_lines(std::slice::from_ref(&first_session_id));
         assert_eq!(
             snapshot
                 .panes
@@ -16791,6 +17428,20 @@ mod tests {
                 restored.reason.as_deref(),
                 Some("Agent restored: claude -c")
             );
+            let launch_spec = store
+                .load_session_launch_spec(&first_session_id)
+                .unwrap()
+                .expect("restored launch spec");
+            assert_eq!(launch_spec.backend_profile.as_deref(), Some("Ubuntu"));
+            assert_eq!(launch_spec.columns, 101);
+            assert_eq!(launch_spec.rows, 37);
+            assert_eq!(
+                launch_spec.env,
+                vec![(
+                    "AGENTMUX_AGENT_INTEGRATION".to_string(),
+                    "claude-teams".to_string()
+                )]
+            );
         }
 
         {
@@ -16814,6 +17465,53 @@ mod tests {
             .any(|session| session.session_id == first_session_id));
         assert_eq!(snapshot.panes.len(), 3);
         let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn restore_ephemeral_terminals_respawns_tmux_managed_team_children() {
+        let state = DesktopControlState::new();
+        {
+            let mut bundle = workspace_bundle_with_unmounted_surface();
+            bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+            bundle.sessions[0].command =
+                vec!["cmd.exe".to_string(), "/d".to_string(), "/q".to_string()];
+            let mut store = state.store.lock().unwrap();
+            store.save_workspace_bundle(&bundle).unwrap();
+            store
+                .upsert_agent_state(&PersistedAgentState {
+                    session_id: "ses_surface".to_string(),
+                    workspace_id: "ws_surface".to_string(),
+                    state: "running".to_string(),
+                    attention: false,
+                    reason: Some("claude-teams split-window worker".to_string()),
+                    updated_at: "before".to_string(),
+                    telemetry_json: Some(
+                        r#"{"activity":"agent_team","session":"claude-teams:split-window"}"#
+                            .to_string(),
+                    ),
+                })
+                .unwrap();
+        }
+
+        state.seed_id_counter();
+        state.restore_ephemeral_terminals();
+        let snapshot = state.recovery_snapshot().unwrap();
+        assert!(!snapshot
+            .sessions
+            .iter()
+            .any(|session| session.session_id == "ses_surface"));
+        let restored_surface = snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_type == "terminal")
+            .expect("restored tmux worker surface");
+        assert_ne!(restored_surface.surface_id, "surf_terminal");
+        assert_ne!(restored_surface.session_id.as_deref(), Some("ses_surface"));
+        assert!(snapshot.panes.iter().any(|pane| {
+            pane.pane_id == "pane_left"
+                && pane.mounted_surface_id.as_deref() == Some(restored_surface.surface_id.as_str())
+        }));
     }
 
     #[test]
@@ -17035,11 +17733,14 @@ mod tests {
 
     #[test]
     fn managed_wsl_env_value_includes_user_env_keys() {
-        let value = managed_wsl_env_value(&[
-            "NO_COLOR".to_string(),
-            "AGENTMUX_SURFACE_TITLE".to_string(),
-            "WSLENV".to_string(),
-        ]);
+        let value = managed_wsl_env_value(
+            &[
+                "NO_COLOR".to_string(),
+                "AGENTMUX_SURFACE_TITLE".to_string(),
+                "WSLENV".to_string(),
+            ],
+            false,
+        );
         let parts = value.split(':').collect::<Vec<_>>();
 
         assert!(parts.contains(&"AGENTMUX_CONTROL_PIPE"));
@@ -17058,6 +17759,7 @@ mod tests {
             "surf_test",
             "pane_test",
             &["TMUX".to_string(), "TMUX_PANE".to_string()],
+            false,
         );
         assert!(!env.iter().any(|item| item.key == "TMUX"));
         assert!(!env.iter().any(|item| item.key == "TMUX_PANE"));
@@ -17068,6 +17770,66 @@ mod tests {
             .expect("managed WSLENV");
         assert!(!wslenv.split(':').any(|item| item == "TMUX"));
         assert!(!wslenv.split(':').any(|item| item == "TMUX_PANE"));
+    }
+
+    #[test]
+    fn managed_terminal_env_exposes_tmux_identity_for_agent_integrations() {
+        let mut env = vec![
+            EnvVarParam {
+                key: "AGENTMUX_AGENT_INTEGRATION".to_string(),
+                value: "claude-teams".to_string(),
+            },
+            EnvVarParam {
+                key: "AGENTMUX_WSL_PATH".to_string(),
+                value: "/tmp/agentmux-shim:/usr/bin:/bin".to_string(),
+            },
+        ];
+        env.extend(managed_terminal_env(
+            "ws_test",
+            "token",
+            "surf_test",
+            "pane_test",
+            &["AGENTMUX_WSL_PATH".to_string()],
+            true,
+        ));
+        assert_eq!(
+            env.iter()
+                .find(|item| item.key == "TMUX")
+                .map(|item| item.value.as_str()),
+            Some("agentmux,ws_test,pane_test")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|item| item.key == "TMUX_PANE")
+                .map(|item| item.value.as_str()),
+            Some("%pane_test")
+        );
+        let wslenv = env
+            .iter()
+            .find(|item| item.key == "WSLENV")
+            .map(|item| item.value.as_str())
+            .expect("managed WSLENV");
+        assert!(wslenv.split(':').any(|item| item == "TMUX"));
+        assert!(wslenv.split(':').any(|item| item == "TMUX_PANE"));
+        assert!(wslenv.split(':').any(|item| item == "AGENTMUX_WSL_PATH"));
+        let persisted = persisted_launch_environment(&env);
+        assert!(persisted.iter().any(|(key, value)| {
+            key == "AGENTMUX_AGENT_INTEGRATION" && value == "claude-teams"
+        }));
+        assert!(!persisted
+            .iter()
+            .any(|(key, _)| matches!(key.as_str(), "TMUX" | "TMUX_PANE")));
+    }
+
+    #[test]
+    fn captured_wsl_path_wraps_child_commands_idempotently() {
+        let wrapped = command_with_restored_wsl_path(vec!["bash".to_string()]);
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[1], "-lc");
+        assert_eq!(wrapped[2], RESTORE_WSL_PATH_SCRIPT);
+        assert_eq!(wrapped[3], "agentmux-wsl-env");
+        assert_eq!(wrapped[4], "bash");
+        assert_eq!(command_with_restored_wsl_path(wrapped.clone()), wrapped);
     }
 
     #[test]
@@ -17145,6 +17907,52 @@ mod tests {
         let pane_id = detail["workspace"]["active_pane_id"].as_str().unwrap();
         assert!(text.contains(surface_id));
         assert!(text.contains(pane_id));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn output_pump_persists_backend_exit_without_session_get() {
+        let state = DesktopControlState::new();
+        let spawn = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_spawn_exit_persistence",
+                "session.spawn",
+                r#"{"workspace_id":"ws_exit_persistence","command":["cmd.exe","/d","/q","/c","exit /b 7"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let session_id = response_string_field(&spawn, "session_id");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut persisted_state = String::new();
+
+        while std::time::Instant::now() < deadline {
+            state.pump_output_stream();
+            persisted_state = state
+                .store
+                .lock()
+                .unwrap()
+                .load_session(&session_id)
+                .unwrap()
+                .map(|session| session.state)
+                .unwrap_or_default();
+            if persisted_state == "exited" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(persisted_state, "exited");
+        assert_eq!(
+            state
+                .store
+                .lock()
+                .unwrap()
+                .load_session(&session_id)
+                .unwrap()
+                .and_then(|session| session.exit_code),
+            Some(7)
+        );
     }
 
     #[test]
