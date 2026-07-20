@@ -13,6 +13,12 @@ use agentmux_ipc::{RequestEnvelope, ResponseEnvelope};
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(windows)]
+mod clipboard_attachments;
+
+#[cfg(windows)]
+mod explorer_file_drop;
+
+#[cfg(windows)]
 const WINDOWS_APP_USER_MODEL_ID: &str = "dev.agentmux.desktop";
 
 #[cfg(windows)]
@@ -97,28 +103,36 @@ fn session_unsubscribe_output(
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn session_send_text_direct(
+async fn session_send_text_direct(
     state: tauri::State<'_, Arc<DesktopControlState>>,
     session_id: String,
     text: String,
 ) -> Result<(), String> {
-    state
-        .inner()
-        .send_text_direct(&session_id, text)
-        .map_err(|error| error.to_string())
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .send_text_direct(&session_id, text)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command(rename_all = "snake_case")]
-fn session_send_paste_direct(
+async fn session_send_paste_direct(
     state: tauri::State<'_, Arc<DesktopControlState>>,
     session_id: String,
     text: String,
     bracketed: bool,
 ) -> Result<(), String> {
-    state
-        .inner()
-        .send_paste_direct(&session_id, text, bracketed)
-        .map_err(|error| error.to_string())
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        state
+            .send_paste_direct(&session_id, text, bracketed)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// Open an http(s) URL in the user's system default browser.
@@ -136,6 +150,14 @@ fn open_external_url(url: String) -> Result<(), String> {
         return Err(format!("refusing to open non-http(s) url: {url}"));
     }
     open_url_in_system_browser(target).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn clipboard_materialize_attachments(
+    app: tauri::AppHandle,
+) -> Result<clipboard_attachments::ClipboardAttachmentPayload, String> {
+    clipboard_attachments::materialize(app).await
 }
 
 #[cfg(windows)]
@@ -242,6 +264,10 @@ fn main() {
                 },
             ));
             notification_state.set_app_handle(app.handle().clone());
+            #[cfg(windows)]
+            if let Err(error) = explorer_file_drop::install(app.handle()) {
+                eprintln!("[agentmux] failed to install Explorer file-drop bridge: {error}");
+            }
             Ok(())
         })
         .manage(state)
@@ -253,7 +279,8 @@ fn main() {
             session_send_text_direct,
             session_send_paste_direct,
             session_report_output_pressure,
-            open_external_url
+            open_external_url,
+            clipboard_materialize_attachments
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AgentMux desktop app");

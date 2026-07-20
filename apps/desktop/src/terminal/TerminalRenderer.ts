@@ -25,6 +25,7 @@ export interface TerminalRenderer {
   setAlternateWheelMode?(mode: AlternateWheelMode): void;
   onData(handler: (data: string) => void): () => void;
   onPaste(handler: (text: string) => void): () => void;
+  onPastePaths?(handler: (paths: string[]) => void): () => void;
   onResize(handler: (columns: number, rows: number) => void): () => void;
   focus(): void;
   dispose(): void;

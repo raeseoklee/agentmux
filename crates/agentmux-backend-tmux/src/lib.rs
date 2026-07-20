@@ -122,12 +122,13 @@ pub fn tmux_control_spawn_command(session_name: &str, command: CommandSpec) -> C
 
 pub fn tmux_control_attach_command(session_name: &str) -> CommandSpec {
     CommandSpec::with_args(
-        TMUX_EXE,
+        "sh",
         vec![
-            "-C".to_string(),
-            "attach-session".to_string(),
-            "-t".to_string(),
-            session_name.to_string(),
+            "-lc".to_string(),
+            format!(
+                "unset TMUX TMUX_PANE; exec tmux -C attach-session -t {}",
+                posix_shell_quote(session_name.to_string())
+            ),
         ],
     )
 }
@@ -312,7 +313,7 @@ pub fn tmux_detached_spawn_then_attach_script(session_name: &str, command: Comma
     let target = posix_shell_quote(session_name.to_string());
     let command = posix_shell_quote(tmux_shell_command(command));
     format!(
-        "if ! tmux has-session -t {target} 2>/dev/null; then tmux new-session -d -s {target} {command} || exit $?; fi; exec tmux -C attach-session -t {target}"
+        "unset TMUX TMUX_PANE; if ! tmux has-session -t {target} 2>/dev/null; then tmux new-session -d -s {target} {command} || exit $?; fi; exec tmux -C attach-session -t {target}"
     )
 }
 
@@ -1156,12 +1157,24 @@ mod tests {
             vec![
                 "-lc",
                 concat!(
+                    "unset TMUX TMUX_PANE; ",
                     "if ! tmux has-session -t agentmux_demo 2>/dev/null; then ",
                     r#"tmux new-session -d -s agentmux_demo 'bash -lc '\''echo hello'\''' || exit $?; "#,
                     "fi; ",
                     "exec tmux -C attach-session -t agentmux_demo"
                 )
             ]
+        );
+        assert_eq!(
+            tmux_control_attach_command("agentmux_demo"),
+            CommandSpec::with_args(
+                "sh",
+                vec![
+                    "-lc".to_string(),
+                    "unset TMUX TMUX_PANE; exec tmux -C attach-session -t agentmux_demo"
+                        .to_string(),
+                ],
+            )
         );
     }
 
@@ -1228,6 +1241,7 @@ mod tests {
             vec![
                 "-lc",
                 concat!(
+                    "unset TMUX TMUX_PANE; ",
                     "if ! tmux has-session -t agentmux_ses_tmux 2>/dev/null; then ",
                     r#"tmux new-session -d -s agentmux_ses_tmux 'bash -lc '\''echo hello'\''' || exit $?; "#,
                     "fi; ",
@@ -1271,7 +1285,10 @@ mod tests {
                 .unwrap()
                 .command
                 .args,
-            vec!["-C", "attach-session", "-t", "agentmux_demo123"]
+            vec![
+                "-lc",
+                "unset TMUX TMUX_PANE; exec tmux -C attach-session -t agentmux_demo123"
+            ]
         );
         assert_eq!(
             backend
