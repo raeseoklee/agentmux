@@ -81,20 +81,28 @@ Dock command by bypassing the UI or backend trust path.
 
 ## Agent Integrations
 
-Use the cmux-compatible wrappers for agent tools:
+Prefer the AgentMux-native integration commands. The `cmux` executable is a
+compatibility alias for third-party tools, not the primary user interface:
 
 ```powershell
-cmux integrations doctor
-cmux integrations install-shims
-cmux integrations setup omo
-cmux integrations setup omc
-cmux omo
-cmux omc
-cmux claude-teams
+agentmux integrations doctor claude-teams --distribution Ubuntu --json
+agentmux integrations install-shims --user-path
+agentmux integrations setup omo
+agentmux integrations setup omc
+agentmux integrations launch claude-teams
+agentmux integrations launch omx
 ```
 
-When a wrapper launches inside WSL, ensure `CMUX_EXE` and `AGENTMUX_EXE` point
-to the Windows-side `cmux.exe` path translated for WSL.
+When MCP is available, use `agent_integration_status`, `agent_worker_start`,
+`agent_worker_list`, and `agent_worker_send`. Use `agent_integration_setup` or
+`agent_worker_stop` only with the `full` profile. `codex-pane` is an independent
+Codex CLI worker; it is not a Codex built-in `/agent` thread.
+
+When a wrapper launches inside WSL, `AGENTMUX_EXE` points to the Windows-side
+`agentmux.exe` path translated for WSL. `CMUX_EXE` remains available only for
+compatibility. Descendant tmux panes must inherit the integration marker and
+captured WSL path; the desktop host restores that Linux path without copying the
+Windows `PATH` and regenerates each pane-specific `TMUX` identity.
 
 ## Verification
 

@@ -6,6 +6,7 @@ import {
 } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
+import { SerializeAddon, type ISerializeOptions } from "@xterm/addon-serialize";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import type { LigaturesAddon } from "@xterm/addon-ligatures";
 import type { WebglAddon } from "@xterm/addon-webgl";
@@ -378,6 +379,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private terminal?: Terminal;
   private fitAddon?: FitAddon;
   private searchAddon?: SearchAddon;
+  private serializeAddon?: SerializeAddon;
   private unicodeAddon?: Unicode11Addon;
   private ligaturesAddon?: LigaturesAddon;
   private mountedElement?: HTMLElement;
@@ -441,7 +443,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     element: HTMLElement,
     initialState: TerminalSnapshot,
     typography?: Partial<TerminalTypography>,
-  ): void {
+  ): Promise<void> {
     this.dispose();
     const fontSize = normalizeFontSize(typography?.fontSize);
     const lineHeight = normalizeLineHeight(typography?.lineHeight);
@@ -477,6 +479,8 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // when the terminal begins rendering.
     const searchAddon = new SearchAddon();
     terminal.loadAddon(searchAddon);
+    const serializeAddon = new SerializeAddon();
+    terminal.loadAddon(serializeAddon);
     terminal.open(element);
 
     // Reset repaint-observation state for this fresh terminal.
@@ -604,13 +608,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.installPlainUrlLinkProvider(terminal);
     fitAddon.fit();
 
-    if (initialState.bytes && initialState.bytes.length > 0) {
-      terminal.write(initialState.bytes);
-    }
-
     this.terminal = terminal;
     this.fitAddon = fitAddon;
     this.searchAddon = searchAddon;
+    this.serializeAddon = serializeAddon;
     this.unicodeAddon = unicodeAddon;
     this.mountedElement = element;
     this.inputEventAbort = inputEventAbort;
@@ -620,6 +621,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // blank or misaligned. Once the face is ready, re-measure: drop the WebGL
     // texture atlas, re-apply the family to force a glyph re-measure, refit.
     this.fontReadyPromise = this.ensureFontsThenRemeasure(terminal, fontSize);
+
+    if (!initialState.bytes || initialState.bytes.length === 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      terminal.write(initialState.bytes!, resolve);
+    });
   }
 
   private ensureFontsThenRemeasure(
@@ -681,6 +689,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.terminal = undefined;
     this.fitAddon = undefined;
     this.searchAddon = undefined;
+    this.serializeAddon = undefined;
     this.unicodeAddon = undefined;
     this.ligaturesAddon = undefined;
     this.mountedElement = undefined;
@@ -701,6 +710,14 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return;
     }
     this.terminal.write(batch, callback);
+  }
+
+  /** Serialize the complete framebuffer, including normal-buffer scrollback. */
+  serialize(options?: ISerializeOptions): string | null {
+    if (!this.terminal || !this.serializeAddon) {
+      return null;
+    }
+    return this.serializeAddon.serialize(options);
   }
 
   reset(): void {

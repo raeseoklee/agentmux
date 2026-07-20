@@ -1,7 +1,7 @@
 {
   "name": "agentmux-workspace",
   "private": true,
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Windows desktop terminal multiplexer for AI-agent workflows.",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,7 @@
     "installer:lifecycle-gate": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installer-lifecycle-gate.ps1",
     "installer:build-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installer-build-smoke.ps1",
     "installer:mcp-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-installed-mcp-smoke.ps1",
-    "mcp:workbench": "cargo build -p agentmux-cli && npx -y @mcp-workbench/cli@0.5.1 run tests/mcp/agentmux-full.workbench.yaml --json --bail",
+    "mcp:workbench": "cargo build -p agentmux-cli && npx -y @mcp-workbench/cli@0.5.1 run tests/mcp/agentmux-read.workbench.yaml --json --bail && npx -y @mcp-workbench/cli@0.5.1 run tests/mcp/agentmux-standard.workbench.yaml --json --bail && npx -y @mcp-workbench/cli@0.5.1 run tests/mcp/agentmux-full.workbench.yaml --json --bail",
     "integration:live-smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-integration-live-smoke.ps1",
     "release:readiness-audit": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-release-readiness-audit.ps1",
     "wsl:state-gate": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-wsl-state-gate.ps1",

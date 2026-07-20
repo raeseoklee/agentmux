@@ -73,6 +73,37 @@ List agent attention:
 agentmux agent list-attention --json
 ```
 
+List all agent sessions or AgentMux-managed workers:
+
+```powershell
+agentmux agent list --workspace <workspace-id> --json
+```
+
+## Agent Integrations
+
+Install the AgentMux-first tmux compatibility wrappers and add them to the
+Windows user PATH:
+
+```powershell
+agentmux integrations install-shims --user-path
+```
+
+Check Claude Teams readiness inside the selected WSL distribution:
+
+```powershell
+agentmux integrations doctor claude-teams --distribution Ubuntu --json
+```
+
+From an AgentMux terminal context, launch a supported integration:
+
+```powershell
+agentmux integrations launch claude-teams
+agentmux integrations launch omx
+```
+
+The `cmux` executable remains a compatibility alias for tools that invoke cmux
+or tmux command shapes. User-facing automation should prefer `agentmux`.
+
 ## Notifications and Sidebar
 
 Send an OS/app notification:

@@ -19,4 +19,31 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 34
+        equals: 40
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worker_list
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_integration_status
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worker_start
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worker_send
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worker_stop
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_integration_setup
+      - kind: count
+        path: $.tools[*].inputSchema.$defs.AgentWorkerKindParam.enum
+        equals: 5
+      - kind: contains
+        path: $.tools[*].inputSchema.$defs.AgentWorkerKindParam.enum
+        value: codex-pane
+      - kind: contains
+        path: $.tools[*].annotations.openWorldHint
+        value: true

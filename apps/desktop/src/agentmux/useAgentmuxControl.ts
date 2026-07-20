@@ -25,6 +25,7 @@ import {
   type WorkspaceSummary,
   type WslDistribution
 } from "../control/ControlClient";
+import { terminalViewStateCache } from "../terminal/TerminalViewStateCache";
 
 const DEFAULT_PROJECT_ROOT: string | null = null;
 const SIGNAL_POLL_INTERVAL_MS = 1500;
@@ -502,6 +503,7 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const activeRef = useRef<string | null>(null);
   const detailRef = useRef<WorkspaceDetail | null>(null);
+  const detailRequestSequenceRef = useRef(0);
   const lastDetailRefreshAtRef = useRef(0);
   const lastSidebarRefreshAtRef = useRef(0);
   const signalRefreshInFlightRef = useRef(false);
@@ -576,10 +578,24 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const loadDetail = useCallback(
     async (workspaceId: string) => {
+      const requestSequence = ++detailRequestSequenceRef.current;
       const next = await client.getWorkspace(workspaceId);
-      if (activeRef.current === workspaceId) {
+      if (
+        activeRef.current === workspaceId &&
+        detailRequestSequenceRef.current === requestSequence
+      ) {
         lastDetailRefreshAtRef.current = Date.now();
         setDetail((previous) => {
+          if (previous?.workspace.workspaceId === next.workspace.workspaceId) {
+            const liveSessionIds = new Set(
+              next.sessions.map((session) => session.sessionId),
+            );
+            terminalViewStateCache.deleteMany(
+              previous.sessions
+                .map((session) => session.sessionId)
+                .filter((sessionId) => !liveSessionIds.has(sessionId)),
+            );
+          }
           const resolved = detailEqual(previous, next) ? previous : next;
           detailRef.current = resolved;
           return resolved;
@@ -757,6 +773,51 @@ export function useAgentmuxControl(): AgentmuxControl {
       unlisten?.();
     };
   }, [refreshSidebar]);
+
+  // Backend exit/error events are persisted by the host output pump and pushed
+  // here. Reload the active topology immediately so exited terminal surfaces
+  // can be closed without relying on typed `exit` heuristics or a polling tick.
+  useEffect(() => {
+    const eventApi = (
+      window as Window & {
+        __TAURI__?: {
+          event?: {
+            listen?: (
+              event: string,
+              handler: () => void
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+    if (!eventApi?.listen) {
+      return;
+    }
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let unlisten: (() => void) | undefined;
+    const handler = () => {
+      clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = undefined;
+        const workspaceId = activeRef.current;
+        if (workspaceId) {
+          void loadDetail(workspaceId);
+        }
+      }, 25);
+    };
+    eventApi
+      .listen("agentmux://session-state-changed", handler)
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {
+        /* periodic detail polling remains as a fallback */
+      });
+    return () => {
+      clearTimeout(refreshTimer);
+      unlisten?.();
+    };
+  }, [loadDetail]);
 
   const refreshTeamCollaboration = useCallback(async () => {
     const workspaceId = activeRef.current;
@@ -963,7 +1024,14 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const closeWorkspace = useCallback(
     async (workspaceId: string, policy: string) => {
+      const closingDetail =
+        detailRef.current?.workspace.workspaceId === workspaceId
+          ? detailRef.current
+          : await client.getWorkspace(workspaceId);
       await client.closeWorkspace(workspaceId, policy);
+      terminalViewStateCache.deleteMany(
+        closingDetail.sessions.map((session) => session.sessionId),
+      );
       const listed = await reloadWorkspaces();
       const next = listed[0]?.workspaceId ?? null;
       // Update the ref first so any concurrent poll-tick reads the new target,
@@ -1726,13 +1794,31 @@ export function useAgentmuxControl(): AgentmuxControl {
 
   const closePane = useCallback(
     (paneId: string) =>
-      withActive((workspaceId) => client.closePane(workspaceId, paneId, "close_surface")),
+      withActive(async (workspaceId) => {
+        const current = detailRef.current;
+        const pane = current?.panes.find((candidate) => candidate.paneId === paneId);
+        const surface = current?.surfaces.find(
+          (candidate) => candidate.surfaceId === pane?.mountedSurfaceId,
+        );
+        await client.closePane(workspaceId, paneId, "close_surface");
+        if (surface?.sessionId) {
+          terminalViewStateCache.delete(surface.sessionId);
+        }
+      }),
     [client, withActive]
   );
 
   const closeSurface = useCallback(
     (surfaceId: string) =>
-      withActive((workspaceId) => client.closeSurface(workspaceId, surfaceId)),
+      withActive(async (workspaceId) => {
+        const sessionId = detailRef.current?.surfaces.find(
+          (candidate) => candidate.surfaceId === surfaceId,
+        )?.sessionId;
+        await client.closeSurface(workspaceId, surfaceId);
+        if (sessionId) {
+          terminalViewStateCache.delete(sessionId);
+        }
+      }),
     [client, withActive]
   );
 

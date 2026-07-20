@@ -16,7 +16,7 @@ export interface TerminalRenderer {
     element: HTMLElement,
     initialState: TerminalSnapshot,
     typography?: Partial<TerminalTypography>,
-  ): void;
+  ): Promise<void>;
   unmount(): void;
   write(batch: Uint8Array, callback?: () => void): void;
   resize(columns: number, rows: number): void;
