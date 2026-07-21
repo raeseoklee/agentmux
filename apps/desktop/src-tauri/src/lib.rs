@@ -62,24 +62,25 @@ use agentmux_ipc::{
     PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, PaneUnmountSurfaceParams,
     ProfileCreateParams, ProfileIdParams, ProfileListResult, ProfileSummaryResult,
     ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, SessionAttachParams, SessionIdParams, SessionSendTextParams,
-    SessionSpawnParams, SessionSpawnResult, SessionSummaryResult, SidebarLogAddParams,
-    SidebarLogListParams, SidebarLogListResult, SidebarLogResult, SidebarProgressResult,
-    SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams, SidebarStatusListResult,
-    SidebarStatusResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
-    SurfaceCreateBrowserParams, SurfaceMoveWorkspaceParams, SurfaceMoveWorkspaceResult,
-    SurfaceSummaryResult, SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult,
-    TeamMessageListParams, TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult,
-    TeamMessageSendParams, TeamTaskBlockParams, TeamTaskClaimParams, TeamTaskCreateParams,
-    TeamTaskDependencyParams, TeamTaskIdParams, TeamTaskListParams, TeamTaskListResult,
-    TeamTaskResult, TerminalOpenParams, TerminalPlacementResult, TerminalSplitParams,
-    TmuxDiagnosticsParams, TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult,
-    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
-    WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
-    WorkspaceGroupMemberParams, WorkspaceGroupMemberResult, WorkspaceGroupResult,
-    WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams,
-    WorkspaceSummaryResult, WorkspaceUpdateParams, WslDistributionListResult,
-    WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
+    ResponseEnvelope, ResponseOutcome, SessionAttachParams, SessionIdParams,
+    SessionSendPasteParams, SessionSendTextParams, SessionSpawnParams, SessionSpawnResult,
+    SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams, SidebarLogListResult,
+    SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams, SidebarStateResult,
+    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult, SidebarStatusSetParams,
+    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
+    SurfaceMoveWorkspaceParams, SurfaceMoveWorkspaceResult, SurfaceSummaryResult,
+    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, TeamMessageListParams,
+    TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult, TeamMessageSendParams,
+    TeamTaskBlockParams, TeamTaskClaimParams, TeamTaskCreateParams, TeamTaskDependencyParams,
+    TeamTaskIdParams, TeamTaskListParams, TeamTaskListResult, TeamTaskResult, TerminalOpenParams,
+    TerminalPlacementResult, TerminalSplitParams, TmuxDiagnosticsParams, TmuxDiagnosticsResult,
+    WorkspaceCloseParams, WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult,
+    WorkspaceGroupCreateParams, WorkspaceGroupIdParams, WorkspaceGroupListParams,
+    WorkspaceGroupListResult, WorkspaceGroupMemberParams, WorkspaceGroupMemberResult,
+    WorkspaceGroupResult, WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult,
+    WorkspaceRenameParams, WorkspaceSummaryResult, WorkspaceUpdateParams,
+    WslDistributionListResult, WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME,
+    DEFAULT_LOCAL_CONTROL_TOKEN,
 };
 use agentmux_store::{
     PersistedAgentState, PersistedDockTrust, PersistedNotification, PersistedPane,
@@ -252,6 +253,12 @@ struct OutputPressureRecord {
     write_in_flight: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeferredTerminalInput {
+    Text(String),
+    Paste { text: String, bracketed: bool },
+}
+
 #[derive(Clone, Debug)]
 struct PendingAgentLaunchLine {
     line: String,
@@ -261,6 +268,8 @@ struct PendingAgentLaunchLine {
     command: Vec<String>,
     previous: PersistedAgentState,
     prompt_observed: bool,
+    launch_delivered: bool,
+    deferred_inputs: VecDeque<DeferredTerminalInput>,
 }
 
 pub struct DesktopControlState {
@@ -714,6 +723,16 @@ impl DesktopControlState {
     /// Fast path for interactive terminal input from the desktop WebView. This
     /// avoids building a full control-plane JSON envelope for every keystroke.
     pub fn send_text_direct(&self, session_id: &str, text: String) -> Result<(), DesktopHostError> {
+        if self.defer_terminal_input_while_restoring(
+            session_id,
+            DeferredTerminalInput::Text(text.clone()),
+        ) {
+            return Ok(());
+        }
+        self.send_text_now(session_id, text)
+    }
+
+    fn send_text_now(&self, session_id: &str, text: String) -> Result<(), DesktopHostError> {
         let Ok(mut control) = self.control.lock() else {
             return Err(DesktopHostError::StateUnavailable(
                 "desktop control state is unavailable".to_string(),
@@ -736,6 +755,24 @@ impl DesktopControlState {
         text: String,
         bracketed: bool,
     ) -> Result<(), DesktopHostError> {
+        if self.defer_terminal_input_while_restoring(
+            session_id,
+            DeferredTerminalInput::Paste {
+                text: text.clone(),
+                bracketed,
+            },
+        ) {
+            return Ok(());
+        }
+        self.send_paste_now(session_id, text, bracketed)
+    }
+
+    fn send_paste_now(
+        &self,
+        session_id: &str,
+        text: String,
+        bracketed: bool,
+    ) -> Result<(), DesktopHostError> {
         let Ok(mut control) = self.control.lock() else {
             return Err(DesktopHostError::StateUnavailable(
                 "desktop control state is unavailable".to_string(),
@@ -752,6 +789,26 @@ impl DesktopControlState {
             self.detect_agent_launch_from_terminal_input(session_id, &text);
         }
         Ok(())
+    }
+
+    fn defer_terminal_input_while_restoring(
+        &self,
+        session_id: &str,
+        input: DeferredTerminalInput,
+    ) -> bool {
+        let Ok(mut pending) = self.pending_agent_launch_lines.lock() else {
+            return false;
+        };
+        let Some(entry) = pending.get_mut(session_id) else {
+            return false;
+        };
+        match (entry.deferred_inputs.back_mut(), input) {
+            (Some(DeferredTerminalInput::Text(buffer)), DeferredTerminalInput::Text(text)) => {
+                buffer.push_str(&text);
+            }
+            (_, input) => entry.deferred_inputs.push_back(input),
+        }
+        true
     }
 
     /// Drains coalesced terminal-output deltas from the control plane and pushes
@@ -776,6 +833,13 @@ impl DesktopControlState {
             if let Ok(mut pending) = self.pending_session_state_updates.lock() {
                 for (session_id, state, exit_code) in &session_state_updates {
                     pending.insert(session_id.clone(), (state.clone(), *exit_code));
+                }
+            }
+            if let Ok(mut pending_launches) = self.pending_agent_launch_lines.lock() {
+                for (session_id, state, _) in &session_state_updates {
+                    if is_terminal_state(state) {
+                        pending_launches.remove(session_id);
+                    }
                 }
             }
         }
@@ -993,6 +1057,11 @@ impl DesktopControlState {
         }
 
         let id = request.id.clone();
+        match self.defer_control_input_while_restoring(&request) {
+            Ok(true) => return ResponseEnvelope::ok_typed(id, &AckResult { ok: true }),
+            Ok(false) => {}
+            Err(error) => return ResponseEnvelope::error(id, error),
+        }
         let request = match self.prepare_runtime_request(request) {
             Ok(request) => request,
             Err(error) => return ResponseEnvelope::error(id, error),
@@ -1022,6 +1091,36 @@ impl DesktopControlState {
             return error;
         }
         response
+    }
+
+    fn defer_control_input_while_restoring(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<bool, ControlError> {
+        if matches!(
+            request.method.as_str(),
+            "session.send_text" | "session.send_paste"
+        ) {
+            validate_desktop_request(request, &self.control_token)?;
+        }
+        let (session_id, input) = match request.method.as_str() {
+            "session.send_text" => {
+                let params: SessionSendTextParams = request.parse_params()?;
+                (params.session_id, DeferredTerminalInput::Text(params.text))
+            }
+            "session.send_paste" => {
+                let params: SessionSendPasteParams = request.parse_params()?;
+                (
+                    params.session_id,
+                    DeferredTerminalInput::Paste {
+                        text: params.text,
+                        bracketed: params.bracketed,
+                    },
+                )
+            }
+            _ => return Ok(false),
+        };
+        Ok(self.defer_terminal_input_while_restoring(&session_id, input))
     }
 
     fn prepare_runtime_request(
@@ -2155,6 +2254,8 @@ impl DesktopControlState {
                     command: session.command.clone(),
                     previous: previous.clone(),
                     prompt_observed: false,
+                    launch_delivered: false,
+                    deferred_inputs: VecDeque::new(),
                 },
             );
             return true;
@@ -2168,7 +2269,7 @@ impl DesktopControlState {
     fn flush_pending_agent_launch_lines(&self, prompted_sessions: &[String]) {
         const LAUNCH_LINE_PROMPT_TIMEOUT: Duration = Duration::from_secs(4);
         const MAX_ATTEMPTS: u8 = 5;
-        let due: Vec<(String, PendingAgentLaunchLine)> = {
+        let due: Vec<String> = {
             let Ok(mut pending) = self.pending_agent_launch_lines.lock() else {
                 return;
             };
@@ -2188,42 +2289,55 @@ impl DesktopControlState {
                         || now.duration_since(entry.queued_at) >= LAUNCH_LINE_PROMPT_TIMEOUT)
                         && now >= entry.next_attempt_at
                 })
-                .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+                .map(|(session_id, _)| session_id.clone())
                 .collect()
         };
-        for (session_id, candidate) in due {
-            match self.send_text_direct(&session_id, format!("{}\r", candidate.line)) {
-                Ok(()) => {
-                    if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
-                        if pending
-                            .get(&session_id)
-                            .is_some_and(|entry| entry.line == candidate.line)
-                        {
-                            pending.remove(&session_id);
+        for session_id in due {
+            let mut completed = None;
+            let mut exhausted = None;
+            let mut delivery_error = None;
+            if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
+                let Some(entry) = pending.get_mut(&session_id) else {
+                    continue;
+                };
+
+                if !entry.launch_delivered {
+                    match self.send_text_now(&session_id, format!("{}\r", entry.line)) {
+                        Ok(()) => {
+                            entry.launch_delivered = true;
+                            entry.attempts = 0;
                         }
+                        Err(error) => delivery_error = Some(error),
                     }
-                    self.replay_restored_agent_state(
-                        &session_id,
-                        &candidate.command,
-                        &candidate.previous,
-                        Some("running"),
-                    );
                 }
-                Err(error) => {
-                    let mut exhausted = None;
-                    if let Ok(mut pending) = self.pending_agent_launch_lines.lock() {
-                        if let Some(entry) = pending.get_mut(&session_id) {
-                            entry.attempts = entry.attempts.saturating_add(1);
-                            if entry.attempts >= MAX_ATTEMPTS {
-                                exhausted = pending.remove(&session_id);
-                            } else {
-                                let delay_ms = 100_u64 << entry.attempts.min(4);
-                                entry.next_attempt_at =
-                                    Instant::now() + Duration::from_millis(delay_ms);
-                            }
+
+                while delivery_error.is_none() && entry.launch_delivered {
+                    let Some(input) = entry.deferred_inputs.pop_front() else {
+                        break;
+                    };
+                    let result = match &input {
+                        DeferredTerminalInput::Text(text) => {
+                            self.send_text_now(&session_id, text.clone())
                         }
+                        DeferredTerminalInput::Paste { text, bracketed } => {
+                            self.send_paste_now(&session_id, text.clone(), *bracketed)
+                        }
+                    };
+                    if let Err(error) = result {
+                        entry.deferred_inputs.push_front(input);
+                        delivery_error = Some(error);
                     }
-                    if let Some(entry) = exhausted {
+                }
+
+                if let Some(error) = delivery_error.as_ref() {
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    if entry.attempts >= MAX_ATTEMPTS && !entry.launch_delivered {
+                        exhausted = pending.remove(&session_id);
+                    } else {
+                        let delay_ms = 100_u64 << entry.attempts.min(4);
+                        entry.next_attempt_at = Instant::now() + Duration::from_millis(delay_ms);
+                    }
+                    if let Some(entry) = exhausted.as_ref() {
                         self.replay_restored_agent_failure(
                             &session_id,
                             &entry.command,
@@ -2231,7 +2345,17 @@ impl DesktopControlState {
                             &error.to_string(),
                         );
                     }
+                } else if entry.launch_delivered && entry.deferred_inputs.is_empty() {
+                    completed = pending.remove(&session_id);
                 }
+            }
+            if let Some(entry) = completed {
+                self.replay_restored_agent_state(
+                    &session_id,
+                    &entry.command,
+                    &entry.previous,
+                    Some("running"),
+                );
             }
         }
     }
@@ -16983,7 +17107,151 @@ mod tests {
             .expect("failed delivery remains queued");
         assert_eq!(queued.attempts, 1);
         assert!(queued.prompt_observed);
+        assert!(!queued.launch_delivered);
         assert!(queued.next_attempt_at > queued.queued_at);
+    }
+
+    #[test]
+    fn restored_agent_gate_defers_desktop_and_control_input_in_order() {
+        let host = DesktopControlState::new();
+        let now = Instant::now();
+        host.pending_agent_launch_lines.lock().unwrap().insert(
+            "ses_restore".to_string(),
+            PendingAgentLaunchLine {
+                line: "claude --resume session-id".to_string(),
+                queued_at: now,
+                next_attempt_at: now,
+                attempts: 0,
+                command: vec!["bash".to_string(), "-l".to_string()],
+                previous: PersistedAgentState {
+                    session_id: "ses_old".to_string(),
+                    workspace_id: "ws_restore".to_string(),
+                    state: "running".to_string(),
+                    attention: false,
+                    reason: Some("Agent started: claude".to_string()),
+                    updated_at: "before".to_string(),
+                    telemetry_json: None,
+                },
+                prompt_observed: false,
+                launch_delivered: false,
+                deferred_inputs: VecDeque::new(),
+            },
+        );
+
+        host.send_text_direct("ses_restore", "typed".to_string())
+            .expect("desktop text is accepted into the restore gate");
+        host.send_paste_direct("ses_restore", "pasted".to_string(), true)
+            .expect("desktop paste is accepted into the restore gate");
+        let response = host.handle_request(RequestEnvelope::new(
+            "req_restore_input",
+            "session.send_text",
+            r#"{"session_id":"ses_restore","text":" control"}"#,
+            DESKTOP_CONTROL_TOKEN,
+        ));
+        assert!(matches!(response.outcome, ResponseOutcome::Ok { .. }));
+
+        let rejected = host.handle_request(RequestEnvelope::new(
+            "req_restore_input_bad_auth",
+            "session.send_text",
+            r#"{"session_id":"ses_restore","text":" rejected"}"#,
+            "invalid-token",
+        ));
+        assert_eq!(response_error_code(&rejected), ErrorCode::Unauthorized);
+
+        let pending = host.pending_agent_launch_lines.lock().unwrap();
+        assert_eq!(
+            pending.get("ses_restore").unwrap().deferred_inputs,
+            VecDeque::from([
+                DeferredTerminalInput::Text("typed".to_string()),
+                DeferredTerminalInput::Paste {
+                    text: "pasted".to_string(),
+                    bracketed: true,
+                },
+                DeferredTerminalInput::Text(" control".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn restored_agent_gate_writes_launch_before_deferred_user_input() {
+        let host = DesktopControlState::new();
+        let spawn = agentmux_control(
+            &host,
+            RequestEnvelope::new(
+                "req_restore_order_spawn",
+                "session.spawn",
+                r#"{"workspace_id":"ws_restore_order","command":["cmd.exe","/d","/q"],"cwd":null,"columns":120,"rows":30,"durability":"ephemeral"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let session_id = response_string_field(&spawn, "session_id");
+        let now = Instant::now();
+        host.pending_agent_launch_lines.lock().unwrap().insert(
+            session_id.clone(),
+            PendingAgentLaunchLine {
+                line: "echo AGENTMUX_RESTORE_FIRST".to_string(),
+                queued_at: now,
+                next_attempt_at: now,
+                attempts: 0,
+                command: vec!["cmd.exe".to_string(), "/d".to_string(), "/q".to_string()],
+                previous: PersistedAgentState {
+                    session_id: "ses_restore_order_old".to_string(),
+                    workspace_id: "ws_restore_order".to_string(),
+                    state: "running".to_string(),
+                    attention: false,
+                    reason: Some("Agent started: claude".to_string()),
+                    updated_at: "before".to_string(),
+                    telemetry_json: None,
+                },
+                prompt_observed: false,
+                launch_delivered: false,
+                deferred_inputs: VecDeque::new(),
+            },
+        );
+        host.send_text_direct(&session_id, "echo AGENTMUX_USER_SECOND\r".to_string())
+            .expect("user input is queued while restore is pending");
+        host.flush_pending_agent_launch_lines(std::slice::from_ref(&session_id));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut output = String::new();
+        while Instant::now() < deadline {
+            host.pump_output_stream();
+            let snapshot = agentmux_control(
+                &host,
+                RequestEnvelope::new(
+                    "req_restore_order_snapshot",
+                    "session.snapshot",
+                    format!(r#"{{"session_id":"{session_id}"}}"#),
+                    DESKTOP_CONTROL_TOKEN,
+                ),
+            );
+            let value = response_value(&snapshot);
+            output = String::from_utf8_lossy(
+                &BASE64_STANDARD
+                    .decode(value["bytes_base64"].as_str().unwrap_or_default())
+                    .unwrap_or_default(),
+            )
+            .into_owned();
+            if output.contains("AGENTMUX_RESTORE_FIRST") && output.contains("AGENTMUX_USER_SECOND")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let restore = output.find("AGENTMUX_RESTORE_FIRST").unwrap();
+        let user = output.find("AGENTMUX_USER_SECOND").unwrap();
+        assert!(
+            restore < user,
+            "restore must precede user input: {output:?}"
+        );
+        assert!(!host
+            .pending_agent_launch_lines
+            .lock()
+            .unwrap()
+            .contains_key(&session_id));
+        host.terminate_runtime_session(&session_id, TerminationMode::Kill);
     }
 
     #[test]

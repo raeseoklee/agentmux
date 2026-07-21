@@ -241,9 +241,65 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
     (box?.y ?? 0) + (box?.height ?? 0) / 2,
   );
   await page.mouse.wheel(0, -1800);
+  await expect(
+    page.locator(".agentmux-live-terminal-host").first(),
+  ).toHaveAttribute("data-agentmux-terminal-wheel-action", "scrollback");
   await expect
     .poll(() => visibleTopLine())
     .toBeLessThan(beforeWheelTop ?? 0);
+});
+
+test("Codex wheel opens transcript instead of editing prompt history", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+
+  const pane = page
+    .locator("[data-agentmux-pane][data-agentmux-terminal-session]")
+    .first();
+  const sessionId = await pane.getAttribute("data-agentmux-terminal-session");
+  expect(sessionId).not.toBeNull();
+
+  await page.evaluate((targetSessionId) => {
+    window.__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      sessionId: targetSessionId ?? undefined,
+      state: "running",
+      telemetry: {
+        activity: "agent",
+        session: "codex --no-alt-screen",
+      },
+    });
+  }, sessionId);
+
+  const host = page.locator(".agentmux-live-terminal-host").first();
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-wheel-mode",
+    "codex",
+  );
+  const box = await host.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(
+    (box?.x ?? 0) + (box?.width ?? 0) / 2,
+    (box?.y ?? 0) + (box?.height ?? 0) / 2,
+  );
+  await page.mouse.wheel(0, -500);
+
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-wheel-action",
+    "codex-transcript",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (targetSessionId) =>
+          window.__AGENTMUX_PREVIEW__
+            ?.terminalOutput(targetSessionId ?? undefined)
+            ?.includes("\u0014") ?? false,
+        sessionId,
+      ),
+    )
+    .toBe(true);
 });
 
 test("terminal profile picker can launch native shells", async ({ page }) => {

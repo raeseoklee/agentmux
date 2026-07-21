@@ -561,7 +561,7 @@ export function LiveTerminal({
       markOutput();
     }
     renderer.setAlternateWheelMode(
-      agentKindRef.current === "codex" ? "page" : "auto",
+      agentKindRef.current === "codex" ? "codex" : "auto",
     );
     const unsubscribeOpenLink = renderer.onOpenLink((url, event) => {
       onOpenLinkRef.current?.(url, event);
@@ -1482,7 +1482,7 @@ export function LiveTerminal({
     const normalized = agentKind ?? null;
     agentKindRef.current = normalized;
     rendererRef.current?.setAlternateWheelMode(
-      normalized === "codex" ? "page" : "auto",
+      normalized === "codex" ? "codex" : "auto",
     );
   }, [agentKind]);
 

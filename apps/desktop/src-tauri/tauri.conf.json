@@ -1,6 +1,6 @@
 {
   "productName": "AgentMux",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "identifier": "dev.agentmux.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

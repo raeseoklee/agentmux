@@ -9,7 +9,7 @@ export interface TerminalTypography {
   lineHeight: number;
 }
 
-export type AlternateWheelMode = "auto" | "page";
+export type AlternateWheelMode = "auto" | "page" | "codex";
 
 export interface TerminalRenderer {
   mount(
