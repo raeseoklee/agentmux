@@ -31,7 +31,7 @@ function decide(
 }
 
 describe("decideTerminalWebglPolicy", () => {
-  it("enables auto only for Windows hardware renderers", () => {
+  it("enables auto for Windows WebGL2 unless software rendering is explicit", () => {
     expect(decide()).toEqual({ enable: true, reason: "enabled-auto" });
     expect(decide({ platform: "linux" })).toEqual({
       enable: false,
@@ -56,7 +56,7 @@ describe("decideTerminalWebglPolicy", () => {
       decide({
         probe: { webgl2: true, renderer: null, rendererKind: "unknown" },
       }),
-    ).toEqual({ enable: false, reason: "auto-renderer-rejected" });
+    ).toEqual({ enable: true, reason: "enabled-auto" });
   });
 
   it("lets explicit on use any available WebGL2 renderer", () => {

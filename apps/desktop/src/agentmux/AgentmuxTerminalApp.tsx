@@ -347,11 +347,10 @@ type BrowserCustomActionPreset =
       percent: number;
     };
 
-// Unified to Pretendard across the UI chrome (the terminal content keeps its own
-// monospace font in XtermTerminalRenderer). Bundled locally via src/fonts.css —
-// no CDN, robust fallbacks so it degrades gracefully if the face ever fails.
+// Prefer Windows' DirectWrite-hinted UI faces for crisp small text. Terminal
+// content keeps its configured monospace font in XtermTerminalRenderer.
 const FONT_MONO =
-  "'Pretendard Variable',Pretendard,-apple-system,'Segoe UI','Malgun Gothic',system-ui,sans-serif";
+  "'Segoe UI Variable Text','Segoe UI','Malgun Gothic','Pretendard Variable',Pretendard,system-ui,sans-serif";
 const FONT_SANS = FONT_MONO;
 const DEFAULT_WORKSPACE_PLUS_ACTION = "workspace.new";
 const DEFAULT_SURFACE_TAB_PLUS_ACTION = "terminal.newWsl";
@@ -11708,6 +11707,7 @@ function SettingsModal(props: SettingsModalProps) {
       }}
     >
       <div
+        className="agentmux-settings-panel"
         onClick={stop}
         style={{
           width: 780,

@@ -125,7 +125,11 @@ export function decideTerminalWebglPolicy(
   if (!input.probe.webgl2) {
     return { enable: false, reason: "webgl2-unavailable" };
   }
-  if (input.mode === "auto" && input.probe.rendererKind !== "hardware") {
+  // WebView2 can expose a working WebGL2 context while withholding
+  // WEBGL_debug_renderer_info. On Windows that privacy-limited `unknown`
+  // result is not evidence of software rendering, so let the attach attempt
+  // proceed and rely on the existing failure backoff/context-loss fallback.
+  if (input.mode === "auto" && input.probe.rendererKind === "software") {
     return { enable: false, reason: "auto-renderer-rejected" };
   }
   return {
