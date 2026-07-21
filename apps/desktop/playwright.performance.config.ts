@@ -11,8 +11,14 @@ export default defineConfig({
   },
   projects: [
     {
-      name: "chromium-terminal-renderer",
-      use: { ...devices["Desktop Chrome"] },
+      name: "chromium-terminal-renderer-100-percent",
+      metadata: { deviceScaleFactor: 1 },
+      use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1 },
+    },
+    {
+      name: "chromium-terminal-renderer-150-percent",
+      metadata: { deviceScaleFactor: 1.5 },
+      use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1.5 },
     },
   ],
   webServer: {

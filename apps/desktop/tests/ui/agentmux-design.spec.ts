@@ -98,11 +98,11 @@ test("opens a live terminal", async ({ page }) => {
   );
   await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
     "data-agentmux-terminal-custom-glyphs",
-    "false",
+    "true",
   );
   await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
     "data-agentmux-terminal-font-family",
-    /Cascadia Code/,
+    /^"D2CodingLigature Nerd Font"/,
   );
   await expect(page.locator(".agentmux-live-terminal-host").first()).toHaveAttribute(
     "data-agentmux-terminal-ligatures",
@@ -1807,6 +1807,26 @@ test("theme toggle switches label", async ({ page }) => {
   await toggle.click();
   const afterText = await toggle.textContent();
   expect(afterText).not.toBe(beforeText);
+});
+
+test("UI chrome prioritizes Windows-native hinted fonts", async ({ page }) => {
+  await bootPreview(page);
+
+  const rootRendering = await page.evaluate(() => {
+    const style = window.getComputedStyle(document.documentElement);
+    return {
+      fontFamily: style.fontFamily,
+      textRendering: style.textRendering,
+    };
+  });
+  expect(rootRendering.fontFamily).toMatch(/^"Segoe UI Variable Text"/);
+  expect(rootRendering.textRendering).toBe("auto");
+
+  await page.locator(".agentmux-settings-open").click();
+  await expect(page.locator(".agentmux-settings-panel")).toHaveCSS(
+    "font-family",
+    /Segoe UI Variable Text/,
+  );
 });
 
 test("appearance settings persist through reload", async ({ page }) => {

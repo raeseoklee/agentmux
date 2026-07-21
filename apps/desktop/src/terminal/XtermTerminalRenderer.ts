@@ -43,14 +43,18 @@ export const XTERM_THEME = {
   scrollbarSliderActiveBackground: "rgba(210, 220, 235, 0.64)"
 } as const;
 
-const TERMINAL_PRIMARY_FONT = "Cascadia Code";
+const TERMINAL_PRIMARY_FONT = "D2CodingLigature Nerd Font";
+const TERMINAL_PRIMARY_MONO_FONT = "D2CodingLigature Nerd Font Mono";
 const TERMINAL_WINDOWS_FALLBACK_FONT = "Cascadia Mono";
 const TERMINAL_BUNDLED_FALLBACK_FONT = "D2Coding Nerd";
 const TERMINAL_SYMBOL_FONT = "Symbols Nerd Font Mono";
 const TERMINAL_FONT_FEATURE_SETTINGS = '"calt" on, "liga" on';
 const TERMINAL_FONT_FAMILY = [
-  // Cascadia Code keeps Windows Terminal-like metrics while enabling
-  // programming ligatures; fallbacks cover symbols, Hangul, and Nerd icons.
+  // Match the user's Windows Terminal typography first. The bundled D2Coding
+  // face keeps the same Latin/Hangul metrics when the system face is absent.
+  '"D2CodingLigature Nerd Font"',
+  '"D2CodingLigature Nerd Font Mono"',
+  '"D2Coding Nerd"',
   '"Cascadia Code"',
   '"Fira Code"',
   '"JetBrains Mono"',
@@ -58,7 +62,6 @@ const TERMINAL_FONT_FAMILY = [
   '"CaskaydiaCove Nerd Font Mono"',
   '"CaskaydiaCove Nerd Font"',
   '"Symbols Nerd Font Mono"',
-  '"D2Coding Nerd"',
   '"MesloLGS NF"',
   '"JetBrainsMono Nerd Font Mono"',
   '"JetBrainsMono Nerd Font"',
@@ -453,7 +456,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const terminal = new Terminal({
       allowProposedApi: true,
       convertEol: false,
-      customGlyphs: false,
+      customGlyphs: true,
       cursorBlink: true,
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize,
@@ -654,6 +657,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     const fontLoads = fonts?.load
       ? Promise.allSettled([
           fonts.load(`${fontSize}px "${TERMINAL_PRIMARY_FONT}"`),
+          fonts.load(`${fontSize}px "${TERMINAL_PRIMARY_MONO_FONT}"`),
           fonts.load(`${fontSize}px "${TERMINAL_WINDOWS_FALLBACK_FONT}"`),
           fonts.load(`${fontSize}px "${TERMINAL_BUNDLED_FALLBACK_FONT}"`),
           fonts.load(`${fontSize}px "${TERMINAL_SYMBOL_FONT}"`)
