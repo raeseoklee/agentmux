@@ -83,6 +83,9 @@ const TRANSIENT_SCROLLBAR_MS = 800;
 const TERMINAL_CLIPBOARD_FALLBACK_MS = 30_000;
 const PAGE_UP_SEQUENCE = "\x1b[5~";
 const PAGE_DOWN_SEQUENCE = "\x1b[6~";
+const CODEX_OPEN_TRANSCRIPT_SEQUENCE = "\x14";
+const CODEX_TRANSCRIPT_TITLE = "T R A N S C R I P T";
+const CODEX_TRANSCRIPT_OPEN_TIMEOUT_MS = 1_000;
 // Screen-interactive heuristic: treat the terminal as running a full-screen TUI
 // when at least this many absolute cursor-repositioning sequences (CUP/HVP/CUU)
 // are observed within SCREEN_INTERACTIVE_WINDOW_MS.  A single `cls`/clear
@@ -429,6 +432,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
   private alternateWheelMode: AlternateWheelMode = "auto";
+  private codexTranscriptWheelActive = false;
+  private codexTranscriptOpenPending = false;
+  private codexTranscriptPendingPages = 0;
+  private codexTranscriptOpenTimer?: number;
   // Copy-on-select: debounce timer and last-copied value to avoid churn.
   private _cosTimer?: number;
   private _cosLast = "";
@@ -518,10 +525,18 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     terminal.attachCustomKeyEventHandler((event) =>
       this.handleClipboardKey(terminal, event)
     );
-    terminal.attachCustomWheelEventHandler((event) =>
-      this.handleWheelEvent(terminal, element, event)
-    );
     const inputEventAbort = new AbortController();
+    // xterm 6's custom scrollable element consumes wheel events before they
+    // bubble to attachCustomWheelEventHandler. Capture at the host boundary so
+    // AgentMux can choose local scrollback, Codex transcript, or PTY mouse
+    // passthrough before xterm's inner scrollbar stops propagation.
+    element.addEventListener(
+      "wheel",
+      (event) => {
+        this.handleWheelEvent(terminal, element, event);
+      },
+      { capture: true, passive: false, signal: inputEventAbort.signal },
+    );
     element.addEventListener(
       "copy",
       (event) => {
@@ -614,6 +629,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.serializeAddon = serializeAddon;
     this.unicodeAddon = unicodeAddon;
     this.mountedElement = element;
+    element.dataset.agentmuxTerminalWheelMode = this.alternateWheelMode;
     this.inputEventAbort = inputEventAbort;
 
     // The Nerd font (@font-face) loads lazily, so xterm's first glyph
@@ -626,7 +642,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return Promise.resolve();
     }
     return new Promise<void>((resolve) => {
-      terminal.write(initialState.bytes!, resolve);
+      terminal.write(initialState.bytes!, () => {
+        this.syncCodexTranscriptWheelState(terminal);
+        resolve();
+      });
     });
   }
 
@@ -675,6 +694,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.linkProviderDisposable?.dispose();
     this.linkProviderDisposable = undefined;
     this.clearTransientScrollbar();
+    this.clearCodexTranscriptWheelTimers();
+    this.codexTranscriptWheelActive = false;
+    this.codexTranscriptOpenPending = false;
+    this.codexTranscriptPendingPages = 0;
     // Dispose copy-on-select subscription and any pending debounce timer.
     this._cosSub?.dispose();
     this._cosSub = undefined;
@@ -705,11 +728,15 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   }
 
   write(batch: Uint8Array, callback?: () => void): void {
-    if (!this.terminal) {
+    const terminal = this.terminal;
+    if (!terminal) {
       callback?.();
       return;
     }
-    this.terminal.write(batch, callback);
+    terminal.write(batch, () => {
+      this.syncCodexTranscriptWheelState(terminal);
+      callback?.();
+    });
   }
 
   /** Serialize the complete framebuffer, including normal-buffer scrollback. */
@@ -763,6 +790,19 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
   setAlternateWheelMode(mode: AlternateWheelMode): void {
     this.alternateWheelMode = mode;
+    if (this.mountedElement) {
+      this.mountedElement.dataset.agentmuxTerminalWheelMode = mode;
+    }
+    if (mode === "codex") {
+      if (this.terminal) {
+        this.syncCodexTranscriptWheelState(this.terminal);
+      }
+      return;
+    }
+    this.clearCodexTranscriptWheelTimers();
+    this.codexTranscriptWheelActive = false;
+    this.codexTranscriptOpenPending = false;
+    this.codexTranscriptPendingPages = 0;
   }
 
   onData(handler: (data: string) => void): () => void {
@@ -1345,6 +1385,81 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     return false;
   }
 
+  private clearCodexTranscriptWheelTimers(): void {
+    if (this.codexTranscriptOpenTimer !== undefined) {
+      window.clearTimeout(this.codexTranscriptOpenTimer);
+      this.codexTranscriptOpenTimer = undefined;
+    }
+  }
+
+  private syncCodexTranscriptWheelState(terminal: Terminal): void {
+    if (this.alternateWheelMode !== "codex" || this.terminal !== terminal) {
+      return;
+    }
+    const buffer = terminal.buffer.active;
+    let transcriptVisible = false;
+    for (let row = 0; row < terminal.rows; row++) {
+      const line = buffer.getLine(buffer.baseY + row)?.translateToString(true);
+      if (line?.includes(CODEX_TRANSCRIPT_TITLE)) {
+        transcriptVisible = true;
+        break;
+      }
+    }
+    if (transcriptVisible) {
+      const pendingPages = this.codexTranscriptPendingPages;
+      this.codexTranscriptPendingPages = 0;
+      this.codexTranscriptWheelActive = true;
+      this.codexTranscriptOpenPending = false;
+      if (this.codexTranscriptOpenTimer !== undefined) {
+        window.clearTimeout(this.codexTranscriptOpenTimer);
+        this.codexTranscriptOpenTimer = undefined;
+      }
+      if (pendingPages !== 0) {
+        const sequence = pendingPages < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE;
+        terminal.input(sequence.repeat(Math.abs(pendingPages)), true);
+      }
+    } else if (!this.codexTranscriptOpenPending) {
+      this.codexTranscriptWheelActive = false;
+      this.codexTranscriptPendingPages = 0;
+    }
+  }
+
+  private handleCodexTranscriptWheel(
+    terminal: Terminal,
+    event: WheelEvent,
+    direction: number,
+  ): boolean {
+    if (direction > 0 && !this.codexTranscriptWheelActive) {
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
+    }
+
+    if (!this.codexTranscriptWheelActive) {
+      this.clearCodexTranscriptWheelTimers();
+      this.codexTranscriptWheelActive = true;
+      this.codexTranscriptOpenPending = true;
+      this.codexTranscriptPendingPages = -1;
+      terminal.input(CODEX_OPEN_TRANSCRIPT_SEQUENCE, true);
+      this.codexTranscriptOpenTimer = window.setTimeout(() => {
+        this.codexTranscriptOpenTimer = undefined;
+        this.codexTranscriptOpenPending = false;
+        this.syncCodexTranscriptWheelState(terminal);
+      }, CODEX_TRANSCRIPT_OPEN_TIMEOUT_MS);
+    } else if (this.codexTranscriptOpenPending) {
+      this.codexTranscriptPendingPages = Math.max(
+        -4,
+        Math.min(4, this.codexTranscriptPendingPages + direction),
+      );
+    } else {
+      terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    return false;
+  }
+
   private handleWheelEvent(
     terminal: Terminal,
     element: HTMLElement,
@@ -1371,13 +1486,21 @@ export class XtermTerminalRenderer implements TerminalRenderer {
         hasScrollback && direction > 0 && buffer.viewportY < buffer.baseY;
       const action = decideTerminalWheelAction({
         bufferType: "normal",
+        hasScrollback,
         canScroll: canScrollUp || canScrollDown,
         alternateWheelMode: this.alternateWheelMode,
         mouseTracking: terminal.modes.mouseTrackingMode !== "none",
       });
+      element.dataset.agentmuxTerminalWheelBuffer = "normal";
+      element.dataset.agentmuxTerminalWheelAction = action;
+      if (action === "codex-transcript") {
+        return this.handleCodexTranscriptWheel(terminal, event, direction);
+      }
       if (action === "scrollback") {
         terminal.scrollLines(direction * lines);
         this.showTransientScrollbar(element);
+      } else if (action === "page") {
+        terminal.input(direction < 0 ? PAGE_UP_SEQUENCE : PAGE_DOWN_SEQUENCE, true);
       }
       event.preventDefault();
       event.stopPropagation();
@@ -1386,10 +1509,16 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
     const action = decideTerminalWheelAction({
       bufferType: "alternate",
+      hasScrollback: false,
       canScroll: false,
       alternateWheelMode: this.alternateWheelMode,
       mouseTracking: terminal.modes.mouseTrackingMode !== "none",
     });
+    element.dataset.agentmuxTerminalWheelBuffer = "alternate";
+    element.dataset.agentmuxTerminalWheelAction = action;
+    if (action === "codex-transcript") {
+      return this.handleCodexTranscriptWheel(terminal, event, direction);
+    }
     if (action === "passthrough") {
       return true;
     }
@@ -1449,6 +1578,19 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
     const key = event.key.toLowerCase();
     const primaryModifier = event.ctrlKey || event.metaKey;
+    if (this.alternateWheelMode === "codex") {
+      if (event.key === "Escape") {
+        this.clearCodexTranscriptWheelTimers();
+        this.codexTranscriptWheelActive = false;
+        this.codexTranscriptOpenPending = false;
+        this.codexTranscriptPendingPages = 0;
+      } else if (!event.altKey && primaryModifier && key === "t") {
+        this.clearCodexTranscriptWheelTimers();
+        this.codexTranscriptWheelActive = !this.codexTranscriptWheelActive;
+        this.codexTranscriptOpenPending = false;
+        this.codexTranscriptPendingPages = 0;
+      }
+    }
     if (!event.altKey && primaryModifier && key === "c") {
       const hasSelection = terminal.getSelection().length > 0;
       // Explicit copy: Ctrl+Shift+C always, and Cmd+C with a selection on
