@@ -12973,6 +12973,9 @@ fn normalize_claude_restore_args(tokens: &[String]) -> String {
     while index < tokens.len() {
         let token = tokens[index].as_str();
         if matches!(token, "--continue" | "-c") {
+            if !continues {
+                restored.push("-c".to_string());
+            }
             continues = true;
             index += 1;
             continue;
@@ -16804,6 +16807,49 @@ mod tests {
         assert_eq!(
             restored_agent_launch_line(&session, &state).as_deref(),
             Some("claude -c")
+        );
+    }
+
+    #[test]
+    fn restored_agent_launch_line_preserves_explicit_claude_continue() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "conpty".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("D:\\work".to_string()),
+            command: vec!["powershell.exe".to_string(), "-NoLogo".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude --dangerously-skip-permissions -c".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"claude --dangerously-skip-permissions -c"}"#
+                    .to_string(),
+            ),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
+        assert_eq!(
+            normalize_restored_agent_launch(
+                "claude --dangerously-skip-permissions --continue --continue"
+            )
+            .as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
         );
     }
 
