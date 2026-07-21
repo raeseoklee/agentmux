@@ -139,6 +139,27 @@ body {
   background: transparent;
 }
 
+/* xterm 6 uses a VS Code-style overlay scrollbar instead of .xterm-viewport.
+   Keep its track out of sight until AgentMux observes an actual scroll. */
+.agentmux-live-terminal-host .xterm-scrollable-element > .scrollbar.vertical,
+.agentmux-live-terminal-host .xterm-decoration-overview-ruler {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"]
+  .xterm-scrollable-element
+  > .scrollbar.vertical {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.agentmux-live-terminal-host[data-agentmux-terminal-scrolling="true"]
+  .xterm-decoration-overview-ruler {
+  opacity: 1;
+}
+
 /* Hover affordances. The prototype used a style-hover attribute; here we use a
    data attribute + class so inline styles stay declarative. */
 .agentmux-hover {

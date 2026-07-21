@@ -8,7 +8,7 @@ describe("decideTerminalWheelAction", () => {
         bufferType: "normal",
         hasScrollback: true,
         canScroll: true,
-        alternateWheelMode: "page",
+        alternateWheelMode: "auto",
         mouseTracking: false,
       }),
     ).toBe("scrollback");
@@ -26,7 +26,7 @@ describe("decideTerminalWheelAction", () => {
     ).toBe("consume");
   });
 
-  it("uses Codex paging when an inline repaint leaves no local scrollback", () => {
+  it("uses agent paging when an inline repaint leaves no local scrollback", () => {
     expect(
       decideTerminalWheelAction({
         bufferType: "normal",
@@ -38,13 +38,13 @@ describe("decideTerminalWheelAction", () => {
     ).toBe("page");
   });
 
-  it("does not leak paging keys at a real local scrollback boundary", () => {
+  it("does not leak paging keys from a regular terminal at its scrollback boundary", () => {
     expect(
       decideTerminalWheelAction({
         bufferType: "normal",
         hasScrollback: true,
         canScroll: false,
-        alternateWheelMode: "page",
+        alternateWheelMode: "auto",
         mouseTracking: false,
       }),
     ).toBe("consume");
@@ -86,7 +86,7 @@ describe("decideTerminalWheelAction", () => {
     ).toBe("passthrough");
   });
 
-  it("lets a page-mode agent handle tracked wheel input itself", () => {
+  it("uses deterministic paging for a tracked Claude fullscreen session", () => {
     expect(
       decideTerminalWheelAction({
         bufferType: "alternate",
@@ -95,7 +95,19 @@ describe("decideTerminalWheelAction", () => {
         alternateWheelMode: "page",
         mouseTracking: true,
       }),
-    ).toBe("passthrough");
+    ).toBe("page");
+  });
+
+  it("keeps Claude paging when repaints create shallow local scrollback", () => {
+    expect(
+      decideTerminalWheelAction({
+        bufferType: "normal",
+        hasScrollback: true,
+        canScroll: true,
+        alternateWheelMode: "page",
+        mouseTracking: false,
+      }),
+    ).toBe("page");
   });
 
   it("uses the configured alternate-screen paging policy", () => {
