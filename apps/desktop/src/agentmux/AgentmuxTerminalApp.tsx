@@ -821,6 +821,7 @@ function terminalAgentKind(
   const text = [
     telemetry?.session,
     telemetry?.activity,
+    telemetry?.ctx,
     session?.backendKind,
   ]
     .filter(Boolean)

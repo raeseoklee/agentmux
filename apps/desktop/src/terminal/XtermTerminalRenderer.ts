@@ -30,14 +30,8 @@ import {
   type TerminalWebglRendererKind,
 } from "./TerminalWebglPolicy";
 import { decideTerminalWheelAction } from "./TerminalWheelPolicy";
+import { detectCodexTerminalScreen } from "./TerminalScreenProfile";
 import "@xterm/xterm/css/xterm.css";
-
-// TS-11: module-level escape hatch — set to false to disable multi-line paste
-// confirmation (e.g. when wiring a settings toggle later).
-let _multilinePasteGuardEnabled = true;
-export function setMultilinePasteGuard(enabled: boolean): void {
-  _multilinePasteGuardEnabled = enabled;
-}
 
 export const XTERM_THEME = {
   background: "#0e1116",
@@ -432,6 +426,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
   private alternateWheelMode: AlternateWheelMode = "auto";
+  private codexScreenDetected = false;
   private codexTranscriptWheelActive = false;
   private codexTranscriptOpenPending = false;
   private codexTranscriptPendingPages = 0;
@@ -493,6 +488,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // Reset repaint-observation state for this fresh terminal.
     this._siRing.fill(0);
     this._siHead = 0;
+    this.codexScreenDetected = false;
 
     // Register non-consuming CSI observers for absolute cursor-repositioning
     // sequences emitted heavily by full-screen TUIs (CUP ESC[row;colH,
@@ -643,6 +639,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     }
     return new Promise<void>((resolve) => {
       terminal.write(initialState.bytes!, () => {
+        this.updateCodexScreenDetection(terminal);
         this.syncCodexTranscriptWheelState(terminal);
         resolve();
       });
@@ -734,6 +731,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       return;
     }
     terminal.write(batch, () => {
+      this.updateCodexScreenDetection(terminal);
       this.syncCodexTranscriptWheelState(terminal);
       callback?.();
     });
@@ -793,7 +791,10 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     if (this.mountedElement) {
       this.mountedElement.dataset.agentmuxTerminalWheelMode = mode;
     }
-    if (mode === "codex") {
+    if (this.terminal) {
+      this.updateCodexScreenDetection(this.terminal);
+    }
+    if (this.effectiveAlternateWheelMode() === "codex") {
       if (this.terminal) {
         this.syncCodexTranscriptWheelState(this.terminal);
       }
@@ -1392,8 +1393,46 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     }
   }
 
+  private visibleTerminalLines(terminal: Terminal): string[] {
+    const buffer = terminal.buffer.active;
+    const lines: string[] = [];
+    for (let row = 0; row < terminal.rows; row++) {
+      lines.push(
+        buffer.getLine(buffer.baseY + row)?.translateToString(true) ?? "",
+      );
+    }
+    return lines;
+  }
+
+  private updateCodexScreenDetection(terminal: Terminal): void {
+    if (this.terminal !== terminal) {
+      return;
+    }
+    this.codexScreenDetected = detectCodexTerminalScreen(
+      this.visibleTerminalLines(terminal),
+    );
+    if (this.mountedElement) {
+      if (this.codexScreenDetected) {
+        this.mountedElement.dataset.agentmuxTerminalDetectedAgent = "codex";
+      } else {
+        delete this.mountedElement.dataset.agentmuxTerminalDetectedAgent;
+      }
+      this.mountedElement.dataset.agentmuxTerminalWheelEffectiveMode =
+        this.effectiveAlternateWheelMode();
+    }
+  }
+
+  private effectiveAlternateWheelMode(): AlternateWheelMode {
+    return this.alternateWheelMode === "codex" || this.codexScreenDetected
+      ? "codex"
+      : this.alternateWheelMode;
+  }
+
   private syncCodexTranscriptWheelState(terminal: Terminal): void {
-    if (this.alternateWheelMode !== "codex" || this.terminal !== terminal) {
+    if (
+      this.effectiveAlternateWheelMode() !== "codex" ||
+      this.terminal !== terminal
+    ) {
       return;
     }
     const buffer = terminal.buffer.active;
@@ -1476,10 +1515,13 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
     const direction = event.deltaY > 0 ? 1 : -1;
     const buffer = terminal.buffer.active;
+    this.updateCodexScreenDetection(terminal);
+    const wheelMode = this.effectiveAlternateWheelMode();
+    element.dataset.agentmuxTerminalWheelEffectiveMode = wheelMode;
     if (buffer.type === "normal") {
-      // Inline agents (notably Codex --no-alt-screen) keep their conversation in
-      // xterm's normal scrollback. Never synthesize PTY keys here: doing so moves
-      // prompt history or TUI selection instead of the visible conversation.
+      // Most inline agents keep their conversation in xterm's normal scrollback.
+      // The wheel policy can still delegate to an agent-owned virtual history
+      // (Claude page mode), even when a repaint left shallow local scrollback.
       const hasScrollback = buffer.baseY > 0;
       const canScrollUp = hasScrollback && direction < 0 && buffer.viewportY > 0;
       const canScrollDown =
@@ -1488,7 +1530,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
         bufferType: "normal",
         hasScrollback,
         canScroll: canScrollUp || canScrollDown,
-        alternateWheelMode: this.alternateWheelMode,
+        alternateWheelMode: wheelMode,
         mouseTracking: terminal.modes.mouseTrackingMode !== "none",
       });
       element.dataset.agentmuxTerminalWheelBuffer = "normal";
@@ -1511,7 +1553,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       bufferType: "alternate",
       hasScrollback: false,
       canScroll: false,
-      alternateWheelMode: this.alternateWheelMode,
+      alternateWheelMode: wheelMode,
       mouseTracking: terminal.modes.mouseTrackingMode !== "none",
     });
     element.dataset.agentmuxTerminalWheelBuffer = "alternate";
@@ -1578,7 +1620,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
 
     const key = event.key.toLowerCase();
     const primaryModifier = event.ctrlKey || event.metaKey;
-    if (this.alternateWheelMode === "codex") {
+    if (this.effectiveAlternateWheelMode() === "codex") {
       if (event.key === "Escape") {
         this.clearCodexTranscriptWheelTimers();
         this.codexTranscriptWheelActive = false;
@@ -1824,19 +1866,6 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // TS-12: normalize newlines before handlers see the text.
     // \r\n → \r, lone \n → \r (matching xterm.paste semantics for PTY input).
     const normalized = text.replace(/\r\n/g, "\r").replace(/\n/g, "\r");
-
-    // TS-11: multi-line paste guard — confirm before sending >1 line.
-    // Trigger when the normalized text has a \r that is not the sole trailing
-    // character — i.e. there is content on more than one line.  A single
-    // trailing \r (pressing Enter at end) does not count.
-    const hasMultipleLines = /\r[\s\S]/.test(normalized);
-    if (_multilinePasteGuardEnabled && hasMultipleLines) {
-      const preview = text.slice(0, 120);
-      const message = `여러 줄을 붙여넣습니다. 계속할까요?\n\n${preview}`;
-      if (!window.confirm(message)) {
-        return;
-      }
-    }
 
     for (const handler of this.pasteHandlers) {
       handler(normalized);

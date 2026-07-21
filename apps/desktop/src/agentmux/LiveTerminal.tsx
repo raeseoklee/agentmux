@@ -325,6 +325,18 @@ interface LiveTerminalProps {
   onExitIntent?: () => void;
 }
 
+function terminalWheelMode(
+  agentKind: LiveTerminalProps["agentKind"],
+): "auto" | "page" | "codex" {
+  if (agentKind === "codex") {
+    return "codex";
+  }
+  if (agentKind === "claude") {
+    return "page";
+  }
+  return "auto";
+}
+
 interface TerminalRestorePreviewProps {
   sessionId: string;
   innerMargin?: number;
@@ -560,9 +572,7 @@ export function LiveTerminal({
     if (restoredViewState) {
       markOutput();
     }
-    renderer.setAlternateWheelMode(
-      agentKindRef.current === "codex" ? "codex" : "auto",
-    );
+    renderer.setAlternateWheelMode(terminalWheelMode(agentKindRef.current));
     const unsubscribeOpenLink = renderer.onOpenLink((url, event) => {
       onOpenLinkRef.current?.(url, event);
     });
@@ -1481,9 +1491,7 @@ export function LiveTerminal({
   useEffect(() => {
     const normalized = agentKind ?? null;
     agentKindRef.current = normalized;
-    rendererRef.current?.setAlternateWheelMode(
-      normalized === "codex" ? "codex" : "auto",
-    );
+    rendererRef.current?.setAlternateWheelMode(terminalWheelMode(normalized));
   }, [agentKind]);
 
   useEffect(() => {

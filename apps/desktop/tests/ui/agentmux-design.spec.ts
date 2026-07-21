@@ -185,8 +185,10 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".xterm").first()).toBeVisible();
   await page.locator(".xterm").first().click();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept();
+  let pasteConfirmationOpened = false;
+  page.on("dialog", async (dialog) => {
+    pasteConfirmationOpened = true;
+    await dialog.dismiss();
   });
   await page.keyboard.press("Control+V");
 
@@ -197,6 +199,7 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
       ),
     )
     .toContain("scroll-line-90");
+  expect(pasteConfirmationOpened).toBe(false);
 
   // xterm 6 scrolls via the VS Code ScrollableElement (.xterm-scrollable-element),
   // not the legacy .xterm-viewport. Assert the real scroller is present and that
@@ -204,10 +207,18 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   const scrollable = page
     .locator(".agentmux-live-terminal-host .xterm-scrollable-element")
     .first();
+  const scrollbar = page
+    .locator(
+      ".agentmux-live-terminal-host .xterm-scrollable-element > .scrollbar.vertical",
+    )
+    .first();
   const scrollbarSlider = page
     .locator(
       ".agentmux-live-terminal-host .xterm-scrollable-element > .scrollbar.vertical > .slider",
     )
+    .first();
+  const overviewRuler = page
+    .locator(".agentmux-live-terminal-host .xterm-decoration-overview-ruler")
     .first();
   await expect(scrollable).toBeVisible();
   await expect
@@ -221,6 +232,8 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
       }),
     )
     .toBe(true);
+  await expect(scrollbar).toHaveCSS("opacity", "0");
+  await expect(overviewRuler).toHaveCSS("opacity", "0");
   const visibleTopLine = async () =>
     page.locator(".xterm-rows").first().evaluate((node) => {
       const matches = [
@@ -244,6 +257,11 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   await expect(
     page.locator(".agentmux-live-terminal-host").first(),
   ).toHaveAttribute("data-agentmux-terminal-wheel-action", "scrollback");
+  await expect(
+    page.locator(".agentmux-live-terminal-host").first(),
+  ).toHaveAttribute("data-agentmux-terminal-scrolling", "true");
+  await expect(scrollbar).toHaveCSS("opacity", "1");
+  await expect(overviewRuler).toHaveCSS("opacity", "1");
   await expect
     .poll(() => visibleTopLine())
     .toBeLessThan(beforeWheelTop ?? 0);
@@ -296,6 +314,139 @@ test("Codex wheel opens transcript instead of editing prompt history", async ({
           window.__AGENTMUX_PREVIEW__
             ?.terminalOutput(targetSessionId ?? undefined)
             ?.includes("\u0014") ?? false,
+        sessionId,
+      ),
+    )
+    .toBe(true);
+});
+
+test("restored Codex screen keeps transcript scrolling without telemetry", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: async () =>
+          ">_ OpenAI Codex (v0.144.6)\r\n" +
+          "\u203a Summarize recent commits\r\n" +
+          "gpt-5.5 default \u00b7 /mnt/c/work/agentmux",
+        writeText: async () => {},
+      },
+    });
+  });
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const host = page.locator(".agentmux-live-terminal-host").first();
+  await host.locator(".xterm").click();
+  await page.keyboard.press("Control+V");
+  await expect(host.locator(".xterm-rows")).toContainText("OpenAI Codex");
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-detected-agent",
+    "codex",
+  );
+
+  const pane = page
+    .locator("[data-agentmux-pane][data-agentmux-terminal-session]")
+    .first();
+  const sessionId = await pane.getAttribute("data-agentmux-terminal-session");
+  const box = await host.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(
+    (box?.x ?? 0) + (box?.width ?? 0) / 2,
+    (box?.y ?? 0) + (box?.height ?? 0) / 2,
+  );
+  await page.mouse.wheel(0, -500);
+
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-wheel-effective-mode",
+    "codex",
+  );
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-wheel-action",
+    "codex-transcript",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (targetSessionId) =>
+          window.__AGENTMUX_PREVIEW__
+            ?.terminalOutput(targetSessionId ?? undefined)
+            ?.includes("\u0014") ?? false,
+        sessionId,
+      ),
+    )
+    .toBe(true);
+});
+
+test("Claude wheel keeps paging past shallow ConPTY repaint scrollback", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  const repaintOutput = Array.from(
+    { length: 90 },
+    (_, index) => `claude-repaint-${String(index + 1).padStart(2, "0")}`,
+  ).join("\r\n");
+  await page.evaluate((text) => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        readText: async () => text,
+        writeText: async () => {},
+      },
+    });
+  }, repaintOutput);
+  await page.locator(".agentmux-new-terminal-tab").click();
+
+  const pane = page
+    .locator("[data-agentmux-pane][data-agentmux-terminal-session]")
+    .first();
+  const sessionId = await pane.getAttribute("data-agentmux-terminal-session");
+  expect(sessionId).not.toBeNull();
+  await page.locator(".xterm").first().click();
+  await page.keyboard.press("Control+V");
+  await expect(page.locator(".xterm-rows").first()).toContainText(
+    "claude-repaint-90",
+  );
+  await page.evaluate((targetSessionId) => {
+    window.__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      sessionId: targetSessionId ?? undefined,
+      state: "running",
+      telemetry: {
+        activity: "agent",
+        session: "claude --dangerously-skip-permissions",
+        ctx: "claude",
+      },
+    });
+  }, sessionId);
+
+  const host = page.locator(".agentmux-live-terminal-host").first();
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-wheel-mode",
+    "page",
+  );
+  const box = await host.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(
+    (box?.x ?? 0) + (box?.width ?? 0) / 2,
+    (box?.y ?? 0) + (box?.height ?? 0) / 2,
+  );
+  await page.mouse.wheel(0, -500);
+  await page.mouse.wheel(0, -500);
+  await page.mouse.wheel(0, -500);
+
+  await expect(host).toHaveAttribute(
+    "data-agentmux-terminal-wheel-action",
+    "page",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (targetSessionId) =>
+          (window.__AGENTMUX_PREVIEW__
+            ?.terminalOutput(targetSessionId ?? undefined)
+            ?.match(/\u001b\[5~/g)?.length ?? 0) >= 3,
         sessionId,
       ),
     )

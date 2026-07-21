@@ -24,21 +24,27 @@ export function decideTerminalWheelAction(
     return "codex-transcript";
   }
 
+  // Claude owns a virtual conversation history. Its repaints can leave a
+  // shallow xterm scrollback behind, but switching to that buffer strands the
+  // wheel at the repaint boundary instead of reaching older messages.
+  if (context.alternateWheelMode === "page") {
+    return "page";
+  }
+
   if (context.bufferType === "normal") {
     if (context.hasScrollback) {
       return context.canScroll ? "scrollback" : "consume";
     }
-    // Codex can repaint in place even with --no-alt-screen, leaving xterm's
-    // normal buffer with no local history. Its page keys are the only useful
-    // fallback in that state; cursor keys would edit composer history.
-    return context.alternateWheelMode === "page" ? "page" : "consume";
+    // Inline TUIs can repaint in place while leaving xterm with no local
+    // history. Page-mode agents receive explicit page navigation in that state;
+    // cursor keys would edit composer history instead of the conversation.
+    return "consume";
   }
 
-  // A full-screen TUI that enabled mouse tracking owns wheel semantics. Let
-  // xterm encode the native wheel report even when the fallback mode is page;
-  // synthetic PageUp bypasses apps such as Codex that scroll their own history.
+  // Other full-screen TUIs that enabled mouse tracking own wheel semantics.
+  // Let xterm encode and forward their native wheel report.
   if (context.mouseTracking) {
     return "passthrough";
   }
-  return context.alternateWheelMode === "page" ? "page" : "cursor";
+  return "cursor";
 }
