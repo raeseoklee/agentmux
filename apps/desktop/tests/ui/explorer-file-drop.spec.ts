@@ -56,12 +56,14 @@ test("Explorer file drop inserts a quoted path into the targeted WSL terminal", 
       }
     ).__TAURI__ = {
       event: {
-        listen: async (_event, handler) => {
-          (
-            window as Window & {
-              __AGENTMUX_FILE_DROP_HANDLER__?: typeof handler;
-            }
-          ).__AGENTMUX_FILE_DROP_HANDLER__ = handler;
+        listen: async (eventName, handler) => {
+          if (eventName === "agentmux://explorer-file-drop") {
+            (
+              window as Window & {
+                __AGENTMUX_FILE_DROP_HANDLER__?: typeof handler;
+              }
+            ).__AGENTMUX_FILE_DROP_HANDLER__ = handler;
+          }
           return () => undefined;
         },
       },
@@ -137,12 +139,15 @@ test("Explorer file drop inserts a quoted path into the targeted WSL terminal", 
 
   await expect
     .poll(() =>
-      page.evaluate(() =>
+      page.evaluate((sessionId) =>
         (
           window as Window & {
-            __AGENTMUX_PREVIEW__?: { terminalOutput: () => string };
+            __AGENTMUX_PREVIEW__?: {
+              terminalOutput: (targetSessionId?: string) => string;
+            };
           }
-        ).__AGENTMUX_PREVIEW__?.terminalOutput(),
+        ).__AGENTMUX_PREVIEW__?.terminalOutput(sessionId ?? undefined),
+        target.sessionId,
       ),
     )
     .toContain("'/mnt/d/Agent Mux/release notes.md' ");

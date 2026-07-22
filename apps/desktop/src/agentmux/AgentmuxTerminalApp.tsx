@@ -67,6 +67,11 @@ import {
 import { useAppDialogs } from "./dialogs";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
 import {
+  readSurfaceTitleOverrides,
+  surfaceTitleOverride,
+  writeSurfaceTitleOverrides,
+} from "./surfaceTitleOverrides";
+import {
   formatDroppedPaths,
   installExplorerFileDrop,
   type ExplorerFileDropPayload,
@@ -99,6 +104,7 @@ import {
   IconGrid,
   IconMoon,
   IconPlus,
+  IconReset,
   IconSearch,
   IconBalance,
   IconServer,
@@ -470,7 +476,6 @@ const SURFACE_TAB_DRAG_TYPE = "application/x-agentmux-surface-tab";
 const PANE_SURFACE_DRAG_TYPE = "application/x-agentmux-pane-surface";
 const WORKSPACE_ORDER_STORAGE_KEY = "agentmux.workspaceOrder.v1";
 const SURFACE_TAB_ORDER_STORAGE_PREFIX = "agentmux.surfaceTabOrder.v1:";
-const SURFACE_TITLE_OVERRIDE_STORAGE_KEY = "agentmux.surfaceTitleOverrides.v1";
 const FONT_SIZE_MIN = 10;
 const FONT_SIZE_MAX = 18;
 const FONT_SIZE_DEFAULT = 12.5;
@@ -527,28 +532,6 @@ function parseDragPayload<T>(
     return JSON.parse(raw) as T;
   } catch {
     return null;
-  }
-}
-
-function readSurfaceTitleOverrides(): Record<string, string> {
-  try {
-    const raw = window.localStorage.getItem(SURFACE_TITLE_OVERRIDE_STORAGE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-      return parsed as Record<string, string>;
-    }
-    return {};
-  } catch {
-    return {};
-  }
-}
-
-function writeSurfaceTitleOverrides(overrides: Record<string, string>): void {
-  try {
-    window.localStorage.setItem(SURFACE_TITLE_OVERRIDE_STORAGE_KEY, JSON.stringify(overrides));
-  } catch {
-    // Storage failures should not block work.
   }
 }
 
@@ -5634,10 +5617,25 @@ export function AgentmuxTerminalApp() {
     setRenamingTabDraft(surfaceTitleOverrides[surfaceId] ?? currentTitle);
   }, [surfaceTitleOverrides]);
 
+  const promptTabRename = useCallback(async (surface: SurfaceSummary) => {
+    const rawTitle = await dialogs.prompt({
+      title: t("surface.tab.renameTitle"),
+      label: t("surface.tab.nameLabel"),
+      initialValue: surfaceTitleOverrides[surface.surfaceId] ?? surface.title,
+      required: true,
+      confirmLabel: t("common.save"),
+      cancelLabel: t("common.cancel"),
+    });
+    const title = surfaceTitleOverride(rawTitle);
+    if (title !== null) {
+      setSurfaceTitleOverride(surface.surfaceId, title);
+    }
+  }, [dialogs, setSurfaceTitleOverride, surfaceTitleOverrides, t]);
+
   const commitTabRename = useCallback((surfaceId: string) => {
-    const trimmed = renamingTabDraft.trim();
-    if (trimmed) {
-      setSurfaceTitleOverride(surfaceId, trimmed);
+    const title = surfaceTitleOverride(renamingTabDraft);
+    if (title !== null) {
+      setSurfaceTitleOverride(surfaceId, title);
     } else {
       clearSurfaceTitleOverride(surfaceId);
     }
@@ -6196,7 +6194,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "surface.renameTab",
         group: "view",
-        title: "탭 이름 바꾸기",
+        title: t("surface.tab.rename"),
         keywords: ["tab", "rename", "title"],
         disabled: activePaneId === null,
         run: renameCurrentTab,
@@ -8197,7 +8195,7 @@ export function AgentmuxTerminalApp() {
                             textOverflow: "ellipsis",
                           }}
                         >
-                          {surface.title}
+                          {surfaceTitleOverrides[surface.surfaceId] ?? surface.title}
                         </div>
                         <div
                           style={{
@@ -8206,9 +8204,43 @@ export function AgentmuxTerminalApp() {
                             marginTop: 4,
                           }}
                         >
-                          Tab actions
+                          {t("surface.tab.actions")}
                         </div>
                       </div>
+                      <Hov
+                        tag="button"
+                        className="agentmux-surface-tab-menu-rename"
+                        style={groupMenuItemStyle}
+                        hover={groupMenuItemHover}
+                        onClick={() => {
+                          closeSurfaceTabMenu();
+                          void promptTabRename(surface);
+                        }}
+                      >
+                        <IconGear size={12} />
+                        {t("surface.tab.rename")}
+                      </Hov>
+                      {surfaceTitleOverrides[surface.surfaceId] ? (
+                        <Hov
+                          tag="button"
+                          className="agentmux-surface-tab-menu-reset-title"
+                          style={groupMenuItemStyle}
+                          hover={groupMenuItemHover}
+                          onClick={() => {
+                            clearSurfaceTitleOverride(surface.surfaceId);
+                            closeSurfaceTabMenu();
+                          }}
+                        >
+                          <IconReset size={12} />
+                          {t("surface.tab.reset")}
+                        </Hov>
+                      ) : null}
+                      <div
+                        style={{
+                          borderTop: "1px solid var(--border)",
+                          margin: "5px 0",
+                        }}
+                      />
                       <Hov
                         tag="button"
                         className="agentmux-surface-tab-menu-split-right"
@@ -8347,6 +8379,8 @@ export function AgentmuxTerminalApp() {
                   : session
                     ? Boolean(attentionBySession.get(session.sessionId))
                     : false;
+                const displayTitle =
+                  surfaceTitleOverrides[surface.surfaceId] ?? surface.title;
                 return (
                   <Hov
                     key={surface.surfaceId}
@@ -8455,13 +8489,13 @@ export function AgentmuxTerminalApp() {
                           beginTabRename(surface.surfaceId, surface.title);
                         }}
                       >
-                        {surfaceTitleOverrides[surface.surfaceId] ?? surface.title}
+                        {displayTitle}
                       </span>
                     )}
                     <Hov
                       tag="span"
                       className="agentmux-surface-tab-move-left"
-                      ariaLabel={`Move ${surface.title} left`}
+                      ariaLabel={`Move ${displayTitle} left`}
                       title="Move tab left"
                       style={{
                         width: 17,
@@ -8494,7 +8528,7 @@ export function AgentmuxTerminalApp() {
                     <Hov
                       tag="span"
                       className="agentmux-surface-tab-move-right"
-                      ariaLabel={`Move ${surface.title} right`}
+                      ariaLabel={`Move ${displayTitle} right`}
                       title="Move tab right"
                       style={{
                         width: 17,
@@ -8526,7 +8560,7 @@ export function AgentmuxTerminalApp() {
                     <Hov
                       tag="span"
                       className="agentmux-surface-tab-workspace-menu"
-                      ariaLabel={`Move ${surface.title} to workspace`}
+                      ariaLabel={`Move ${displayTitle} to workspace`}
                       title="Move tab to workspace"
                       style={{
                         width: 17,
@@ -8560,7 +8594,7 @@ export function AgentmuxTerminalApp() {
                     <Hov
                       tag="span"
                       className="agentmux-surface-tab-close"
-                      ariaLabel={`Close ${surface.title}`}
+                      ariaLabel={`Close ${displayTitle}`}
                       title="Close tab"
                       style={{
                         width: 17,

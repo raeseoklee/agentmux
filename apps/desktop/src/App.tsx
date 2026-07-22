@@ -12,6 +12,7 @@ import {
   type WslDistribution
 } from "./control/ControlClient";
 import { XtermTerminalRenderer } from "./terminal/XtermTerminalRenderer";
+import { TerminalResizeCoordinator } from "./terminal/TerminalResizeCoordinator";
 import { useAppDialogs } from "./agentmux/dialogs";
 
 const encoder = new TextEncoder();
@@ -47,6 +48,7 @@ const DEFAULT_BROWSER_STATE: BrowserPaneState = {
 export function App() {
   const dialogs = useAppDialogs();
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
+  const resizeCoordinatorRef = useRef<TerminalResizeCoordinator | null>(null);
   const sessionRef = useRef<TerminalSession | null>(null);
   const activeWorkspaceRef = useRef<WorkspaceSummary | null>(null);
   const renderedLengthRef = useRef(0);
@@ -90,6 +92,20 @@ export function App() {
       bytes: encoder.encode("")
     });
     rendererRef.current = renderer;
+    const resizeCoordinator = new TerminalResizeCoordinator({
+      delayMs: 160,
+      send: async ({ columns, rows }) => {
+        const activeSession = sessionRef.current;
+        if (!activeSession) {
+          return;
+        }
+        await client.resize(activeSession.sessionId, columns, rows);
+      },
+      onError: () => {
+        setSession((current) => ({ ...current, state: "failed" }));
+      },
+    });
+    resizeCoordinatorRef.current = resizeCoordinator;
 
     const unsubscribeInput = renderer.onData((data) => {
       const activeSession = sessionRef.current;
@@ -108,9 +124,7 @@ export function App() {
         return;
       }
 
-      client.resize(activeSession.sessionId, columns, rows).catch(() => {
-        setSession((current) => ({ ...current, state: "failed" }));
-      });
+      resizeCoordinator.request({ columns, rows });
     });
 
     const resizeObserver = new ResizeObserver(() => renderer.fit());
@@ -127,6 +141,10 @@ export function App() {
     return () => {
       unsubscribeInput();
       unsubscribeResize();
+      resizeCoordinator.dispose();
+      if (resizeCoordinatorRef.current === resizeCoordinator) {
+        resizeCoordinatorRef.current = null;
+      }
       resizeObserver.disconnect();
       renderer.dispose();
       if (rendererRef.current === renderer) {
@@ -675,6 +693,14 @@ export function App() {
     const nextSession = selectSession(detail, preferredSessionId);
     const sessionChanged = nextSession?.sessionId !== previousSessionId;
     sessionRef.current = nextSession;
+    if (sessionChanged) {
+      const resizeCoordinator = resizeCoordinatorRef.current;
+      resizeCoordinator?.reset();
+      const size = rendererRef.current?.size();
+      if (nextSession && size) {
+        resizeCoordinator?.request(size, true);
+      }
+    }
     if (resetOutput || sessionChanged) {
       renderedLengthRef.current = 0;
     }
