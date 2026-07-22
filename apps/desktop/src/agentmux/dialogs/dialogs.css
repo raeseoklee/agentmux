@@ -5,8 +5,8 @@
   display: grid;
   place-items: center;
   padding: 20px;
-  background: color-mix(in srgb, #000 58%, transparent);
-  backdrop-filter: blur(8px);
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: none;
 }
 
 .agentmux-dialog {
