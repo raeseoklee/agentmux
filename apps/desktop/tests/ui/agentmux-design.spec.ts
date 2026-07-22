@@ -647,6 +647,64 @@ test("workspace project settings update metadata and agent preset", async ({
   await expect(page.getByText("D:\\work\\alpha").first()).toBeVisible();
 });
 
+test("workspace settings can target a workspace from its context menu or selector", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-workspace-plus").click();
+  await page.locator(".agentmux-workspace-inline-name-input").press("Enter");
+
+  const secondWorkspace = page
+    .locator(".agentmux-workspace-card")
+    .filter({ hasText: "Workspace 2" });
+  await expect(secondWorkspace).toHaveAttribute("data-agentmux-active", "true");
+  const firstWorkspace = page
+    .locator(".agentmux-workspace-card")
+    .filter({ hasText: "Workspace 1" });
+  await firstWorkspace.click({ button: "right" });
+  await page.locator(".agentmux-workspace-menu-settings").click();
+
+  await expect(page.locator("[data-agentmux-workspace-settings]")).toBeVisible();
+  const selector = page.locator(".agentmux-workspace-settings-selector");
+  await expect(selector).toHaveAccessibleName("Workspace to edit");
+  await expect(page.locator(".agentmux-workspace-name-input")).toHaveValue(
+    "Workspace 1",
+  );
+
+  await page
+    .locator(".agentmux-workspace-description-input")
+    .fill("Unsaved workspace draft");
+  await selector.selectOption({ label: "Workspace 2" });
+  const discardDialog = appDialog(page);
+  await expect(discardDialog).toContainText(
+    "Discard unsaved workspace changes?",
+  );
+  await dismissAppDialog(page);
+  await expect(page.locator(".agentmux-workspace-name-input")).toHaveValue(
+    "Workspace 1",
+  );
+
+  await selector.selectOption({ label: "Workspace 2" });
+  await acceptAppDialog(page);
+  await expect(page.locator(".agentmux-workspace-name-input")).toHaveValue(
+    "Workspace 2",
+  );
+  await page.locator(".agentmux-workspace-name-input").fill("Second project");
+  await page.locator(".agentmux-workspace-save").click();
+  await page.keyboard.press("Escape");
+
+  const renamedSecondWorkspace = page
+    .locator(".agentmux-workspace-card")
+    .filter({ hasText: "Second project" });
+  await expect(renamedSecondWorkspace).toHaveCount(1);
+  await expect(firstWorkspace).toHaveCount(1);
+  await expect(renamedSecondWorkspace).toHaveAttribute(
+    "data-agentmux-active",
+    "true",
+  );
+});
+
 test("workspace groups can be created edited collapsed and extended", async ({
   page,
 }) => {

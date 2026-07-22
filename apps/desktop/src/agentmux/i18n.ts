@@ -129,6 +129,7 @@ export type I18nKey =
   | "workspace.status.running"
   | "workspace.status.sessionCount"
   | "workspace.status.idle"
+  | "workspace.settings"
   | "statusbar.surfaceSummary"
   | "action.group.agent"
   | "action.group.terminal"
@@ -137,6 +138,7 @@ export type I18nKey =
   | "action.group.remote"
   | "settings.workspace.noActiveProject"
   | "settings.workspace.scope"
+  | "settings.workspace.selector"
   | "settings.workspace.name"
   | "settings.workspace.root"
   | "settings.workspace.description"
@@ -147,7 +149,11 @@ export type I18nKey =
   | "settings.workspace.defaultAgentCommand"
   | "settings.workspace.systemDefault"
   | "settings.workspace.saveProject"
+  | "settings.workspace.saveFailed"
   | "settings.workspace.title"
+  | "settings.workspace.unsavedTitle"
+  | "settings.workspace.unsavedDescription"
+  | "settings.workspace.discardChanges"
   | "shortcuts.conflictsTitle"
   | "shortcuts.editDescription"
   | "shortcuts.editTitle"
@@ -359,7 +365,8 @@ const en: Record<I18nKey, string> = {
   "action.group.view": "View",
   "action.group.remote": "Remote · WSL",
   "settings.workspace.noActiveProject": "No active workspace.",
-  "settings.workspace.scope": "Active workspace",
+  "settings.workspace.scope": "Workspace to edit",
+  "settings.workspace.selector": "Workspace to edit",
   "settings.workspace.name": "Name",
   "settings.workspace.root": "Workspace root",
   "settings.workspace.description": "Description",
@@ -370,7 +377,12 @@ const en: Record<I18nKey, string> = {
   "settings.workspace.defaultAgentCommand": "Default agent command",
   "settings.workspace.systemDefault": "System default",
   "settings.workspace.saveProject": "Save workspace",
+  "settings.workspace.saveFailed": "Could not save workspace settings",
   "settings.workspace.title": "Workspace",
+  "settings.workspace.unsavedTitle": "Discard unsaved workspace changes?",
+  "settings.workspace.unsavedDescription":
+    "Switching workspaces will discard changes you have not saved.",
+  "settings.workspace.discardChanges": "Discard changes",
   "shortcuts.conflictsTitle": "Shortcut conflicts",
   "shortcuts.editDescription":
     "Focus a key field and press the combination. Use the second field only for a two-step chord.",
@@ -388,7 +400,7 @@ const en: Record<I18nKey, string> = {
   "shortcuts.secondStroke": "Second key (optional chord)",
   "shortcuts.unassign": "Unassign",
   "updates.autoCheck": "Check for updates automatically",
-  "updates.autoCheckHint": "AgentMux checks GitHub Releases at startup. Installation still requires your approval.",
+  "updates.autoCheckHint": "AgentMux checks GitHub Releases at startup and periodically while it is running. Installation still requires your approval.",
   "updates.check": "Check for updates",
   "updates.install": "Download and install",
   "updates.notification.action": "Open update",
@@ -430,6 +442,7 @@ const en: Record<I18nKey, string> = {
   "workspace.group.nameLabel": "Group name",
   "workspace.none": "No workspace",
   "workspace.section": "Workspaces",
+  "workspace.settings": "Workspace settings",
   "workspace.selectedCount": "{count} selected",
 };
 
@@ -529,7 +542,8 @@ const ko: Record<I18nKey, string> = {
   "settings.terminalLinkOpen.system": "시스템 브라우저",
   "settings.terminalLinkOpen.inApp": "앱 내부 브라우저",
   "settings.workspace.noActiveProject": "활성 워크스페이스가 없습니다.",
-  "settings.workspace.scope": "활성 워크스페이스",
+  "settings.workspace.scope": "편집할 워크스페이스",
+  "settings.workspace.selector": "편집할 워크스페이스",
   "settings.workspace.name": "이름",
   "settings.workspace.root": "워크스페이스 루트",
   "settings.workspace.description": "설명",
@@ -540,9 +554,14 @@ const ko: Record<I18nKey, string> = {
   "settings.workspace.defaultAgentCommand": "기본 에이전트 명령",
   "settings.workspace.systemDefault": "시스템 기본값",
   "settings.workspace.saveProject": "워크스페이스 저장",
+  "settings.workspace.saveFailed": "워크스페이스 설정을 저장하지 못했습니다",
   "settings.workspace.title": "워크스페이스",
+  "settings.workspace.unsavedTitle": "저장하지 않은 변경사항을 버릴까요?",
+  "settings.workspace.unsavedDescription":
+    "다른 워크스페이스로 전환하면 저장하지 않은 변경사항이 사라집니다.",
+  "settings.workspace.discardChanges": "변경사항 버리기",
   "updates.autoCheck": "자동으로 업데이트 확인",
-  "updates.autoCheckHint": "AgentMux가 시작될 때 GitHub Release를 확인합니다. 설치는 사용자가 승인해야 진행됩니다.",
+  "updates.autoCheckHint": "AgentMux가 시작될 때와 실행 중에 주기적으로 GitHub Release를 확인합니다. 설치는 사용자가 승인해야 진행됩니다.",
   "updates.check": "업데이트 확인",
   "updates.install": "다운로드 및 설치",
   "updates.notification.action": "업데이트 열기",
@@ -572,6 +591,7 @@ const ko: Record<I18nKey, string> = {
   "workspace.group.moveUp": "그룹 위로 이동",
   "workspace.none": "워크스페이스 없음",
   "workspace.section": "워크스페이스",
+  "workspace.settings": "워크스페이스 설정",
   "workspace.selectedCount": "{count}개 선택",
   "settings.terminalStartDirectory": "터미널 시작 위치",
   "settings.terminalStartDirectoryHint":

@@ -36,6 +36,10 @@ test("settings separates workspace scope and advanced configuration", async ({ p
   await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
+  await page.locator(".agentmux-settings-tab-general").click();
+  await expect(page.locator("[data-agentmux-update-settings]")).toContainText(
+    "AgentMux checks GitHub Releases at startup and periodically while it is running.",
+  );
   await page.locator(".agentmux-settings-tab-workspace").click();
 
   await expect(page.locator("[data-agentmux-workspace-settings]")).toBeVisible();
@@ -64,6 +68,30 @@ test("app dialogs restore focus after keyboard cancellation", async ({ page }) =
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(trigger).toBeFocused();
+});
+
+test("app dialogs keep the application visible without backdrop blur", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-workspace-group-create").click();
+  const backdrop = page.getByTestId("agentmux-dialog-backdrop");
+  await expect(backdrop).toBeVisible();
+  await expect
+    .poll(() =>
+      backdrop.evaluate((element) => {
+        const style = window.getComputedStyle(element);
+        return {
+          backdropFilter: style.backdropFilter,
+          backgroundColor: style.backgroundColor,
+        };
+      }),
+    )
+    .toEqual({
+      backdropFilter: "none",
+      backgroundColor: "rgba(0, 0, 0, 0.5)",
+    });
 });
 
 test("settings traps focus and restores the caller after Escape", async ({ page }) => {

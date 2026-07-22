@@ -219,6 +219,13 @@ import {
   shouldUseInAppUpdateFallback,
   UPDATE_NOTIFICATION_OPEN_EVENT,
 } from "./updateNotifications";
+import {
+  AUTO_UPDATE_PERIODIC_INTERVAL_MS,
+  AUTO_UPDATE_RESUME_STALE_MS,
+  isAutomaticUpdateCheckDue,
+  shouldPauseAutomaticUpdateChecks,
+  type UpdateLifecycleStatus,
+} from "./updateCheckSchedule";
 import desktopPackage from "../../package.json";
 
 type Overlay = "palette" | "search" | "settings" | "setup" | "notifications" | null;
@@ -235,15 +242,7 @@ const SSH_UI_ENABLED = false;
 const APP_VERSION =
   typeof desktopPackage.version === "string" ? desktopPackage.version : "0.0.0";
 
-type AppUpdateStatus =
-  | "idle"
-  | "checking"
-  | "available"
-  | "not_available"
-  | "downloading"
-  | "installed"
-  | "error"
-  | "unsupported";
+type AppUpdateStatus = UpdateLifecycleStatus;
 
 interface AppUpdateState {
   status: AppUpdateStatus;
@@ -2044,6 +2043,9 @@ export function AgentmuxTerminalApp() {
   const [accentKey, setAccentKey] = useState("blue");
   const [overlay, setOverlay] = useState<Overlay>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("appearance");
+  const [settingsWorkspaceId, setSettingsWorkspaceId] = useState<string | null>(
+    null,
+  );
   const [query, setQuery] = useState("");
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
   const [fontSize, setFontSize] = useState(12.5);
@@ -2170,11 +2172,36 @@ export function AgentmuxTerminalApp() {
   const [broadcastRootId, setBroadcastRootId] = useState<string | null>(null);
   const broadcastRootIdRef = useRef<string | null>(null);
   const terminalLaunchPendingRef = useRef(false);
-  const autoUpdateCheckStartedRef = useRef(false);
+  const lastUpdateCheckAttemptAtRef = useRef<number | null>(null);
+  const updateCheckInFlightRef = useRef<Promise<TauriUpdate | null> | null>(
+    null,
+  );
   const updateResourceRef = useRef<TauriUpdate | null>(null);
+  const workspaceUpdateQueueRef = useRef<Map<string, Promise<void>>>(
+    new Map(),
+  );
   const pendingShortcutRef = useRef<string | null>(null);
   const pendingShortcutTimerRef = useRef<number | null>(null);
   const browserDialogsInFlightRef = useRef<Set<string>>(new Set());
+
+  const updateWorkspaceSerialized = useCallback(
+    (workspaceId: string, input: WorkspaceUpdateInput): Promise<void> => {
+      const queue = workspaceUpdateQueueRef.current;
+      const previous = queue.get(workspaceId) ?? Promise.resolve();
+      const next = previous
+        .catch(() => undefined)
+        .then(() => ctl.updateWorkspace(workspaceId, input));
+      queue.set(workspaceId, next);
+      const clearIfCurrent = () => {
+        if (queue.get(workspaceId) === next) {
+          queue.delete(workspaceId);
+        }
+      };
+      void next.then(clearIfCurrent, clearIfCurrent);
+      return next;
+    },
+    [ctl.updateWorkspace],
+  );
 
   const applyConfig = useCallback((config: AppConfig) => {
     setTheme(config.appearance.theme);
@@ -2339,11 +2366,16 @@ export function AgentmuxTerminalApp() {
     [],
   );
   const setAutoUpdateCheck = useCallback((autoCheck: boolean) => {
+    if (autoCheck) {
+      lastUpdateCheckAttemptAtRef.current = null;
+    }
     setUpdatesConfig((current) => ({ ...current, autoCheck }));
   }, []);
   const checkForUpdates = useCallback(
     async (options: { background?: boolean } = {}) => {
       const background = options.background ?? false;
+      let request: Promise<TauriUpdate | null> | null = null;
+      lastUpdateCheckAttemptAtRef.current = Date.now();
       if (!isTauriDesktopRuntime()) {
         if (!background) {
           setUpdateState({
@@ -2362,10 +2394,17 @@ export function AgentmuxTerminalApp() {
             message: null,
           }));
         }
-        const updater = await import("@tauri-apps/plugin-updater");
-        await updateResourceRef.current?.close().catch(() => undefined);
-        updateResourceRef.current = null;
-        const update = await updater.check({ timeout: 15_000 });
+        request = updateCheckInFlightRef.current;
+        if (!request) {
+          request = (async () => {
+            const updater = await import("@tauri-apps/plugin-updater");
+            await updateResourceRef.current?.close().catch(() => undefined);
+            updateResourceRef.current = null;
+            return updater.check({ timeout: 15_000 });
+          })();
+          updateCheckInFlightRef.current = request;
+        }
+        const update = await request;
         const checkedAt = new Date().toISOString();
         if (!update) {
           setUpdateState({
@@ -2431,6 +2470,10 @@ export function AgentmuxTerminalApp() {
           });
         }
         return null;
+      } finally {
+        if (updateCheckInFlightRef.current === request) {
+          updateCheckInFlightRef.current = null;
+        }
       }
     },
     [activeWorkspaceId, client, t],
@@ -2488,13 +2531,56 @@ export function AgentmuxTerminalApp() {
     if (
       !configLoaded ||
       !updatesConfig.autoCheck ||
-      autoUpdateCheckStartedRef.current
+      shouldPauseAutomaticUpdateChecks(
+        updateState.status,
+        updateResourceRef.current !== null,
+      )
     ) {
       return;
     }
-    autoUpdateCheckStartedRef.current = true;
-    void checkForUpdates({ background: true });
-  }, [checkForUpdates, configLoaded, updatesConfig.autoCheck]);
+
+    const checkIfDue = (minimumIntervalMs: number) => {
+      if (
+        shouldPauseAutomaticUpdateChecks(
+          updateState.status,
+          updateResourceRef.current !== null,
+        ) ||
+        updateCheckInFlightRef.current ||
+        !isAutomaticUpdateCheckDue(
+          lastUpdateCheckAttemptAtRef.current,
+          Date.now(),
+          minimumIntervalMs,
+        )
+      ) {
+        return;
+      }
+      void checkForUpdates({ background: true });
+    };
+
+    checkIfDue(AUTO_UPDATE_RESUME_STALE_MS);
+    const interval = window.setInterval(
+      () => checkIfDue(AUTO_UPDATE_PERIODIC_INTERVAL_MS),
+      AUTO_UPDATE_PERIODIC_INTERVAL_MS,
+    );
+    const checkAfterResume = () => {
+      if (document.visibilityState === "visible") {
+        checkIfDue(AUTO_UPDATE_RESUME_STALE_MS);
+      }
+    };
+    window.addEventListener("focus", checkAfterResume);
+    document.addEventListener("visibilitychange", checkAfterResume);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", checkAfterResume);
+      document.removeEventListener("visibilitychange", checkAfterResume);
+    };
+  }, [
+    checkForUpdates,
+    configLoaded,
+    updatesConfig.autoCheck,
+    updateState.status,
+  ]);
   useEffect(() => {
     const eventApi = (
       window as Window & {
@@ -2519,6 +2605,7 @@ export function AgentmuxTerminalApp() {
         if (typeof event.payload?.version === "string") {
           acknowledgeUpdateNotification(event.payload.version);
         }
+        setSettingsWorkspaceId(activeWorkspaceId);
         setSettingsTab("general");
         setOverlay("settings");
       })
@@ -2534,7 +2621,7 @@ export function AgentmuxTerminalApp() {
       disposed = true;
       unlisten?.();
     };
-  }, []);
+  }, [activeWorkspaceId]);
   const reloadConfig = useCallback(async () => {
     try {
       const config = await client.reloadConfig(activeWorkspaceId);
@@ -3194,6 +3281,11 @@ export function AgentmuxTerminalApp() {
   const activeWorkspace = workspaces.find(
     (ws) => ws.workspaceId === activeWorkspaceId,
   );
+  const settingsWorkspace =
+    workspaces.find((ws) => ws.workspaceId === settingsWorkspaceId) ??
+    activeWorkspace ??
+    workspaces[0] ??
+    null;
   const gitStatusLabel = useMemo(() => {
     const branch = sidebarState?.gitBranch?.trim();
     const hash = sidebarState?.gitHash?.trim();
@@ -6219,7 +6311,10 @@ export function AgentmuxTerminalApp() {
         group: "view",
         title: t("app.settings.open"),
         keywords: ["settings"],
-        run: () => setOverlay("settings"),
+        run: () => {
+          setSettingsWorkspaceId(activeWorkspaceId);
+          setOverlay("settings");
+        },
       },
       {
         id: "notification.openPanel",
@@ -6961,7 +7056,10 @@ export function AgentmuxTerminalApp() {
             title={t("app.settings.open")}
             style={iconBtn}
             hover={iconBtnHover}
-            onClick={() => setOverlay("settings")}
+            onClick={() => {
+              setSettingsWorkspaceId(activeWorkspaceId);
+              setOverlay("settings");
+            }}
           >
             <IconGear />
           </Hov>
@@ -7756,7 +7854,10 @@ export function AgentmuxTerminalApp() {
                 color: "var(--fg3)",
               }}
               hover={{ background: "var(--s2)", color: "var(--fg1)" }}
-              onClick={() => setOverlay("settings")}
+              onClick={() => {
+                setSettingsWorkspaceId(activeWorkspaceId);
+                setOverlay("settings");
+              }}
             >
               <IconGear size={14} />
               <span style={{ font: `500 12px/1 ${FONT_SANS}` }}>
@@ -8004,6 +8105,21 @@ export function AgentmuxTerminalApp() {
                           </div>
                         )}
                       </div>
+                      <Hov
+                        tag="button"
+                        className="agentmux-workspace-menu-settings"
+                        style={groupMenuItemStyle}
+                        hover={groupMenuItemHover}
+                        onClick={() => {
+                          closeWorkspaceMenu();
+                          setSettingsWorkspaceId(workspace.workspaceId);
+                          setSettingsTab("workspace");
+                          setOverlay("settings");
+                        }}
+                      >
+                        <IconGear size={12} />
+                        {t("workspace.settings")}
+                      </Hov>
                       <Hov
                         tag="button"
                         className="agentmux-workspace-menu-rename"
@@ -8934,7 +9050,7 @@ export function AgentmuxTerminalApp() {
             stop={stop}
             onRunTmuxProbe={(distribution) => void runTmuxProbe(distribution)}
             onUpdateWorkspace={(workspaceId, input) =>
-              void ctl.updateWorkspace(workspaceId, input)
+              void updateWorkspaceSerialized(workspaceId, input)
             }
           />
         ) : null}
@@ -8976,7 +9092,9 @@ export function AgentmuxTerminalApp() {
             tmuxProbe={tmuxProbe}
             tmuxProbeBusy={tmuxProbeBusy}
             profiles={profiles}
-            activeWorkspace={activeWorkspace ?? null}
+            workspaces={workspaces}
+            activeWorkspace={settingsWorkspace}
+            selectedWorkspaceId={settingsWorkspace?.workspaceId ?? null}
             wslDistributions={wslDistributions}
             actions={actions}
             shortcutBindings={shortcutBindings}
@@ -8984,6 +9102,7 @@ export function AgentmuxTerminalApp() {
             onClose={closeOverlay}
             stop={stop}
             setSettingsTab={setSettingsTab}
+            setSelectedWorkspaceId={setSettingsWorkspaceId}
             setLanguage={setLanguage}
             setTheme={setTheme}
             setAccentKey={setAccentKey}
@@ -9005,9 +9124,7 @@ export function AgentmuxTerminalApp() {
             onInstallUpdate={() => void installAvailableUpdate()}
             onUpdateShortcuts={(bindings) => void updateShortcutBindings(bindings)}
             onRunTmuxProbe={() => void runTmuxProbe()}
-            onUpdateWorkspace={(workspaceId, input) =>
-              void ctl.updateWorkspace(workspaceId, input)
-            }
+            onUpdateWorkspace={updateWorkspaceSerialized}
             onCreateProfile={(input) => void ctl.createProfile(input)}
             onUpdateProfile={(profileId, input) =>
               void ctl.updateProfile(profileId, input)
@@ -11311,7 +11428,9 @@ interface SettingsModalProps {
   tmuxProbe: TmuxDiagnostics | null;
   tmuxProbeBusy: boolean;
   profiles: SshProfile[];
+  workspaces: WorkspaceSummary[];
   activeWorkspace: WorkspaceSummary | null;
+  selectedWorkspaceId: string | null;
   wslDistributions: { name: string; isDefault: boolean }[];
   actions: ActionDescriptor[];
   shortcutBindings: ResolvedShortcutBindings;
@@ -11319,6 +11438,7 @@ interface SettingsModalProps {
   onClose: () => void;
   stop: (e: { stopPropagation: () => void }) => void;
   setSettingsTab: (tab: SettingsTab) => void;
+  setSelectedWorkspaceId: (workspaceId: string | null) => void;
   setLanguage: (language: AppLocaleLanguage) => void;
   setTheme: (theme: ThemeName) => void;
   setAccentKey: (key: string) => void;
@@ -11339,7 +11459,10 @@ interface SettingsModalProps {
   onInstallUpdate: () => void;
   onUpdateShortcuts: (bindings: ShortcutBindingMap) => void;
   onRunTmuxProbe: (distribution?: string | null) => void;
-  onUpdateWorkspace: (workspaceId: string, input: WorkspaceUpdateInput) => void;
+  onUpdateWorkspace: (
+    workspaceId: string,
+    input: WorkspaceUpdateInput,
+  ) => Promise<void>;
   onCreateProfile: (input: SshProfileInput) => void;
   onUpdateProfile: (profileId: string, input: SshProfileInput) => void;
   onDeleteProfile: (id: string) => void;
@@ -11886,6 +12009,29 @@ function SetupModal(props: SetupModalProps) {
   );
 }
 
+function workspaceSettingsDraft(
+  workspace: WorkspaceSummary | null,
+): WorkspaceUpdateInput {
+  return {
+    name: workspace?.name ?? "",
+    projectRoot: workspace?.projectRoot ?? "",
+    environmentProfileId: workspace?.environmentProfileId ?? null,
+    description: workspace?.description ?? "",
+    icon: workspace?.icon ?? "",
+    color: workspace?.color ?? ACCENTS[0].hex,
+    defaultWslDistribution: workspace?.defaultWslDistribution ?? "",
+    defaultTerminalProfile: workspace?.defaultTerminalProfile ?? "wsl",
+    defaultAgentCommand: workspace?.defaultAgentCommand ?? "",
+  };
+}
+
+function workspaceSettingsDraftEqual(
+  left: WorkspaceUpdateInput,
+  right: WorkspaceUpdateInput,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
 function SettingsModal(props: SettingsModalProps) {
   const dialogs = useAppDialogs();
   const {
@@ -11910,7 +12056,9 @@ function SettingsModal(props: SettingsModalProps) {
     tmuxProbe,
     tmuxProbeBusy,
     profiles,
+    workspaces,
     activeWorkspace,
+    selectedWorkspaceId,
     wslDistributions,
     actions,
     shortcutBindings,
@@ -11918,6 +12066,7 @@ function SettingsModal(props: SettingsModalProps) {
     onClose,
     stop,
     setSettingsTab,
+    setSelectedWorkspaceId,
     setLanguage,
     setTheme,
     setAccentKey,
@@ -11949,41 +12098,43 @@ function SettingsModal(props: SettingsModalProps) {
     containerRef: settingsDialogRef,
     onKeyDown: onSettingsDialogKeyDown,
   } = useOverlayFocusGuard<HTMLDivElement>(onClose);
-  const [workspaceDraft, setWorkspaceDraft] = useState<WorkspaceUpdateInput>({
-    name: activeWorkspace?.name ?? "",
-    projectRoot: activeWorkspace?.projectRoot ?? "",
-    environmentProfileId: activeWorkspace?.environmentProfileId ?? null,
-    description: activeWorkspace?.description ?? "",
-    icon: activeWorkspace?.icon ?? "",
-    color: activeWorkspace?.color ?? ACCENTS[0].hex,
-    defaultWslDistribution: activeWorkspace?.defaultWslDistribution ?? "",
-    defaultTerminalProfile: activeWorkspace?.defaultTerminalProfile ?? "wsl",
-    defaultAgentCommand: activeWorkspace?.defaultAgentCommand ?? "",
-  });
+  const [workspaceDraft, setWorkspaceDraft] = useState<WorkspaceUpdateInput>(
+    () => workspaceSettingsDraft(activeWorkspace),
+  );
+  const [workspaceDraftBaseline, setWorkspaceDraftBaseline] =
+    useState<WorkspaceUpdateInput>(() => workspaceSettingsDraft(activeWorkspace));
+  const [workspaceSaveInFlight, setWorkspaceSaveInFlight] = useState(false);
+  const workspaceSaveInFlightRef = useRef(false);
+  const workspaceDraftTargetIdRef = useRef(
+    activeWorkspace?.workspaceId ?? null,
+  );
+  const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
+  selectedWorkspaceIdRef.current = selectedWorkspaceId;
 
   useEffect(() => {
-    setWorkspaceDraft({
-      name: activeWorkspace?.name ?? "",
-      projectRoot: activeWorkspace?.projectRoot ?? "",
-      environmentProfileId: activeWorkspace?.environmentProfileId ?? null,
-      description: activeWorkspace?.description ?? "",
-      icon: activeWorkspace?.icon ?? "",
-      color: activeWorkspace?.color ?? ACCENTS[0].hex,
-      defaultWslDistribution: activeWorkspace?.defaultWslDistribution ?? "",
-      defaultTerminalProfile: activeWorkspace?.defaultTerminalProfile ?? "wsl",
-      defaultAgentCommand: activeWorkspace?.defaultAgentCommand ?? "",
-    });
+    const targetWorkspaceId = activeWorkspace?.workspaceId ?? null;
+    if (workspaceDraftTargetIdRef.current === targetWorkspaceId) {
+      return;
+    }
+    workspaceDraftTargetIdRef.current = targetWorkspaceId;
+    const nextDraft = workspaceSettingsDraft(activeWorkspace);
+    setWorkspaceDraft(nextDraft);
+    setWorkspaceDraftBaseline(nextDraft);
   }, [activeWorkspace]);
 
   const updateWorkspaceDraft = (patch: Partial<WorkspaceUpdateInput>) => {
     setWorkspaceDraft((current) => ({ ...current, ...patch }));
   };
 
-  const saveWorkspaceDraft = () => {
-    if (!activeWorkspace) {
+  const saveWorkspaceDraft = async () => {
+    if (!activeWorkspace || workspaceSaveInFlightRef.current) {
       return;
     }
-    onUpdateWorkspace(activeWorkspace.workspaceId, {
+    workspaceSaveInFlightRef.current = true;
+    setWorkspaceSaveInFlight(true);
+    const targetWorkspaceId = activeWorkspace.workspaceId;
+    const submittedDraft = workspaceDraft;
+    const savedDraft: WorkspaceUpdateInput = {
       name: workspaceDraft.name.trim() || activeWorkspace.name,
       projectRoot: workspaceDraft.projectRoot?.trim() || null,
       environmentProfileId: workspaceDraft.environmentProfileId?.trim() || null,
@@ -11994,7 +12145,52 @@ function SettingsModal(props: SettingsModalProps) {
         workspaceDraft.defaultWslDistribution?.trim() || null,
       defaultTerminalProfile: workspaceDraft.defaultTerminalProfile ?? "wsl",
       defaultAgentCommand: workspaceDraft.defaultAgentCommand?.trim() || null,
-    });
+    };
+    try {
+      await onUpdateWorkspace(targetWorkspaceId, savedDraft);
+      if (selectedWorkspaceIdRef.current !== targetWorkspaceId) {
+        return;
+      }
+      setWorkspaceDraft((current) =>
+        workspaceSettingsDraftEqual(current, submittedDraft)
+          ? savedDraft
+          : current,
+      );
+      setWorkspaceDraftBaseline(savedDraft);
+    } catch (cause) {
+      if (selectedWorkspaceIdRef.current !== targetWorkspaceId) {
+        return;
+      }
+      dialogs.toast({
+        title: t("settings.workspace.saveFailed"),
+        description: cause instanceof Error ? cause.message : undefined,
+        tone: "danger",
+      });
+    } finally {
+      workspaceSaveInFlightRef.current = false;
+      setWorkspaceSaveInFlight(false);
+    }
+  };
+
+  const selectWorkspaceForSettings = async (workspaceId: string) => {
+    if (workspaceId === selectedWorkspaceId) {
+      return;
+    }
+    const hasUnsavedChanges =
+      !workspaceSettingsDraftEqual(workspaceDraft, workspaceDraftBaseline);
+    if (hasUnsavedChanges) {
+      const discard = await dialogs.confirm({
+        title: t("settings.workspace.unsavedTitle"),
+        description: t("settings.workspace.unsavedDescription"),
+        confirmLabel: t("settings.workspace.discardChanges"),
+        cancelLabel: t("common.cancel"),
+        tone: "warning",
+      });
+      if (!discard) {
+        return;
+      }
+    }
+    setSelectedWorkspaceId(workspaceId);
   };
 
   const visibleActions = actions.filter(isShortcutEditorVisible);
@@ -12869,9 +13065,10 @@ function SettingsModal(props: SettingsModalProps) {
           {settingsTab === "workspace" ? (
             <form
               data-agentmux-workspace-settings
+              aria-busy={workspaceSaveInFlight}
               onSubmit={(event) => {
                 event.preventDefault();
-                saveWorkspaceDraft();
+                void saveWorkspaceDraft();
               }}
             >
               <div
@@ -12899,26 +13096,43 @@ function SettingsModal(props: SettingsModalProps) {
                       background: "var(--canvas)",
                     }}
                   >
-                    <span
+                    <label
                       style={{
-                        color: "var(--fg4)",
-                        font: `600 11px/1 ${FONT_SANS}`,
+                        display: "grid",
+                        gridTemplateColumns: "auto minmax(180px, 280px)",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 18,
+                        width: "100%",
                       }}
                     >
-                      {t("settings.workspace.scope")}
-                    </span>
-                    <strong
-                      style={{
-                        minWidth: 0,
-                        color: "var(--fg1)",
-                        font: `700 12px/1.2 ${FONT_SANS}`,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {activeWorkspace.name}
-                    </strong>
+                      <span
+                        style={{
+                          color: "var(--fg4)",
+                          font: `600 11px/1 ${FONT_SANS}`,
+                        }}
+                      >
+                        {t("settings.workspace.scope")}
+                      </span>
+                      <select
+                        className="agentmux-workspace-settings-selector"
+                        aria-label={t("settings.workspace.selector")}
+                        value={selectedWorkspaceId ?? ""}
+                        onChange={(event) =>
+                          void selectWorkspaceForSettings(event.currentTarget.value)
+                        }
+                        style={{ ...fieldInput, minWidth: 0 }}
+                      >
+                        {workspaces.map((workspace) => (
+                          <option
+                            key={workspace.workspaceId}
+                            value={workspace.workspaceId}
+                          >
+                            {workspace.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                   </div>
                   <div
                     style={{
@@ -13104,13 +13318,15 @@ function SettingsModal(props: SettingsModalProps) {
                   <button
                     type="submit"
                     className="agentmux-workspace-save"
+                    disabled={workspaceSaveInFlight}
                     style={{
                       background: "var(--accent)",
                       color: "#fff",
                       border: 0,
                       borderRadius: 8,
                       padding: "9px 14px",
-                      cursor: "pointer",
+                      cursor: workspaceSaveInFlight ? "wait" : "pointer",
+                      opacity: workspaceSaveInFlight ? 0.6 : 1,
                       font: `700 12px/1 ${FONT_SANS}`,
                     }}
                   >
