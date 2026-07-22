@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -8,14 +8,16 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use tungstenite::{connect, Message};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{connect, Message, WebSocket};
 
 const AGENTMUX_CONSOLE_RECORDER_SOURCE: &str = r#"(function () {
   if (!window.__agentmuxConsoleMessages) {
@@ -66,48 +68,6 @@ const AGENTMUX_CONSOLE_RECORDER_SOURCE: &str = r#"(function () {
       return original.apply(console, args);
     };
   });
-})();"#;
-
-const AGENTMUX_DIALOG_RECORDER_SOURCE: &str = r#"(function () {
-  if (!window.__agentmuxDialogMessages) {
-    Object.defineProperty(window, "__agentmuxDialogMessages", {
-      value: [],
-      writable: false,
-      configurable: false
-    });
-  }
-  if (window.__agentmuxDialogRecorderInstalled) {
-    return;
-  }
-  Object.defineProperty(window, "__agentmuxDialogRecorderInstalled", {
-    value: true,
-    writable: false,
-    configurable: false
-  });
-  const record = function (type, message, defaultValue, response) {
-    window.__agentmuxDialogMessages.push({
-      type: type,
-      message: String(message || ""),
-      defaultValue: defaultValue == null ? null : String(defaultValue),
-      response: response == null ? null : String(response),
-      timestamp: new Date().toISOString()
-    });
-    if (window.__agentmuxDialogMessages.length > 500) {
-      window.__agentmuxDialogMessages.splice(0, window.__agentmuxDialogMessages.length - 500);
-    }
-  };
-  window.alert = function (message) {
-    record("alert", message, null, null);
-  };
-  window.confirm = function (message) {
-    record("confirm", message, null, true);
-    return true;
-  };
-  window.prompt = function (message, defaultValue) {
-    const response = defaultValue == null ? "" : String(defaultValue);
-    record("prompt", message, defaultValue, response);
-    return response;
-  };
 })();"#;
 
 const AGENTMUX_ERROR_RECORDER_SOURCE: &str = r#"(function () {
@@ -229,6 +189,16 @@ pub enum BrowserCommand {
         surface_id: String,
         limit: usize,
     },
+    RespondDialog {
+        surface_id: String,
+        dialog_id: String,
+        accept: bool,
+        prompt_text: Option<String>,
+    },
+    CancelDialog {
+        surface_id: String,
+        dialog_id: String,
+    },
     ErrorEvents {
         surface_id: String,
         limit: usize,
@@ -344,6 +314,8 @@ impl BrowserCommand {
             | BrowserCommand::History { surface_id }
             | BrowserCommand::ConsoleMessages { surface_id, .. }
             | BrowserCommand::DialogMessages { surface_id, .. }
+            | BrowserCommand::RespondDialog { surface_id, .. }
+            | BrowserCommand::CancelDialog { surface_id, .. }
             | BrowserCommand::ErrorEvents { surface_id, .. }
             | BrowserCommand::ClickSelector { surface_id, .. }
             | BrowserCommand::ClickPoint { surface_id, .. }
@@ -410,6 +382,11 @@ pub enum BrowserCommandResult {
     DialogMessages {
         surface_id: String,
         messages: Vec<BrowserDialogMessage>,
+    },
+    DialogHandled {
+        surface_id: String,
+        dialog_id: String,
+        status: String,
     },
     ErrorEvents {
         surface_id: String,
@@ -542,11 +519,252 @@ pub struct BrowserHistoryEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserDialogMessage {
+    pub dialog_id: String,
+    pub surface_id: String,
+    pub kind: String,
+    // Kept for compatibility with the existing CLI/IPC response shape.
     pub dialog_type: String,
     pub message: String,
     pub default_value: Option<String>,
+    pub status: String,
     pub response: Option<String>,
     pub timestamp: String,
+    pub resolved_at: Option<String>,
+    pub resolution: Option<String>,
+}
+
+const BROWSER_DIALOG_HISTORY_LIMIT: usize = 500;
+const BROWSER_DIALOG_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSER_DIALOG_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct ActiveBrowserDialog {
+    dialog_id: String,
+    opened_at: Instant,
+}
+
+#[derive(Default, Debug)]
+struct BrowserDialogRegistry {
+    next_dialog_id: u64,
+    messages: VecDeque<BrowserDialogMessage>,
+    active: Option<ActiveBrowserDialog>,
+}
+
+impl BrowserDialogRegistry {
+    fn observe(
+        &mut self,
+        surface_id: &str,
+        kind: &str,
+        message: &str,
+        default_value: Option<String>,
+        opened_at: Instant,
+    ) -> String {
+        self.next_dialog_id += 1;
+        let dialog_id = format!("{surface_id}:dialog:{:016x}", self.next_dialog_id);
+        let timestamp = browser_dialog_timestamp();
+        self.messages.push_back(BrowserDialogMessage {
+            dialog_id: dialog_id.clone(),
+            surface_id: surface_id.to_string(),
+            kind: kind.to_string(),
+            dialog_type: kind.to_string(),
+            message: message.to_string(),
+            default_value,
+            status: "pending".to_string(),
+            response: None,
+            timestamp,
+            resolved_at: None,
+            resolution: None,
+        });
+        while self.messages.len() > BROWSER_DIALOG_HISTORY_LIMIT {
+            self.messages.pop_front();
+        }
+        self.active = Some(ActiveBrowserDialog {
+            dialog_id: dialog_id.clone(),
+            opened_at,
+        });
+        dialog_id
+    }
+
+    fn messages(&self, limit: usize) -> Vec<BrowserDialogMessage> {
+        let limit = limit.clamp(1, BROWSER_DIALOG_HISTORY_LIMIT);
+        self.messages
+            .iter()
+            .skip(self.messages.len().saturating_sub(limit))
+            .cloned()
+            .collect()
+    }
+
+    fn active_dialog_id(&self) -> Option<&str> {
+        self.active.as_ref().map(|active| active.dialog_id.as_str())
+    }
+
+    fn active_timed_out(&self, now: Instant, timeout: Duration) -> Option<String> {
+        self.active
+            .as_ref()
+            .filter(|active| now.saturating_duration_since(active.opened_at) >= timeout)
+            .map(|active| active.dialog_id.clone())
+    }
+
+    fn resolve(
+        &mut self,
+        dialog_id: &str,
+        status: &str,
+        response: Option<String>,
+        resolution: &str,
+    ) -> bool {
+        let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|message| message.dialog_id == dialog_id)
+        else {
+            return false;
+        };
+        if message.status != "pending" {
+            return false;
+        }
+        message.status = status.to_string();
+        message.response = response;
+        message.resolved_at = Some(browser_dialog_timestamp());
+        message.resolution = Some(resolution.to_string());
+        if self.active_dialog_id() == Some(dialog_id) {
+            self.active = None;
+        }
+        true
+    }
+}
+
+fn browser_dialog_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+
+type DialogCommandReply = mpsc::SyncSender<BrowserAutomationResult<String>>;
+
+enum DialogMonitorCommand {
+    Respond {
+        dialog_id: String,
+        accept: bool,
+        prompt_text: Option<String>,
+        resolution: String,
+        reply: DialogCommandReply,
+    },
+    CancelActive {
+        resolution: String,
+        reply: DialogCommandReply,
+    },
+    Shutdown,
+}
+
+struct DialogMonitorHandle {
+    surface_id: String,
+    state: Arc<Mutex<BrowserDialogRegistry>>,
+    command_tx: mpsc::Sender<DialogMonitorCommand>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl DialogMonitorHandle {
+    fn has_active_dialog(&self) -> BrowserAutomationResult<bool> {
+        self.state
+            .lock()
+            .map(|state| state.active_dialog_id().is_some())
+            .map_err(|_| {
+                BrowserAutomationError::automation_failed("Browser dialog state is unavailable.")
+            })
+    }
+
+    fn messages(&self, limit: usize) -> BrowserAutomationResult<Vec<BrowserDialogMessage>> {
+        self.state
+            .lock()
+            .map(|state| state.messages(limit))
+            .map_err(|_| {
+                BrowserAutomationError::automation_failed("Browser dialog state is unavailable.")
+            })
+    }
+
+    fn respond(
+        &self,
+        dialog_id: &str,
+        accept: bool,
+        prompt_text: Option<String>,
+    ) -> BrowserAutomationResult<String> {
+        let resolution = if accept { "accepted" } else { "rejected" };
+        self.send_respond(dialog_id, accept, prompt_text, resolution)
+    }
+
+    fn cancel(&self, dialog_id: &str) -> BrowserAutomationResult<String> {
+        self.send_respond(dialog_id, false, None, "canceled_by_user")
+    }
+
+    fn cancel_active(&self, resolution: &str) -> BrowserAutomationResult<Option<String>> {
+        let active = self
+            .state
+            .lock()
+            .map_err(|_| {
+                BrowserAutomationError::automation_failed("Browser dialog state is unavailable.")
+            })?
+            .active_dialog_id()
+            .map(str::to_string);
+        let Some(dialog_id) = active else {
+            return Ok(None);
+        };
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(DialogMonitorCommand::CancelActive {
+                resolution: resolution.to_string(),
+                reply,
+            })
+            .map_err(|_| self.monitor_unavailable())?;
+        receiver
+            .recv_timeout(BROWSER_DIALOG_COMMAND_TIMEOUT)
+            .map_err(|_| self.monitor_unavailable())??;
+        Ok(Some(dialog_id))
+    }
+
+    fn send_respond(
+        &self,
+        dialog_id: &str,
+        accept: bool,
+        prompt_text: Option<String>,
+        resolution: &str,
+    ) -> BrowserAutomationResult<String> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.command_tx
+            .send(DialogMonitorCommand::Respond {
+                dialog_id: dialog_id.to_string(),
+                accept,
+                prompt_text,
+                resolution: resolution.to_string(),
+                reply,
+            })
+            .map_err(|_| self.monitor_unavailable())?;
+        receiver
+            .recv_timeout(BROWSER_DIALOG_COMMAND_TIMEOUT)
+            .map_err(|_| self.monitor_unavailable())?
+    }
+
+    fn monitor_unavailable(&self) -> BrowserAutomationError {
+        BrowserAutomationError::automation_failed(format!(
+            "Browser dialog monitor for surface '{}' is unavailable.",
+            self.surface_id
+        ))
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.cancel_active("surface_closed");
+        let _ = self.command_tx.send(DialogMonitorCommand::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for DialogMonitorHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -625,6 +843,7 @@ pub trait BrowserAutomation: Send {
 #[derive(Default)]
 pub struct InMemoryBrowserAutomation {
     surfaces: HashMap<String, BrowserSurface>,
+    dialogs: HashMap<String, BrowserDialogRegistry>,
     next_browser_id: u64,
 }
 
@@ -681,6 +900,8 @@ impl BrowserAutomation for InMemoryBrowserAutomation {
             profile,
         };
         self.surfaces.insert(surface_id, surface.clone());
+        self.dialogs
+            .insert(surface.surface_id.clone(), BrowserDialogRegistry::default());
         Ok(surface)
     }
 
@@ -689,9 +910,16 @@ impl BrowserAutomation for InMemoryBrowserAutomation {
     }
 
     fn close_surface(&mut self, surface_id: &str) -> BrowserAutomationResult<BrowserSurface> {
-        self.surfaces
+        let surface = self
+            .surfaces
             .remove(surface_id)
-            .ok_or_else(|| BrowserAutomationError::surface_not_found(surface_id))
+            .ok_or_else(|| BrowserAutomationError::surface_not_found(surface_id))?;
+        if let Some(mut dialogs) = self.dialogs.remove(surface_id) {
+            if let Some(dialog_id) = dialogs.active_dialog_id().map(str::to_string) {
+                dialogs.resolve(&dialog_id, "canceled", None, "surface_closed");
+            }
+        }
+        Ok(surface)
     }
 
     fn execute(
@@ -805,11 +1033,62 @@ impl BrowserAutomation for InMemoryBrowserAutomation {
                     messages: Vec::new(),
                 })
             }
-            BrowserCommand::DialogMessages { surface_id, .. } => {
+            BrowserCommand::DialogMessages { surface_id, limit } => {
                 self.require_surface(&surface_id)?;
                 Ok(BrowserCommandResult::DialogMessages {
+                    messages: self
+                        .dialogs
+                        .get(&surface_id)
+                        .map(|dialogs| dialogs.messages(limit))
+                        .unwrap_or_default(),
                     surface_id,
-                    messages: Vec::new(),
+                })
+            }
+            BrowserCommand::RespondDialog {
+                surface_id,
+                dialog_id,
+                accept,
+                prompt_text,
+            } => {
+                self.require_surface(&surface_id)?;
+                let dialogs = self.dialogs.get_mut(&surface_id).ok_or_else(|| {
+                    BrowserAutomationError::automation_failed(
+                        "Browser dialog state is unavailable.",
+                    )
+                })?;
+                if dialogs.active_dialog_id() != Some(dialog_id.as_str()) {
+                    return Err(BrowserAutomationError::invalid_request(format!(
+                        "Browser dialog '{dialog_id}' is not pending on surface '{surface_id}'."
+                    )));
+                }
+                let status = if accept { "accepted" } else { "rejected" };
+                dialogs.resolve(&dialog_id, status, prompt_text, status);
+                Ok(BrowserCommandResult::DialogHandled {
+                    surface_id,
+                    dialog_id,
+                    status: status.to_string(),
+                })
+            }
+            BrowserCommand::CancelDialog {
+                surface_id,
+                dialog_id,
+            } => {
+                self.require_surface(&surface_id)?;
+                let dialogs = self.dialogs.get_mut(&surface_id).ok_or_else(|| {
+                    BrowserAutomationError::automation_failed(
+                        "Browser dialog state is unavailable.",
+                    )
+                })?;
+                if dialogs.active_dialog_id() != Some(dialog_id.as_str()) {
+                    return Err(BrowserAutomationError::invalid_request(format!(
+                        "Browser dialog '{dialog_id}' is not pending on surface '{surface_id}'."
+                    )));
+                }
+                dialogs.resolve(&dialog_id, "canceled", None, "canceled_by_user");
+                Ok(BrowserCommandResult::DialogHandled {
+                    surface_id,
+                    dialog_id,
+                    status: "canceled".to_string(),
                 })
             }
             BrowserCommand::ErrorEvents { surface_id, .. } => {
@@ -1137,12 +1416,14 @@ struct CdpBrowserSurface {
     surface: BrowserSurface,
     websocket_url: String,
     downloads_dir: PathBuf,
+    dialog_monitor: DialogMonitorHandle,
     child: Child,
     _profile_dir: TempDir,
 }
 
 impl Drop for CdpBrowserSurface {
     fn drop(&mut self) {
+        self.dialog_monitor.shutdown();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1183,6 +1464,17 @@ impl CdpBrowserAutomation {
         self.surfaces
             .get(surface_id)
             .ok_or_else(|| BrowserAutomationError::surface_not_found(surface_id))
+    }
+
+    fn cancel_pending_dialog(
+        &self,
+        surface_id: &str,
+        resolution: &str,
+    ) -> BrowserAutomationResult<()> {
+        self.require_surface(surface_id)?
+            .dialog_monitor
+            .cancel_active(resolution)?;
+        Ok(())
     }
 
     fn launch_surface(
@@ -1256,6 +1548,14 @@ impl CdpBrowserAutomation {
             let _ = child.wait();
             return Err(error);
         }
+        let dialog_monitor = match start_dialog_monitor(&surface_id, &websocket_url) {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let _ = configure_download_behavior(&websocket_url, &downloads_dir);
 
         self.next_browser_id += 1;
@@ -1272,6 +1572,7 @@ impl CdpBrowserAutomation {
                 surface: surface.clone(),
                 websocket_url,
                 downloads_dir,
+                dialog_monitor,
                 child,
                 _profile_dir: profile_dir,
             },
@@ -1289,6 +1590,7 @@ impl CdpBrowserAutomation {
                 "Navigation URL must not be empty.",
             ));
         }
+        self.cancel_pending_dialog(&surface_id, "navigation")?;
         let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
         let result = cdp_call(&websocket_url, "Page.navigate", json!({ "url": url }))?;
         if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
@@ -1307,7 +1609,13 @@ impl CdpBrowserAutomation {
         &mut self,
         surface_id: String,
     ) -> BrowserAutomationResult<BrowserCommandResult> {
-        let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
+        let surface = self.require_surface(&surface_id)?;
+        if surface.dialog_monitor.has_active_dialog()? {
+            if let Some(url) = surface.surface.current_url.clone() {
+                return Ok(BrowserCommandResult::Navigated { surface_id, url });
+            }
+        }
+        let websocket_url = surface.websocket_url.clone();
         let url = self.read_current_url(&surface_id, &websocket_url)?;
         Ok(BrowserCommandResult::Navigated { surface_id, url })
     }
@@ -1316,6 +1624,7 @@ impl CdpBrowserAutomation {
         &mut self,
         surface_id: String,
     ) -> BrowserAutomationResult<BrowserCommandResult> {
+        self.cancel_pending_dialog(&surface_id, "navigation")?;
         let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
         cdp_call(&websocket_url, "Page.reload", json!({}))?;
         thread::sleep(Duration::from_millis(100));
@@ -1328,6 +1637,7 @@ impl CdpBrowserAutomation {
         surface_id: String,
         delta: i64,
     ) -> BrowserAutomationResult<BrowserCommandResult> {
+        self.cancel_pending_dialog(&surface_id, "navigation")?;
         let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
         let history = cdp_call(&websocket_url, "Page.getNavigationHistory", json!({}))?;
         let current_index = history
@@ -1546,28 +1856,48 @@ impl CdpBrowserAutomation {
         surface_id: String,
         limit: usize,
     ) -> BrowserAutomationResult<BrowserCommandResult> {
-        let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
-        let limit = limit.clamp(1, 500);
-        let expression = format!(
-            r#"(function () {{
-  {};
-  return (window.__agentmuxDialogMessages || []).slice(-{});
-}})()"#,
-            AGENTMUX_DIALOG_RECORDER_SOURCE, limit
-        );
-        let result = cdp_call(
-            &websocket_url,
-            "Runtime.evaluate",
-            json!({
-                "expression": expression,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
-        )?;
-        let value = runtime_result_value(&result)?;
+        let messages = self
+            .require_surface(&surface_id)?
+            .dialog_monitor
+            .messages(limit)?;
         Ok(BrowserCommandResult::DialogMessages {
             surface_id,
-            messages: dialog_messages_from_value(Some(&value)),
+            messages,
+        })
+    }
+
+    fn execute_respond_dialog(
+        &self,
+        surface_id: String,
+        dialog_id: String,
+        accept: bool,
+        prompt_text: Option<String>,
+    ) -> BrowserAutomationResult<BrowserCommandResult> {
+        let status = self.require_surface(&surface_id)?.dialog_monitor.respond(
+            &dialog_id,
+            accept,
+            prompt_text,
+        )?;
+        Ok(BrowserCommandResult::DialogHandled {
+            surface_id,
+            dialog_id,
+            status,
+        })
+    }
+
+    fn execute_cancel_dialog(
+        &self,
+        surface_id: String,
+        dialog_id: String,
+    ) -> BrowserAutomationResult<BrowserCommandResult> {
+        let status = self
+            .require_surface(&surface_id)?
+            .dialog_monitor
+            .cancel(&dialog_id)?;
+        Ok(BrowserCommandResult::DialogHandled {
+            surface_id,
+            dialog_id,
+            status,
         })
     }
 
@@ -2405,6 +2735,16 @@ impl BrowserAutomation for CdpBrowserAutomation {
             BrowserCommand::DialogMessages { surface_id, limit } => {
                 self.execute_dialog_messages(surface_id, limit)
             }
+            BrowserCommand::RespondDialog {
+                surface_id,
+                dialog_id,
+                accept,
+                prompt_text,
+            } => self.execute_respond_dialog(surface_id, dialog_id, accept, prompt_text),
+            BrowserCommand::CancelDialog {
+                surface_id,
+                dialog_id,
+            } => self.execute_cancel_dialog(surface_id, dialog_id),
             BrowserCommand::ErrorEvents { surface_id, limit } => {
                 self.execute_error_events(surface_id, limit)
             }
@@ -2725,6 +3065,373 @@ fn http_content_length(line: &str) -> Option<usize> {
     value.trim().parse().ok()
 }
 
+type CdpWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+fn start_dialog_monitor(
+    surface_id: &str,
+    websocket_url: &str,
+) -> BrowserAutomationResult<DialogMonitorHandle> {
+    let state = Arc::new(Mutex::new(BrowserDialogRegistry::default()));
+    let (command_tx, command_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let thread_surface_id = surface_id.to_string();
+    let thread_websocket_url = websocket_url.to_string();
+    let thread_state = Arc::clone(&state);
+    let thread = thread::Builder::new()
+        .name(format!("agentmux-dialog-{surface_id}"))
+        .spawn(move || {
+            run_dialog_monitor(
+                thread_surface_id,
+                thread_websocket_url,
+                thread_state,
+                command_rx,
+                ready_tx,
+            );
+        })
+        .map_err(|error| {
+            BrowserAutomationError::automation_failed(format!(
+                "Failed to start browser dialog monitor: {error}"
+            ))
+        })?;
+
+    match ready_rx.recv_timeout(BROWSER_DIALOG_COMMAND_TIMEOUT) {
+        Ok(Ok(())) => Ok(DialogMonitorHandle {
+            surface_id: surface_id.to_string(),
+            state,
+            command_tx,
+            thread: Some(thread),
+        }),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(error)
+        }
+        Err(_) => {
+            let _ = command_tx.send(DialogMonitorCommand::Shutdown);
+            let _ = thread.join();
+            Err(BrowserAutomationError::automation_failed(format!(
+                "Timed out starting browser dialog monitor for surface '{surface_id}'."
+            )))
+        }
+    }
+}
+
+fn run_dialog_monitor(
+    surface_id: String,
+    websocket_url: String,
+    state: Arc<Mutex<BrowserDialogRegistry>>,
+    command_rx: mpsc::Receiver<DialogMonitorCommand>,
+    ready_tx: mpsc::SyncSender<BrowserAutomationResult<()>>,
+) {
+    let setup = (|| -> BrowserAutomationResult<(CdpWebSocket, u64)> {
+        let (mut socket, _) = connect(websocket_url.as_str()).map_err(|error| {
+            BrowserAutomationError::automation_failed(format!(
+                "Failed to connect browser dialog monitor: {error}"
+            ))
+        })?;
+        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .map_err(|error| {
+                    BrowserAutomationError::automation_failed(format!(
+                        "Failed to configure browser dialog monitor: {error}"
+                    ))
+                })?;
+        }
+        send_monitor_request(&mut socket, 1, "Page.enable", json!({}))?;
+        wait_for_monitor_response(&mut socket, 1, &surface_id, &state)?;
+        Ok((socket, 2))
+    })();
+
+    let (mut socket, mut next_request_id) = match setup {
+        Ok(value) => {
+            let _ = ready_tx.send(Ok(()));
+            value
+        }
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            return;
+        }
+    };
+
+    loop {
+        if let Some(dialog_id) = state
+            .lock()
+            .ok()
+            .and_then(|state| state.active_timed_out(Instant::now(), BROWSER_DIALOG_TIMEOUT))
+        {
+            let result = handle_dialog_with_cdp(
+                &mut socket,
+                &mut next_request_id,
+                &surface_id,
+                &state,
+                false,
+                None,
+            );
+            if result.is_ok() {
+                resolve_dialog(&state, &dialog_id, "timed_out", None, "timeout");
+            }
+        }
+
+        match command_rx.try_recv() {
+            Ok(DialogMonitorCommand::Respond {
+                dialog_id,
+                accept,
+                prompt_text,
+                resolution,
+                reply,
+            }) => {
+                let is_active = state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.active_dialog_id().map(str::to_string))
+                    .as_deref()
+                    == Some(dialog_id.as_str());
+                if !is_active {
+                    let _ = reply.send(Err(BrowserAutomationError::invalid_request(format!(
+                        "Browser dialog '{dialog_id}' is not pending on surface '{surface_id}'."
+                    ))));
+                    continue;
+                }
+                let response = if accept { prompt_text.clone() } else { None };
+                let result = handle_dialog_with_cdp(
+                    &mut socket,
+                    &mut next_request_id,
+                    &surface_id,
+                    &state,
+                    accept,
+                    prompt_text,
+                );
+                let result = result.map(|()| {
+                    let status = if accept {
+                        "accepted"
+                    } else if resolution == "canceled_by_user" {
+                        "canceled"
+                    } else {
+                        "rejected"
+                    };
+                    resolve_dialog(&state, &dialog_id, status, response, &resolution);
+                    status.to_string()
+                });
+                let _ = reply.send(result);
+            }
+            Ok(DialogMonitorCommand::CancelActive { resolution, reply }) => {
+                let dialog_id = state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.active_dialog_id().map(str::to_string));
+                let result = if let Some(dialog_id) = dialog_id {
+                    handle_dialog_with_cdp(
+                        &mut socket,
+                        &mut next_request_id,
+                        &surface_id,
+                        &state,
+                        false,
+                        None,
+                    )
+                    .map(|()| {
+                        resolve_dialog(&state, &dialog_id, "canceled", None, &resolution);
+                        "canceled".to_string()
+                    })
+                } else {
+                    Ok("idle".to_string())
+                };
+                let _ = reply.send(result);
+            }
+            Ok(DialogMonitorCommand::Shutdown) => break,
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if let Ok(message) = serde_json::from_str::<Value>(&text) {
+                    process_monitor_event(&surface_id, &state, &message, false);
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(_) => break,
+        }
+    }
+
+    if let Some(dialog_id) = state
+        .lock()
+        .ok()
+        .and_then(|state| state.active_dialog_id().map(str::to_string))
+    {
+        // The browser target is about to be torn down. Best effort rejection keeps
+        // shutdown fail-closed even if the CDP connection is already unhealthy.
+        let _ = send_monitor_request(
+            &mut socket,
+            next_request_id,
+            "Page.handleJavaScriptDialog",
+            json!({ "accept": false }),
+        );
+        resolve_dialog(&state, &dialog_id, "canceled", None, "monitor_closed");
+    }
+}
+
+fn send_monitor_request(
+    socket: &mut CdpWebSocket,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> BrowserAutomationResult<()> {
+    socket
+        .send(Message::Text(
+            json!({ "id": id, "method": method, "params": params }).to_string(),
+        ))
+        .map_err(|error| {
+            BrowserAutomationError::automation_failed(format!(
+                "Failed to send browser dialog command '{method}': {error}"
+            ))
+        })
+}
+
+fn wait_for_monitor_response(
+    socket: &mut CdpWebSocket,
+    request_id: u64,
+    surface_id: &str,
+    state: &Arc<Mutex<BrowserDialogRegistry>>,
+) -> BrowserAutomationResult<()> {
+    let deadline = Instant::now() + BROWSER_DIALOG_COMMAND_TIMEOUT;
+    loop {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let message: Value = serde_json::from_str(&text).map_err(|error| {
+                    BrowserAutomationError::automation_failed(format!(
+                        "Failed to parse browser dialog protocol message: {error}"
+                    ))
+                })?;
+                if message.get("id").and_then(Value::as_u64) == Some(request_id) {
+                    if let Some(error) = message.get("error") {
+                        return Err(BrowserAutomationError::automation_failed(format!(
+                            "Browser dialog command failed: {}",
+                            cdp_protocol_error_message(error)
+                        )));
+                    }
+                    return Ok(());
+                }
+                process_monitor_event(surface_id, state, &message, true);
+            }
+            Ok(Message::Close(_)) => {
+                return Err(BrowserAutomationError::automation_failed(
+                    "Browser dialog monitor connection closed.",
+                ));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => {
+                return Err(BrowserAutomationError::automation_failed(format!(
+                    "Failed to read browser dialog response: {error}"
+                )));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(BrowserAutomationError::automation_failed(
+                "Timed out waiting for browser dialog response.",
+            ));
+        }
+    }
+}
+
+fn handle_dialog_with_cdp(
+    socket: &mut CdpWebSocket,
+    next_request_id: &mut u64,
+    surface_id: &str,
+    state: &Arc<Mutex<BrowserDialogRegistry>>,
+    accept: bool,
+    prompt_text: Option<String>,
+) -> BrowserAutomationResult<()> {
+    let request_id = *next_request_id;
+    *next_request_id += 1;
+    let mut params = json!({ "accept": accept });
+    if accept {
+        if let Some(prompt_text) = prompt_text {
+            params["promptText"] = Value::String(prompt_text);
+        }
+    }
+    send_monitor_request(socket, request_id, "Page.handleJavaScriptDialog", params)?;
+    wait_for_monitor_response(socket, request_id, surface_id, state)
+}
+
+fn process_monitor_event(
+    surface_id: &str,
+    state: &Arc<Mutex<BrowserDialogRegistry>>,
+    message: &Value,
+    defer_dialog_closed: bool,
+) {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let params = message.get("params").unwrap_or(&Value::Null);
+    match method {
+        "Page.javascriptDialogOpening" => {
+            let kind = params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("alert");
+            let message = params.get("message").and_then(Value::as_str).unwrap_or("");
+            let default_value = params
+                .get("defaultPrompt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Ok(mut state) = state.lock() {
+                if let Some(previous_id) = state.active_dialog_id().map(str::to_string) {
+                    state.resolve(&previous_id, "canceled", None, "superseded_by_browser");
+                }
+                state.observe(surface_id, kind, message, default_value, Instant::now());
+            }
+        }
+        "Page.javascriptDialogClosed" if !defer_dialog_closed => {
+            let accepted = params
+                .get("result")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let response = params
+                .get("userInput")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Ok(mut state) = state.lock() {
+                if let Some(dialog_id) = state.active_dialog_id().map(str::to_string) {
+                    let status = if accepted { "accepted" } else { "canceled" };
+                    state.resolve(&dialog_id, status, response, "browser_ui");
+                }
+            }
+        }
+        "Page.frameNavigated" | "Page.frameDetached" => {
+            if let Ok(mut state) = state.lock() {
+                if let Some(dialog_id) = state.active_dialog_id().map(str::to_string) {
+                    state.resolve(&dialog_id, "canceled", None, "navigation");
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_dialog(
+    state: &Arc<Mutex<BrowserDialogRegistry>>,
+    dialog_id: &str,
+    status: &str,
+    response: Option<String>,
+    resolution: &str,
+) {
+    if let Ok(mut state) = state.lock() {
+        state.resolve(dialog_id, status, response, resolution);
+    }
+}
+
 fn cdp_call(websocket_url: &str, method: &str, params: Value) -> BrowserAutomationResult<Value> {
     let (mut socket, _) = connect(websocket_url).map_err(|error| {
         BrowserAutomationError::automation_failed(format!(
@@ -2777,7 +3484,6 @@ fn cdp_call(websocket_url: &str, method: &str, params: Value) -> BrowserAutomati
 
 fn install_browser_recorders(websocket_url: &str) -> BrowserAutomationResult<()> {
     install_page_recorder(websocket_url, AGENTMUX_CONSOLE_RECORDER_SOURCE)?;
-    install_page_recorder(websocket_url, AGENTMUX_DIALOG_RECORDER_SOURCE)?;
     install_page_recorder(websocket_url, AGENTMUX_ERROR_RECORDER_SOURCE)?;
     Ok(())
 }
@@ -3026,40 +3732,6 @@ fn console_messages_from_value(value: Option<&Value>) -> Vec<BrowserConsoleMessa
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                        timestamp: item
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn dialog_messages_from_value(value: Option<&Value>) -> Vec<BrowserDialogMessage> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    Some(BrowserDialogMessage {
-                        dialog_type: item.get("type")?.as_str()?.to_string(),
-                        message: item
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        default_value: item
-                            .get("defaultValue")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        response: item
-                            .get("response")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
                         timestamp: item
                             .get("timestamp")
                             .and_then(Value::as_str)
@@ -3380,11 +4052,136 @@ mod tests {
         };
         assert_eq!(dialogs.surface_id(), "surf_dialogs");
 
+        let respond = BrowserCommand::RespondDialog {
+            surface_id: "surf_dialogs".to_string(),
+            dialog_id: "surf_dialogs:dialog:0001".to_string(),
+            accept: false,
+            prompt_text: None,
+        };
+        assert_eq!(respond.surface_id(), "surf_dialogs");
+
+        let cancel = BrowserCommand::CancelDialog {
+            surface_id: "surf_dialogs".to_string(),
+            dialog_id: "surf_dialogs:dialog:0001".to_string(),
+        };
+        assert_eq!(cancel.surface_id(), "surf_dialogs");
+
         let errors = BrowserCommand::ErrorEvents {
             surface_id: "surf_errors".to_string(),
             limit: 25,
         };
         assert_eq!(errors.surface_id(), "surf_errors");
+    }
+
+    #[test]
+    fn dialog_registry_assigns_stable_ordered_ids_and_tracks_resolution() {
+        let mut dialogs = BrowserDialogRegistry::default();
+        let opened_at = Instant::now();
+        let first = dialogs.observe("surf_dialogs", "confirm", "Continue?", None, opened_at);
+        assert_eq!(first, "surf_dialogs:dialog:0000000000000001");
+        assert_eq!(dialogs.active_dialog_id(), Some(first.as_str()));
+        assert!(dialogs.resolve(&first, "rejected", None, "rejected"));
+
+        let second = dialogs.observe(
+            "surf_dialogs",
+            "prompt",
+            "Name",
+            Some("default".to_string()),
+            opened_at + Duration::from_millis(1),
+        );
+        assert_eq!(second, "surf_dialogs:dialog:0000000000000002");
+        assert_eq!(dialogs.active_dialog_id(), Some(second.as_str()));
+
+        let messages = dialogs.messages(10);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].status, "rejected");
+        assert_eq!(messages[0].resolution.as_deref(), Some("rejected"));
+        assert_eq!(messages[1].kind, "prompt");
+        assert_eq!(messages[1].status, "pending");
+        assert_eq!(messages[1].default_value.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn dialog_monitor_events_never_auto_approve_and_preserve_observation_order() {
+        let state = Arc::new(Mutex::new(BrowserDialogRegistry::default()));
+        process_monitor_event(
+            "surf_dialogs",
+            &state,
+            &json!({
+                "method": "Page.javascriptDialogOpening",
+                "params": {
+                    "type": "confirm",
+                    "message": "Delete everything?"
+                }
+            }),
+            false,
+        );
+        process_monitor_event(
+            "surf_dialogs",
+            &state,
+            &json!({
+                "method": "Page.javascriptDialogOpening",
+                "params": {
+                    "type": "prompt",
+                    "message": "Name",
+                    "defaultPrompt": "unsafe default"
+                }
+            }),
+            false,
+        );
+
+        let messages = state.lock().unwrap().messages(10);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].dialog_id,
+            "surf_dialogs:dialog:0000000000000001"
+        );
+        assert_eq!(messages[0].status, "canceled");
+        assert_eq!(
+            messages[0].resolution.as_deref(),
+            Some("superseded_by_browser")
+        );
+        assert_eq!(messages[0].response, None);
+        assert_eq!(
+            messages[1].dialog_id,
+            "surf_dialogs:dialog:0000000000000002"
+        );
+        assert_eq!(messages[1].status, "pending");
+        assert_eq!(messages[1].response, None);
+    }
+
+    #[test]
+    fn dialog_timeout_detection_is_fail_closed() {
+        let mut dialogs = BrowserDialogRegistry::default();
+        let opened_at = Instant::now();
+        let dialog_id =
+            dialogs.observe("surf_timeout", "confirm", "Wait forever?", None, opened_at);
+        assert_eq!(
+            dialogs.active_timed_out(opened_at + Duration::from_secs(29), Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            dialogs.active_timed_out(opened_at + Duration::from_secs(30), Duration::from_secs(30)),
+            Some(dialog_id)
+        );
+    }
+
+    #[test]
+    fn dialog_response_requires_a_matching_pending_dialog() {
+        let mut browser = InMemoryBrowserAutomation::new();
+        browser
+            .create_surface("surf_dialogs".to_string(), "ws_dialogs".to_string(), None)
+            .unwrap();
+
+        let error = browser
+            .execute(BrowserCommand::RespondDialog {
+                surface_id: "surf_dialogs".to_string(),
+                dialog_id: "surf_dialogs:dialog:0000000000000001".to_string(),
+                accept: true,
+                prompt_text: Some("must not be applied".to_string()),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, BrowserAutomationErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -3934,6 +4731,291 @@ mod tests {
             panic!("expected screenshot");
         };
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    #[ignore = "launches an installed Edge/Chrome/Chromium process for CDP dialog coverage"]
+    fn cdp_dialog_monitor_requires_explicit_response_and_rejects_safely() {
+        let Some(executable) = discover_browser_executable() else {
+            eprintln!("skipping CDP dialog smoke because no supported browser was found");
+            return;
+        };
+        let mut browser = CdpBrowserAutomation::with_executable_and_headless(executable, true);
+        let surface = browser
+            .create_surface(
+                "surf_cdp_dialog".to_string(),
+                "ws_cdp_dialog".to_string(),
+                Some("dialog-smoke".to_string()),
+            )
+            .unwrap();
+
+        browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: surface.surface_id.clone(),
+                script: r#"window.__agentmuxConfirmResult = "pending"; setTimeout(() => { window.__agentmuxConfirmResult = confirm("Approve unsafe action?"); }, 0); true"#.to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pending = loop {
+            let result = browser
+                .execute(BrowserCommand::DialogMessages {
+                    surface_id: surface.surface_id.clone(),
+                    limit: 10,
+                })
+                .unwrap();
+            let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+                panic!("expected dialog messages");
+            };
+            if let Some(message) = messages
+                .into_iter()
+                .find(|message| message.status == "pending")
+            {
+                break message;
+            }
+            assert!(Instant::now() < deadline, "dialog was not observed by CDP");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(pending.kind, "confirm");
+        assert_eq!(pending.response, None);
+
+        let handled = browser
+            .execute(BrowserCommand::CancelDialog {
+                surface_id: surface.surface_id.clone(),
+                dialog_id: pending.dialog_id,
+            })
+            .unwrap();
+        assert!(matches!(
+            handled,
+            BrowserCommandResult::DialogHandled { ref status, .. } if status == "canceled"
+        ));
+
+        let evaluated = browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: surface.surface_id,
+                script: "window.__agentmuxConfirmResult".to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let BrowserCommandResult::Evaluated { value_json, .. } = evaluated else {
+            panic!("expected evaluation result");
+        };
+        assert_eq!(value_json, "false");
+
+        browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: "surf_cdp_dialog".to_string(),
+                script: r#"window.__agentmuxPromptResult = "pending"; setTimeout(() => { window.__agentmuxPromptResult = prompt("Name", "unsafe default"); }, 0); true"#.to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pending = loop {
+            let result = browser
+                .execute(BrowserCommand::DialogMessages {
+                    surface_id: "surf_cdp_dialog".to_string(),
+                    limit: 10,
+                })
+                .unwrap();
+            let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+                panic!("expected dialog messages");
+            };
+            if let Some(message) = messages
+                .into_iter()
+                .rev()
+                .find(|message| message.status == "pending")
+            {
+                break message;
+            }
+            assert!(Instant::now() < deadline, "prompt was not observed by CDP");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(pending.kind, "prompt");
+        assert_eq!(pending.default_value.as_deref(), Some("unsafe default"));
+        browser
+            .execute(BrowserCommand::RespondDialog {
+                surface_id: "surf_cdp_dialog".to_string(),
+                dialog_id: pending.dialog_id,
+                accept: true,
+                prompt_text: Some("explicit response".to_string()),
+            })
+            .unwrap();
+        let evaluated = browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: "surf_cdp_dialog".to_string(),
+                script: "window.__agentmuxPromptResult".to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let BrowserCommandResult::Evaluated { value_json, .. } = evaluated else {
+            panic!("expected prompt evaluation result");
+        };
+        assert_eq!(value_json, r#""explicit response""#);
+
+        browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: "surf_cdp_dialog".to_string(),
+                script: r#"setTimeout(() => { confirm("Canceled by reload"); }, 0); true"#
+                    .to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reload_dialog_id = loop {
+            let result = browser
+                .execute(BrowserCommand::DialogMessages {
+                    surface_id: "surf_cdp_dialog".to_string(),
+                    limit: 10,
+                })
+                .unwrap();
+            let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+                panic!("expected dialog messages");
+            };
+            if let Some(message) = messages
+                .into_iter()
+                .rev()
+                .find(|message| message.status == "pending")
+            {
+                break message.dialog_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reload dialog was not observed by CDP"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let current_url = browser
+            .execute(BrowserCommand::CurrentUrl {
+                surface_id: "surf_cdp_dialog".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            current_url,
+            BrowserCommandResult::Navigated { .. }
+        ));
+        let result = browser
+            .execute(BrowserCommand::DialogMessages {
+                surface_id: "surf_cdp_dialog".to_string(),
+                limit: 10,
+            })
+            .unwrap();
+        let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+            panic!("expected dialog messages");
+        };
+        assert_eq!(
+            messages
+                .iter()
+                .find(|message| message.dialog_id == reload_dialog_id)
+                .map(|message| message.status.as_str()),
+            Some("pending")
+        );
+        browser
+            .execute(BrowserCommand::Reload {
+                surface_id: "surf_cdp_dialog".to_string(),
+            })
+            .unwrap();
+        let result = browser
+            .execute(BrowserCommand::DialogMessages {
+                surface_id: "surf_cdp_dialog".to_string(),
+                limit: 10,
+            })
+            .unwrap();
+        let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+            panic!("expected dialog messages");
+        };
+        let canceled = messages
+            .iter()
+            .find(|message| message.dialog_id == reload_dialog_id)
+            .unwrap();
+        assert_eq!(canceled.status, "canceled");
+        assert_eq!(canceled.resolution.as_deref(), Some("navigation"));
+
+        browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: "surf_cdp_dialog".to_string(),
+                script: r#"setTimeout(() => { confirm("Canceled by navigation"); }, 0); true"#
+                    .to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let navigation_dialog_id = loop {
+            let result = browser
+                .execute(BrowserCommand::DialogMessages {
+                    surface_id: "surf_cdp_dialog".to_string(),
+                    limit: 10,
+                })
+                .unwrap();
+            let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+                panic!("expected dialog messages");
+            };
+            if let Some(message) = messages
+                .into_iter()
+                .rev()
+                .find(|message| message.status == "pending")
+            {
+                break message.dialog_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "navigation dialog was not observed by CDP"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        browser
+            .execute(BrowserCommand::Navigate {
+                surface_id: "surf_cdp_dialog".to_string(),
+                url: "about:blank".to_string(),
+            })
+            .unwrap();
+        let result = browser
+            .execute(BrowserCommand::DialogMessages {
+                surface_id: "surf_cdp_dialog".to_string(),
+                limit: 10,
+            })
+            .unwrap();
+        let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+            panic!("expected dialog messages");
+        };
+        let canceled = messages
+            .iter()
+            .find(|message| message.dialog_id == navigation_dialog_id)
+            .unwrap();
+        assert_eq!(canceled.status, "canceled");
+        assert_eq!(canceled.resolution.as_deref(), Some("navigation"));
+
+        browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: "surf_cdp_dialog".to_string(),
+                script: r#"setTimeout(() => { confirm("Canceled on close"); }, 0); true"#
+                    .to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let result = browser
+                .execute(BrowserCommand::DialogMessages {
+                    surface_id: "surf_cdp_dialog".to_string(),
+                    limit: 10,
+                })
+                .unwrap();
+            let BrowserCommandResult::DialogMessages { messages, .. } = result else {
+                panic!("expected dialog messages");
+            };
+            if messages.iter().any(|message| message.status == "pending") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "close dialog was not observed by CDP"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let close_started = Instant::now();
+        browser.close_surface("surf_cdp_dialog").unwrap();
+        assert!(close_started.elapsed() < Duration::from_secs(2));
     }
 
     fn start_browser_fixture_server() -> String {

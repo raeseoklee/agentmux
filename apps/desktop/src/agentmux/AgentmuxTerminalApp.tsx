@@ -52,9 +52,11 @@ import {
   buildResolvedShortcutBindings,
   buildShortcutIndex,
   chordKey,
+  collectShortcutConflicts,
+  isUnsafeUnmodifiedShortcutStroke,
+  isShortcutEditorVisible,
   keyboardEventToStroke,
-  normalizeShortcutBinding,
-  parseShortcutBindingInput,
+  resolveShortcutBinding,
   shortcutLabelForAction,
   type ActionGroup,
   type ActionDescriptor,
@@ -62,6 +64,7 @@ import {
   type ShortcutBindingValue,
   type ShortcutBindingMap,
 } from "./actions";
+import { useAppDialogs } from "./dialogs";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
 import {
   formatDroppedPaths,
@@ -121,6 +124,94 @@ import {
   SUPPORTED_LANGUAGES,
   type Translator,
 } from "./i18n";
+
+const OVERLAY_FOCUSABLE_SELECTOR =
+  "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex]:not([tabindex='-1'])";
+
+function overlayFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(OVERLAY_FOCUSABLE_SELECTOR),
+  ).filter((element) => {
+    if (element.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden";
+  });
+}
+
+function useOverlayFocusGuard<T extends HTMLElement>(onClose: () => void) {
+  const containerRef = useRef<T>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  if (
+    restoreFocusRef.current === null &&
+    typeof document !== "undefined" &&
+    document.activeElement instanceof HTMLElement
+  ) {
+    restoreFocusRef.current = document.activeElement;
+  }
+
+  useEffect(() => {
+    const restoreFocus = restoreFocusRef.current;
+    const frame = window.requestAnimationFrame(() => {
+      const container = containerRef.current;
+      if (container === null) {
+        return;
+      }
+      const autofocus = container.querySelector<HTMLElement>(
+        "[data-overlay-autofocus='true']",
+      );
+      (autofocus ?? overlayFocusableElements(container)[0] ?? container).focus();
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (restoreFocus?.isConnected) {
+        window.requestAnimationFrame(() => restoreFocus.focus());
+      }
+    };
+  }, []);
+
+  const onKeyDown = useCallback(
+    (event: ReactKeyboardEvent<T>) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+      const container = containerRef.current;
+      if (container === null) {
+        return;
+      }
+      const focusable = overlayFocusableElements(container);
+      if (focusable.length === 0) {
+        event.preventDefault();
+        container.focus();
+        return;
+      }
+      const currentIndex = focusable.indexOf(
+        document.activeElement as HTMLElement,
+      );
+      const nextIndex = event.shiftKey
+        ? currentIndex <= 0
+          ? focusable.length - 1
+          : currentIndex - 1
+        : currentIndex < 0 || currentIndex === focusable.length - 1
+          ? 0
+          : currentIndex + 1;
+      event.preventDefault();
+      focusable[nextIndex]?.focus();
+    },
+    [onClose],
+  );
+
+  return { containerRef, onKeyDown };
+}
 import {
   acknowledgeUpdateNotification,
   createUpdateNotificationSession,
@@ -130,13 +221,14 @@ import {
 } from "./updateNotifications";
 import desktopPackage from "../../package.json";
 
-type Overlay = "palette" | "search" | "settings" | "setup" | null;
+type Overlay = "palette" | "search" | "settings" | "setup" | "notifications" | null;
 type SettingsTab =
   | "general"
   | "workspace"
   | "appearance"
   | "profiles"
   | "keys"
+  | "advanced"
   | "diagnostics";
 
 const SSH_UI_ENABLED = false;
@@ -1391,19 +1483,13 @@ function isWorkspaceRunningCloseError(cause: unknown): boolean {
   );
 }
 
-type AppConfirmVariant = "default" | "danger";
-
 interface AppConfirmOptions {
   title: string;
   message: string;
   detail?: string;
   confirmLabel: string;
   cancelLabel?: string;
-  variant?: AppConfirmVariant;
-}
-
-interface AppConfirmDialog extends AppConfirmOptions {
-  variant: AppConfirmVariant;
+  variant?: "default" | "danger";
 }
 
 // PR-2: the leaf (terminal/browser/empty) pane renderer, extracted into a
@@ -1925,6 +2011,7 @@ const PaneView = memo(function PaneView({
 });
 
 export function AgentmuxTerminalApp() {
+  const dialogs = useAppDialogs();
   const ctl = useAgentmuxControl();
   const {
     client,
@@ -2054,9 +2141,6 @@ export function AgentmuxTerminalApp() {
     null,
   );
   const [terminalLaunchPending, setTerminalLaunchPending] = useState(false);
-  const [confirmDialog, setConfirmDialog] = useState<AppConfirmDialog | null>(
-    null,
-  );
   // DD-7: drag-and-drop visual feedback state.
   // dragSourceId: the surfaceId / workspaceId / groupId / paneId being dragged.
   // dragFeedback: the current drop target and its computed placement.
@@ -2090,9 +2174,7 @@ export function AgentmuxTerminalApp() {
   const updateResourceRef = useRef<TauriUpdate | null>(null);
   const pendingShortcutRef = useRef<string | null>(null);
   const pendingShortcutTimerRef = useRef<number | null>(null);
-  const confirmResolverRef = useRef<((confirmed: boolean) => void) | null>(
-    null,
-  );
+  const browserDialogsInFlightRef = useRef<Set<string>>(new Set());
 
   const applyConfig = useCallback((config: AppConfig) => {
     setTheme(config.appearance.theme);
@@ -2227,6 +2309,9 @@ export function AgentmuxTerminalApp() {
 
   const T = THEMES[theme];
   const t = useMemo(() => createTranslator(language), [language]);
+  useEffect(() => {
+    document.documentElement.lang = language;
+  }, [language]);
   const accent = ACCENTS.find((a) => a.key === accentKey) ?? ACCENTS[0];
   const isDark = theme === "dark";
   const closeOverlay = useCallback(() => setOverlay(null), []);
@@ -2234,28 +2319,17 @@ export function AgentmuxTerminalApp() {
     (event: { stopPropagation: () => void }) => event.stopPropagation(),
     [],
   );
-  const resolveConfirmDialog = useCallback((confirmed: boolean) => {
-    confirmResolverRef.current?.(confirmed);
-    confirmResolverRef.current = null;
-    setConfirmDialog(null);
-  }, []);
-  const requestConfirm = useCallback((options: AppConfirmOptions) => {
-    confirmResolverRef.current?.(false);
-    return new Promise<boolean>((resolve) => {
-      confirmResolverRef.current = resolve;
-      setConfirmDialog({
-        ...options,
+  const requestConfirm = useCallback(
+    (options: AppConfirmOptions) =>
+      dialogs.confirm({
+        title: options.title,
+        description: options.message,
+        detail: options.detail,
+        confirmLabel: options.confirmLabel,
         cancelLabel: options.cancelLabel ?? t("common.cancel"),
-        variant: options.variant ?? "default",
-      });
-    });
-  }, [t]);
-  useEffect(
-    () => () => {
-      confirmResolverRef.current?.(false);
-      confirmResolverRef.current = null;
-    },
-    [],
+        tone: options.variant === "danger" ? "danger" : "default",
+      }),
+    [dialogs, t],
   );
   useEffect(
     () => () => {
@@ -2488,7 +2562,13 @@ export function AgentmuxTerminalApp() {
               : "Config JSON copied.",
           );
         } else {
-          window.prompt("Config JSON", result.json);
+          await dialogs.prompt({
+            title: "Export configuration",
+            label: "Configuration JSON",
+            initialValue: result.json,
+            multiline: true,
+            confirmLabel: "Done",
+          });
           setConfigReloadMessage(
             scope === "project"
               ? "Project config JSON exported."
@@ -2501,11 +2581,18 @@ export function AgentmuxTerminalApp() {
         );
       }
     },
-    [activeWorkspaceId, client],
+    [activeWorkspaceId, client, dialogs],
   );
   const importConfig = useCallback(
     async (scope: AppConfigScope = "global") => {
-      const json = window.prompt("Paste config JSON");
+      const json = await dialogs.prompt({
+        title: "Import configuration",
+        label: "Configuration JSON",
+        description: "Paste the JSON configuration to validate and import.",
+        multiline: true,
+        required: true,
+        confirmLabel: "Import",
+      });
       if (!json) {
         return;
       }
@@ -2525,17 +2612,24 @@ export function AgentmuxTerminalApp() {
         );
       }
     },
-    [activeWorkspaceId, applyConfig, client, refreshConfigDiagnostics],
+    [activeWorkspaceId, applyConfig, client, dialogs, refreshConfigDiagnostics],
   );
   const resetConfig = useCallback(
     async (scope: AppConfigScope = "global") => {
-      if (
-        !window.confirm(
+      const confirmed = await dialogs.confirm({
+        title:
+          scope === "project"
+            ? t("config.resetProject")
+            : "Reset global configuration",
+        description:
           scope === "project"
             ? t("config.resetProjectConfirm")
             : t("config.resetGlobalConfirm"),
-        )
-      ) {
+        confirmLabel: "Reset",
+        cancelLabel: t("common.cancel"),
+        tone: "danger",
+      });
+      if (!confirmed) {
         return;
       }
       try {
@@ -2554,7 +2648,7 @@ export function AgentmuxTerminalApp() {
         );
       }
     },
-    [activeWorkspaceId, applyConfig, client, refreshConfigDiagnostics, t],
+    [activeWorkspaceId, applyConfig, client, dialogs, refreshConfigDiagnostics, t],
   );
   const migrateProjectConfig = useCallback(async () => {
     try {
@@ -2575,23 +2669,19 @@ export function AgentmuxTerminalApp() {
       );
     }
   }, [activeWorkspaceId, applyConfig, client, refreshConfigDiagnostics]);
-  const updateShortcutBinding = useCallback(
-    async (actionId: string, binding: ShortcutBindingValue) => {
+  const updateShortcutBindings = useCallback(
+    async (bindings: ShortcutBindingMap) => {
       try {
         const config = await client.updateConfig(
           {
             shortcuts: {
-              bindings: {
-                [actionId]: binding,
-              },
+              bindings,
             },
           },
           activeWorkspaceId,
         );
         applyConfig(config);
-        setShortcutEditMessage(
-          binding === null ? "Shortcut cleared." : "Shortcut saved.",
-        );
+        setShortcutEditMessage("Shortcut settings saved.");
       } catch (cause) {
         setShortcutEditMessage(
           cause instanceof Error ? cause.message : "Shortcut save failed.",
@@ -2631,6 +2721,192 @@ export function AgentmuxTerminalApp() {
   const panes = useMemo(() => detail?.panes ?? [], [detail]);
   const surfaces = useMemo(() => detail?.surfaces ?? [], [detail]);
   const sessions = useMemo(() => detail?.sessions ?? [], [detail]);
+
+  useEffect(() => {
+    const browserSurfaces = surfaces.filter(
+      (surface) => surface.surfaceType === "browser",
+    );
+    if (browserSurfaces.length === 0) {
+      return;
+    }
+
+    let polling = false;
+    let disposed = false;
+    const isDialogPending = async (surfaceId: string, dialogId: string) => {
+      try {
+        const messages = await client.browserDialogs(surfaceId, 100);
+        return messages.some(
+          (candidate) =>
+            candidate.dialogId === dialogId && candidate.status === "pending",
+        );
+      } catch {
+        return false;
+      }
+    };
+    const awaitBrowserDialog = async <T,>(
+      surfaceId: string,
+      dialogId: string,
+      requestKey: string,
+      request: Promise<T>,
+    ): Promise<{ value: T; pending: boolean }> => {
+      let checking = false;
+      const leaseTimer = window.setInterval(() => {
+        if (checking) {
+          return;
+        }
+        checking = true;
+        void isDialogPending(surfaceId, dialogId)
+          .then((pending) => {
+            if (!pending) {
+              dialogs.cancelRequest(requestKey);
+            }
+          })
+          .finally(() => {
+            checking = false;
+          });
+      }, 350);
+      try {
+        const value = await request;
+        return {
+          value,
+          pending: await isDialogPending(surfaceId, dialogId),
+        };
+      } finally {
+        window.clearInterval(leaseTimer);
+      }
+    };
+    const poll = async () => {
+      if (polling || disposed) {
+        return;
+      }
+      polling = true;
+      try {
+        const results = await Promise.allSettled(
+          browserSurfaces.map(async (surface) => ({
+            surface,
+            messages: await client.browserDialogs(surface.surfaceId, 25),
+          })),
+        );
+        const pending = results
+          .flatMap((result) =>
+            result.status === "fulfilled"
+              ? result.value.messages
+                  .filter((message) => message.status === "pending")
+                  .map((message) => ({ surface: result.value.surface, message }))
+              : [],
+          )
+          .sort((left, right) =>
+            left.message.timestamp.localeCompare(right.message.timestamp),
+          );
+
+        for (const { surface, message } of pending) {
+          if (browserDialogsInFlightRef.current.has(message.dialogId)) {
+            continue;
+          }
+          browserDialogsInFlightRef.current.add(message.dialogId);
+          try {
+            const source = surface.title || "Browser";
+            const requestKey = `browser-dialog:${surface.surfaceId}:${message.dialogId}`;
+            if (message.kind === "prompt") {
+              const { value, pending: stillPending } = await awaitBrowserDialog(
+                surface.surfaceId,
+                message.dialogId,
+                requestKey,
+                dialogs.prompt({
+                  requestKey,
+                  title: t("browser.dialog.promptTitle", { source }),
+                  label: message.message || t("browser.dialog.promptLabel"),
+                  initialValue: message.defaultValue ?? "",
+                  confirmLabel: t("browser.dialog.submit"),
+                  cancelLabel: t("common.cancel"),
+                }),
+              );
+              if (!stillPending) {
+                continue;
+              }
+              if (value === null) {
+                await client.browserCancelDialog(surface.surfaceId, message.dialogId);
+              } else {
+                await client.browserRespondDialog(
+                  surface.surfaceId,
+                  message.dialogId,
+                  true,
+                  value,
+                );
+              }
+            } else if (message.kind === "confirm") {
+              const { value: accepted, pending: stillPending } =
+                await awaitBrowserDialog(
+                  surface.surfaceId,
+                  message.dialogId,
+                  requestKey,
+                  dialogs.confirm({
+                    requestKey,
+                    title: t("browser.dialog.confirmTitle", { source }),
+                    description: message.message,
+                    confirmLabel: t("browser.dialog.allow"),
+                    cancelLabel: t("common.cancel"),
+                    tone: "warning",
+                  }),
+                );
+              if (!stillPending) {
+                continue;
+              }
+              await client.browserRespondDialog(
+                surface.surfaceId,
+                message.dialogId,
+                accepted,
+              );
+            } else {
+              const { pending: stillPending } = await awaitBrowserDialog(
+                surface.surfaceId,
+                message.dialogId,
+                requestKey,
+                dialogs.notice({
+                  requestKey,
+                  title: source,
+                  description: message.message,
+                  acknowledgeLabel: t("dialog.confirm"),
+                }),
+              );
+              if (!stillPending) {
+                continue;
+              }
+              await client.browserRespondDialog(
+                surface.surfaceId,
+                message.dialogId,
+                true,
+              );
+            }
+          } catch (cause) {
+            if (!(await isDialogPending(surface.surfaceId, message.dialogId))) {
+              continue;
+            }
+            dialogs.toast({
+              title: t("browser.dialog.expiredTitle"),
+              description:
+                cause instanceof Error
+                  ? cause.message
+                  : t("browser.dialog.expiredDescription"),
+              tone: "warning",
+            });
+          } finally {
+            browserDialogsInFlightRef.current.delete(message.dialogId);
+          }
+        }
+      } finally {
+        polling = false;
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => void poll(), 350);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [client, dialogs, surfaces, t]);
+
   const activePaneId = detail?.workspace.activePaneId ?? null;
   // Per-tab last-active-pane memory: maps a tab's root pane ID to the leaf
   // pane the user most recently focused within that tab. Pane IDs are globally
@@ -3320,7 +3596,14 @@ export function AgentmuxTerminalApp() {
   );
   const createWorkspaceGroup = useCallback(async () => {
     const defaultName = nextWorkspaceGroupName(workspaceGroups);
-    const rawName = window.prompt("Workspace group name", defaultName);
+    const rawName = await dialogs.prompt({
+      title: t("workspace.group.createTitle"),
+      label: t("workspace.group.nameLabel"),
+      initialValue: defaultName,
+      required: true,
+      confirmLabel: t("workspace.group.createAction"),
+      cancelLabel: t("common.cancel"),
+    });
     if (rawName === null) {
       return;
     }
@@ -3350,36 +3633,54 @@ export function AgentmuxTerminalApp() {
     activeWorkspaceId,
     clearWorkspaceSelection,
     ctl,
+    dialogs,
     selectedWorkspaces,
+    t,
     workspaceGroups,
   ]);
   const editWorkspaceGroup = useCallback(
     async (group: WorkspaceGroup) => {
-      const rawName = window.prompt("Workspace group name", group.name);
-      if (rawName === null) {
-        return;
-      }
-      const rawIcon = window.prompt(
-        "Group icon (1-2 letters)",
-        group.icon ?? "",
-      );
-      if (rawIcon === null) {
-        return;
-      }
-      const rawColor = window.prompt(
-        "Group color (#RRGGBB)",
-        group.color ?? "",
-      );
-      if (rawColor === null) {
+      const values = await dialogs.form({
+        title: t("workspace.group.editTitle"),
+        fields: [
+          {
+            id: "name",
+            label: t("workspace.group.nameLabel"),
+            initialValue: group.name,
+            required: true,
+          },
+          {
+            id: "icon",
+            label: t("workspace.group.iconLabel"),
+            description: t("workspace.group.iconDescription"),
+            initialValue: group.icon ?? "",
+          },
+          {
+            id: "color",
+            label: t("workspace.group.colorLabel"),
+            description: t("workspace.group.colorDescription"),
+            initialValue: group.color ?? "",
+            validate: (value) => {
+              const text = String(value).trim();
+              return text && !/^#[0-9a-f]{6}$/i.test(text)
+                ? t("workspace.group.invalidColor")
+                : null;
+            },
+          },
+        ],
+        confirmLabel: t("common.save"),
+        cancelLabel: t("common.cancel"),
+      });
+      if (!values) {
         return;
       }
       await ctl.updateWorkspaceGroup(group.groupId, {
-        name: rawName.trim() || group.name,
-        icon: normalizeGroupIcon(rawIcon),
-        color: normalizeGroupColor(rawColor),
+        name: String(values.name).trim() || group.name,
+        icon: normalizeGroupIcon(String(values.icon)),
+        color: normalizeGroupColor(String(values.color)),
       });
     },
-    [ctl],
+    [ctl, dialogs, t],
   );
   const toggleWorkspaceGroupPin = useCallback(
     (group: WorkspaceGroup) => {
@@ -3388,16 +3689,19 @@ export function AgentmuxTerminalApp() {
     [ctl],
   );
   const deleteWorkspaceGroup = useCallback(
-    (group: WorkspaceGroup) => {
-      if (
-        window.confirm(
-          `Delete workspace group "${group.name}"? Workspaces will remain.`,
-        )
-      ) {
+    async (group: WorkspaceGroup) => {
+      const confirmed = await dialogs.confirm({
+        title: t("workspace.group.deleteTitle", { name: group.name }),
+        description: t("workspace.group.deleteDescription"),
+        confirmLabel: t("workspace.group.deleteAction"),
+        cancelLabel: t("common.cancel"),
+        tone: "danger",
+      });
+      if (confirmed) {
         void ctl.deleteWorkspaceGroup(group.groupId);
       }
     },
-    [ctl],
+    [ctl, dialogs, t],
   );
   const closeWorkspaceFromMenu = useCallback(
     async (workspace: WorkspaceSummary) => {
@@ -3450,12 +3754,15 @@ export function AgentmuxTerminalApp() {
           clearWorkspaceSelection();
           return;
         }
-        window.alert(
-          cause instanceof Error ? cause.message : "Workspace close failed.",
-        );
+        dialogs.toast({
+          title: "Workspace close failed",
+          description:
+            cause instanceof Error ? cause.message : "Unable to close workspace.",
+          tone: "danger",
+        });
       }
     },
-    [clearWorkspaceSelection, client, ctl, requestConfirm, workspaceGroups],
+    [clearWorkspaceSelection, client, ctl, dialogs, requestConfirm, workspaceGroups],
   );
   const createWorkspaceInGroup = useCallback(
     async (group: WorkspaceGroup) => {
@@ -4982,8 +5289,7 @@ export function AgentmuxTerminalApp() {
     return focusAttentionTarget(nextTarget);
   }, [activePaneId, attentionPaneQueue, focusAttentionTarget]);
   const openNotificationPanel = useCallback(() => {
-    setSettingsTab("general");
-    setOverlay("settings");
+    setOverlay("notifications");
   }, []);
   const closePaneStable = useCallback(
     (paneId: string) => {
@@ -5383,16 +5689,21 @@ export function AgentmuxTerminalApp() {
     () => buildShortcutIndex(shortcutBindings),
     [shortcutBindings],
   );
-  const promptCustomAgent = useCallback(() => {
-    const raw = window.prompt(
-      "Agent command to run in a durable session (for example: claude)",
-    );
+  const promptCustomAgent = useCallback(async () => {
+    const raw = await dialogs.prompt({
+      title: "Run custom agent",
+      label: "Agent command",
+      description: "The command will run in a durable session.",
+      placeholder: "claude",
+      required: true,
+      confirmLabel: "Run agent",
+    });
     const parts = (raw ?? "").trim().split(/\s+/).filter(Boolean);
     if (parts.length > 0) {
       void ctl.spawnAgent(parts);
     }
     closeOverlay();
-  }, [closeOverlay, ctl.spawnAgent]);
+  }, [closeOverlay, ctl.spawnAgent, dialogs]);
 
   // PR-7: keep source-list-derived command descriptors separate from the core
   // command list so workspace/WSL/custom maps do not rebuild on unrelated UI
@@ -5913,7 +6224,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "notification.openPanel",
         group: "view",
-        title: "Open notifications",
+        title: t("notifications.open"),
         keywords: ["notification", "attention", "waiting"],
         run: openNotificationPanel,
       },
@@ -6151,7 +6462,7 @@ export function AgentmuxTerminalApp() {
     }
 
     function onKey(event: KeyboardEvent) {
-      if (confirmDialog) {
+      if (dialogs.isDialogOpen) {
         return;
       }
       const key = (event.key || "").toLowerCase();
@@ -6167,6 +6478,8 @@ export function AgentmuxTerminalApp() {
       }
 
       const stroke = keyboardEventToStroke(event);
+      const terminalTarget =
+        event.target instanceof Element && event.target.closest(".xterm") !== null;
 
       // ⌘/Ctrl+B — toggle the workspace sidebar (VS Code convention).
       if (
@@ -6174,6 +6487,7 @@ export function AgentmuxTerminalApp() {
         !event.altKey &&
         !event.shiftKey &&
         key === "b" &&
+        !terminalTarget &&
         (!stroke ||
           (!shortcutIndex.chordPrefix.has(stroke) &&
             !shortcutIndex.single.has(stroke)))
@@ -6232,6 +6546,10 @@ export function AgentmuxTerminalApp() {
         return;
       }
 
+      if (terminalTarget && isUnsafeUnmodifiedShortcutStroke(stroke)) {
+        return;
+      }
+
       if (shortcutIndex.chordPrefix.has(stroke)) {
         event.preventDefault();
         event.stopPropagation();
@@ -6255,7 +6573,7 @@ export function AgentmuxTerminalApp() {
       window.removeEventListener("keydown", onKey, true);
       clearPendingShortcut();
     };
-  }, [confirmDialog, executeAction, overlay, shortcutIndex]);
+  }, [dialogs.isDialogOpen, executeAction, overlay, shortcutIndex]);
 
   const q = query.trim().toLowerCase();
   const rawGroups = ACTION_GROUP_ORDER.map((group) => ({
@@ -8620,6 +8938,22 @@ export function AgentmuxTerminalApp() {
             }
           />
         ) : null}
+        {overlay === "notifications" ? (
+          <NotificationCenter
+            notifications={notifications}
+            notificationActionsFor={notificationActionsFor}
+            onClose={closeOverlay}
+            onDismissNotification={(id) => void ctl.dismissNotification(id)}
+            onFocusNotificationSession={(sessionId) => {
+              if (focusSessionPane(sessionId)) {
+                closeOverlay();
+              }
+            }}
+            onRunNotificationAction={runNotificationAction}
+            stop={stop}
+            t={t}
+          />
+        ) : null}
         {overlay === "settings" ? (
           <SettingsModal
             isDark={isDark}
@@ -8632,7 +8966,6 @@ export function AgentmuxTerminalApp() {
             terminalStartCustomCwd={terminalStartCustomCwd}
             terminalSplitBehavior={terminalSplitBehavior}
             settingsTab={settingsTab}
-            notifications={notifications}
             updatesConfig={updatesConfig}
             updateState={updateState}
             configPath={configPath}
@@ -8646,7 +8979,6 @@ export function AgentmuxTerminalApp() {
             activeWorkspace={activeWorkspace ?? null}
             wslDistributions={wslDistributions}
             actions={actions}
-            notificationActionsFor={notificationActionsFor}
             shortcutBindings={shortcutBindings}
             shortcutEditMessage={shortcutEditMessage}
             onClose={closeOverlay}
@@ -8664,9 +8996,6 @@ export function AgentmuxTerminalApp() {
             terminalLinkOpenMode={terminalLinkOpenMode}
             setTerminalLinkOpenMode={setTerminalLinkOpenMode}
             setAutoUpdateCheck={setAutoUpdateCheck}
-            onDismissNotification={(id) => void ctl.dismissNotification(id)}
-            onFocusNotificationSession={focusSessionPane}
-            onRunNotificationAction={runNotificationAction}
             onReloadConfig={() => void reloadConfig()}
             onExportConfig={(scope) => void exportConfig(scope)}
             onImportConfig={(scope) => void importConfig(scope)}
@@ -8674,9 +9003,7 @@ export function AgentmuxTerminalApp() {
             onMigrateProjectConfig={() => void migrateProjectConfig()}
             onCheckForUpdates={() => void checkForUpdates()}
             onInstallUpdate={() => void installAvailableUpdate()}
-            onUpdateShortcut={(actionId, binding) =>
-              void updateShortcutBinding(actionId, binding)
-            }
+            onUpdateShortcuts={(bindings) => void updateShortcutBindings(bindings)}
             onRunTmuxProbe={() => void runTmuxProbe()}
             onUpdateWorkspace={(workspaceId, input) =>
               void ctl.updateWorkspace(workspaceId, input)
@@ -8693,18 +9020,326 @@ export function AgentmuxTerminalApp() {
             t={t}
           />
         ) : null}
-        {confirmDialog ? (
-          <AppConfirmModal
-            dialog={confirmDialog}
-            onCancel={() => resolveConfirmDialog(false)}
-            onConfirm={() => resolveConfirmDialog(true)}
-            stop={stop}
-          />
-        ) : null}
       </div>
     </div>
   );
 }
+
+function NotificationCenter({
+  notifications,
+  notificationActionsFor,
+  onClose,
+  onDismissNotification,
+  onFocusNotificationSession,
+  onRunNotificationAction,
+  stop,
+  t,
+}: {
+  notifications: NotificationSummary[];
+  notificationActionsFor: (
+    notification: NotificationSummary,
+  ) => NotificationActionBinding[];
+  onClose: () => void;
+  onDismissNotification: (id: string) => void;
+  onFocusNotificationSession: (sessionId: string | null | undefined) => void;
+  onRunNotificationAction: (
+    hook: AppConfigNotificationAction,
+    notification: NotificationSummary,
+  ) => void;
+  stop: (event: { stopPropagation: () => void }) => void;
+  t: Translator;
+}) {
+  const {
+    containerRef: notificationCenterRef,
+    onKeyDown: onNotificationCenterKeyDown,
+  } = useOverlayFocusGuard<HTMLElement>(onClose);
+  const severityCounts = ["error", "warning", "info"].map((severity) => ({
+    severity,
+    count: notifications.filter(
+      (notification) => notification.severity.toLowerCase() === severity,
+    ).length,
+  }));
+  const severityLabel = (severity: string) => {
+    switch (severity.toLowerCase()) {
+      case "error":
+        return t("notifications.severity.error");
+      case "warning":
+        return t("notifications.severity.warning");
+      default:
+        return t("notifications.severity.info");
+    }
+  };
+
+  return (
+    <div
+      className="agentmux-notification-center-backdrop"
+      onClick={onClose}
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 45,
+        background: "rgba(0,0,0,0.28)",
+        display: "flex",
+        justifyContent: "flex-end",
+        animation: "fadein .12s ease",
+      }}
+    >
+      <aside
+        ref={notificationCenterRef}
+        className="agentmux-notification-center"
+        data-agentmux-notification-center
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("notifications.title")}
+        tabIndex={-1}
+        onKeyDown={onNotificationCenterKeyDown}
+        onClick={stop}
+        style={{
+          width: 420,
+          maxWidth: "min(420px, 94vw)",
+          height: "100%",
+          background: "var(--surface)",
+          borderLeft: "1px solid var(--border-strong)",
+          boxShadow: "-24px 0 70px rgba(0,0,0,0.32)",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        <header
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "18px 18px 14px",
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          <div>
+            <h2
+              style={{
+                margin: 0,
+                color: "var(--fg1)",
+                font: `700 16px/1.2 ${FONT_SANS}`,
+              }}
+            >
+              {t("notifications.title")}
+            </h2>
+            <p
+              data-agentmux-notification-summary
+              style={{
+                margin: "5px 0 0",
+                color: "var(--fg4)",
+                font: `500 11.5px/1.35 ${FONT_SANS}`,
+              }}
+            >
+              {t("notifications.summary", { count: notifications.length })}
+            </p>
+          </div>
+          <button
+            type="button"
+            data-overlay-autofocus="true"
+            aria-label={t("common.close")}
+            onClick={onClose}
+            style={{
+              width: 30,
+              height: 30,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              border: "1px solid var(--border)",
+              borderRadius: 7,
+              background: "var(--canvas)",
+              color: "var(--fg2)",
+              cursor: "pointer",
+            }}
+          >
+            <IconClose size={15} />
+          </button>
+        </header>
+        <div
+          aria-label={t("notifications.title")}
+          style={{
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap",
+            padding: "12px 18px",
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          {severityCounts.map(({ severity, count }) =>
+            count > 0 ? (
+              <span
+                key={severity}
+                data-agentmux-notification-severity-count={severity}
+                style={{
+                  padding: "4px 8px",
+                  borderRadius: 999,
+                  color:
+                    severity === "error"
+                      ? "#f87171"
+                      : severity === "warning"
+                        ? "#fbbf24"
+                        : "var(--accent)",
+                  background:
+                    severity === "error"
+                      ? "rgba(248,113,113,0.12)"
+                      : severity === "warning"
+                        ? "rgba(251,191,36,0.12)"
+                        : "var(--accent-soft)",
+                  font: `700 10.5px/1 ${FONT_SANS}`,
+                }}
+              >
+                {severityLabel(severity)} {count}
+              </span>
+            ) : null,
+          )}
+        </div>
+        <div
+          className="agentmux-scroll"
+          style={{
+            flex: 1,
+            overflow: "auto",
+            padding: 14,
+          }}
+        >
+          {notifications.length === 0 ? (
+            <p
+              style={{
+                margin: 0,
+                color: "var(--fg4)",
+                font: `400 12px/1.5 ${FONT_SANS}`,
+              }}
+            >
+              {t("notifications.empty")}
+            </p>
+          ) : (
+            <div style={{ display: "grid", gap: 10 }}>
+              {notifications.map((notification) => (
+                <article
+                  key={notification.notificationId}
+                  className="agentmux-notification-row"
+                  data-agentmux-notification={notification.notificationId}
+                  data-agentmux-notification-type={notification.notificationType}
+                  data-agentmux-notification-severity={notification.severity}
+                  style={{
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    padding: 12,
+                    background: "var(--canvas)",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      justifyContent: "space-between",
+                      gap: 10,
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div
+                        style={{
+                          color: "var(--fg1)",
+                          font: `700 12.5px/1.35 ${FONT_SANS}`,
+                        }}
+                      >
+                        {notification.title}
+                      </div>
+                      <div
+                        style={{
+                          marginTop: 5,
+                          color: "var(--fg3)",
+                          font: `400 11.5px/1.45 ${FONT_SANS}`,
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        {notification.message}
+                      </div>
+                    </div>
+                    <span
+                      style={{
+                        flex: "none",
+                        color: "var(--fg4)",
+                        font: `600 10px/1 ${FONT_SANS}`,
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      {severityLabel(notification.severity)}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "flex-end",
+                      gap: 7,
+                      flexWrap: "wrap",
+                      marginTop: 12,
+                    }}
+                  >
+                    {notification.sessionId ? (
+                      <button
+                        type="button"
+                        className="agentmux-notification-focus"
+                        onClick={() =>
+                          onFocusNotificationSession(notification.sessionId)
+                        }
+                        style={notificationSecondaryButtonStyle}
+                      >
+                        {t("notifications.focus")}
+                      </button>
+                    ) : null}
+                    {notificationActionsFor(notification).map(
+                      ({ hook, action }, index) => (
+                        <button
+                          key={`${notification.notificationId}-${hook.action}-${index}`}
+                          type="button"
+                          className={`agentmux-notification-action agentmux-notification-action-${actionClassFragment(hook.action)}`}
+                          onClick={() => onRunNotificationAction(hook, notification)}
+                          style={notificationPrimaryButtonStyle}
+                        >
+                          {hook.label ?? action.title}
+                        </button>
+                      ),
+                    )}
+                    <button
+                      type="button"
+                      className="agentmux-notification-dismiss"
+                      onClick={() => onDismissNotification(notification.notificationId)}
+                      style={notificationSecondaryButtonStyle}
+                    >
+                      {t("common.dismiss")}
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+const notificationSecondaryButtonStyle: CSSProperties = {
+  background: "var(--s2)",
+  color: "var(--fg2)",
+  border: "1px solid var(--border)",
+  borderRadius: 7,
+  padding: "6px 10px",
+  cursor: "pointer",
+  font: `600 11px/1 ${FONT_SANS}`,
+};
+
+const notificationPrimaryButtonStyle: CSSProperties = {
+  background: "var(--accent)",
+  color: "#fff",
+  border: 0,
+  borderRadius: 7,
+  padding: "6px 10px",
+  cursor: "pointer",
+  font: `600 11px/1 ${FONT_SANS}`,
+};
 
 function TextBoxComposer({
   draft,
@@ -10459,6 +11094,7 @@ function CommandPalette({
             <IconSearch size={17} />
           </span>
           <input
+            className="agentmux-palette-input"
             value={query}
             onChange={(e) => onQuery(e.target.value)}
             autoFocus
@@ -10581,33 +11217,6 @@ function CommandPalette({
   );
 }
 
-function collectShortcutConflicts(
-  actions: ActionDescriptor[],
-  bindings: ResolvedShortcutBindings,
-): Array<{ key: string; label: string; actions: string[] }> {
-  const byShortcut = new Map<string, { label: string; actions: string[] }>();
-  for (const action of actions) {
-    const binding = bindings[action.id];
-    if (!binding) {
-      continue;
-    }
-    const key = binding.strokes.join(" ");
-    const current = byShortcut.get(key) ?? {
-      label: binding.label,
-      actions: [],
-    };
-    current.actions.push(action.id);
-    byShortcut.set(key, current);
-  }
-  return Array.from(byShortcut.entries())
-    .filter(([, value]) => value.actions.length > 1)
-    .map(([key, value]) => ({
-      key,
-      label: value.label,
-      actions: value.actions,
-    }));
-}
-
 function SearchOverlay({
   onClose,
   t,
@@ -10692,7 +11301,6 @@ interface SettingsModalProps {
   terminalSplitBehavior: TerminalSplitBehavior;
   terminalLinkOpenMode: TerminalLinkOpenMode;
   settingsTab: SettingsTab;
-  notifications: NotificationSummary[];
   updatesConfig: AppConfigUpdates;
   updateState: AppUpdateState;
   configPath: string;
@@ -10706,9 +11314,6 @@ interface SettingsModalProps {
   activeWorkspace: WorkspaceSummary | null;
   wslDistributions: { name: string; isDefault: boolean }[];
   actions: ActionDescriptor[];
-  notificationActionsFor: (
-    notification: NotificationSummary,
-  ) => NotificationActionBinding[];
   shortcutBindings: ResolvedShortcutBindings;
   shortcutEditMessage: string;
   onClose: () => void;
@@ -10725,12 +11330,6 @@ interface SettingsModalProps {
   setTerminalSplitBehavior: (value: TerminalSplitBehavior) => void;
   setTerminalLinkOpenMode: (mode: TerminalLinkOpenMode) => void;
   setAutoUpdateCheck: (enabled: boolean) => void;
-  onDismissNotification: (id: string) => void;
-  onFocusNotificationSession: (sessionId: string | null | undefined) => boolean;
-  onRunNotificationAction: (
-    hook: AppConfigNotificationAction,
-    notification: NotificationSummary,
-  ) => void;
   onReloadConfig: () => void;
   onExportConfig: (scope?: AppConfigScope) => void;
   onImportConfig: (scope?: AppConfigScope) => void;
@@ -10738,7 +11337,7 @@ interface SettingsModalProps {
   onMigrateProjectConfig: () => void;
   onCheckForUpdates: () => void;
   onInstallUpdate: () => void;
-  onUpdateShortcut: (actionId: string, binding: ShortcutBindingValue) => void;
+  onUpdateShortcuts: (bindings: ShortcutBindingMap) => void;
   onRunTmuxProbe: (distribution?: string | null) => void;
   onUpdateWorkspace: (workspaceId: string, input: WorkspaceUpdateInput) => void;
   onCreateProfile: (input: SshProfileInput) => void;
@@ -10758,198 +11357,6 @@ interface SetupModalProps {
   stop: (e: { stopPropagation: () => void }) => void;
   onRunTmuxProbe: (distribution?: string | null) => void;
   onUpdateWorkspace: (workspaceId: string, input: WorkspaceUpdateInput) => void;
-}
-
-function AppConfirmModal({
-  dialog,
-  onCancel,
-  onConfirm,
-  stop,
-}: {
-  dialog: AppConfirmDialog;
-  onCancel: () => void;
-  onConfirm: () => void;
-  stop: (e: { stopPropagation: () => void }) => void;
-}) {
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onCancel();
-      }
-      if (event.key === "Enter") {
-        event.preventDefault();
-        onConfirm();
-      }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onCancel, onConfirm]);
-
-  const danger = dialog.variant === "danger";
-  const messageParts = dialog.message.split("\n").filter(Boolean);
-  const detailParts = dialog.detail?.split("\n").filter(Boolean) ?? [];
-
-  return (
-    <div
-      className="agentmux-confirm-backdrop"
-      onMouseDown={onCancel}
-      style={{
-        position: "absolute",
-        inset: 0,
-        zIndex: 90,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 20,
-        background: "rgba(0,0,0,0.58)",
-        backdropFilter: "blur(10px)",
-        animation: "fadein .12s ease",
-      }}
-    >
-      <div
-        className={`agentmux-confirm-modal is-${dialog.variant}`}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agentmux-confirm-title"
-        onMouseDown={stop}
-        style={{
-          width: 430,
-          maxWidth: "min(430px, 94vw)",
-          background: "var(--surface)",
-          border: "1px solid var(--border-strong)",
-          borderRadius: 10,
-          boxShadow: "0 28px 80px rgba(0,0,0,0.5)",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            gap: 12,
-            padding: "18px 18px 14px",
-            borderBottom: "1px solid var(--border)",
-          }}
-        >
-          <div
-            aria-hidden="true"
-            style={{
-              width: 34,
-              height: 34,
-              borderRadius: 8,
-              flex: "none",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              background: danger
-                ? "rgba(248,113,113,0.13)"
-                : "var(--accent-soft)",
-              border: danger
-                ? "1px solid rgba(248,113,113,0.32)"
-                : "1px solid var(--border)",
-              color: danger ? "var(--red, #F87171)" : "var(--accent)",
-              font: `800 18px/1 ${FONT_SANS}`,
-            }}
-          >
-            !
-          </div>
-          <div style={{ minWidth: 0 }}>
-            <div
-              id="agentmux-confirm-title"
-              className="agentmux-confirm-title"
-              style={{
-                color: "var(--fg1)",
-                font: `700 14px/1.3 ${FONT_SANS}`,
-              }}
-            >
-              {dialog.title}
-            </div>
-            <div
-              className="agentmux-confirm-message"
-              style={{
-                marginTop: 8,
-                color: "var(--fg3)",
-                font: `400 12.5px/1.55 ${FONT_SANS}`,
-              }}
-            >
-              {messageParts.map((part) => (
-                <p key={part} style={{ margin: "0 0 6px" }}>
-                  {part}
-                </p>
-              ))}
-              {detailParts.length > 0 ? (
-                <div
-                  className="agentmux-confirm-detail"
-                  style={{
-                    marginTop: 10,
-                    padding: "9px 10px",
-                    borderRadius: 7,
-                    border: "1px solid var(--border)",
-                    background: "var(--canvas)",
-                    color: danger ? "var(--fg2)" : "var(--fg4)",
-                  }}
-                >
-                  {detailParts.map((part) => (
-                    <p key={part} style={{ margin: "0 0 5px" }}>
-                      {part}
-                    </p>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          </div>
-        </div>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: 8,
-            padding: "12px 14px",
-            background: "var(--canvas)",
-          }}
-        >
-          <button
-            type="button"
-            className="agentmux-confirm-cancel"
-            onClick={onCancel}
-            autoFocus
-            style={{
-              height: 32,
-              borderRadius: 7,
-              border: "1px solid var(--border)",
-              background: "var(--surface)",
-              color: "var(--fg2)",
-              cursor: "pointer",
-              padding: "0 12px",
-              font: `600 12px/1 ${FONT_SANS}`,
-            }}
-          >
-            {dialog.cancelLabel ?? "Cancel"}
-          </button>
-          <button
-            type="button"
-            className="agentmux-confirm-confirm"
-            onClick={onConfirm}
-            style={{
-              height: 32,
-              borderRadius: 7,
-              border: danger ? "1px solid rgba(248,113,113,0.42)" : 0,
-              background: danger ? "var(--red, #EF4444)" : "var(--accent)",
-              color: "#fff",
-              cursor: "pointer",
-              padding: "0 13px",
-              font: `700 12px/1 ${FONT_SANS}`,
-              boxShadow: danger
-                ? "0 8px 22px rgba(239,68,68,0.24)"
-                : "0 8px 22px rgba(37,99,235,0.22)",
-            }}
-          >
-            {dialog.confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function SetupModal(props: SetupModalProps) {
@@ -11480,6 +11887,7 @@ function SetupModal(props: SetupModalProps) {
 }
 
 function SettingsModal(props: SettingsModalProps) {
+  const dialogs = useAppDialogs();
   const {
     isDark,
     language,
@@ -11492,7 +11900,6 @@ function SettingsModal(props: SettingsModalProps) {
     terminalSplitBehavior,
     terminalLinkOpenMode,
     settingsTab,
-    notifications,
     updatesConfig,
     updateState,
     configPath,
@@ -11506,7 +11913,6 @@ function SettingsModal(props: SettingsModalProps) {
     activeWorkspace,
     wslDistributions,
     actions,
-    notificationActionsFor,
     shortcutBindings,
     shortcutEditMessage,
     onClose,
@@ -11523,9 +11929,6 @@ function SettingsModal(props: SettingsModalProps) {
     setTerminalSplitBehavior,
     setTerminalLinkOpenMode,
     setAutoUpdateCheck,
-    onDismissNotification,
-    onFocusNotificationSession,
-    onRunNotificationAction,
     onReloadConfig,
     onExportConfig,
     onImportConfig,
@@ -11533,7 +11936,7 @@ function SettingsModal(props: SettingsModalProps) {
     onMigrateProjectConfig,
     onCheckForUpdates,
     onInstallUpdate,
-    onUpdateShortcut,
+    onUpdateShortcuts,
     onRunTmuxProbe,
     onUpdateWorkspace,
     onCreateProfile,
@@ -11542,6 +11945,10 @@ function SettingsModal(props: SettingsModalProps) {
     onConnectProfile,
     t,
   } = props;
+  const {
+    containerRef: settingsDialogRef,
+    onKeyDown: onSettingsDialogKeyDown,
+  } = useOverlayFocusGuard<HTMLDivElement>(onClose);
   const [workspaceDraft, setWorkspaceDraft] = useState<WorkspaceUpdateInput>({
     name: activeWorkspace?.name ?? "",
     projectRoot: activeWorkspace?.projectRoot ?? "",
@@ -11590,64 +11997,154 @@ function SettingsModal(props: SettingsModalProps) {
     });
   };
 
-  const visibleActions = actions.filter(
-    (action) => action.visibleInPalette !== false,
-  );
-  const shortcutConflicts = collectShortcutConflicts(actions, shortcutBindings);
-  const editShortcut = (action: ActionDescriptor) => {
-    const current = shortcutLabelForAction(shortcutBindings, action.id);
-    const raw = window.prompt(
-      "Shortcut (examples: ctrl+shift+p or ctrl+b, c). Leave empty to clear.",
-      current,
+  const visibleActions = actions.filter(isShortcutEditorVisible);
+  const shortcutConflicts = collectShortcutConflicts(shortcutBindings);
+  const editShortcut = async (action: ActionDescriptor) => {
+    const current = shortcutBindings[action.id];
+    const currentValue: ShortcutBindingValue = !current
+      ? null
+      : current.strokes.length === 2
+        ? [current.strokes[0], current.strokes[1]]
+        : current.strokes[0];
+    const captured = await dialogs.captureShortcut({
+      title: t("shortcuts.editTitle", { action: action.title }),
+      description: t("shortcuts.editDescription"),
+      initialValue: currentValue,
+      firstStrokeLabel: t("shortcuts.firstStroke"),
+      secondStrokeLabel: t("shortcuts.secondStroke"),
+      confirmLabel: t("shortcuts.save"),
+      cancelLabel: t("common.cancel"),
+      clearLabel: t("shortcuts.unassign"),
+    });
+    if (captured === undefined) {
+      return;
+    }
+    const resolution = resolveShortcutBinding(
+      shortcutBindings,
+      action.id,
+      captured,
+      "reject",
     );
-    if (raw === null) {
+    if (resolution.error === "invalid") {
+      dialogs.toast({
+        title: t("shortcuts.invalidTitle"),
+        description: t("shortcuts.invalidDescription"),
+        tone: "danger",
+      });
       return;
     }
-    const binding = parseShortcutBindingInput(raw);
-    if (binding !== null && !normalizeShortcutBinding(binding)) {
-      window.alert(
-        "Invalid shortcut. Use a single shortcut or a two-step chord separated by a comma.",
+    if (resolution.error === "conflict") {
+      const conflictingIds = [
+        ...new Set(
+          resolution.conflicts.flatMap((conflict) => conflict.actions),
+        ),
+      ].filter((actionId) => actionId !== action.id);
+      const conflictingNames = conflictingIds.map(
+        (actionId) =>
+          actions.find((candidate) => candidate.id === actionId)?.title ?? actionId,
       );
+      const replace = await dialogs.confirm({
+        title: t("shortcuts.replaceTitle"),
+        description: t("shortcuts.replaceDescription", {
+          binding: resolution.binding?.label ?? t("shortcuts.firstStroke"),
+          actions: conflictingNames.join(", "),
+        }),
+        detail: t("shortcuts.replaceDetail"),
+        confirmLabel: t("shortcuts.replaceAction"),
+        cancelLabel: t("common.cancel"),
+        tone: "warning",
+      });
+      if (!replace) {
+        return;
+      }
+      const replaced = resolveShortcutBinding(
+        shortcutBindings,
+        action.id,
+        captured,
+        "replace",
+      );
+      onUpdateShortcuts({
+        [action.id]: captured,
+        ...Object.fromEntries(
+          replaced.replacedActionIds.map((actionId) => [actionId, null]),
+        ),
+      });
       return;
     }
-    onUpdateShortcut(action.id, binding);
+    onUpdateShortcuts({ [action.id]: captured });
   };
 
-  const promptNewProfile = () => {
-    const name = window.prompt("프로필 이름")?.trim();
-    if (!name) return;
-    const host = window.prompt("호스트 (예: 10.0.0.1)")?.trim();
-    if (!host) return;
-    const user = window.prompt("사용자")?.trim();
-    if (!user) return;
-    onCreateProfile({ name, host, user, port: 22 });
+  const promptNewProfile = async () => {
+    const values = await dialogs.form({
+      title: "Create SSH profile",
+      fields: [
+        { id: "name", label: "Profile name", required: true },
+        {
+          id: "host",
+          label: "Host",
+          placeholder: "10.0.0.1",
+          required: true,
+        },
+        { id: "user", label: "User", required: true },
+        {
+          id: "port",
+          label: "Port",
+          initialValue: "22",
+          required: true,
+          validate: (value) => {
+            const port = Number.parseInt(String(value), 10);
+            return port >= 1 && port <= 65535 ? null : "Use a port from 1 to 65535.";
+          },
+        },
+      ],
+      confirmLabel: "Create profile",
+    });
+    if (!values) return;
+    onCreateProfile({
+      name: String(values.name).trim(),
+      host: String(values.host).trim(),
+      user: String(values.user).trim(),
+      port: Number.parseInt(String(values.port), 10),
+    });
   };
-  const promptEditProfile = (profile: SshProfile) => {
-    const name = window.prompt("프로필 이름", profile.name)?.trim();
-    if (!name) return;
-    const host = window.prompt("호스트", profile.host)?.trim();
-    if (!host) return;
-    const user = window.prompt("사용자", profile.user)?.trim();
-    if (!user) return;
-    const portText =
-      window.prompt("포트", String(profile.port ?? 22))?.trim() ?? "";
-    const port = Number.parseInt(portText, 10);
+  const promptEditProfile = async (profile: SshProfile) => {
+    const values = await dialogs.form({
+      title: "Edit SSH profile",
+      fields: [
+        { id: "name", label: "Profile name", initialValue: profile.name, required: true },
+        { id: "host", label: "Host", initialValue: profile.host, required: true },
+        { id: "user", label: "User", initialValue: profile.user, required: true },
+        {
+          id: "port",
+          label: "Port",
+          initialValue: String(profile.port ?? 22),
+          required: true,
+          validate: (value) => {
+            const port = Number.parseInt(String(value), 10);
+            return port >= 1 && port <= 65535 ? null : "Use a port from 1 to 65535.";
+          },
+        },
+      ],
+      confirmLabel: "Save profile",
+    });
+    if (!values) return;
     onUpdateProfile(profile.profileId, {
-      name,
-      host,
-      user,
-      port: Number.isFinite(port) ? port : 22,
+      name: String(values.name).trim(),
+      host: String(values.host).trim(),
+      user: String(values.user).trim(),
+      port: Number.parseInt(String(values.port), 10),
     });
   };
   const tabs: { key: SettingsTab; label: string }[] = [
     { key: "general", label: t("settings.tabs.general") },
-    { key: "workspace", label: t("settings.tabs.workspace") },
-    { key: "diagnostics", label: t("settings.tabs.diagnostics") },
     { key: "appearance", label: t("settings.tabs.appearance") },
+    { key: "workspace", label: t("settings.tabs.workspace") },
     ...(SSH_UI_ENABLED
       ? ([{ key: "profiles", label: t("settings.tabs.profiles") }] as const)
       : []),
     { key: "keys", label: t("settings.tabs.keys") },
+    { key: "advanced", label: t("settings.tabs.advanced") },
+    { key: "diagnostics", label: t("settings.tabs.diagnostics") },
   ];
   const fieldLabel: CSSProperties = {
     display: "block",
@@ -11691,6 +12188,41 @@ function SettingsModal(props: SettingsModalProps) {
                   : t("updates.status.idle");
   const updateBusy =
     updateState.status === "checking" || updateState.status === "downloading";
+  const activateSettingsTab = (key: SettingsTab) => {
+    setSettingsTab(key);
+    window.requestAnimationFrame(() => {
+      settingsDialogRef.current
+        ?.querySelector<HTMLElement>(`[data-agentmux-settings-tab="${key}"]`)
+        ?.focus();
+    });
+  };
+  const onSettingsCategoryKeyDown = (
+    event: ReactKeyboardEvent<HTMLElement>,
+    currentIndex: number,
+  ) => {
+    let nextIndex: number | null = null;
+    switch (event.key) {
+      case "ArrowDown":
+      case "ArrowRight":
+        nextIndex = (currentIndex + 1) % tabs.length;
+        break;
+      case "ArrowUp":
+      case "ArrowLeft":
+        nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+        break;
+      case "Home":
+        nextIndex = 0;
+        break;
+      case "End":
+        nextIndex = tabs.length - 1;
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    activateSettingsTab(tabs[nextIndex].key);
+  };
 
   return (
     <div
@@ -11707,7 +12239,13 @@ function SettingsModal(props: SettingsModalProps) {
       }}
     >
       <div
+        ref={settingsDialogRef}
         className="agentmux-settings-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agentmux-settings-title"
+        tabIndex={-1}
+        onKeyDown={onSettingsDialogKeyDown}
         onClick={stop}
         style={{
           width: 780,
@@ -11723,6 +12261,9 @@ function SettingsModal(props: SettingsModalProps) {
         }}
       >
         <div
+          role="tablist"
+          aria-label={t("common.settings")}
+          aria-orientation="vertical"
           style={{
             width: 188,
             flex: "none",
@@ -11735,6 +12276,7 @@ function SettingsModal(props: SettingsModalProps) {
           }}
         >
           <div
+            id="agentmux-settings-title"
             style={{
               font: `700 14px/1 ${FONT_SANS}`,
               color: "var(--fg1)",
@@ -11743,30 +12285,47 @@ function SettingsModal(props: SettingsModalProps) {
           >
             {t("common.settings")}
           </div>
-          {tabs.map((t) => {
-            const on = settingsTab === t.key;
+          {tabs.map((tab, tabIndex) => {
+            const on = settingsTab === tab.key;
             return (
               <Hov
-                key={t.key}
-                className={`agentmux-settings-tab-${t.key}`}
+                key={tab.key}
+                tag="button"
+                id={`agentmux-settings-tab-${tab.key}`}
+                className={`agentmux-settings-tab-${tab.key}`}
+                data-agentmux-settings-tab={tab.key}
+                role="tab"
+                ariaSelected={on}
+                ariaControls={`agentmux-settings-panel-${tab.key}`}
+                tabIndex={on ? 0 : -1}
                 style={{
+                  width: "100%",
                   padding: "9px 11px",
                   borderRadius: 8,
+                  border: "1px solid transparent",
                   cursor: "pointer",
                   font: `500 13px/1 ${FONT_SANS}`,
+                  textAlign: "left",
                   color: on ? "var(--fg1)" : "var(--fg3)",
                   background: on ? "var(--s2)" : "transparent",
                 }}
                 hover={on ? {} : { background: "var(--s2)" }}
-                onClick={() => setSettingsTab(t.key)}
+                onClick={() => setSettingsTab(tab.key)}
+                onKeyDown={(event) =>
+                  onSettingsCategoryKeyDown(event, tabIndex)
+                }
               >
-                {t.label}
+                {tab.label}
               </Hov>
             );
           })}
         </div>
         <div
+          id={`agentmux-settings-panel-${settingsTab}`}
           className="agentmux-scroll"
+          role="tabpanel"
+          aria-labelledby={`agentmux-settings-tab-${settingsTab}`}
+          tabIndex={0}
           style={{
             flex: 1,
             overflow: "auto",
@@ -11775,8 +12334,10 @@ function SettingsModal(props: SettingsModalProps) {
           }}
         >
           <Hov
-            tag="span"
+            tag="button"
             className="agentmux-settings-close"
+            ariaLabel={t("common.close")}
+            data-overlay-autofocus="true"
             style={{
               position: "absolute",
               top: 16,
@@ -11789,6 +12350,9 @@ function SettingsModal(props: SettingsModalProps) {
               justifyContent: "center",
               color: "var(--fg3)",
               cursor: "pointer",
+              border: "1px solid transparent",
+              background: "transparent",
+              padding: 0,
             }}
             hover={{ background: "var(--s2)", color: "var(--fg1)" }}
             onClick={onClose}
@@ -12322,6 +12886,41 @@ function SettingsModal(props: SettingsModalProps) {
               {activeWorkspace ? (
                 <>
                   <div
+                    data-agentmux-workspace-scope
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 12,
+                      marginBottom: 14,
+                      padding: "10px 12px",
+                      border: "1px solid var(--border)",
+                      borderRadius: 8,
+                      background: "var(--canvas)",
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: "var(--fg4)",
+                        font: `600 11px/1 ${FONT_SANS}`,
+                      }}
+                    >
+                      {t("settings.workspace.scope")}
+                    </span>
+                    <strong
+                      style={{
+                        minWidth: 0,
+                        color: "var(--fg1)",
+                        font: `700 12px/1.2 ${FONT_SANS}`,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {activeWorkspace.name}
+                    </strong>
+                  </div>
+                  <div
                     style={{
                       display: "grid",
                       gridTemplateColumns: "1fr 1fr",
@@ -12330,7 +12929,7 @@ function SettingsModal(props: SettingsModalProps) {
                     }}
                   >
                     <label>
-                      <span style={fieldLabel}>Name</span>
+                      <span style={fieldLabel}>{t("settings.workspace.name")}</span>
                       <input
                         className="agentmux-workspace-name-input"
                         aria-label="Workspace name"
@@ -12344,10 +12943,10 @@ function SettingsModal(props: SettingsModalProps) {
                       />
                     </label>
                     <label>
-                      <span style={fieldLabel}>Project root</span>
+                      <span style={fieldLabel}>{t("settings.workspace.root")}</span>
                       <input
                         className="agentmux-workspace-root-input"
-                        aria-label="Project root"
+                        aria-label={t("settings.workspace.root")}
                         value={workspaceDraft.projectRoot ?? ""}
                         onChange={(event) =>
                           updateWorkspaceDraft({
@@ -12359,7 +12958,7 @@ function SettingsModal(props: SettingsModalProps) {
                     </label>
                   </div>
                   <label style={{ display: "block", marginBottom: 14 }}>
-                    <span style={fieldLabel}>Description</span>
+                    <span style={fieldLabel}>{t("settings.workspace.description")}</span>
                     <textarea
                       className="agentmux-workspace-description-input"
                       aria-label="Workspace description"
@@ -12386,7 +12985,7 @@ function SettingsModal(props: SettingsModalProps) {
                     }}
                   >
                     <label>
-                      <span style={fieldLabel}>Icon</span>
+                      <span style={fieldLabel}>{t("settings.workspace.icon")}</span>
                       <input
                         className="agentmux-workspace-icon-input"
                         aria-label="Workspace icon"
@@ -12403,7 +13002,7 @@ function SettingsModal(props: SettingsModalProps) {
                       />
                     </label>
                     <div>
-                      <span style={fieldLabel}>Color</span>
+                      <span style={fieldLabel}>{t("settings.workspace.color")}</span>
                       <div
                         style={{
                           display: "flex",
@@ -12443,7 +13042,7 @@ function SettingsModal(props: SettingsModalProps) {
                     }}
                   >
                     <label>
-                      <span style={fieldLabel}>Default terminal</span>
+                      <span style={fieldLabel}>{t("settings.workspace.defaultTerminal")}</span>
                       <select
                         className="agentmux-workspace-terminal-profile-select"
                         aria-label="Default terminal profile"
@@ -12462,7 +13061,7 @@ function SettingsModal(props: SettingsModalProps) {
                       </select>
                     </label>
                     <label>
-                      <span style={fieldLabel}>Default WSL</span>
+                      <span style={fieldLabel}>{t("settings.workspace.defaultWsl")}</span>
                       <select
                         className="agentmux-workspace-wsl-select"
                         aria-label="Default WSL distribution"
@@ -12474,7 +13073,7 @@ function SettingsModal(props: SettingsModalProps) {
                         }
                         style={fieldInput}
                       >
-                        <option value="">System default</option>
+                          <option value="">{t("settings.workspace.systemDefault")}</option>
                         {wslDistributions.map((distribution) => (
                           <option
                             key={distribution.name}
@@ -12487,7 +13086,7 @@ function SettingsModal(props: SettingsModalProps) {
                       </select>
                     </label>
                     <label>
-                      <span style={fieldLabel}>Default agent command</span>
+                      <span style={fieldLabel}>{t("settings.workspace.defaultAgentCommand")}</span>
                       <input
                         className="agentmux-workspace-agent-input"
                         aria-label="Default agent command"
@@ -12746,7 +13345,7 @@ function SettingsModal(props: SettingsModalProps) {
                       marginBottom: 8,
                     }}
                   >
-                    Shortcut conflicts
+                    {t("shortcuts.conflictsTitle")}
                   </div>
                   {shortcutConflicts.map((conflict) => (
                     <div
@@ -12846,7 +13445,7 @@ function SettingsModal(props: SettingsModalProps) {
                     <button
                       type="button"
                       className="agentmux-shortcut-clear"
-                      onClick={() => onUpdateShortcut(action.id, null)}
+                      onClick={() => onUpdateShortcuts({ [action.id]: null })}
                       style={{
                         background: "transparent",
                         color: "var(--fg4)",
@@ -13246,6 +13845,20 @@ function SettingsModal(props: SettingsModalProps) {
                   </details>
                 ) : null}
               </div>
+            </>
+          ) : null}
+
+          {settingsTab === "advanced" ? (
+            <>
+              <div
+                style={{
+                  font: `700 18px/1 ${FONT_SANS}`,
+                  color: "var(--fg1)",
+                  marginBottom: 20,
+                }}
+              >
+                {t("settings.advanced")}
+              </div>
               <div
                 data-agentmux-config-reload
                 style={{
@@ -13550,117 +14163,6 @@ function SettingsModal(props: SettingsModalProps) {
                   </div>
                 ) : null}
               </div>
-              {notifications.length === 0 ? (
-                <div
-                  style={{
-                    font: `400 12px/1.5 ${FONT_SANS}`,
-                    color: "var(--fg4)",
-                  }}
-                >
-                  {t("notifications.empty")}
-                </div>
-              ) : (
-                <div
-                  style={{ display: "flex", flexDirection: "column", gap: 8 }}
-                >
-                  {notifications.map((n) => (
-                    <div
-                      key={n.notificationId}
-                      data-agentmux-notification={n.notificationId}
-                      data-agentmux-notification-type={n.notificationType}
-                      data-agentmux-notification-severity={n.severity}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        padding: "12px 14px",
-                        border: "1px solid var(--border)",
-                        borderRadius: 8,
-                      }}
-                    >
-                      <div style={{ minWidth: 0, flex: "1 1 auto" }}>
-                        <div
-                          style={{
-                            font: `600 12.5px/1.3 ${FONT_SANS}`,
-                            color: "var(--fg1)",
-                          }}
-                        >
-                          {n.title}
-                        </div>
-                        <div
-                          style={{
-                            font: `400 11.5px/1.4 ${FONT_SANS}`,
-                            color: "var(--fg4)",
-                            marginTop: 3,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                          }}
-                        >
-                          {n.message}
-                        </div>
-                      </div>
-                      {n.sessionId ? (
-                        <button
-                          type="button"
-                          className="agentmux-notification-focus"
-                          onClick={() => onFocusNotificationSession(n.sessionId)}
-                          style={{
-                            flex: "none",
-                            marginLeft: 12,
-                            background: "var(--accent-soft)",
-                            border: "1px solid rgba(88, 166, 255, 0.38)",
-                            borderRadius: 7,
-                            padding: "6px 10px",
-                            cursor: "pointer",
-                            font: `600 11px/1 ${FONT_SANS}`,
-                            color: "var(--accent)",
-                          }}
-                        >
-                          Focus
-                        </button>
-                      ) : null}
-                      {notificationActionsFor(n).map(
-                        ({ hook, action }, index) => (
-                          <button
-                            key={`${n.notificationId}-${hook.action}-${index}`}
-                            type="button"
-                            className={`agentmux-notification-action agentmux-notification-action-${actionClassFragment(hook.action)}`}
-                            onClick={() => onRunNotificationAction(hook, n)}
-                            style={{
-                              background: "var(--accent)",
-                              border: 0,
-                              borderRadius: 7,
-                              padding: "6px 10px",
-                              cursor: "pointer",
-                              font: `600 11px/1 ${FONT_SANS}`,
-                              color: "#fff",
-                            }}
-                          >
-                            {hook.label ?? action.title}
-                          </button>
-                        ),
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => onDismissNotification(n.notificationId)}
-                        style={{
-                          flex: "none",
-                          marginLeft: 12,
-                          background: "var(--s2)",
-                          border: "1px solid var(--border)",
-                          borderRadius: 7,
-                          padding: "6px 10px",
-                          cursor: "pointer",
-                          font: `500 11px/1 ${FONT_SANS}`,
-                          color: "var(--fg2)",
-                        }}
-                      >
-                        {t("common.close")}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
             </>
           ) : null}
         </div>
