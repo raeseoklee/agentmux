@@ -12,6 +12,7 @@ import {
   type WslDistribution
 } from "./control/ControlClient";
 import { XtermTerminalRenderer } from "./terminal/XtermTerminalRenderer";
+import { useAppDialogs } from "./agentmux/dialogs";
 
 const encoder = new TextEncoder();
 const DEFAULT_PROJECT_ROOT: string | null = null;
@@ -44,6 +45,7 @@ const DEFAULT_BROWSER_STATE: BrowserPaneState = {
 };
 
 export function App() {
+  const dialogs = useAppDialogs();
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
   const sessionRef = useRef<TerminalSession | null>(null);
   const activeWorkspaceRef = useRef<WorkspaceSummary | null>(null);
@@ -250,7 +252,11 @@ export function App() {
       await client.clearAgentAttention(sessionId);
       await refreshAgentSignals();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Attention clear failed.");
+      dialogs.toast({
+        title: "Attention clear failed",
+        description: error instanceof Error ? error.message : "Unable to clear attention.",
+        tone: "danger"
+      });
     }
   }
 
@@ -259,7 +265,11 @@ export function App() {
       await client.dismissNotification(notificationId);
       await refreshAgentSignals();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Notification dismiss failed.");
+      dialogs.toast({
+        title: "Notification dismiss failed",
+        description: error instanceof Error ? error.message : "Unable to dismiss notification.",
+        tone: "danger"
+      });
     }
   }
 
@@ -315,7 +325,11 @@ export function App() {
       });
       applyWorkspaceDetail(detail);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Browser surface create failed.");
+      dialogs.toast({
+        title: "Browser surface creation failed",
+        description: error instanceof Error ? error.message : "Unable to create browser surface.",
+        tone: "danger"
+      });
     }
   }
 
@@ -347,7 +361,13 @@ export function App() {
       return;
     }
 
-    const name = window.prompt("Workspace name", workspace.name)?.trim();
+    const name = (await dialogs.prompt({
+      title: "Rename workspace",
+      label: "Workspace name",
+      initialValue: workspace.name,
+      required: true,
+      confirmLabel: "Rename"
+    }))?.trim();
     if (!name) {
       return;
     }
@@ -357,13 +377,26 @@ export function App() {
       const detail = await client.getWorkspace(renamed.workspaceId);
       applyWorkspaceDetail(detail);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Workspace rename failed.");
+      dialogs.toast({
+        title: "Workspace rename failed",
+        description: error instanceof Error ? error.message : "Unable to rename workspace.",
+        tone: "danger"
+      });
     }
   }
 
   async function closeActiveWorkspace() {
     const workspace = activeWorkspaceRef.current;
-    if (!workspace || !window.confirm("Close workspace?")) {
+    if (!workspace) {
+      return;
+    }
+    const confirmed = await dialogs.confirm({
+      title: "Close workspace?",
+      description: `Close ${workspace.name} and its open surfaces?`,
+      confirmLabel: "Close workspace",
+      tone: "danger"
+    });
+    if (!confirmed) {
       return;
     }
 
@@ -387,7 +420,11 @@ export function App() {
       setWorkspaces(listed.length > 0 ? listed : [next]);
       applyWorkspaceDetail(detail);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Workspace close failed.");
+      dialogs.toast({
+        title: "Workspace close failed",
+        description: error instanceof Error ? error.message : "Unable to close workspace.",
+        tone: "danger"
+      });
     }
   }
 
@@ -420,7 +457,11 @@ export function App() {
       );
       applyWorkspaceDetail(detail);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Pane close failed.");
+      dialogs.toast({
+        title: "Pane close failed",
+        description: error instanceof Error ? error.message : "Unable to close pane.",
+        tone: "danger"
+      });
     }
   }
 
@@ -452,7 +493,11 @@ export function App() {
       applyWorkspaceDetail(detail, surface?.sessionId ?? undefined);
       rendererRef.current?.focus();
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Surface mount failed.");
+      dialogs.toast({
+        title: "Surface mount failed",
+        description: error instanceof Error ? error.message : "Unable to mount surface.",
+        tone: "danger"
+      });
     }
   }
 
@@ -466,7 +511,11 @@ export function App() {
       const detail = await client.unmountSurface(workspace.workspaceId, workspace.activePaneId);
       applyWorkspaceDetail(detail);
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "Surface unmount failed.");
+      dialogs.toast({
+        title: "Surface unmount failed",
+        description: error instanceof Error ? error.message : "Unable to unmount surface.",
+        tone: "danger"
+      });
     }
   }
 

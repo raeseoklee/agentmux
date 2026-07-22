@@ -4,17 +4,23 @@ import path from "node:path";
 
 const root = process.cwd();
 
-function listTrackedFiles() {
+function listRepositoryFiles() {
   try {
-    return execFileSync("git", ["ls-files", "-z"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    })
+    return execFileSync(
+      "git",
+      ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      },
+    )
       .split("\0")
-      .filter(Boolean);
-  } catch {
-    return [];
+      .filter((file) => file && !normalizePath(file).startsWith(".tmp/"));
+  } catch (cause) {
+    throw new Error("Unable to enumerate repository files for hygiene checks.", {
+      cause,
+    });
   }
 }
 
@@ -26,7 +32,7 @@ function normalizePath(value) {
   return value.replaceAll("\\", "/");
 }
 
-const trackedFiles = listTrackedFiles();
+const repositoryFiles = listRepositoryFiles();
 const failures = [];
 const markdownLinkPattern = /\[[^\]]+\]\(([^)]+)\)/g;
 const personalPathPatterns = [
@@ -58,6 +64,80 @@ function isPublicDoc(file) {
   return normalized.startsWith("docs/en/") || normalized.startsWith("docs/ko/");
 }
 
+function isDesktopProductSource(file) {
+  const normalized = normalizePath(file);
+  if (!normalized.startsWith("apps/desktop/src/")) {
+    return false;
+  }
+
+  if (!/\.[cm]?[jt]sx?$/.test(normalized)) {
+    return false;
+  }
+
+  return !(
+    normalized.includes("/__tests__/") ||
+    normalized.includes("/test/") ||
+    /(?:^|\.)(?:spec|test)\.[cm]?[jt]sx?$/.test(path.basename(normalized))
+  );
+}
+
+function findLineNumber(text, index) {
+  return text.slice(0, index).split("\n").length;
+}
+
+function findNativeDialogCalls(text) {
+  const matches = [];
+  const candidatePattern = /\b(?:alert|confirm|prompt)\s*\(/g;
+  let match;
+  while ((match = candidatePattern.exec(text)) !== null) {
+    const before = text.slice(0, match.index);
+    const memberAccess = before.match(/([A-Za-z_$][\w$]*)\s*\??\.\s*$/);
+
+    if (memberAccess) {
+      const receiver = memberAccess[1];
+      if (
+        receiver !== "window" &&
+        receiver !== "globalThis" &&
+        receiver !== "self"
+      ) {
+        continue;
+      }
+    } else {
+      const linePrefix = before.slice(before.lastIndexOf("\n") + 1).trim();
+      const parameterTail = text.slice(candidatePattern.lastIndex);
+      const isDeclaration =
+        /(?:^|\s)(?:function|declare)\s*$/.test(linePrefix) ||
+        (linePrefix === "" &&
+          /^\s*[A-Za-z_$][\w$]*\s*[?:]\s*/.test(parameterTail));
+      if (isDeclaration) {
+        continue;
+      }
+    }
+
+    matches.push(match.index);
+  }
+  return matches;
+}
+
+const nativeDialogRuleFixtures = [
+  { source: "window.confirm('delete?')", expected: 1 },
+  { source: "globalThis.prompt('value')", expected: 1 },
+  { source: "window?.alert('failed')", expected: 1 },
+  { source: "self.confirm('continue?')", expected: 1 },
+  { source: "alert('failed')", expected: 1 },
+  { source: "dialogs.confirm({ title: 'Safe' })", expected: 0 },
+  { source: "confirm(options: ConfirmDialogOptions): Promise<boolean>;", expected: 0 },
+  { source: "function prompt(value) { return value; }", expected: 0 },
+];
+for (const fixture of nativeDialogRuleFixtures) {
+  const actual = findNativeDialogCalls(fixture.source).length;
+  if (actual !== fixture.expected) {
+    failures.push(
+      `internal native-dialog rule fixture failed (${JSON.stringify(fixture.source)}: expected ${fixture.expected}, received ${actual})`,
+    );
+  }
+}
+
 function requireFileText(relativeFile) {
   const absoluteFile = path.join(root, relativeFile);
   if (!fs.existsSync(absoluteFile)) {
@@ -73,7 +153,7 @@ function requireText(text, relativeFile, description, pattern) {
   }
 }
 
-for (const relativeFile of trackedFiles) {
+for (const relativeFile of repositoryFiles) {
   const absoluteFile = path.join(root, relativeFile);
   if (!fs.existsSync(absoluteFile)) {
     continue;
@@ -88,6 +168,14 @@ for (const relativeFile of trackedFiles) {
   for (const { name, pattern } of personalPathPatterns) {
     if (pattern.test(text)) {
       failures.push(`${relativeFile}: contains ${name}`);
+    }
+  }
+
+  if (isDesktopProductSource(relativeFile)) {
+    for (const nativeDialogIndex of findNativeDialogCalls(text)) {
+      failures.push(
+        `${relativeFile}:${findLineNumber(text, nativeDialogIndex)}: browser-native dialog is forbidden; use the themed app dialog service`,
+      );
     }
   }
 
@@ -176,4 +264,4 @@ if (failures.length > 0) {
   process.exit(1);
 }
 
-console.log(`Checked ${trackedFiles.length} tracked files for repository hygiene.`);
+console.log(`Checked ${repositoryFiles.length} repository files for hygiene.`);

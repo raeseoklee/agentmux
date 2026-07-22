@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
 import { AgentmuxTerminalApp } from "./agentmux/AgentmuxTerminalApp";
+import { DialogProvider } from "./agentmux/dialogs";
 import "./fonts.css";
 import "./styles.css";
 
@@ -44,6 +45,8 @@ installContextMenuGuard();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <Root />
+    <DialogProvider>
+      <Root />
+    </DialogProvider>
   </React.StrictMode>
 );

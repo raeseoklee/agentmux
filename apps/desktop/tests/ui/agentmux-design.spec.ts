@@ -37,6 +37,49 @@ async function bootPreview(
   }
 }
 
+function appDialog(page: Page) {
+  return page.locator("[data-agentmux-app-dialog='true']");
+}
+
+async function submitAppPrompt(page: Page, value: string) {
+  const dialog = appDialog(page);
+  await expect(dialog).toBeVisible();
+  await dialog.locator("input, textarea").first().fill(value);
+  await dialog.locator(".agentmux-dialog__button--primary").click();
+  await expect(dialog).toHaveCount(0);
+}
+
+async function acceptAppDialog(page: Page) {
+  const dialog = appDialog(page);
+  await expect(dialog).toBeVisible();
+  await dialog.locator(".agentmux-dialog__button--primary, .agentmux-dialog__button--danger").click();
+  await expect(dialog).toHaveCount(0);
+}
+
+async function dismissAppDialog(page: Page) {
+  const dialog = appDialog(page);
+  await expect(dialog).toBeVisible();
+  await dialog.locator(".agentmux-dialog__button--secondary").last().click();
+  await expect(dialog).toHaveCount(0);
+}
+
+async function captureShortcut(
+  page: Page,
+  first: string,
+  second?: string,
+) {
+  const dialog = appDialog(page);
+  await expect(dialog).toBeVisible();
+  const keys = dialog.locator(".agentmux-shortcut-capture__key");
+  await keys.first().click();
+  await page.keyboard.press(first);
+  if (second) {
+    await keys.nth(1).click();
+    await page.keyboard.press(second);
+  }
+  await dialog.getByRole("button", { name: "Save shortcut" }).click();
+}
+
 test("design boots without a default workspace and can create one", async ({ page }) => {
   await bootPreview(page, { ensureWorkspace: false });
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(0);
@@ -185,11 +228,6 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".xterm").first()).toBeVisible();
   await page.locator(".xterm").first().click();
-  let pasteConfirmationOpened = false;
-  page.on("dialog", async (dialog) => {
-    pasteConfirmationOpened = true;
-    await dialog.dismiss();
-  });
   await page.keyboard.press("Control+V");
 
   await expect
@@ -199,7 +237,7 @@ test("single pane terminal keeps an xterm scroll viewport", async ({ page }) => 
       ),
     )
     .toContain("scroll-line-90");
-  expect(pasteConfirmationOpened).toBe(false);
+  await expect(appDialog(page)).toHaveCount(0);
 
   // xterm 6 scrolls via the VS Code ScrollableElement (.xterm-scrollable-element),
   // not the legacy .xterm-viewport. Assert the real scroller is present and that
@@ -614,10 +652,8 @@ test("workspace groups can be created edited collapsed and extended", async ({
 }) => {
   await bootPreview(page);
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Agents");
-  });
   await page.locator(".agentmux-workspace-group-create").click();
+  await submitAppPrompt(page, "Agents");
   await expect(page.locator("[data-agentmux-workspace-group]")).toHaveCount(1);
   await expect(
     page.locator("[data-agentmux-workspace-group]").first(),
@@ -629,12 +665,12 @@ test("workspace groups can be created edited collapsed and extended", async ({
   await page.locator(".agentmux-workspace-group-toggle").click();
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
 
-  const editValues = ["Core", "CG", "#22C55E"];
-  let editIndex = 0;
-  page.on("dialog", async (dialog) => {
-    await dialog.accept(editValues[editIndex++] ?? "");
-  });
   await page.locator(".agentmux-workspace-group-edit").click();
+  const editDialog = appDialog(page);
+  await editDialog.getByLabel("Group name").fill("Core");
+  await editDialog.getByLabel("Group icon").fill("CG");
+  await editDialog.getByLabel("Group color").fill("#22C55E");
+  await editDialog.getByRole("button", { name: "Save" }).click();
   await expect(
     page.locator("[data-agentmux-workspace-group]").first(),
   ).toContainText("Core");
@@ -657,10 +693,8 @@ test("selected workspaces can be grouped and added to an existing group", async 
   await page.locator(".agentmux-workspace-select").nth(1).check();
   await expect(page.locator(".agentmux-workspace-selection-bar")).toBeVisible();
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Batch");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Batch");
   const group = page
     .locator("[data-agentmux-workspace-group]")
     .filter({ hasText: "Batch" });
@@ -694,10 +728,8 @@ test("workspace sidebar filter narrows groups and workspaces", async ({
   // Group the LAST ungrouped card ("Workspace 3") so the grouped name stays
   // distinct from the ungrouped "Workspace 1" card the filter assertions target.
   await page.locator(".agentmux-workspace-select").last().check();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Agents");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Agents");
   const filter = page.locator(".agentmux-workspace-filter-input");
 
   await filter.fill("Agents");
@@ -736,20 +768,16 @@ test("workspace groups and members can be reordered from the sidebar", async ({
 
   await page.locator(".agentmux-workspace-select").nth(0).check();
   await page.locator(".agentmux-workspace-select").nth(1).check();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Alpha");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Alpha");
   const alpha = page
     .locator("[data-agentmux-workspace-group]")
     .filter({ hasText: "Alpha" });
   await expect(alpha.locator(".agentmux-workspace-card")).toHaveCount(2);
 
   await page.locator(".agentmux-workspace-select").last().check();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Beta");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Beta");
   await expect(
     page.locator("[data-agentmux-workspace-group]").first(),
   ).toContainText("Alpha");
@@ -776,16 +804,12 @@ test("workspace groups and members can be drag reordered from the sidebar", asyn
 
   await page.locator(".agentmux-workspace-select").nth(0).check();
   await page.locator(".agentmux-workspace-select").nth(1).check();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Alpha");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Alpha");
 
   await page.locator(".agentmux-workspace-select").last().check();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Beta");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Beta");
 
   const groups = page.locator("[data-agentmux-workspace-group]");
   const alpha = groups.filter({ hasText: "Alpha" });
@@ -911,10 +935,8 @@ test("workspace group context menu exposes primary actions", async ({
 }) => {
   await bootPreview(page);
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Alpha");
-  });
   await page.locator(".agentmux-workspace-group-create").click();
+  await submitAppPrompt(page, "Alpha");
   const alpha = page
     .locator("[data-agentmux-workspace-group]")
     .filter({ hasText: "Alpha" });
@@ -930,10 +952,8 @@ test("workspace group context menu exposes primary actions", async ({
   await page.locator(".agentmux-workspace-plus").click();
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(3);
   await page.locator(".agentmux-workspace-select").last().check();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Beta");
-  });
   await page.locator(".agentmux-workspace-selection-create-group").click();
+  await submitAppPrompt(page, "Beta");
 
   const groups = page.locator("[data-agentmux-workspace-group]");
   const beta = groups.filter({ hasText: "Beta" });
@@ -949,10 +969,8 @@ test("workspace context menu warns before closing a group anchor", async ({
 }) => {
   await bootPreview(page);
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("Anchors");
-  });
   await page.locator(".agentmux-workspace-group-create").click();
+  await submitAppPrompt(page, "Anchors");
   const group = page
     .locator("[data-agentmux-workspace-group]")
     .filter({ hasText: "Anchors" });
@@ -972,11 +990,11 @@ test("workspace context menu warns before closing a group anchor", async ({
 
   await page.locator(".agentmux-workspace-menu-close").click();
 
-  const confirmation = page.locator(".agentmux-confirm-modal");
+  const confirmation = appDialog(page);
   await expect(confirmation).toBeVisible();
   await expect(confirmation).toContainText("Anchors");
   await expect(confirmation).toContainText("clear those group anchors");
-  await confirmation.locator(".agentmux-confirm-confirm").click();
+  await acceptAppDialog(page);
   await expect(anchorCard).toHaveCount(0);
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
 });
@@ -996,20 +1014,20 @@ test("workspace close warns before terminating open terminal sessions", async ({
 
   await workspaceCard.click({ button: "right" });
   await page.locator(".agentmux-workspace-menu-close").click();
-  const cancelConfirm = page.locator(".agentmux-confirm-modal");
+  const cancelConfirm = appDialog(page);
   await expect(cancelConfirm).toBeVisible();
   await expect(cancelConfirm).toContainText("open terminal session");
-  await cancelConfirm.locator(".agentmux-confirm-cancel").click();
+  await cancelConfirm.locator(".agentmux-dialog__button--secondary").click();
   await expect(cancelConfirm).toHaveCount(0);
   await expect(workspaceCard).toHaveCount(1);
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 
   await workspaceCard.click({ button: "right" });
   await page.locator(".agentmux-workspace-menu-close").click();
-  const acceptConfirm = page.locator(".agentmux-confirm-modal");
+  const acceptConfirm = appDialog(page);
   await expect(acceptConfirm).toBeVisible();
   await expect(acceptConfirm).toContainText("terminate those sessions");
-  await acceptConfirm.locator(".agentmux-confirm-confirm").click();
+  await acceptConfirm.locator(".agentmux-dialog__button--danger").click();
   await expect(workspaceCard).toHaveCount(0);
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(0);
 });
@@ -1428,8 +1446,8 @@ test("notification action hooks execute configured UI actions", async ({
   });
   await bootPreview(page);
 
-  await page.locator(".agentmux-settings-open").click();
-  await page.locator(".agentmux-settings-tab-general").click();
+  await page.keyboard.press("Control+Shift+I");
+  await expect(page.locator("[data-agentmux-notification-center]")).toBeVisible();
   await expect(page.getByRole("button", { name: "Open setup" })).toBeVisible();
   await page
     .locator(".agentmux-notification-action-browser-openNewTab")
@@ -1520,32 +1538,26 @@ test("settings can edit shortcuts and report conflicts", async ({ page }) => {
   await page.locator(".agentmux-settings-open").click();
   await page.locator(".agentmux-settings-tab-keys").click();
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("ctrl+t");
-  });
   await page
     .locator(
       '[data-agentmux-shortcut-row="workspace.new"] .agentmux-shortcut-edit',
     )
     .click();
-  await expect(page.locator(".agentmux-shortcut-conflict")).toContainText(
-    "workspace.new",
-  );
-  await expect(page.locator(".agentmux-shortcut-conflict")).toContainText(
-    "terminal.newWsl",
-  );
+  await captureShortcut(page, "Control+T");
+  await expect(appDialog(page)).toContainText("New terminal");
+  await dismissAppDialog(page);
+  await expect(page.locator(".agentmux-shortcut-conflict")).toHaveCount(0);
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept("ctrl+b, c");
-  });
   await page
     .locator(
       '[data-agentmux-shortcut-row="workspace.new"] .agentmux-shortcut-edit',
     )
     .click();
+  await captureShortcut(page, "Control+B", "C");
+  await expect(appDialog(page)).toHaveCount(0);
   await expect(page.locator(".agentmux-shortcut-conflict")).toHaveCount(0);
   await expect(page.locator(".agentmux-shortcut-edit-message")).toContainText(
-    "Shortcut saved",
+    "Shortcut settings saved",
   );
 
   await page.keyboard.press("Escape");
@@ -2069,7 +2081,7 @@ test("settings reload config applies external changes without restart", async ({
   });
 
   await page.locator(".agentmux-settings-open").click();
-  await page.locator(".agentmux-settings-tab-general").click();
+  await page.locator(".agentmux-settings-tab-advanced").click();
   await page.locator(".agentmux-config-reload").click();
 
   await expect(page.locator(".agentmux-config-reload-message")).toContainText(
@@ -2099,12 +2111,10 @@ test("settings can import and reset config JSON", async ({ page }) => {
   await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
-  await page.locator(".agentmux-settings-tab-general").click();
+  await page.locator(".agentmux-settings-tab-advanced").click();
   await expect(page.locator(".agentmux-project-config-import")).toBeEnabled();
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept(
-      JSON.stringify({
+  const globalConfig = JSON.stringify({
         format_version: "agentmux.config.v1",
         appearance: {
           theme: "light",
@@ -2123,10 +2133,9 @@ test("settings can import and reset config JSON", async ({ page }) => {
         notifications: {
           actions: [],
         },
-      }),
-    );
-  });
+      });
   await page.locator(".agentmux-config-import").click();
+  await submitAppPrompt(page, globalConfig);
   await expect(page.locator(".agentmux-config-reload-message")).toContainText(
     "Config imported",
   );
@@ -2140,16 +2149,13 @@ test("settings can import and reset config JSON", async ({ page }) => {
     )
     .toBe("#F4F5F7");
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept(
-      JSON.stringify({
+  const workspaceConfig = JSON.stringify({
         ui: {
           workspace_plus_action: "terminal.newWsl",
         },
-      }),
-    );
-  });
+      });
   await page.locator(".agentmux-project-config-import").click();
+  await submitAppPrompt(page, workspaceConfig);
   await expect(page.locator(".agentmux-config-reload-message")).toContainText(
     "Project config imported",
   );
@@ -2160,19 +2166,15 @@ test("settings can import and reset config JSON", async ({ page }) => {
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 
   await page.locator(".agentmux-settings-open").click();
-  await page.locator(".agentmux-settings-tab-general").click();
-  page.once("dialog", async (dialog) => {
-    await dialog.accept();
-  });
+  await page.locator(".agentmux-settings-tab-advanced").click();
   await page.locator(".agentmux-project-config-reset").click();
+  await acceptAppDialog(page);
   await expect(page.locator(".agentmux-config-reload-message")).toContainText(
     "Project config reset",
   );
 
-  page.once("dialog", async (dialog) => {
-    await dialog.accept();
-  });
   await page.locator(".agentmux-config-reset").click();
+  await acceptAppDialog(page);
   await expect(page.locator(".agentmux-config-reload-message")).toContainText(
     "Config reset",
   );
@@ -2205,7 +2207,7 @@ test("settings can migrate preview cmux project config", async ({ page }) => {
   });
 
   await page.locator(".agentmux-settings-open").click();
-  await page.locator(".agentmux-settings-tab-general").click();
+  await page.locator(".agentmux-settings-tab-advanced").click();
   await expect(
     page.locator(".agentmux-project-config-migrate-cmux"),
   ).toBeEnabled();
@@ -2242,7 +2244,7 @@ test("settings hides cmux project diagnostics when no legacy config exists", asy
   await bootPreview(page);
 
   await page.locator(".agentmux-settings-open").click();
-  await page.locator(".agentmux-settings-tab-general").click();
+  await page.locator(".agentmux-settings-tab-advanced").click();
 
   await expect(
     page.locator('[data-agentmux-config-diagnostic-source="global"]'),

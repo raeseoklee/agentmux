@@ -877,6 +877,20 @@ pub struct BrowserDialogsParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDialogRespondParams {
+    pub surface_id: String,
+    pub dialog_id: String,
+    pub accept: bool,
+    pub prompt_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDialogCancelParams {
+    pub surface_id: String,
+    pub dialog_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserErrorsParams {
     pub surface_id: String,
     pub limit: Option<usize>,
@@ -1368,17 +1382,30 @@ pub struct BrowserConsoleResult {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserDialogMessageResult {
+    pub dialog_id: String,
+    pub surface_id: String,
+    pub kind: String,
     pub dialog_type: String,
     pub message: String,
     pub default_value: Option<String>,
+    pub status: String,
     pub response: Option<String>,
     pub timestamp: String,
+    pub resolved_at: Option<String>,
+    pub resolution: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserDialogsResult {
     pub surface_id: String,
     pub messages: Vec<BrowserDialogMessageResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserDialogHandledResult {
+    pub surface_id: String,
+    pub dialog_id: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3056,6 +3083,27 @@ mod tests {
         let params: BrowserDialogsParams = request.parse_params().unwrap();
         assert_eq!(params.surface_id, "surf_browser");
         assert_eq!(params.limit, Some(25));
+
+        let request = RequestEnvelope::new(
+            "req_browser_dialog_respond",
+            "browser.dialog.respond",
+            r#"{"surface_id":"surf_browser","dialog_id":"surf_browser:dialog:0001","accept":true,"prompt_text":"approved"}"#,
+            "token",
+        );
+        let params: BrowserDialogRespondParams = request.parse_params().unwrap();
+        assert_eq!(params.dialog_id, "surf_browser:dialog:0001");
+        assert!(params.accept);
+        assert_eq!(params.prompt_text.as_deref(), Some("approved"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_dialog_cancel",
+            "browser.dialog.cancel",
+            r#"{"surface_id":"surf_browser","dialog_id":"surf_browser:dialog:0001"}"#,
+            "token",
+        );
+        let params: BrowserDialogCancelParams = request.parse_params().unwrap();
+        assert_eq!(params.surface_id, "surf_browser");
+        assert_eq!(params.dialog_id, "surf_browser:dialog:0001");
 
         let request = RequestEnvelope::new(
             "req_browser_errors",

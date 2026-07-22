@@ -557,6 +557,25 @@ export interface BrowserEvaluateResult {
   valueJson: string;
 }
 
+export interface BrowserDialogMessage {
+  dialogId: string;
+  surfaceId: string;
+  kind: "alert" | "confirm" | "prompt" | string;
+  message: string;
+  defaultValue?: string | null;
+  status: string;
+  response?: string | null;
+  timestamp: string;
+  resolvedAt?: string | null;
+  resolution?: string | null;
+}
+
+export interface BrowserDialogHandledResult {
+  surfaceId: string;
+  dialogId: string;
+  status: string;
+}
+
 export type TerminalPlacement = "new_tab" | "active_pane";
 type SessionPlacement = TerminalPlacement | "dock";
 
@@ -750,6 +769,17 @@ export interface ControlClient {
     script: string,
     options?: { frameId?: string | null },
   ): Promise<BrowserEvaluateResult>;
+  browserDialogs(surfaceId: string, limit?: number): Promise<BrowserDialogMessage[]>;
+  browserRespondDialog(
+    surfaceId: string,
+    dialogId: string,
+    accept: boolean,
+    promptText?: string | null,
+  ): Promise<BrowserDialogHandledResult>;
+  browserCancelDialog(
+    surfaceId: string,
+    dialogId: string,
+  ): Promise<BrowserDialogHandledResult>;
   browserDiagnostics(options?: {
     workspaceId?: string | null;
     surfaceId?: string | null;
@@ -1606,6 +1636,46 @@ class TauriControlClient implements ControlClient {
     return mapBrowserEvaluate(result);
   }
 
+  async browserDialogs(
+    surfaceId: string,
+    limit = 25,
+  ): Promise<BrowserDialogMessage[]> {
+    const result = await this.call<BrowserDialogsResultWire>("browser.dialogs", {
+      surface_id: surfaceId,
+      limit,
+    });
+    return result.messages.map(mapBrowserDialogMessage);
+  }
+
+  async browserRespondDialog(
+    surfaceId: string,
+    dialogId: string,
+    accept: boolean,
+    promptText?: string | null,
+  ): Promise<BrowserDialogHandledResult> {
+    const result = await this.call<BrowserDialogHandledResultWire>(
+      "browser.dialog.respond",
+      {
+        surface_id: surfaceId,
+        dialog_id: dialogId,
+        accept,
+        prompt_text: promptText ?? null,
+      },
+    );
+    return mapBrowserDialogHandled(result);
+  }
+
+  async browserCancelDialog(
+    surfaceId: string,
+    dialogId: string,
+  ): Promise<BrowserDialogHandledResult> {
+    const result = await this.call<BrowserDialogHandledResultWire>(
+      "browser.dialog.cancel",
+      { surface_id: surfaceId, dialog_id: dialogId },
+    );
+    return mapBrowserDialogHandled(result);
+  }
+
   async browserDiagnostics(options?: {
     workspaceId?: string | null;
     surfaceId?: string | null;
@@ -2414,6 +2484,10 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
   private readonly browserActionLog: string[] = [];
+  private readonly browserDialogMessages = new Map<
+    string,
+    BrowserDialogMessage[]
+  >();
   private readonly wslDistributions: WslDistribution[];
   private workspaceGroupCounter = 0;
   private terminalCounter = 0;
@@ -2421,6 +2495,7 @@ class BrowserPreviewControlClient implements ControlClient {
   private teamMessageCounter = 0;
   private lastSessionId?: string;
   private profileCounter = 3;
+  private browserDialogCounter = 0;
   private readonly profiles: SshProfile[] = [
     {
       profileId: "prof_preview_1",
@@ -2468,6 +2543,7 @@ class BrowserPreviewControlClient implements ControlClient {
         return id ? (this.browserUrls.get(id) ?? null) : null;
       },
       browserActions: () => [...this.browserActionLog],
+      browserDialog: (detail = {}) => this.addSyntheticBrowserDialog(detail),
       terminalOutput: (sessionId?: string) => {
         const id = sessionId ?? this.lastSessionId;
         return id ? (this.outputs.get(id) ?? null) : null;
@@ -3458,6 +3534,42 @@ class BrowserPreviewControlClient implements ControlClient {
     };
   }
 
+  async browserDialogs(surfaceId: string): Promise<BrowserDialogMessage[]> {
+    this.findBrowserSurface(surfaceId);
+    return [...(this.browserDialogMessages.get(surfaceId) ?? [])];
+  }
+
+  async browserRespondDialog(
+    surfaceId: string,
+    dialogId: string,
+    accept: boolean,
+    promptText?: string | null,
+  ): Promise<BrowserDialogHandledResult> {
+    this.findBrowserSurface(surfaceId);
+    const dialog = this.findPreviewBrowserDialog(surfaceId, dialogId);
+    dialog.status = accept ? "accepted" : "rejected";
+    dialog.response = promptText ?? null;
+    dialog.resolvedAt = new Date().toISOString();
+    dialog.resolution = accept ? "accepted" : "rejected";
+    this.browserActionLog.push(
+      `dialog:${surfaceId}:${dialogId}:${accept ? "accept" : "dismiss"}:${promptText ?? ""}`,
+    );
+    return { surfaceId, dialogId, status: dialog.status };
+  }
+
+  async browserCancelDialog(
+    surfaceId: string,
+    dialogId: string,
+  ): Promise<BrowserDialogHandledResult> {
+    this.findBrowserSurface(surfaceId);
+    const dialog = this.findPreviewBrowserDialog(surfaceId, dialogId);
+    dialog.status = "canceled";
+    dialog.resolvedAt = new Date().toISOString();
+    dialog.resolution = "canceled";
+    this.browserActionLog.push(`dialog:${surfaceId}:${dialogId}:cancel`);
+    return { surfaceId, dialogId, status: "canceled" };
+  }
+
   async browserDiagnostics(): Promise<BrowserDiagnostic[]> {
     return [];
   }
@@ -4214,6 +4326,48 @@ class BrowserPreviewControlClient implements ControlClient {
       throw new Error(`Workspace group '${groupId}' was not found.`);
     }
     return group;
+  }
+
+  private addSyntheticBrowserDialog(
+    detail: SyntheticBrowserDialogDetail,
+  ): string | null {
+    const surfaceId =
+      detail.surfaceId ??
+      this.browserSurfaces[this.browserSurfaces.length - 1]?.surfaceId;
+    if (!surfaceId) {
+      return null;
+    }
+    this.findBrowserSurface(surfaceId);
+    const dialogId = `${surfaceId}:preview-dialog:${++this.browserDialogCounter}`;
+    const message: BrowserDialogMessage = {
+      dialogId,
+      surfaceId,
+      kind: detail.kind ?? "confirm",
+      message: detail.message ?? "Preview browser dialog",
+      defaultValue: detail.defaultValue ?? null,
+      status: "pending",
+      response: null,
+      timestamp: new Date().toISOString(),
+      resolvedAt: null,
+      resolution: null,
+    };
+    const messages = this.browserDialogMessages.get(surfaceId) ?? [];
+    messages.push(message);
+    this.browserDialogMessages.set(surfaceId, messages);
+    return dialogId;
+  }
+
+  private findPreviewBrowserDialog(
+    surfaceId: string,
+    dialogId: string,
+  ): BrowserDialogMessage {
+    const dialog = (this.browserDialogMessages.get(surfaceId) ?? []).find(
+      (candidate) => candidate.dialogId === dialogId,
+    );
+    if (!dialog || dialog.status !== "pending") {
+      throw new Error(`Pending browser dialog '${dialogId}' was not found.`);
+    }
+    return dialog;
   }
 
   private findBrowserSurface(surfaceId: string): SurfaceSummary {
@@ -5928,6 +6082,7 @@ interface BrowserPreviewApi {
   teamMessage(detail?: SyntheticTeamMessageDetail): void;
   browserUrl(surfaceId?: string): string | null;
   browserActions(): string[];
+  browserDialog(detail?: SyntheticBrowserDialogDetail): string | null;
   terminalOutput(sessionId?: string): string | null;
   terminalResizes(sessionId?: string): Array<{ columns: number; rows: number }>;
 }
@@ -6262,6 +6417,37 @@ interface BrowserWaitForSelectorResultWire {
 interface BrowserEvaluateResultWire {
   surface_id: string;
   value_json: string;
+}
+
+interface SyntheticBrowserDialogDetail {
+  surfaceId?: string;
+  kind?: "alert" | "confirm" | "prompt";
+  message?: string;
+  defaultValue?: string | null;
+}
+
+interface BrowserDialogMessageWire {
+  dialog_id: string;
+  surface_id: string;
+  kind: string;
+  message: string;
+  default_value?: string | null;
+  status: string;
+  response?: string | null;
+  timestamp: string;
+  resolved_at?: string | null;
+  resolution?: string | null;
+}
+
+interface BrowserDialogsResultWire {
+  surface_id: string;
+  messages: BrowserDialogMessageWire[];
+}
+
+interface BrowserDialogHandledResultWire {
+  surface_id: string;
+  dialog_id: string;
+  status: string;
 }
 
 interface BrowserDiagnosticWire {
@@ -7859,6 +8045,33 @@ function mapBrowserEvaluate(
   return {
     surfaceId: value.surface_id,
     valueJson: value.value_json,
+  };
+}
+
+function mapBrowserDialogMessage(
+  value: BrowserDialogMessageWire,
+): BrowserDialogMessage {
+  return {
+    dialogId: value.dialog_id,
+    surfaceId: value.surface_id,
+    kind: value.kind,
+    message: value.message,
+    defaultValue: value.default_value ?? null,
+    status: value.status,
+    response: value.response ?? null,
+    timestamp: value.timestamp,
+    resolvedAt: value.resolved_at ?? null,
+    resolution: value.resolution ?? null,
+  };
+}
+
+function mapBrowserDialogHandled(
+  value: BrowserDialogHandledResultWire,
+): BrowserDialogHandledResult {
+  return {
+    surfaceId: value.surface_id,
+    dialogId: value.dialog_id,
+    status: value.status,
   };
 }
 

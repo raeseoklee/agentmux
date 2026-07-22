@@ -36,6 +36,13 @@ export type I18nKey =
   | "common.save"
   | "common.settings"
   | "common.unassigned"
+  | "browser.dialog.allow"
+  | "browser.dialog.confirmTitle"
+  | "browser.dialog.expiredDescription"
+  | "browser.dialog.expiredTitle"
+  | "browser.dialog.promptLabel"
+  | "browser.dialog.promptTitle"
+  | "browser.dialog.submit"
   | "config.configuration"
   | "config.export"
   | "config.exportProject"
@@ -51,21 +58,35 @@ export type I18nKey =
   | "config.resetProjectConfirm"
   | "config.scopeGlobal"
   | "config.scopeProject"
+  | "dialog.dismissToast"
+  | "dialog.confirm"
+  | "dialog.pressKey"
+  | "dialog.pressSecondKey"
+  | "dialog.required"
   | "language.english"
   | "language.korean"
   | "language.label"
   | "language.savedGlobally"
   | "notifications.empty"
+  | "notifications.focus"
+  | "notifications.open"
+  | "notifications.severity.error"
+  | "notifications.severity.info"
+  | "notifications.severity.warning"
+  | "notifications.summary"
+  | "notifications.title"
   | "pane.empty"
   | "pane.invalidLayout"
   | "pane.restoring"
   | "settings.appearance"
+  | "settings.advanced"
   | "settings.diagnostics"
   | "settings.general"
   | "settings.keys"
   | "settings.profiles"
   | "settings.project"
   | "settings.tabs.appearance"
+  | "settings.tabs.advanced"
   | "settings.tabs.diagnostics"
   | "settings.tabs.general"
   | "settings.tabs.keys"
@@ -115,8 +136,31 @@ export type I18nKey =
   | "action.group.view"
   | "action.group.remote"
   | "settings.workspace.noActiveProject"
+  | "settings.workspace.scope"
+  | "settings.workspace.name"
+  | "settings.workspace.root"
+  | "settings.workspace.description"
+  | "settings.workspace.icon"
+  | "settings.workspace.color"
+  | "settings.workspace.defaultTerminal"
+  | "settings.workspace.defaultWsl"
+  | "settings.workspace.defaultAgentCommand"
+  | "settings.workspace.systemDefault"
   | "settings.workspace.saveProject"
   | "settings.workspace.title"
+  | "shortcuts.conflictsTitle"
+  | "shortcuts.editDescription"
+  | "shortcuts.editTitle"
+  | "shortcuts.firstStroke"
+  | "shortcuts.invalidDescription"
+  | "shortcuts.invalidTitle"
+  | "shortcuts.replaceAction"
+  | "shortcuts.replaceDescription"
+  | "shortcuts.replaceDetail"
+  | "shortcuts.replaceTitle"
+  | "shortcuts.save"
+  | "shortcuts.secondStroke"
+  | "shortcuts.unassign"
   | "updates.autoCheck"
   | "updates.autoCheckHint"
   | "updates.check"
@@ -146,6 +190,18 @@ export type I18nKey =
   | "workspace.group.addWorkspace"
   | "workspace.group.moveDown"
   | "workspace.group.moveUp"
+  | "workspace.group.colorDescription"
+  | "workspace.group.colorLabel"
+  | "workspace.group.createAction"
+  | "workspace.group.createTitle"
+  | "workspace.group.deleteAction"
+  | "workspace.group.deleteDescription"
+  | "workspace.group.deleteTitle"
+  | "workspace.group.editTitle"
+  | "workspace.group.iconDescription"
+  | "workspace.group.iconLabel"
+  | "workspace.group.invalidColor"
+  | "workspace.group.nameLabel"
   | "workspace.none"
   | "workspace.section"
   | "workspace.selectedCount";
@@ -199,41 +255,62 @@ const en: Record<I18nKey, string> = {
   "common.save": "Save",
   "common.settings": "Settings",
   "common.unassigned": "Unassigned",
+  "browser.dialog.allow": "Allow",
+  "browser.dialog.confirmTitle": "{source} asks for confirmation",
+  "browser.dialog.expiredDescription": "The browser dialog could not be completed.",
+  "browser.dialog.expiredTitle": "Browser dialog expired",
+  "browser.dialog.promptLabel": "Value",
+  "browser.dialog.promptTitle": "{source} requests input",
+  "browser.dialog.submit": "Submit",
   "config.configuration": "Configuration",
   "config.export": "Export",
-  "config.exportProject": "Export project",
+  "config.exportProject": "Export workspace",
   "config.globalPath": "global {path}",
   "config.import": "Import",
-  "config.importProject": "Import project",
+  "config.importProject": "Import workspace",
   "config.jsonOnlyHint": "Saved in agentmux.json. Edit the JSON file directly or use import/export.",
   "config.migrateCmux": "Migrate .cmux",
-  "config.projectPath": "project {path}",
+  "config.projectPath": "workspace {path}",
   "config.reload": "Reload",
   "config.resetGlobalConfirm": "Reset global AgentMux config?",
-  "config.resetProject": "Reset project",
-  "config.resetProjectConfirm": "Reset project AgentMux config?",
+  "config.resetProject": "Reset workspace",
+  "config.resetProjectConfirm": "Reset workspace AgentMux config?",
   "config.scopeGlobal": "Global",
-  "config.scopeProject": "Project",
+  "config.scopeProject": "Workspace",
+  "dialog.dismissToast": "Dismiss {title}",
+  "dialog.confirm": "OK",
+  "dialog.pressKey": "Press a key combination",
+  "dialog.pressSecondKey": "Press a second key combination",
+  "dialog.required": "{label} is required.",
   "language.english": "English",
   "language.korean": "Korean",
   "language.label": "Language",
   "language.savedGlobally": "Language is saved globally and applies to every workspace.",
   "notifications.empty": "No active notifications.",
+  "notifications.focus": "Focus",
+  "notifications.open": "Open notifications",
+  "notifications.severity.error": "Error",
+  "notifications.severity.info": "Info",
+  "notifications.severity.warning": "Warning",
+  "notifications.summary": "{count} active",
+  "notifications.title": "Notifications",
   "pane.empty": "Empty pane",
   "pane.invalidLayout": "Invalid pane layout",
   "pane.restoring": "Restoring",
   "settings.appearance": "Appearance",
+  "settings.advanced": "Advanced",
   "settings.diagnostics": "Diagnostics",
-  "settings.general": "General and notifications",
+  "settings.general": "General",
   "settings.keys": "Keyboard shortcuts",
   "settings.profiles": "Profiles",
-  "settings.project": "Project",
+  "settings.project": "Workspace",
   "settings.tabs.appearance": "Appearance",
+  "settings.tabs.advanced": "Advanced",
   "settings.tabs.diagnostics": "Diagnostics",
   "settings.tabs.general": "General",
   "settings.tabs.keys": "Shortcuts",
   "settings.tabs.profiles": "Profiles and SSH",
-  "settings.tabs.workspace": "Project",
+  "settings.tabs.workspace": "Workspace",
   "settings.theme": "Theme",
   "settings.accentColor": "Accent color",
   "settings.uiFontSize": "UI font size",
@@ -281,9 +358,35 @@ const en: Record<I18nKey, string> = {
   "action.group.workspace": "Workspace",
   "action.group.view": "View",
   "action.group.remote": "Remote · WSL",
-  "settings.workspace.noActiveProject": "No active project.",
-  "settings.workspace.saveProject": "Save project",
-  "settings.workspace.title": "Project",
+  "settings.workspace.noActiveProject": "No active workspace.",
+  "settings.workspace.scope": "Active workspace",
+  "settings.workspace.name": "Name",
+  "settings.workspace.root": "Workspace root",
+  "settings.workspace.description": "Description",
+  "settings.workspace.icon": "Icon",
+  "settings.workspace.color": "Color",
+  "settings.workspace.defaultTerminal": "Default terminal",
+  "settings.workspace.defaultWsl": "Default WSL distribution",
+  "settings.workspace.defaultAgentCommand": "Default agent command",
+  "settings.workspace.systemDefault": "System default",
+  "settings.workspace.saveProject": "Save workspace",
+  "settings.workspace.title": "Workspace",
+  "shortcuts.conflictsTitle": "Shortcut conflicts",
+  "shortcuts.editDescription":
+    "Focus a key field and press the combination. Use the second field only for a two-step chord.",
+  "shortcuts.editTitle": "Edit shortcut: {action}",
+  "shortcuts.firstStroke": "Shortcut",
+  "shortcuts.invalidDescription":
+    "Press one key combination or an optional two-step chord.",
+  "shortcuts.invalidTitle": "Invalid shortcut",
+  "shortcuts.replaceAction": "Replace",
+  "shortcuts.replaceDescription": "{binding} is already assigned to {actions}.",
+  "shortcuts.replaceDetail":
+    "Replacing it will unassign the shortcut from those actions.",
+  "shortcuts.replaceTitle": "Replace existing shortcut?",
+  "shortcuts.save": "Save shortcut",
+  "shortcuts.secondStroke": "Second key (optional chord)",
+  "shortcuts.unassign": "Unassign",
   "updates.autoCheck": "Check for updates automatically",
   "updates.autoCheckHint": "AgentMux checks GitHub Releases at startup. Installation still requires your approval.",
   "updates.check": "Check for updates",
@@ -313,6 +416,18 @@ const en: Record<I18nKey, string> = {
   "workspace.group.addWorkspace": "Add workspace to group",
   "workspace.group.moveDown": "Move group down",
   "workspace.group.moveUp": "Move group up",
+  "workspace.group.colorDescription": "Hex color in #RRGGBB format.",
+  "workspace.group.colorLabel": "Group color",
+  "workspace.group.createAction": "Create",
+  "workspace.group.createTitle": "Create workspace group",
+  "workspace.group.deleteAction": "Delete group",
+  "workspace.group.deleteDescription": "The workspaces in this group will remain.",
+  "workspace.group.deleteTitle": "Delete {name}?",
+  "workspace.group.editTitle": "Edit workspace group",
+  "workspace.group.iconDescription": "One or two letters.",
+  "workspace.group.iconLabel": "Group icon",
+  "workspace.group.invalidColor": "Use a color such as #58A6FF.",
+  "workspace.group.nameLabel": "Group name",
   "workspace.none": "No workspace",
   "workspace.section": "Workspaces",
   "workspace.selectedCount": "{count} selected",
@@ -356,39 +471,48 @@ const ko: Record<I18nKey, string> = {
   "common.unassigned": "미지정",
   "config.configuration": "설정 파일",
   "config.export": "내보내기",
-  "config.exportProject": "프로젝트 내보내기",
+  "config.exportProject": "워크스페이스 내보내기",
   "config.globalPath": "전역 {path}",
   "config.import": "가져오기",
-  "config.importProject": "프로젝트 가져오기",
+  "config.importProject": "워크스페이스 가져오기",
   "config.jsonOnlyHint": "agentmux.json에 저장됩니다. JSON 파일을 직접 편집하거나 가져오기/내보내기를 사용하세요.",
   "config.migrateCmux": ".cmux 마이그레이션",
-  "config.projectPath": "프로젝트 {path}",
+  "config.projectPath": "워크스페이스 {path}",
   "config.reload": "다시 불러오기",
   "config.resetGlobalConfirm": "전역 AgentMux 설정을 초기화할까요?",
-  "config.resetProject": "프로젝트 초기화",
-  "config.resetProjectConfirm": "프로젝트 AgentMux 설정을 초기화할까요?",
+  "config.resetProject": "워크스페이스 초기화",
+  "config.resetProjectConfirm": "워크스페이스 AgentMux 설정을 초기화할까요?",
   "config.scopeGlobal": "전역",
-  "config.scopeProject": "프로젝트",
+  "config.scopeProject": "워크스페이스",
   "language.english": "영어",
   "language.korean": "한국어",
   "language.label": "언어",
   "language.savedGlobally": "언어는 전역으로 저장되며 모든 워크스페이스에 적용됩니다.",
   "notifications.empty": "활성 알림이 없습니다.",
+  "notifications.focus": "포커스",
+  "notifications.open": "알림 열기",
+  "notifications.severity.error": "오류",
+  "notifications.severity.info": "정보",
+  "notifications.severity.warning": "경고",
+  "notifications.summary": "활성 {count}개",
+  "notifications.title": "알림",
   "pane.empty": "빈 페인",
   "pane.invalidLayout": "잘못된 페인 레이아웃",
   "pane.restoring": "복원 중",
   "settings.appearance": "모양",
+  "settings.advanced": "고급",
   "settings.diagnostics": "진단",
-  "settings.general": "일반 및 알림",
+  "settings.general": "일반",
   "settings.keys": "키보드 단축키",
   "settings.profiles": "프로필",
-  "settings.project": "프로젝트",
+  "settings.project": "워크스페이스",
   "settings.tabs.appearance": "모양",
+  "settings.tabs.advanced": "고급",
   "settings.tabs.diagnostics": "진단",
   "settings.tabs.general": "일반",
   "settings.tabs.keys": "단축키",
   "settings.tabs.profiles": "프로필 및 SSH",
-  "settings.tabs.workspace": "프로젝트",
+  "settings.tabs.workspace": "워크스페이스",
   "settings.theme": "테마",
   "settings.accentColor": "강조 색상",
   "settings.uiFontSize": "UI 글자 크기",
@@ -404,9 +528,19 @@ const ko: Record<I18nKey, string> = {
     "OAuth/로그인 흐름(예: Claude Code)이 localhost 콜백을 완료하려면 시스템 브라우저가 필요합니다.",
   "settings.terminalLinkOpen.system": "시스템 브라우저",
   "settings.terminalLinkOpen.inApp": "앱 내부 브라우저",
-  "settings.workspace.noActiveProject": "활성 프로젝트가 없습니다.",
-  "settings.workspace.saveProject": "프로젝트 저장",
-  "settings.workspace.title": "프로젝트",
+  "settings.workspace.noActiveProject": "활성 워크스페이스가 없습니다.",
+  "settings.workspace.scope": "활성 워크스페이스",
+  "settings.workspace.name": "이름",
+  "settings.workspace.root": "워크스페이스 루트",
+  "settings.workspace.description": "설명",
+  "settings.workspace.icon": "아이콘",
+  "settings.workspace.color": "색상",
+  "settings.workspace.defaultTerminal": "기본 터미널",
+  "settings.workspace.defaultWsl": "기본 WSL 배포판",
+  "settings.workspace.defaultAgentCommand": "기본 에이전트 명령",
+  "settings.workspace.systemDefault": "시스템 기본값",
+  "settings.workspace.saveProject": "워크스페이스 저장",
+  "settings.workspace.title": "워크스페이스",
   "updates.autoCheck": "자동으로 업데이트 확인",
   "updates.autoCheckHint": "AgentMux가 시작될 때 GitHub Release를 확인합니다. 설치는 사용자가 승인해야 진행됩니다.",
   "updates.check": "업데이트 확인",
@@ -471,6 +605,45 @@ const ko: Record<I18nKey, string> = {
   "action.group.workspace": "워크스페이스",
   "action.group.view": "보기",
   "action.group.remote": "원격 · WSL",
+  "dialog.dismissToast": "{title} 알림 닫기",
+  "dialog.confirm": "확인",
+  "dialog.pressKey": "키 조합을 누르세요",
+  "dialog.pressSecondKey": "두 번째 키 조합을 누르세요",
+  "dialog.required": "{label} 항목은 필수입니다.",
+  "browser.dialog.allow": "허용",
+  "browser.dialog.confirmTitle": "{source}에서 확인을 요청합니다",
+  "browser.dialog.expiredDescription": "브라우저 대화 상자를 완료하지 못했습니다.",
+  "browser.dialog.expiredTitle": "브라우저 대화 상자 만료",
+  "browser.dialog.promptLabel": "값",
+  "browser.dialog.promptTitle": "{source}에서 입력을 요청합니다",
+  "browser.dialog.submit": "제출",
+  "shortcuts.conflictsTitle": "단축키 충돌",
+  "shortcuts.editDescription":
+    "키 입력란에 포커스를 두고 조합을 누르세요. 두 단계 단축키일 때만 두 번째 입력란을 사용합니다.",
+  "shortcuts.editTitle": "단축키 편집: {action}",
+  "shortcuts.firstStroke": "단축키",
+  "shortcuts.invalidDescription":
+    "하나의 키 조합 또는 선택적인 두 단계 단축키를 입력하세요.",
+  "shortcuts.invalidTitle": "잘못된 단축키",
+  "shortcuts.replaceAction": "교체",
+  "shortcuts.replaceDescription": "{binding} 단축키는 이미 {actions}에 할당되어 있습니다.",
+  "shortcuts.replaceDetail": "교체하면 해당 작업에서 기존 단축키 할당이 해제됩니다.",
+  "shortcuts.replaceTitle": "기존 단축키를 교체할까요?",
+  "shortcuts.save": "단축키 저장",
+  "shortcuts.secondStroke": "두 번째 키(선택적 두 단계 단축키)",
+  "shortcuts.unassign": "할당 해제",
+  "workspace.group.colorDescription": "#RRGGBB 형식의 16진수 색상입니다.",
+  "workspace.group.colorLabel": "그룹 색상",
+  "workspace.group.createAction": "만들기",
+  "workspace.group.createTitle": "워크스페이스 그룹 만들기",
+  "workspace.group.deleteAction": "그룹 삭제",
+  "workspace.group.deleteDescription": "그룹에 포함된 워크스페이스는 유지됩니다.",
+  "workspace.group.deleteTitle": "{name} 그룹을 삭제할까요?",
+  "workspace.group.editTitle": "워크스페이스 그룹 편집",
+  "workspace.group.iconDescription": "한두 글자를 입력하세요.",
+  "workspace.group.iconLabel": "그룹 아이콘",
+  "workspace.group.invalidColor": "#58A6FF 같은 색상을 사용하세요.",
+  "workspace.group.nameLabel": "그룹 이름",
 };
 
 const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {

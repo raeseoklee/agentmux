@@ -41,7 +41,8 @@ use agentmux_ipc::{
     AppConfigUpdateParams, AppConfigUpdates, BrowserActionResult, BrowserCheckParams,
     BrowserClickParams, BrowserConsoleMessageResult, BrowserConsoleParams, BrowserConsoleResult,
     BrowserCookieResult, BrowserCookiesResult, BrowserDiagnosticResult, BrowserDiagnosticsParams,
-    BrowserDiagnosticsResult, BrowserDialogMessageResult, BrowserDialogsParams,
+    BrowserDiagnosticsResult, BrowserDialogCancelParams, BrowserDialogHandledResult,
+    BrowserDialogMessageResult, BrowserDialogRespondParams, BrowserDialogsParams,
     BrowserDialogsResult, BrowserDomSnapshotParams, BrowserDomSnapshotResult,
     BrowserDownloadResult, BrowserDownloadsParams, BrowserDownloadsResult, BrowserErrorEventResult,
     BrowserErrorsParams, BrowserErrorsResult, BrowserEvaluateParams, BrowserEvaluateResult,
@@ -2468,6 +2469,8 @@ impl DesktopControlState {
             "browser.history" => self.handle_browser_history(&request),
             "browser.console" => self.handle_browser_console(&request),
             "browser.dialogs" => self.handle_browser_dialogs(&request),
+            "browser.dialog.respond" => self.handle_browser_dialog_respond(&request),
+            "browser.dialog.cancel" => self.handle_browser_dialog_cancel(&request),
             "browser.errors" => self.handle_browser_errors(&request),
             "browser.click" => self.handle_browser_click(&request),
             "browser.type" => self.handle_browser_type(&request),
@@ -4069,6 +4072,68 @@ impl DesktopControlState {
                     .into_iter()
                     .map(browser_dialog_message_result)
                     .collect(),
+            },
+        ))
+    }
+
+    fn handle_browser_dialog_respond(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: BrowserDialogRespondParams = request.parse_params()?;
+        let result = self.execute_browser_command(
+            "browser.dialog.respond",
+            BrowserCommand::RespondDialog {
+                surface_id: params.surface_id,
+                dialog_id: params.dialog_id,
+                accept: params.accept,
+                prompt_text: params.prompt_text,
+            },
+        )?;
+        let BrowserCommandResult::DialogHandled {
+            surface_id,
+            dialog_id,
+            status,
+        } = result
+        else {
+            unreachable!("dialog response command returns handled result")
+        };
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &BrowserDialogHandledResult {
+                surface_id,
+                dialog_id,
+                status,
+            },
+        ))
+    }
+
+    fn handle_browser_dialog_cancel(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: BrowserDialogCancelParams = request.parse_params()?;
+        let result = self.execute_browser_command(
+            "browser.dialog.cancel",
+            BrowserCommand::CancelDialog {
+                surface_id: params.surface_id,
+                dialog_id: params.dialog_id,
+            },
+        )?;
+        let BrowserCommandResult::DialogHandled {
+            surface_id,
+            dialog_id,
+            status,
+        } = result
+        else {
+            unreachable!("dialog cancel command returns handled result")
+        };
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &BrowserDialogHandledResult {
+                surface_id,
+                dialog_id,
+                status,
             },
         ))
     }
@@ -7299,6 +7364,8 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "browser.history",
         "browser.console",
         "browser.dialogs",
+        "browser.dialog.respond",
+        "browser.dialog.cancel",
         "browser.errors",
         "browser.click",
         "browser.type",
@@ -10505,6 +10572,8 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "browser.history"
             | "browser.console"
             | "browser.dialogs"
+            | "browser.dialog.respond"
+            | "browser.dialog.cancel"
             | "browser.errors"
             | "browser.click"
             | "browser.type"
@@ -10847,11 +10916,17 @@ fn browser_history_entry_result(entry: BrowserHistoryEntry) -> BrowserHistoryEnt
 
 fn browser_dialog_message_result(message: BrowserDialogMessage) -> BrowserDialogMessageResult {
     BrowserDialogMessageResult {
+        dialog_id: message.dialog_id,
+        surface_id: message.surface_id,
+        kind: message.kind,
         dialog_type: message.dialog_type,
         message: message.message,
         default_value: message.default_value,
+        status: message.status,
         response: message.response,
         timestamp: message.timestamp,
+        resolved_at: message.resolved_at,
+        resolution: message.resolution,
     }
 }
 
@@ -12515,6 +12590,8 @@ fn is_mutating_control_method(method: &str) -> bool {
             | "browser.reload"
             | "browser.back"
             | "browser.forward"
+            | "browser.dialog.respond"
+            | "browser.dialog.cancel"
             | "browser.click"
             | "browser.type"
             | "browser.fill"
@@ -15991,6 +16068,38 @@ mod tests {
         let dialogs = response_value(&dialogs);
         assert_eq!(dialogs["surface_id"], surface_id);
         assert!(dialogs["messages"].as_array().unwrap().is_empty());
+
+        let unknown_dialog = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_browser_dialog_respond",
+                "browser.dialog.respond",
+                format!(
+                    r#"{{"surface_id":"{surface_id}","dialog_id":"{surface_id}:dialog:0000000000000001","accept":true,"prompt_text":"unsafe"}}"#
+                ),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(
+            response_error_code(&unknown_dialog),
+            ErrorCode::InvalidRequest
+        );
+
+        let unknown_dialog = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_browser_dialog_cancel",
+                "browser.dialog.cancel",
+                format!(
+                    r#"{{"surface_id":"{surface_id}","dialog_id":"{surface_id}:dialog:0000000000000001"}}"#
+                ),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(
+            response_error_code(&unknown_dialog),
+            ErrorCode::InvalidRequest
+        );
 
         let errors = agentmux_control(
             &state,

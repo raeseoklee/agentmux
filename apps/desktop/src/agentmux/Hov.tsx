@@ -1,6 +1,7 @@
 import {
   type CSSProperties,
   type DragEventHandler,
+  type KeyboardEventHandler,
   type MouseEventHandler,
   type ReactNode,
   useState
@@ -13,10 +14,16 @@ interface HovProps {
   style: CSSProperties;
   hover?: CSSProperties;
   className?: string;
+  id?: string;
   title?: string;
   ariaLabel?: string;
+  ariaControls?: string;
+  ariaSelected?: boolean;
+  role?: "button" | "menuitem" | "tab";
+  tabIndex?: number;
   draggable?: boolean;
   onClick?: MouseEventHandler<HTMLElement>;
+  onKeyDown?: KeyboardEventHandler<HTMLElement>;
   onContextMenu?: MouseEventHandler<HTMLElement>;
   onDragStart?: DragEventHandler<HTMLElement>;
   onDragOver?: DragEventHandler<HTMLElement>;
@@ -34,10 +41,16 @@ export function Hov({
   style,
   hover,
   className,
+  id,
   title,
   ariaLabel,
+  ariaControls,
+  ariaSelected,
+  role,
+  tabIndex,
   draggable,
   onClick,
+  onKeyDown,
   onContextMenu,
   onDragStart,
   onDragOver,
@@ -53,10 +66,16 @@ export function Hov({
     ...dataAttributes,
     style: merged,
     className: className ? `agentmux-hover ${className}` : "agentmux-hover",
+    id,
     title,
     "aria-label": ariaLabel,
+    "aria-controls": ariaControls,
+    "aria-selected": ariaSelected,
+    role,
+    tabIndex,
     draggable,
     onClick,
+    onKeyDown,
     onContextMenu,
     onDragStart,
     onDragOver,
