@@ -426,6 +426,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     updatedAt: Date.now(),
   };
   private fontReadyPromise?: Promise<void>;
+  private fontMeasurementGeneration = 0;
   private ligaturesReadyPromise?: Promise<void>;
   private scrollbarHideTimer?: number;
   private alternateWheelMode: AlternateWheelMode = "auto";
@@ -653,6 +654,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     terminal: Terminal,
     fontSize = normalizeFontSize(this.terminal?.options.fontSize),
   ): Promise<void> {
+    const generation = ++this.fontMeasurementGeneration;
     const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
     const fontLoads = fonts?.load
       ? Promise.allSettled([
@@ -665,20 +667,14 @@ export class XtermTerminalRenderer implements TerminalRenderer {
       : Promise.resolve();
     return fontLoads
       .catch(() => {})
-      .then(
-        () =>
-          new Promise<void>((resolve) => {
-            window.setTimeout(resolve, 80);
-          })
-      )
       .then(() => {
-        if (this.terminal !== terminal) {
+        if (
+          this.terminal !== terminal ||
+          this.fontMeasurementGeneration !== generation
+        ) {
           return;
         }
-        this.webglAddon?.clearTextureAtlas();
-        terminal.options.fontFamily = TERMINAL_FONT_FAMILY;
-        this.fitAddon?.fit();
-        terminal.refresh(0, terminal.rows - 1);
+        this.remeasureDisplay(terminal);
       })
       .catch(() => {
         /* font failed to load — keep the monospace fallback */
@@ -689,6 +685,7 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     // WebGL addon must be disposed BEFORE the terminal: disposing the terminal
     // first leaves the addon holding a dangling reference / leaked GL context.
     this.webglGeneration++;
+    this.fontMeasurementGeneration++;
     this.webglEnablePending = false;
     this.cancelWebglFallbackRefresh();
     this.disposeWebglAddon(false);
@@ -788,6 +785,22 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     this.fitAddon?.fit();
     terminal.refresh(0, terminal.rows - 1);
     this.fontReadyPromise = this.ensureFontsThenRemeasure(terminal, nextFontSize);
+  }
+
+  refreshDisplayMetrics(): void {
+    const terminal = this.terminal;
+    if (!terminal) {
+      return;
+    }
+    this.remeasureDisplay(terminal);
+  }
+
+  private remeasureDisplay(terminal: Terminal): void {
+    this.webglAddon?.clearTextureAtlas();
+    terminal.options.fontFamily = TERMINAL_FONT_FAMILY;
+    terminal.options.letterSpacing = 0;
+    this.fitAddon?.fit();
+    terminal.refresh(0, terminal.rows - 1);
   }
 
   setAlternateWheelMode(mode: AlternateWheelMode): void {

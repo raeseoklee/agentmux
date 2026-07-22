@@ -22,6 +22,7 @@ export interface TerminalRenderer {
   resize(columns: number, rows: number): void;
   size(): { columns: number; rows: number } | null;
   setTypography(typography: Partial<TerminalTypography>): void;
+  refreshDisplayMetrics?(): void;
   setAlternateWheelMode?(mode: AlternateWheelMode): void;
   onData(handler: (data: string) => void): () => void;
   onPaste(handler: (text: string) => void): () => void;

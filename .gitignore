@@ -25,6 +25,7 @@ docs/implementation/evidence/**/runtime/
 .omc/
 .codexus/
 .agentmux-dev-isolated/
+.tmp/
 test-results/
 tauri-dev.log
 

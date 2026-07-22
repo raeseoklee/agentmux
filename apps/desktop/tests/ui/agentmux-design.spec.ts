@@ -951,6 +951,55 @@ test("surface tabs can be reordered and moved to another workspace", async ({
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 });
 
+test("surface tabs can be renamed and restored to their automatic title", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tab = page.locator(".agentmux-surface-tab").first();
+  await expect(tab).toBeVisible();
+
+  await tab.locator(".agentmux-surface-tab-workspace-menu").click();
+  await page.locator(".agentmux-surface-tab-menu-rename").click();
+  await submitAppPrompt(page, "Release monitor");
+  await expect(tab).toContainText("Release monitor");
+  await expect(tab.locator(".agentmux-surface-tab-close")).toHaveAttribute(
+    "aria-label",
+    "Close Release monitor",
+  );
+
+  await tab.locator(".agentmux-surface-tab-workspace-menu").click();
+  await page.locator(".agentmux-surface-tab-menu-reset-title").click();
+  await expect(tab).not.toContainText("Release monitor");
+});
+
+test("terminal viewport resize bursts are coalesced", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.waitForTimeout(500);
+
+  const resizeCount = () =>
+    page.evaluate(() => {
+      const preview = (
+        window as unknown as {
+          __AGENTMUX_PREVIEW__?: { terminalResizes(): unknown[] };
+        }
+      ).__AGENTMUX_PREVIEW__;
+      return preview?.terminalResizes().length ?? 0;
+    });
+  const before = await resizeCount();
+
+  await page.setViewportSize({ width: 1180, height: 760 });
+  await page.setViewportSize({ width: 1210, height: 780 });
+  await page.setViewportSize({ width: 1240, height: 800 });
+  await page.waitForTimeout(350);
+
+  const resizeDelta = (await resizeCount()) - before;
+  expect(resizeDelta).toBeGreaterThanOrEqual(1);
+  expect(resizeDelta).toBeLessThanOrEqual(2);
+});
+
 test("split pane surfaces can be swapped with explicit controls", async ({
   page,
 }) => {

@@ -9,6 +9,8 @@ import {
   XTERM_THEME,
 } from "../terminal/XtermTerminalRenderer";
 import { TerminalInputScheduler } from "../terminal/TerminalInputScheduler";
+import { observeDevicePixelRatio } from "../terminal/DevicePixelRatioObserver";
+import { TerminalResizeCoordinator } from "../terminal/TerminalResizeCoordinator";
 import { terminalViewStateCache } from "../terminal/TerminalViewStateCache";
 import type {
   TerminalWebglMode as TerminalGpuAccelerationMode,
@@ -80,6 +82,7 @@ const MAX_PENDING_STREAM_FRAMES = 256;
 const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
 const WEBGL_DISABLE_DEBOUNCE_MS = 250;
+const TERMINAL_RESIZE_SETTLE_MS = 160;
 const TERMINAL_LINE_HEIGHT = 1.0;
 const PREVIEW_CACHE_ENABLED_KEY = "agentmux.terminal.previewCache";
 const PREVIEW_CACHE_PREFIX = "agentmux.terminal.preview.v1.";
@@ -387,16 +390,10 @@ export function TerminalRestorePreview({
     };
     const resizeObserver = new ResizeObserver(requestFit);
     resizeObserver.observe(host);
-    const timers = [80, 300, 900].map((delay) =>
-      window.setTimeout(() => renderer.fit(), delay),
-    );
 
     return () => {
       if (fitFrame !== null) {
         window.cancelAnimationFrame(fitFrame);
-      }
-      for (const timer of timers) {
-        window.clearTimeout(timer);
       }
       resizeObserver.disconnect();
       renderer.dispose();
@@ -706,81 +703,40 @@ export function LiveTerminal({
     };
 
     // --- resize (shared by both output paths) ---
-    let resizeTimer: number | null = null;
-    let pendingResize: { columns: number; rows: number } | null = null;
-    let lastResizeSent = { columns: 0, rows: 0 };
-    const sendResize = (columns: number, rows: number, force = false) => {
-      if (columns <= 0 || rows <= 0) {
-        return;
-      }
-      if (!force && columns === lastResizeSent.columns && rows === lastResizeSent.rows) {
-        return;
-      }
-      lastResizeSent = { columns, rows };
-      client
-        .resize(sessionId, columns, rows)
-        .catch(() => onError?.());
-    };
+    const resizeCoordinator = new TerminalResizeCoordinator({
+      delayMs: TERMINAL_RESIZE_SETTLE_MS,
+      send: ({ columns, rows }) => client.resize(sessionId, columns, rows),
+      onError: () => {
+        if (alive) {
+          onError?.();
+        }
+      },
+    });
     const reportRendererSize = (immediate: boolean) => {
       const size = renderer.size();
       if (!size) {
         return;
       }
-      if (immediate) {
-        if (resizeTimer !== null) {
-          window.clearTimeout(resizeTimer);
-          resizeTimer = null;
-        }
-        pendingResize = null;
-        sendResize(size.columns, size.rows, true);
-        return;
-      }
-      pendingResize = { columns: size.columns, rows: size.rows };
-      if (resizeTimer !== null) {
-        window.clearTimeout(resizeTimer);
-      }
-      resizeTimer = window.setTimeout(() => {
-        resizeTimer = null;
-        const next = pendingResize;
-        pendingResize = null;
-        if (!next || !alive) {
-          return;
-        }
-        sendResize(next.columns, next.rows);
-      }, 80);
+      resizeCoordinator.request(size, immediate);
     };
     const unsubscribeResize = renderer.onResize((columns, rows) => {
-      if (
-        !alive ||
-        (columns === lastResizeSent.columns && rows === lastResizeSent.rows)
-      ) {
+      if (!alive) {
         return;
       }
-      pendingResize = { columns, rows };
-      if (resizeTimer !== null) {
-        window.clearTimeout(resizeTimer);
-      }
-      resizeTimer = window.setTimeout(() => {
-        resizeTimer = null;
-        const next = pendingResize;
-        pendingResize = null;
-        if (!next || !alive) {
-          return;
-        }
-        sendResize(next.columns, next.rows);
-      }, 80);
+      resizeCoordinator.request({ columns, rows });
     });
     reportRendererSize(true);
-    const forceResizeTimers = [120, 400, 1000].map((delay) =>
+    const resizeRetryTimers = [120, 400].map((delay) =>
       window.setTimeout(() => {
         if (!alive) {
           return;
         }
         renderer.fit();
-        reportRendererSize(true);
+        reportRendererSize(false);
       }, delay)
     );
     let fitFrame: number | null = null;
+    let displayMetricsFrame: number | null = null;
     const requestFit = () => {
       if (fitFrame !== null) {
         return;
@@ -791,8 +747,24 @@ export function LiveTerminal({
         reportRendererSize(false);
       });
     };
+    const requestDisplayMetricsRefresh = () => {
+      if (displayMetricsFrame !== null) {
+        return;
+      }
+      displayMetricsFrame = window.requestAnimationFrame(() => {
+        displayMetricsFrame = null;
+        if (!alive) {
+          return;
+        }
+        renderer.refreshDisplayMetrics?.();
+        reportRendererSize(false);
+      });
+    };
     const resizeObserver = new ResizeObserver(requestFit);
     resizeObserver.observe(host);
+    const stopObservingDevicePixelRatio = observeDevicePixelRatio(
+      requestDisplayMetricsRefresh,
+    );
 
     // Register imperative commands for this session so app-level code can call
     // clearBuffer / selectAll / findNext / findPrevious / scrollToBottom without
@@ -829,19 +801,21 @@ export function LiveTerminal({
         _terminalCommandRegistry.delete(sessionId);
       }
       window.clearTimeout(bootingBackstop);
-      if (resizeTimer !== null) {
-        window.clearTimeout(resizeTimer);
-      }
+      resizeCoordinator.dispose();
       if (fitFrame !== null) {
         window.cancelAnimationFrame(fitFrame);
       }
-      for (const timer of forceResizeTimers) {
+      if (displayMetricsFrame !== null) {
+        window.cancelAnimationFrame(displayMetricsFrame);
+      }
+      for (const timer of resizeRetryTimers) {
         window.clearTimeout(timer);
       }
       unsubscribeResize();
       unsubscribeOpenLink();
       unsubscribePastePaths();
       resizeObserver.disconnect();
+      stopObservingDevicePixelRatio();
       if (viewCheckpointTimer !== null) {
         window.clearTimeout(viewCheckpointTimer);
         viewCheckpointTimer = null;
@@ -1512,12 +1486,7 @@ export function LiveTerminal({
       return;
     }
     renderer.setTypography({ fontSize, lineHeight: TERMINAL_LINE_HEIGHT });
-    renderer.fit();
-    const size = renderer.size();
-    if (size) {
-      client.resize(sessionId, size.columns, size.rows).catch(() => onError?.());
-    }
-  }, [client, fontSize, onError, sessionId]);
+  }, [fontSize]);
 
   // Terminal preview cache is also opt-in because terminal output can contain
   // secrets. Local users can enable it with:

@@ -125,6 +125,11 @@ export type I18nKey =
   | "session.status.exited"
   | "session.status.failed"
   | "session.status.lost"
+  | "surface.tab.actions"
+  | "surface.tab.nameLabel"
+  | "surface.tab.rename"
+  | "surface.tab.renameTitle"
+  | "surface.tab.reset"
   | "workspace.status.needsInput"
   | "workspace.status.running"
   | "workspace.status.sessionCount"
@@ -345,6 +350,11 @@ const en: Record<I18nKey, string> = {
     "System browser is required for OAuth/login flows (e.g. Claude Code) to complete their localhost callback.",
   "settings.terminalLinkOpen.system": "System browser",
   "settings.terminalLinkOpen.inApp": "In-app browser",
+  "surface.tab.actions": "Tab actions",
+  "surface.tab.nameLabel": "Tab name",
+  "surface.tab.rename": "Rename tab",
+  "surface.tab.renameTitle": "Rename tab",
+  "surface.tab.reset": "Restore automatic title",
   "session.status.attention": "Waiting for input",
   "session.status.running": "Running",
   "session.status.starting": "Starting",
@@ -541,6 +551,11 @@ const ko: Record<I18nKey, string> = {
     "OAuth/로그인 흐름(예: Claude Code)이 localhost 콜백을 완료하려면 시스템 브라우저가 필요합니다.",
   "settings.terminalLinkOpen.system": "시스템 브라우저",
   "settings.terminalLinkOpen.inApp": "앱 내부 브라우저",
+  "surface.tab.actions": "탭 작업",
+  "surface.tab.nameLabel": "탭 이름",
+  "surface.tab.rename": "탭 이름 바꾸기",
+  "surface.tab.renameTitle": "탭 이름 바꾸기",
+  "surface.tab.reset": "자동 이름으로 복원",
   "settings.workspace.noActiveProject": "활성 워크스페이스가 없습니다.",
   "settings.workspace.scope": "편집할 워크스페이스",
   "settings.workspace.selector": "편집할 워크스페이스",
