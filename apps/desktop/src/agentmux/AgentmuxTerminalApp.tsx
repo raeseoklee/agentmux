@@ -79,6 +79,7 @@ import {
 import { Hov } from "./Hov";
 import { LiveTerminal, TerminalRestorePreview, setBroadcastResolver, terminalCommandsForSession } from "./LiveTerminal";
 import { SplitHandle } from "./SplitHandle";
+import { SourceControlPanel } from "./SourceControlPanel";
 import { useAgentmuxControl } from "./useAgentmuxControl";
 import type {
   TerminalWebglMode as TerminalGpuAccelerationMode,
@@ -234,7 +235,14 @@ import {
 } from "./updateCheckSchedule";
 import desktopPackage from "../../package.json";
 
-type Overlay = "palette" | "search" | "settings" | "setup" | "notifications" | null;
+type Overlay =
+  | "palette"
+  | "search"
+  | "settings"
+  | "setup"
+  | "notifications"
+  | "sourceControl"
+  | null;
 type SettingsTab =
   | "general"
   | "workspace"
@@ -660,6 +668,20 @@ async function openUrlInSystemBrowser(url: string): Promise<boolean> {
     }
   }
   return window.open(url, "_blank", "noopener,noreferrer") !== null;
+}
+
+async function openPathInFileExplorer(
+  path: string,
+  distribution?: string | null,
+): Promise<void> {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (!invoke) {
+    throw new Error("File Explorer is available in the desktop app.");
+  }
+  await invoke("open_path_in_explorer", {
+    path,
+    distribution: distribution ?? null,
+  });
 }
 
 function targetPaneForSplitBrowser(
@@ -3303,6 +3325,26 @@ export function AgentmuxTerminalApp() {
     }
     return branch || hash || "no git";
   }, [sidebarState?.gitBranch, sidebarState?.gitHash]);
+  const statusBarPath =
+    sidebarState?.cwd?.trim() || activeWorkspace?.projectRoot?.trim() || "";
+  const canOpenStatusBarPath =
+    Boolean(statusBarPath) && Boolean(window.__TAURI__?.core?.invoke);
+  const handleOpenStatusBarPath = useCallback(async () => {
+    if (!statusBarPath) return;
+    try {
+      await openPathInFileExplorer(
+        statusBarPath,
+        activeWorkspace?.defaultWslDistribution,
+      );
+    } catch (cause) {
+      dialogs.toast({
+        title: t("statusbar.openPathFailed"),
+        description:
+          cause instanceof Error ? cause.message : String(cause),
+        tone: "danger",
+      });
+    }
+  }, [activeWorkspace?.defaultWslDistribution, dialogs, statusBarPath, t]);
   const teamTaskStats = useMemo(() => {
     const total = teamTasks.length;
     const completed = teamTasks.filter((task) => task.status === "completed").length;
@@ -7142,7 +7184,10 @@ export function AgentmuxTerminalApp() {
         </div>
 
         {/* body */}
-        <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+        <div
+          className="agentmux-shell-body"
+          style={{ flex: 1, minHeight: 0, display: "flex" }}
+        >
           {/* sidebar */}
           <div
             style={{
@@ -8353,6 +8398,7 @@ export function AgentmuxTerminalApp() {
 
           {/* right: tabs + mosaic */}
           <div
+            className="agentmux-workbench"
             style={{
               flex: 1,
               minWidth: 0,
@@ -8986,6 +9032,15 @@ export function AgentmuxTerminalApp() {
             onCloseSurface={(surfaceId) => void closeDockSurface(surfaceId)}
             onFocusSession={setActiveDockSessionId}
           />
+          {overlay === "sourceControl" && activeWorkspace ? (
+            <SourceControlPanel
+              client={client}
+              workspace={activeWorkspace}
+              onClose={closeOverlay}
+              onRepositoryChanged={ctl.refreshSidebar}
+              t={t}
+            />
+          ) : null}
         </div>
 
         {/* status bar */}
@@ -9001,13 +9056,23 @@ export function AgentmuxTerminalApp() {
             fontFamily: FONT_MONO,
           }}
         >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              color: "var(--fg3)",
+          <button
+            type="button"
+            className="agentmux-status-git-button"
+            onClick={() => {
+              if (client.supportsSourceControl) setOverlay("sourceControl");
             }}
+            disabled={!client.supportsSourceControl}
+            title={t(
+              client.supportsSourceControl
+                ? "sourceControl.title"
+                : "sourceControl.unavailableServer",
+            )}
+            aria-label={t(
+              client.supportsSourceControl
+                ? "sourceControl.title"
+                : "sourceControl.unavailableServer",
+            )}
           >
             <IconBranch size={12} />
             <span
@@ -9016,7 +9081,7 @@ export function AgentmuxTerminalApp() {
             >
               {gitStatusLabel}
             </span>
-          </div>
+          </button>
           <div
             style={{
               width: 1,
@@ -9025,9 +9090,25 @@ export function AgentmuxTerminalApp() {
               margin: "0 12px",
             }}
           />
-          <span style={{ fontSize: 10.5, color: "var(--fg4)" }}>
-            {sidebarState?.cwd ?? activeWorkspace?.projectRoot ?? ""}
-          </span>
+          <button
+            type="button"
+            className="agentmux-status-path"
+            disabled={!canOpenStatusBarPath}
+            onClick={() => void handleOpenStatusBarPath()}
+            title={
+              statusBarPath
+                ? t("statusbar.openPath", { path: statusBarPath })
+                : undefined
+            }
+            aria-label={
+              statusBarPath
+                ? t("statusbar.openPath", { path: statusBarPath })
+                : undefined
+            }
+          >
+            <IconFolder size={11} />
+            <span className="agentmux-status-path__text">{statusBarPath}</span>
+          </button>
           <div style={{ flex: 1 }} />
           {teamTaskStats.total > 0 || unreadTeamMessageCount > 0 ? (
             <>
