@@ -1264,6 +1264,7 @@ impl AgentMuxMcpServer {
             METHOD_GIT_STATUS_SUMMARY,
             json!(GitRepositoryParams {
                 workspace_id: params.workspace_id,
+                pane_id: params.pane_id,
                 repository_id: params.repository_id,
             }),
         )
@@ -1286,6 +1287,7 @@ impl AgentMuxMcpServer {
     ) -> CallToolResult {
         let request = GitStatusPageParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             state: params.state,
             cursor: params.cursor,
@@ -1311,6 +1313,7 @@ impl AgentMuxMcpServer {
     async fn git_diff(&self, Parameters(params): Parameters<GitDiffToolParams>) -> CallToolResult {
         let request = GitDiffParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             path: params.path,
             stage: params.stage,
@@ -1788,6 +1791,7 @@ impl AgentMuxMcpServer {
     ) -> CallToolResult {
         let request = GitCommitParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             message: params.message,
             amend: params.amend,
@@ -1884,6 +1888,7 @@ impl AgentMuxMcpServer {
     ) -> CallToolResult {
         let request = GitPathMutationParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             paths: params.paths,
             idempotency_key: params.idempotency_key,
@@ -1901,6 +1906,7 @@ impl AgentMuxMcpServer {
     ) -> CallToolResult {
         let request = GitAllMutationParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             idempotency_key: params.idempotency_key,
         };
@@ -5109,6 +5115,7 @@ fn validate_git_repository(
 ) -> Result<(), agentmux_ipc::ControlError> {
     GitStatusPageParams {
         workspace_id: params.workspace_id.clone(),
+        pane_id: params.pane_id.clone(),
         repository_id: params.repository_id.clone(),
         state: None,
         cursor: None,
@@ -6300,6 +6307,8 @@ struct NotificationClearToolParams {
 struct GitRepositoryToolParams {
     /// AgentMux workspace containing the repository.
     workspace_id: String,
+    /// Optional terminal pane whose live working directory selects the repository.
+    pane_id: Option<String>,
     /// Optional repository identity when a workspace contains more than one repository.
     repository_id: Option<String>,
 }
@@ -6307,6 +6316,8 @@ struct GitRepositoryToolParams {
 #[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
 struct GitStatusPageToolParams {
     workspace_id: String,
+    /// Optional terminal pane whose live working directory selects the repository.
+    pane_id: Option<String>,
     repository_id: Option<String>,
     /// Filter by a host-defined change state such as staged or unstaged.
     state: Option<String>,
@@ -6321,6 +6332,8 @@ struct GitStatusPageToolParams {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct GitDiffToolParams {
     workspace_id: String,
+    /// Optional terminal pane whose live working directory selects the repository.
+    pane_id: Option<String>,
     repository_id: Option<String>,
     /// Repository-relative path from git_status_page.
     path: String,
@@ -6334,6 +6347,8 @@ struct GitDiffToolParams {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct GitPathMutationToolParams {
     workspace_id: String,
+    /// Optional terminal pane whose live working directory selects the repository.
+    pane_id: Option<String>,
     repository_id: Option<String>,
     /// One to 500 repository-relative paths.
     paths: Vec<String>,
@@ -6344,6 +6359,8 @@ struct GitPathMutationToolParams {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct GitAllMutationToolParams {
     workspace_id: String,
+    /// Optional terminal pane whose live working directory selects the repository.
+    pane_id: Option<String>,
     repository_id: Option<String>,
     idempotency_key: Option<String>,
 }
@@ -6351,6 +6368,8 @@ struct GitAllMutationToolParams {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct GitCommitToolParams {
     workspace_id: String,
+    /// Optional terminal pane whose live working directory selects the repository.
+    pane_id: Option<String>,
     repository_id: Option<String>,
     /// Commit message for already staged changes.
     message: String,
@@ -7002,6 +7021,7 @@ mod tests {
         let result = server
             .git_status_page(Parameters(GitStatusPageToolParams {
                 workspace_id: "workspace-1".to_string(),
+                pane_id: Some("pane-1".to_string()),
                 repository_id: Some("repo-1".to_string()),
                 state: Some("unstaged".to_string()),
                 cursor: Some("cursor-1".to_string()),
@@ -7014,6 +7034,7 @@ mod tests {
             let calls = transport.calls.lock().expect("fake calls lock");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].0, METHOD_GIT_STATUS_PAGE);
+            assert_eq!(calls[0].1["pane_id"], "pane-1");
             assert_eq!(calls[0].1["repository_id"], "repo-1");
             assert_eq!(calls[0].1["generation"], 7);
         }
@@ -7022,6 +7043,7 @@ mod tests {
         let result = server
             .git_status_page(Parameters(GitStatusPageToolParams {
                 workspace_id: " ".to_string(),
+                pane_id: None,
                 repository_id: None,
                 state: None,
                 cursor: None,

@@ -1561,6 +1561,7 @@ fn parse_git_repository_options(
 ) -> Result<(ControlInvokeOptions, GitRepositoryParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut index = 0;
     while index < args.len() {
@@ -1570,6 +1571,10 @@ fn parse_git_repository_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -1595,6 +1600,7 @@ fn parse_git_repository_options(
                 workspace_id,
                 &format!("{command_name} requires --workspace or AGENTMUX_WORKSPACE_ID."),
             )?,
+            pane_id,
             repository_id,
         },
     ))
@@ -1605,6 +1611,7 @@ fn parse_git_page_options(
 ) -> Result<(ControlInvokeOptions, GitStatusPageParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut state = None;
     let mut cursor = None;
@@ -1618,6 +1625,10 @@ fn parse_git_page_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -1665,6 +1676,7 @@ fn parse_git_page_options(
                 workspace_id,
                 "git page requires --workspace or AGENTMUX_WORKSPACE_ID.",
             )?,
+            pane_id,
             repository_id,
             state,
             cursor,
@@ -1679,6 +1691,7 @@ fn parse_git_diff_options(
 ) -> Result<(ControlInvokeOptions, GitDiffParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut path = None;
     let mut stage = None;
@@ -1692,6 +1705,10 @@ fn parse_git_diff_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -1738,6 +1755,7 @@ fn parse_git_diff_options(
                 workspace_id,
                 "git diff requires --workspace or AGENTMUX_WORKSPACE_ID.",
             )?,
+            pane_id,
             repository_id,
             path: required_cli_value(path, "git diff requires a path.")?,
             stage,
@@ -1753,6 +1771,7 @@ fn parse_git_path_mutation_options(
 ) -> Result<(ControlInvokeOptions, GitPathMutationParams, bool), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut paths = Vec::new();
     let mut idempotency_key = None;
@@ -1765,6 +1784,10 @@ fn parse_git_path_mutation_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -1802,6 +1825,7 @@ fn parse_git_path_mutation_options(
                 workspace_id,
                 &format!("git {command} requires --workspace or AGENTMUX_WORKSPACE_ID."),
             )?,
+            pane_id,
             repository_id,
             paths,
             idempotency_key,
@@ -1816,6 +1840,7 @@ fn parse_git_all_mutation_options(
 ) -> Result<(ControlInvokeOptions, GitAllMutationParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut idempotency_key = None;
     let mut index = 0;
@@ -1826,6 +1851,10 @@ fn parse_git_all_mutation_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -1855,6 +1884,7 @@ fn parse_git_all_mutation_options(
                 workspace_id,
                 &format!("git {command} requires --workspace or AGENTMUX_WORKSPACE_ID."),
             )?,
+            pane_id,
             repository_id,
             idempotency_key,
         },
@@ -1866,6 +1896,7 @@ fn parse_git_commit_options(
 ) -> Result<(ControlInvokeOptions, GitCommitParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut message = None;
     let mut amend = false;
@@ -1878,6 +1909,10 @@ fn parse_git_commit_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -1915,6 +1950,7 @@ fn parse_git_commit_options(
                 workspace_id,
                 "git commit requires --workspace or AGENTMUX_WORKSPACE_ID.",
             )?,
+            pane_id,
             repository_id,
             message: required_cli_value(message, "git commit requires --message.")?,
             amend,
@@ -17323,6 +17359,49 @@ mod tests {
         assert!(text.contains("actions list"));
         assert!(text.contains("notify"));
         assert!(text.contains("sidebar-state"));
+    }
+
+    #[test]
+    fn git_parsers_forward_selected_pane_to_every_operation() {
+        let repository_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane".to_string(),
+            "pane_1".to_string(),
+        ];
+        let (_, repository) = parse_git_repository_options(&repository_args, "git status").unwrap();
+        assert_eq!(repository.pane_id.as_deref(), Some("pane_1"));
+
+        let mut page_args = repository_args.clone();
+        page_args.extend(["--limit".to_string(), "25".to_string()]);
+        let (_, page) = parse_git_page_options(&page_args).unwrap();
+        assert_eq!(page.pane_id.as_deref(), Some("pane_1"));
+
+        let mut diff_args = repository_args.clone();
+        diff_args.push("src/lib.rs".to_string());
+        let (_, diff) = parse_git_diff_options(&diff_args).unwrap();
+        assert_eq!(diff.pane_id.as_deref(), Some("pane_1"));
+
+        let mut path_args = repository_args.clone();
+        path_args.extend(["--yes".to_string(), "src/lib.rs".to_string()]);
+        let (_, mutation, confirmed) =
+            parse_git_path_mutation_options(&path_args, "stage").unwrap();
+        assert!(confirmed);
+        assert_eq!(mutation.pane_id.as_deref(), Some("pane_1"));
+
+        let (_, all) = parse_git_all_mutation_options(&repository_args, "stage-all").unwrap();
+        assert_eq!(all.pane_id.as_deref(), Some("pane_1"));
+
+        let commit_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane-id".to_string(),
+            "pane_1".to_string(),
+            "--message".to_string(),
+            "test".to_string(),
+        ];
+        let (_, commit) = parse_git_commit_options(&commit_args).unwrap();
+        assert_eq!(commit.pane_id.as_deref(), Some("pane_1"));
     }
 
     #[test]
