@@ -6,7 +6,9 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import type {
   ControlClient,
   GitDiff,
@@ -37,7 +39,6 @@ interface StatusRequest {
   promise: Promise<GitStatus>;
 }
 
-const MAX_RENDERED_CHANGES_PER_SECTION = 500;
 const STATUS_POLL_INTERVAL_MS = 15_000;
 const STATUS_CACHE_TTL_MS = STATUS_POLL_INTERVAL_MS;
 const FILTER_VISIBILITY_THRESHOLD = 12;
@@ -50,6 +51,27 @@ interface CachedGitStatus {
   status: GitStatus;
   updatedAt: number;
 }
+
+type GitVirtualRow =
+  | {
+      kind: "header";
+      key: string;
+      title: string;
+      changes: GitFileChange[];
+      staged: boolean;
+    }
+  | {
+      kind: "change";
+      key: string;
+      change: GitFileChange;
+      staged: boolean;
+    }
+  | {
+      kind: "message";
+      key: string;
+      text: string;
+      className: string;
+    };
 
 const statusCacheByClient = new WeakMap<ControlClient, Map<string, CachedGitStatus>>();
 const statusRequestsByClient = new WeakMap<ControlClient, Map<string, StatusRequest>>();
@@ -180,18 +202,13 @@ export function SourceControlPanel({
     DEFAULT_CHANGES_SPLIT_RATIO,
   );
   const [resizingSplit, setResizingSplit] = useState(false);
-  const [stagedRenderLimit, setStagedRenderLimit] = useState(
-    MAX_RENDERED_CHANGES_PER_SECTION,
-  );
-  const [workingRenderLimit, setWorkingRenderLimit] = useState(
-    MAX_RENDERED_CHANGES_PER_SECTION,
-  );
   const busyRef = useRef(false);
   const statusSequenceRef = useRef(0);
   const diffSequenceRef = useRef(0);
   const workspaceIdRef = useRef(workspace.workspaceId);
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const splitHandleRef = useRef<HTMLDivElement>(null);
+  const changesScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     workspaceIdRef.current = workspace.workspaceId;
@@ -203,8 +220,6 @@ export function SourceControlPanel({
     setCommitMessage("");
     setError(null);
     setStatusLoading(true);
-    setStagedRenderLimit(MAX_RENDERED_CHANGES_PER_SECTION);
-    setWorkingRenderLimit(MAX_RENDERED_CHANGES_PER_SECTION);
   }, [workspace.workspaceId]);
 
   const setChangesHeight = useCallback((requestedHeight: number) => {
@@ -425,11 +440,6 @@ export function SourceControlPanel({
         : null;
   const normalizedFilter = showFilter ? filter.trim().toLocaleLowerCase() : "";
 
-  useEffect(() => {
-    setStagedRenderLimit(MAX_RENDERED_CHANGES_PER_SECTION);
-    setWorkingRenderLimit(MAX_RENDERED_CHANGES_PER_SECTION);
-  }, [normalizedFilter]);
-
   const matchesFilter = useCallback(
     (change: GitFileChange) => {
       if (!normalizedFilter) return true;
@@ -447,6 +457,82 @@ export function SourceControlPanel({
     () => workingChanges.filter(matchesFilter),
     [matchesFilter, workingChanges],
   );
+  const virtualRows = useMemo<GitVirtualRow[]>(() => {
+    const rows: GitVirtualRow[] = [];
+    const appendSection = (
+      title: string,
+      changes: GitFileChange[],
+      matchingChanges: GitFileChange[],
+      staged: boolean,
+    ) => {
+      const sectionKey = staged ? "staged" : "working";
+      rows.push({
+        kind: "header",
+        key: `${sectionKey}:header`,
+        title,
+        changes,
+        staged,
+      });
+      if (matchingChanges.length === 0 && changes.length > 0) {
+        rows.push({
+          kind: "message",
+          key: `${sectionKey}:no-matches`,
+          text: t("sourceControl.noMatchingChanges"),
+          className: "agentmux-source-control__no-matches",
+        });
+      }
+      for (const change of matchingChanges) {
+        rows.push({
+          kind: "change",
+          key: `${sectionKey}:${change.path}`,
+          change,
+          staged,
+        });
+      }
+    };
+
+    appendSection(
+      t("sourceControl.stagedChanges"),
+      stagedChanges,
+      filteredStagedChanges,
+      true,
+    );
+    appendSection(
+      t("sourceControl.changes"),
+      workingChanges,
+      filteredWorkingChanges,
+      false,
+    );
+    if (status && status.files.length === 0) {
+      rows.push({
+        kind: "message",
+        key: "repository:clean",
+        text: t("sourceControl.clean"),
+        className: "agentmux-source-control__clean",
+      });
+    }
+    return rows;
+  }, [
+    filteredStagedChanges,
+    filteredWorkingChanges,
+    stagedChanges,
+    status,
+    t,
+    workingChanges,
+  ]);
+  const changesVirtualizer = useVirtualizer({
+    count: virtualRows.length,
+    getScrollElement: () => changesScrollRef.current,
+    estimateSize: (index) => {
+      const row = virtualRows[index];
+      if (row?.kind === "header") return 39;
+      if (row?.kind === "message") return 42;
+      return 34;
+    },
+    getItemKey: (index) => virtualRows[index]?.key ?? index,
+    overscan: 14,
+    useFlushSync: false,
+  });
   const renderedDiff = useMemo(() => {
     const lines = diff?.patch.split("\n") ?? [];
     return lines.slice(0, 4_000).map((line, index) => {
@@ -519,106 +605,6 @@ export function SourceControlPanel({
     t,
     workspace.workspaceId,
   ]);
-
-  const renderSection = (
-    title: string,
-    changes: GitFileChange[],
-    matchingChanges: GitFileChange[],
-    staged: boolean,
-    renderLimit: number,
-    onLoadMore: () => void,
-  ) => {
-    const renderedChanges = matchingChanges.slice(0, renderLimit);
-    const remainingChanges = matchingChanges.length - renderedChanges.length;
-    return (
-      <section className="agentmux-source-control__section">
-        <div className="agentmux-source-control__section-header">
-          <span>{title}</span>
-          <span className="agentmux-source-control__count">{changes.length}</span>
-          {changes.length > 0 ? (
-            <button
-              type="button"
-              className="agentmux-source-control__section-action"
-              onClick={() =>
-                void mutate(() =>
-                  staged
-                    ? client.unstageGitFiles(workspace.workspaceId)
-                    : client.stageGitFiles(workspace.workspaceId),
-                )
-              }
-              disabled={busy}
-            >
-              {staged
-                ? t("sourceControl.unstageAll")
-                : t("sourceControl.stageAll")}
-            </button>
-          ) : null}
-        </div>
-        {remainingChanges > 0 ? (
-          <div className="agentmux-source-control__shown-count">
-            <span>
-              {t("sourceControl.shownCount", {
-                shown: renderedChanges.length,
-                total: matchingChanges.length,
-              })}
-            </span>
-            <button
-              type="button"
-              className="agentmux-source-control__load-more"
-              onClick={onLoadMore}
-              disabled={busy}
-            >
-              {t("sourceControl.loadMore", {
-                count: Math.min(
-                  remainingChanges,
-                  MAX_RENDERED_CHANGES_PER_SECTION,
-                ),
-              })}
-            </button>
-          </div>
-        ) : null}
-        {matchingChanges.length === 0 && changes.length > 0 ? (
-          <div className="agentmux-source-control__no-matches">
-            {t("sourceControl.noMatchingChanges")}
-          </div>
-        ) : null}
-        {renderedChanges.map((change) => {
-          const nextSelection = {
-            path: change.path,
-            staged,
-            untracked: !staged && change.untracked,
-          };
-          return (
-            <GitChangeRow
-              key={`${staged ? "staged" : "working"}:${change.path}`}
-              change={change}
-              staged={staged}
-              selected={
-                selection !== null &&
-                selectionKey(selection) === selectionKey(nextSelection)
-              }
-              disabled={busy}
-              onSelect={() => setSelection(nextSelection)}
-              onToggleStage={() =>
-                void mutate(() =>
-                  staged
-                    ? client.unstageGitFiles(
-                        workspace.workspaceId,
-                        pathsForChange(change),
-                      )
-                    : client.stageGitFiles(
-                        workspace.workspaceId,
-                        pathsForChange(change),
-                      ),
-                )
-              }
-              t={t}
-            />
-          );
-        })}
-      </section>
-    );
-  };
 
   return (
     <aside
@@ -696,7 +682,7 @@ export function SourceControlPanel({
         <>
           <div className="agentmux-source-control__content" ref={splitContainerRef}>
             <div
-              className="agentmux-source-control__changes agentmux-scroll"
+              className="agentmux-source-control__changes"
               data-filter-visible={showFilter ? "true" : undefined}
               style={{ flexBasis: `${changesSplitRatio * 100}%` }}
             >
@@ -712,33 +698,94 @@ export function SourceControlPanel({
                   />
                 </label>
               ) : null}
-              {renderSection(
-                t("sourceControl.stagedChanges"),
-                stagedChanges,
-                filteredStagedChanges,
-                true,
-                stagedRenderLimit,
-                () =>
-                  setStagedRenderLimit((current) =>
-                    current + MAX_RENDERED_CHANGES_PER_SECTION,
-                  ),
-              )}
-              {renderSection(
-                t("sourceControl.changes"),
-                workingChanges,
-                filteredWorkingChanges,
-                false,
-                workingRenderLimit,
-                () =>
-                  setWorkingRenderLimit((current) =>
-                    current + MAX_RENDERED_CHANGES_PER_SECTION,
-                  ),
-              )}
-              {status && status.files.length === 0 ? (
-                <div className="agentmux-source-control__clean">
-                  {t("sourceControl.clean")}
+              <div
+                ref={changesScrollRef}
+                className="agentmux-source-control__virtual-scroll agentmux-scroll"
+              >
+                <div
+                  className="agentmux-source-control__virtual-list"
+                  style={{ height: `${changesVirtualizer.getTotalSize()}px` }}
+                >
+                  {changesVirtualizer.getVirtualItems().map((virtualRow) => {
+                    const row = virtualRows[virtualRow.index];
+                    if (!row) return null;
+                    let content: ReactNode;
+                    if (row.kind === "header") {
+                      content = (
+                        <div className="agentmux-source-control__section-header">
+                          <span>{row.title}</span>
+                          <span className="agentmux-source-control__count">
+                            {row.changes.length}
+                          </span>
+                          {row.changes.length > 0 ? (
+                            <button
+                              type="button"
+                              className="agentmux-source-control__section-action"
+                              onClick={() =>
+                                void mutate(() =>
+                                  row.staged
+                                    ? client.unstageGitFiles(workspace.workspaceId)
+                                    : client.stageGitFiles(workspace.workspaceId),
+                                )
+                              }
+                              disabled={busy}
+                            >
+                              {row.staged
+                                ? t("sourceControl.unstageAll")
+                                : t("sourceControl.stageAll")}
+                            </button>
+                          ) : null}
+                        </div>
+                      );
+                    } else if (row.kind === "message") {
+                      content = <div className={row.className}>{row.text}</div>;
+                    } else {
+                      const nextSelection = {
+                        path: row.change.path,
+                        staged: row.staged,
+                        untracked: !row.staged && row.change.untracked,
+                      };
+                      content = (
+                        <GitChangeRow
+                          change={row.change}
+                          staged={row.staged}
+                          selected={
+                            selection !== null &&
+                            selectionKey(selection) === selectionKey(nextSelection)
+                          }
+                          disabled={busy}
+                          onSelect={() => setSelection(nextSelection)}
+                          onToggleStage={() =>
+                            void mutate(() =>
+                              row.staged
+                                ? client.unstageGitFiles(
+                                    workspace.workspaceId,
+                                    pathsForChange(row.change),
+                                  )
+                                : client.stageGitFiles(
+                                    workspace.workspaceId,
+                                    pathsForChange(row.change),
+                                  ),
+                            )
+                          }
+                          t={t}
+                        />
+                      );
+                    }
+                    return (
+                      <div
+                        key={row.key}
+                        className="agentmux-source-control__virtual-row"
+                        data-index={virtualRow.index}
+                        ref={changesVirtualizer.measureElement}
+                        style={{ transform: `translateY(${virtualRow.start}px)` }}
+                      >
+                        {content}
+                      </div>
+                    );
+                  })}
                 </div>
-              ) : null}
+              </div>
             </div>
 
             <div

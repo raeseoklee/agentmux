@@ -955,6 +955,13 @@ struct ServerTmuxCheckRequest {
     distribution: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ServerControlRequest {
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AgentSetStateOptions {
     invoke: ControlInvokeOptions,
@@ -7425,6 +7432,7 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
         ("GET", "/api/wsl/distributions") => server_wsl_distributions_response(),
         ("POST", "/api/tmux/check") => server_tmux_check_response(request),
         ("POST", "/api/spawn") => server_spawn_response(request, state),
+        ("POST", "/api/control") => server_control_response(request, state),
         ("OPTIONS", _) => empty_response(204),
         _ => {
             if request.method == "GET" {
@@ -7460,6 +7468,60 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
             api_error_response(404, "Not found.")
         }
     }
+}
+
+fn server_control_response(request: &HttpRequest, state: &mut ServerState) -> HttpResponse {
+    let parsed = match parse_json_body::<ServerControlRequest>(&request.body) {
+        Ok(value) => value,
+        Err(error) => return api_error_response(400, &error.to_string()),
+    };
+    let method = parsed.method.trim();
+    if method.len() > 128 || !server_control_method_allowed(method, state.options.mode) {
+        return api_error_response(403, "Control method is not available through server mode.");
+    }
+    match state
+        .invoke(method, &parsed.params)
+        .and_then(|response| response_result::<serde_json::Value>(&response))
+    {
+        Ok(result) => api_json_response(200, result),
+        Err(error) => api_error_response(503, &server_control_error_message(error, &state.options)),
+    }
+}
+
+fn server_control_method_allowed(method: &str, mode: ServerMode) -> bool {
+    if mode != ServerMode::DesktopBridge {
+        return false;
+    }
+    matches!(
+        method,
+        "git.status"
+            | "git.status_summary"
+            | "git.status_page"
+            | "git.diff"
+            | "git.stage"
+            | "git.unstage"
+            | "git.stage_all"
+            | "git.unstage_all"
+            | "git.discard"
+            | "git.commit"
+            | "agent.worktree.create"
+            | "agent.worktree.list"
+            | "agent.worktree.recover"
+            | "agent.worktree.remove"
+            | "git.review_thread.create"
+            | "git.review_thread.list"
+            | "git.review_thread.update"
+            | "git.review_thread.delete"
+            | "git.review_thread.mark_stale"
+            | "git.review_thread.deliver"
+            | "git.review_comment.list"
+            | "git.review_comment.create"
+            | "git.review_comment.update"
+            | "git.review_comment.delete"
+            | "dev_server.candidate.list"
+            | "dev_server.candidate.dismiss"
+            | "dev_server.candidate.open_in_split"
+    )
 }
 
 fn server_request_requires_auth(request: &HttpRequest) -> bool {
@@ -15927,6 +15989,49 @@ mod tests {
             body: String::new(),
         };
         assert!(!server_request_requires_auth(&public_asset));
+    }
+
+    #[test]
+    fn server_control_bridge_is_allowlisted_and_desktop_only() {
+        assert!(server_control_method_allowed(
+            "git.status",
+            ServerMode::DesktopBridge
+        ));
+        assert!(server_control_method_allowed(
+            "agent.worktree.create",
+            ServerMode::DesktopBridge
+        ));
+        assert!(!server_control_method_allowed(
+            "session.send_text",
+            ServerMode::DesktopBridge
+        ));
+        assert!(!server_control_method_allowed(
+            "git.status",
+            ServerMode::Local
+        ));
+
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-agentmux-server-token".to_string(),
+            options.auth_token.clone(),
+        );
+        let mut state = ServerState::new(options);
+        let response = route_server_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/control".to_string(),
+                query: None,
+                headers,
+                body: serde_json::json!({
+                    "method": "git.status",
+                    "params": { "workspace_id": "ws_1" }
+                })
+                .to_string(),
+            },
+            &mut state,
+        );
+        assert_eq!(response.status_code, 403);
     }
 
     #[test]

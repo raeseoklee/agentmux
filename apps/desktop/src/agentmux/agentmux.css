@@ -437,7 +437,28 @@ body {
   flex: 0 0 52%;
   min-height: 116px;
   max-height: calc(100% - 147px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.agentmux-source-control__virtual-scroll {
+  min-height: 0;
+  flex: 1 1 auto;
   overflow: auto;
+  contain: strict;
+}
+
+.agentmux-source-control__virtual-list {
+  position: relative;
+  width: 100%;
+}
+
+.agentmux-source-control__virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
 }
 
 .agentmux-source-control__splitter {

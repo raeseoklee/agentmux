@@ -5350,7 +5350,7 @@ interface ServerStateResult {
 }
 
 class ServerControlClient extends BrowserPreviewControlClient {
-  override readonly supportsSourceControl = false;
+  override readonly supportsSourceControl: boolean;
   private readonly serverBaseUrl: string;
   private readonly serverToken: string | null;
   private readonly serverDefaults: NonNullable<AgentmuxServerBootstrap["defaults"]>;
@@ -5367,6 +5367,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
     this.serverBaseUrl = (bootstrap.baseUrl ?? "").replace(/\/+$/, "");
     this.serverToken = bootstrap.token?.trim() || null;
     this.serverDefaults = bootstrap.defaults ?? {};
+    this.supportsSourceControl = bootstrap.mode === "desktop-bridge";
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -5982,49 +5983,56 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return mapTmuxDiagnostics(result);
   }
 
-  async getGitStatus(_workspaceId: string): Promise<GitStatus> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
-    );
+  async getGitStatus(workspaceId: string): Promise<GitStatus> {
+    const result = await this.serverControl<GitStatusWire>("git.status", {
+      workspace_id: workspaceId,
+    });
+    return mapGitStatus(result);
   }
 
   async getGitDiff(
-    _workspaceId: string,
-    _path: string,
-    _options: { staged?: boolean; untracked?: boolean } = {},
+    workspaceId: string,
+    path: string,
+    options: { staged?: boolean; untracked?: boolean } = {},
   ): Promise<GitDiff> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
-    );
+    const result = await this.serverControl<GitDiffWire>("git.diff", {
+      workspace_id: workspaceId,
+      path,
+      staged: options.staged ?? false,
+      untracked: options.untracked ?? false,
+    });
+    return mapGitDiff(result);
   }
 
-  async stageGitFiles(_workspaceId: string, _paths: string[] = []): Promise<void> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
-    );
+  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
+    await this.serverControl("git.stage", {
+      workspace_id: workspaceId,
+      paths,
+    });
   }
 
   async unstageGitFiles(
-    _workspaceId: string,
-    _paths: string[] = [],
+    workspaceId: string,
+    paths: string[] = [],
   ): Promise<void> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
-    );
+    await this.serverControl("git.unstage", {
+      workspace_id: workspaceId,
+      paths,
+    });
   }
 
   async commitGitChanges(
-    _workspaceId: string,
-    _message: string,
+    workspaceId: string,
+    message: string,
   ): Promise<GitCommitResult> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
-    );
+    const result = await this.serverControl<GitCommitResultWire>("git.commit", {
+      workspace_id: workspaceId,
+      message,
+    });
+    return {
+      commit: result.commit,
+      summary: result.summary,
+    };
   }
 
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
@@ -6313,6 +6321,13 @@ class ServerControlClient extends BrowserPreviewControlClient {
       throw new Error(data.error || response.statusText);
     }
     return data.result as T;
+  }
+
+  private serverControl<T = unknown>(method: string, params: unknown): Promise<T> {
+    return this.serverApi<T>("/api/control", {
+      method: "POST",
+      body: JSON.stringify({ method, params }),
+    });
   }
 
   private serverWebSocketUrl(path: string): string {
