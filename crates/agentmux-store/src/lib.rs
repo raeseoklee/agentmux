@@ -466,6 +466,27 @@ CREATE INDEX IF NOT EXISTS idx_git_mutation_receipts_retention
   );
 "#;
 
+pub const GIT_MUTATION_LIFECYCLE_SCHEMA: &str = r#"
+ALTER TABLE git_mutation_receipts
+  ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'completed'
+  CHECK(lifecycle_state IN ('pending', 'completed', 'indeterminate'));
+ALTER TABLE git_mutation_receipts
+  ADD COLUMN precondition_fingerprint TEXT NOT NULL DEFAULT '';
+ALTER TABLE git_mutation_receipts
+  ADD COLUMN failure_json TEXT;
+ALTER TABLE git_mutation_receipts
+  ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+
+UPDATE git_mutation_receipts
+SET updated_at = created_at
+WHERE updated_at = '';
+
+CREATE INDEX IF NOT EXISTS idx_git_mutation_receipts_lifecycle
+  ON git_mutation_receipts (
+    lifecycle_state, updated_at, method, repository_id, idempotency_key
+  );
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -541,6 +562,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "git_mutation_receipts",
         sql: GIT_MUTATION_RECEIPTS_SCHEMA,
+    },
+    Migration {
+        version: 16,
+        name: "git_mutation_lifecycle",
+        sql: GIT_MUTATION_LIFECYCLE_SCHEMA,
     },
 ];
 
@@ -971,12 +997,22 @@ pub struct PersistedVerifiedAgentHook {
     pub updated_at: String,
 }
 
-/// A successful Git mutation result retained for idempotent retries.
+/// The durable intent written before an idempotent Git mutation is attempted.
 ///
 /// `method`, `repository_id`, and `idempotency_key` form the durable identity.
-/// The caller must provide a canonical `request_fingerprint` for the complete
-/// mutation payload. The store never replaces an existing receipt for that
-/// identity, so a different fingerprint can be rejected by the caller.
+/// The request fingerprint binds that identity to one payload, while the
+/// precondition fingerprint lets callers reconcile interrupted operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedGitMutationIntent {
+    pub method: String,
+    pub repository_id: String,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub precondition_fingerprint: String,
+    pub created_at: String,
+}
+
+/// A completed Git mutation result retained for idempotent retries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistedGitMutationReceipt {
     pub method: String,
@@ -990,8 +1026,28 @@ pub struct PersistedGitMutationReceipt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitMutationReceiptLookup {
     Missing,
+    Pending(PersistedGitMutationIntent),
     Match(PersistedGitMutationReceipt),
-    FingerprintMismatch { stored_request_fingerprint: String },
+    Indeterminate {
+        intent: PersistedGitMutationIntent,
+        failure_json: Option<String>,
+    },
+    FingerprintMismatch {
+        stored_request_fingerprint: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PersistedGitMutationRecord {
+    method: String,
+    repository_id: String,
+    idempotency_key: String,
+    request_fingerprint: String,
+    response_json: String,
+    created_at: String,
+    lifecycle_state: String,
+    precondition_fingerprint: String,
+    failure_json: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1035,6 +1091,133 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    /// Durably reserves a Git mutation identity before its external effect.
+    /// Existing rows are never replaced, so retries can only continue when
+    /// both the request and repository precondition fingerprints still match.
+    pub fn prepare_git_mutation(
+        &mut self,
+        intent: &PersistedGitMutationIntent,
+    ) -> StoreResult<GitMutationReceiptLookup> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO git_mutation_receipts (
+                method, repository_id, idempotency_key, request_fingerprint,
+                response_json, created_at, lifecycle_state,
+                precondition_fingerprint, failure_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, '', ?5, 'pending', ?6, NULL, ?5)
+             ON CONFLICT(method, repository_id, idempotency_key) DO NOTHING",
+            params![
+                intent.method,
+                intent.repository_id,
+                intent.idempotency_key,
+                intent.request_fingerprint,
+                intent.created_at,
+                intent.precondition_fingerprint,
+            ],
+        )?;
+        let stored = load_git_mutation_record(
+            &transaction,
+            &intent.method,
+            &intent.repository_id,
+            &intent.idempotency_key,
+        )?
+        .expect("the inserted or conflicting Git mutation row must exist");
+        transaction.commit()?;
+        Ok(git_mutation_receipt_lookup(
+            stored,
+            &intent.request_fingerprint,
+        ))
+    }
+
+    /// Marks a pending Git mutation completed after its external effect.
+    pub fn complete_git_mutation(
+        &mut self,
+        intent: &PersistedGitMutationIntent,
+        response_json: &str,
+        updated_at: &str,
+    ) -> StoreResult<GitMutationReceiptLookup> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE git_mutation_receipts
+             SET response_json = ?6,
+                 lifecycle_state = 'completed',
+                 failure_json = NULL,
+                 updated_at = ?7
+             WHERE method = ?1
+               AND repository_id = ?2
+               AND idempotency_key = ?3
+               AND request_fingerprint = ?4
+               AND precondition_fingerprint = ?5
+               AND lifecycle_state = 'pending'",
+            params![
+                intent.method,
+                intent.repository_id,
+                intent.idempotency_key,
+                intent.request_fingerprint,
+                intent.precondition_fingerprint,
+                response_json,
+                updated_at,
+            ],
+        )?;
+        let stored = load_git_mutation_record(
+            &transaction,
+            &intent.method,
+            &intent.repository_id,
+            &intent.idempotency_key,
+        )?;
+        transaction.commit()?;
+        Ok(match stored {
+            Some(stored) => git_mutation_receipt_lookup(stored, &intent.request_fingerprint),
+            None => GitMutationReceiptLookup::Missing,
+        })
+    }
+
+    /// Permanently blocks automatic replay when the external effect cannot be
+    /// distinguished from a concurrent repository change.
+    pub fn mark_git_mutation_indeterminate(
+        &mut self,
+        intent: &PersistedGitMutationIntent,
+        failure_json: &str,
+        updated_at: &str,
+    ) -> StoreResult<GitMutationReceiptLookup> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE git_mutation_receipts
+             SET lifecycle_state = 'indeterminate',
+                 failure_json = ?6,
+                 updated_at = ?7
+             WHERE method = ?1
+               AND repository_id = ?2
+               AND idempotency_key = ?3
+               AND request_fingerprint = ?4
+               AND precondition_fingerprint = ?5
+               AND lifecycle_state = 'pending'",
+            params![
+                intent.method,
+                intent.repository_id,
+                intent.idempotency_key,
+                intent.request_fingerprint,
+                intent.precondition_fingerprint,
+                failure_json,
+                updated_at,
+            ],
+        )?;
+        let stored = load_git_mutation_record(
+            &transaction,
+            &intent.method,
+            &intent.repository_id,
+            &intent.idempotency_key,
+        )?;
+        transaction.commit()?;
+        Ok(match stored {
+            Some(stored) => git_mutation_receipt_lookup(stored, &intent.request_fingerprint),
+            None => GitMutationReceiptLookup::Missing,
+        })
+    }
+
     /// Atomically persists the first successful response for a Git mutation
     /// identity or returns the result of comparing a prior receipt.
     ///
@@ -1049,8 +1232,9 @@ impl SqliteStore {
         transaction.execute(
             "INSERT INTO git_mutation_receipts (
                 method, repository_id, idempotency_key, request_fingerprint,
-                response_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                response_json, created_at, lifecycle_state,
+                precondition_fingerprint, failure_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'completed', '', NULL, ?6)
              ON CONFLICT(method, repository_id, idempotency_key) DO NOTHING",
             params![
                 receipt.method,
@@ -1061,20 +1245,13 @@ impl SqliteStore {
                 receipt.created_at,
             ],
         )?;
-        let stored = transaction.query_row(
-            "SELECT method, repository_id, idempotency_key, request_fingerprint,
-                    response_json, created_at
-             FROM git_mutation_receipts
-             WHERE method = ?1
-               AND repository_id = ?2
-               AND idempotency_key = ?3",
-            params![
-                receipt.method,
-                receipt.repository_id,
-                receipt.idempotency_key,
-            ],
-            git_mutation_receipt_from_row,
-        )?;
+        let stored = load_git_mutation_record(
+            &transaction,
+            &receipt.method,
+            &receipt.repository_id,
+            &receipt.idempotency_key,
+        )?
+        .expect("the inserted or conflicting Git mutation row must exist");
         transaction.commit()?;
         Ok(git_mutation_receipt_lookup(
             stored,
@@ -1092,37 +1269,27 @@ impl SqliteStore {
         idempotency_key: &str,
         request_fingerprint: &str,
     ) -> StoreResult<GitMutationReceiptLookup> {
-        let stored = self
-            .connection
-            .query_row(
-                "SELECT method, repository_id, idempotency_key, request_fingerprint,
-                        response_json, created_at
-                 FROM git_mutation_receipts
-                 WHERE method = ?1
-                   AND repository_id = ?2
-                   AND idempotency_key = ?3",
-                params![method, repository_id, idempotency_key],
-                git_mutation_receipt_from_row,
-            )
-            .optional()?;
+        let stored =
+            load_git_mutation_record(&self.connection, method, repository_id, idempotency_key)?;
         Ok(match stored {
             Some(stored) => git_mutation_receipt_lookup(stored, request_fingerprint),
             None => GitMutationReceiptLookup::Missing,
         })
     }
 
-    /// Retains the newest `max_entries` receipts using a stable tie-breaker.
-    /// Returns the number of deleted entries. Passing zero clears the receipt
-    /// ledger, which is useful for explicit maintenance and tests.
+    /// Retains the newest `max_entries` completed receipts using a stable
+    /// tie-breaker. Pending and indeterminate rows are never pruned.
     pub fn prune_git_mutation_receipts(&mut self, max_entries: usize) -> StoreResult<usize> {
         let max_entries = i64::try_from(max_entries).unwrap_or(i64::MAX);
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let deleted = transaction.execute(
             "DELETE FROM git_mutation_receipts
-             WHERE rowid IN (
+             WHERE lifecycle_state = 'completed'
+               AND rowid IN (
                SELECT rowid
                FROM git_mutation_receipts
+               WHERE lifecycle_state = 'completed'
                ORDER BY created_at DESC, method ASC, repository_id ASC, idempotency_key ASC
                LIMIT -1 OFFSET ?1
              )",
@@ -3918,29 +4085,78 @@ fn verified_agent_hook_from_row(
     })
 }
 
-fn git_mutation_receipt_from_row(
+fn load_git_mutation_record(
+    connection: &Connection,
+    method: &str,
+    repository_id: &str,
+    idempotency_key: &str,
+) -> rusqlite::Result<Option<PersistedGitMutationRecord>> {
+    connection
+        .query_row(
+            "SELECT method, repository_id, idempotency_key, request_fingerprint,
+                    response_json, created_at, lifecycle_state,
+                    precondition_fingerprint, failure_json
+             FROM git_mutation_receipts
+             WHERE method = ?1
+               AND repository_id = ?2
+               AND idempotency_key = ?3",
+            params![method, repository_id, idempotency_key],
+            git_mutation_record_from_row,
+        )
+        .optional()
+}
+
+fn git_mutation_record_from_row(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<PersistedGitMutationReceipt> {
-    Ok(PersistedGitMutationReceipt {
+) -> rusqlite::Result<PersistedGitMutationRecord> {
+    Ok(PersistedGitMutationRecord {
         method: row.get(0)?,
         repository_id: row.get(1)?,
         idempotency_key: row.get(2)?,
         request_fingerprint: row.get(3)?,
         response_json: row.get(4)?,
         created_at: row.get(5)?,
+        lifecycle_state: row.get(6)?,
+        precondition_fingerprint: row.get(7)?,
+        failure_json: row.get(8)?,
     })
 }
 
 fn git_mutation_receipt_lookup(
-    stored: PersistedGitMutationReceipt,
+    stored: PersistedGitMutationRecord,
     request_fingerprint: &str,
 ) -> GitMutationReceiptLookup {
-    if stored.request_fingerprint == request_fingerprint {
-        GitMutationReceiptLookup::Match(stored)
-    } else {
-        GitMutationReceiptLookup::FingerprintMismatch {
+    if stored.request_fingerprint != request_fingerprint {
+        return GitMutationReceiptLookup::FingerprintMismatch {
             stored_request_fingerprint: stored.request_fingerprint,
-        }
+        };
+    }
+    let intent = PersistedGitMutationIntent {
+        method: stored.method.clone(),
+        repository_id: stored.repository_id.clone(),
+        idempotency_key: stored.idempotency_key.clone(),
+        request_fingerprint: stored.request_fingerprint.clone(),
+        precondition_fingerprint: stored.precondition_fingerprint,
+        created_at: stored.created_at.clone(),
+    };
+    match stored.lifecycle_state.as_str() {
+        "pending" => GitMutationReceiptLookup::Pending(intent),
+        "completed" => GitMutationReceiptLookup::Match(PersistedGitMutationReceipt {
+            method: stored.method,
+            repository_id: stored.repository_id,
+            idempotency_key: stored.idempotency_key,
+            request_fingerprint: stored.request_fingerprint,
+            response_json: stored.response_json,
+            created_at: stored.created_at,
+        }),
+        "indeterminate" => GitMutationReceiptLookup::Indeterminate {
+            intent,
+            failure_json: stored.failure_json,
+        },
+        _ => GitMutationReceiptLookup::Indeterminate {
+            intent,
+            failure_json: Some(r#"{"reason":"invalid_lifecycle_state"}"#.to_string()),
+        },
     }
 }
 
@@ -3965,7 +4181,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
     }
 
     #[test]
@@ -4007,7 +4223,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 15);
+        assert_eq!(after, 16);
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -4132,7 +4348,7 @@ SELECT * FROM migration_atomicity_failure;
         );
 
         apply_migrations(&store.connection, MIGRATIONS).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
         assert_eq!(
             store
                 .load_worktree_operation("op_atomic_v12")
@@ -4156,7 +4372,7 @@ SELECT * FROM migration_atomicity_failure;
             .mark_worktree_operation_removed("op_v12", r#"{"owned":false}"#, "removed")
             .unwrap();
         assert_eq!(removed.state, WorktreeOperationState::Removed);
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
     }
 
     #[test]
@@ -4778,7 +4994,142 @@ SELECT * FROM migration_atomicity_failure;
             )
             .unwrap();
         assert!(table_exists);
-        assert_eq!(after, 15);
+        assert_eq!(after, 16);
+    }
+
+    #[test]
+    fn git_mutation_lifecycle_upgrades_v15_receipts_as_completed() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&connection, &MIGRATIONS[..15]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO git_mutation_receipts (
+                    method, repository_id, idempotency_key, request_fingerprint,
+                    response_json, created_at
+                 ) VALUES ('git.commit', 'repo-a', 'key-a', 'request-a', '{}', 'created')",
+                [],
+            )
+            .unwrap();
+
+        apply_migrations(&connection, MIGRATIONS).unwrap();
+        let upgraded: (String, String, String) = connection
+            .query_row(
+                "SELECT lifecycle_state, precondition_fingerprint, updated_at
+                 FROM git_mutation_receipts
+                 WHERE idempotency_key = 'key-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(upgraded, ("completed".into(), "".into(), "created".into()));
+    }
+
+    #[test]
+    fn git_mutation_lifecycle_persists_pending_then_completes_after_reopen() {
+        let path = unique_temp_db_path("git_mutation_lifecycle_reopen");
+        let intent = sample_git_mutation_intent("git.commit", "repo-a", "key-a");
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            assert_eq!(
+                store.prepare_git_mutation(&intent).unwrap(),
+                GitMutationReceiptLookup::Pending(intent.clone())
+            );
+        }
+
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.prepare_git_mutation(&intent).unwrap(),
+            GitMutationReceiptLookup::Pending(intent.clone())
+        );
+        assert_eq!(
+            reopened
+                .complete_git_mutation(&intent, r#"{"commit":"abc"}"#, "completed")
+                .unwrap(),
+            GitMutationReceiptLookup::Match(PersistedGitMutationReceipt {
+                method: intent.method.clone(),
+                repository_id: intent.repository_id.clone(),
+                idempotency_key: intent.idempotency_key.clone(),
+                request_fingerprint: intent.request_fingerprint.clone(),
+                response_json: r#"{"commit":"abc"}"#.to_string(),
+                created_at: intent.created_at.clone(),
+            })
+        );
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn git_mutation_pending_rejects_mismatch_and_can_be_marked_indeterminate() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let intent = sample_git_mutation_intent("git.stage", "repo-a", "key-a");
+        assert!(matches!(
+            store.prepare_git_mutation(&intent).unwrap(),
+            GitMutationReceiptLookup::Pending(_)
+        ));
+
+        let mut changed_request = intent.clone();
+        changed_request.request_fingerprint = "different-request".to_string();
+        assert_eq!(
+            store.prepare_git_mutation(&changed_request).unwrap(),
+            GitMutationReceiptLookup::FingerprintMismatch {
+                stored_request_fingerprint: intent.request_fingerprint.clone(),
+            }
+        );
+
+        let mut changed_precondition = intent.clone();
+        changed_precondition.precondition_fingerprint = "different-state".to_string();
+        assert_eq!(
+            store.prepare_git_mutation(&changed_precondition).unwrap(),
+            GitMutationReceiptLookup::Pending(intent.clone())
+        );
+
+        let failure = r#"{"reason":"repository_changed"}"#;
+        assert_eq!(
+            store
+                .mark_git_mutation_indeterminate(&intent, failure, "failed")
+                .unwrap(),
+            GitMutationReceiptLookup::Indeterminate {
+                intent: intent.clone(),
+                failure_json: Some(failure.to_string()),
+            }
+        );
+        assert_eq!(store.prune_git_mutation_receipts(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn failed_completion_persistence_leaves_a_durable_pending_intent() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let intent = sample_git_mutation_intent("git.unstage", "repo-a", "key-a");
+        store.prepare_git_mutation(&intent).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_git_mutation_completion
+                 BEFORE UPDATE OF lifecycle_state ON git_mutation_receipts
+                 WHEN NEW.lifecycle_state = 'completed'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected completion persistence failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = store
+            .complete_git_mutation(&intent, r#"{"generation":2}"#, "completed")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected completion persistence failure"));
+        assert_eq!(
+            store
+                .load_git_mutation_receipt(
+                    &intent.method,
+                    &intent.repository_id,
+                    &intent.idempotency_key,
+                    &intent.request_fingerprint,
+                )
+                .unwrap(),
+            GitMutationReceiptLookup::Pending(intent)
+        );
     }
 
     #[test]
@@ -4875,6 +5226,12 @@ SELECT * FROM migration_atomicity_failure;
         assert!(MIGRATIONS[14]
             .sql
             .contains("CREATE TABLE IF NOT EXISTS git_mutation_receipts"));
+    }
+
+    #[test]
+    fn git_mutation_lifecycle_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[15].version, 16);
+        assert!(MIGRATIONS[15].sql.contains("ADD COLUMN lifecycle_state"));
     }
 
     #[test]
@@ -5502,6 +5859,21 @@ SELECT * FROM migration_atomicity_failure;
             request_fingerprint: request_fingerprint.to_string(),
             response_json: format!(r#"{{"result":"{idempotency_key}"}}"#),
             created_at: created_at.to_string(),
+        }
+    }
+
+    fn sample_git_mutation_intent(
+        method: &str,
+        repository_id: &str,
+        idempotency_key: &str,
+    ) -> PersistedGitMutationIntent {
+        PersistedGitMutationIntent {
+            method: method.to_string(),
+            repository_id: repository_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint: format!("request-{idempotency_key}"),
+            precondition_fingerprint: format!("state-{idempotency_key}"),
+            created_at: "created".to_string(),
         }
     }
 

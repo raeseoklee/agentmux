@@ -1,7 +1,8 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
@@ -14,7 +15,7 @@ use agentmux_ipc::{
     GitStatusPageParams, GitStatusPageResult, GitStatusSummaryResult, RequestEnvelope,
     ResponseEnvelope,
 };
-use agentmux_store::{GitMutationReceiptLookup, PersistedGitMutationReceipt, SqliteStore};
+use agentmux_store::{GitMutationReceiptLookup, PersistedGitMutationIntent, SqliteStore};
 use agentmux_vcs::{
     DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost, Repository, StatusScan,
     StatusScanFirstPage, StatusSnapshot, StatusSummary,
@@ -34,6 +35,7 @@ const LOCAL_GIT_MUTATION_METHODS: &[&str] = &[
     "git.commit",
 ];
 const MAX_IDEMPOTENCY_RECEIPTS: usize = 512;
+const MAX_STATUS_QUERY_INDEXES: usize = 16;
 
 pub(crate) struct ServerLocalGit {
     client: GitClient,
@@ -41,7 +43,7 @@ pub(crate) struct ServerLocalGit {
     repository_id: String,
     workspace_id: String,
     receipt_store: SqliteStore,
-    status_snapshot: Option<Arc<StatusSnapshot>>,
+    status_snapshot: Option<Arc<LocalStatusSnapshot>>,
     status_scan: Option<LocalStatusScan>,
     status_refresh_count: u64,
 }
@@ -50,6 +52,142 @@ pub(crate) struct ServerLocalGit {
 struct LocalStatusScan {
     generation: u64,
     scan: StatusScan,
+}
+
+struct LocalStatusSnapshot {
+    snapshot: StatusSnapshot,
+    page_indexes: LocalStatusPageIndexes,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LocalStatusPageFilter {
+    state: String,
+    query: String,
+}
+
+#[derive(Debug)]
+struct LocalStatusPageIndexes {
+    all: Arc<Vec<usize>>,
+    staged: Arc<Vec<usize>>,
+    unstaged: Arc<Vec<usize>>,
+    untracked: Arc<Vec<usize>>,
+    conflicted: Arc<Vec<usize>>,
+    query_cache: Mutex<VecDeque<(LocalStatusPageFilter, Arc<Vec<usize>>)>>,
+}
+
+enum PreparedLocalGitMutation {
+    Untracked,
+    Execute(PersistedGitMutationIntent),
+    Reused(GitMutationResult),
+}
+
+impl LocalStatusSnapshot {
+    fn new(snapshot: StatusSnapshot) -> Self {
+        let page_indexes = LocalStatusPageIndexes::from_snapshot(&snapshot);
+        Self {
+            snapshot,
+            page_indexes,
+        }
+    }
+}
+
+impl Deref for LocalStatusSnapshot {
+    type Target = StatusSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl LocalStatusPageFilter {
+    fn new(state: Option<&str>, query: Option<&str>) -> Self {
+        Self {
+            state: state
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("all")
+                .to_ascii_lowercase(),
+            query: query
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl LocalStatusPageIndexes {
+    fn from_snapshot(snapshot: &StatusSnapshot) -> Self {
+        let mut all = Vec::with_capacity(snapshot.files.len());
+        let mut staged = Vec::with_capacity(snapshot.summary.staged_count);
+        let mut unstaged = Vec::with_capacity(snapshot.summary.unstaged_count);
+        let mut untracked = Vec::with_capacity(snapshot.summary.untracked_count);
+        let mut conflicted = Vec::with_capacity(snapshot.summary.conflict_count);
+        for (index, change) in snapshot.files.iter().enumerate() {
+            all.push(index);
+            if change.staged {
+                staged.push(index);
+            }
+            if change.unstaged {
+                unstaged.push(index);
+            }
+            if change.untracked {
+                untracked.push(index);
+            }
+            if change.conflict {
+                conflicted.push(index);
+            }
+        }
+        Self {
+            all: Arc::new(all),
+            staged: Arc::new(staged),
+            unstaged: Arc::new(unstaged),
+            untracked: Arc::new(untracked),
+            conflicted: Arc::new(conflicted),
+            query_cache: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn for_filter(
+        &self,
+        snapshot: &StatusSnapshot,
+        filter: &LocalStatusPageFilter,
+    ) -> Arc<Vec<usize>> {
+        let base = match filter.state.as_str() {
+            "all" => self.all.clone(),
+            "staged" => self.staged.clone(),
+            "unstaged" => self.unstaged.clone(),
+            "untracked" => self.untracked.clone(),
+            "conflicted" | "conflict" => self.conflicted.clone(),
+            _ => Arc::new(Vec::new()),
+        };
+        if filter.query.is_empty() {
+            return base;
+        }
+        if let Ok(cache) = self.query_cache.lock() {
+            if let Some((_, indexes)) = cache.iter().find(|(key, _)| key == filter) {
+                return indexes.clone();
+            }
+        }
+        let indexes = Arc::new(
+            base.iter()
+                .copied()
+                .filter(|index| {
+                    change_matches_normalized_query(&snapshot.files[*index], &filter.query)
+                })
+                .collect::<Vec<_>>(),
+        );
+        if let Ok(mut cache) = self.query_cache.lock() {
+            if let Some((_, cached)) = cache.iter().find(|(key, _)| key == filter) {
+                return cached.clone();
+            }
+            if cache.len() >= MAX_STATUS_QUERY_INDEXES {
+                cache.pop_front();
+            }
+            cache.push_back((filter.clone(), indexes.clone()));
+        }
+        indexes
+    }
 }
 
 impl ServerLocalGit {
@@ -226,18 +364,14 @@ impl ServerLocalGit {
         &self,
         request: &RequestEnvelope,
         params: &GitStatusPageParams,
-        snapshot: &StatusSnapshot,
+        snapshot: &LocalStatusSnapshot,
         limit: usize,
     ) -> Result<ResponseEnvelope, ControlError> {
         validate_generation(params.generation, snapshot.summary.generation)?;
+        let filter = LocalStatusPageFilter::new(params.state.as_deref(), params.query.as_deref());
         let matching = snapshot
-            .files
-            .iter()
-            .filter(|change| {
-                change_matches_state(change, params.state.as_deref())
-                    && change_matches_query(change, params.query.as_deref())
-            })
-            .collect::<Vec<_>>();
+            .page_indexes
+            .for_filter(&snapshot.snapshot, &filter);
         let generation = snapshot.summary.generation;
         let cursor_fingerprint = status_page_cursor_fingerprint(
             generation,
@@ -254,7 +388,7 @@ impl ServerLocalGit {
         let end = offset.saturating_add(limit).min(matching.len());
         let changes = matching[offset..end]
             .iter()
-            .map(|change| change_result(change))
+            .map(|index| change_result(&snapshot.files[*index]))
             .collect();
         let summary = self.summary_result(snapshot.summary.clone());
         Ok(ResponseEnvelope::ok_typed(
@@ -291,7 +425,7 @@ impl ServerLocalGit {
     fn completed_snapshot(
         &mut self,
         requested_generation: Option<u64>,
-    ) -> Result<Arc<StatusSnapshot>, ControlError> {
+    ) -> Result<Arc<LocalStatusSnapshot>, ControlError> {
         if let Some(snapshot) = self.status_snapshot.clone() {
             validate_generation(requested_generation, snapshot.summary.generation)?;
             return Ok(snapshot);
@@ -316,7 +450,7 @@ impl ServerLocalGit {
         &mut self,
         generation: u64,
         result: Arc<agentmux_vcs::StatusReadResult>,
-    ) -> Result<Arc<StatusSnapshot>, ControlError> {
+    ) -> Result<Arc<LocalStatusSnapshot>, ControlError> {
         if result.snapshot.summary.generation != generation
             || self.client.generation(&self.repository) != generation
         {
@@ -326,7 +460,7 @@ impl ServerLocalGit {
                 "Git repository changed while its status snapshot was loading; refresh and retry.",
             ));
         }
-        let snapshot = Arc::new(result.snapshot.clone());
+        let snapshot = Arc::new(LocalStatusSnapshot::new(result.snapshot.clone()));
         self.status_snapshot = Some(snapshot.clone());
         if self
             .status_scan
@@ -429,20 +563,29 @@ impl ServerLocalGit {
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
         let fingerprint = mutation_request_fingerprint(&params)?;
-        if let Some(result) = self.reused_result(
+        let intent = match self.prepare_mutation(
             request.method.as_str(),
             params.idempotency_key.as_deref(),
             &fingerprint,
         )? {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
-        }
+            PreparedLocalGitMutation::Untracked => None,
+            PreparedLocalGitMutation::Execute(intent) => Some(intent),
+            PreparedLocalGitMutation::Reused(result) => {
+                return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+            }
+        };
         self.invalidate_status();
-        let generation = if stage {
+        let mutation = if stage {
             self.client.stage(&self.repository, &params.paths)
         } else {
             self.client.unstage(&self.repository, &params.paths)
-        }
-        .map_err(vcs_error)?;
+        };
+        let generation = match mutation {
+            Ok(generation) => generation,
+            Err(error) => {
+                return Err(self.reconcile_failed_mutation(intent.as_ref(), vcs_error(error)));
+            }
+        };
         let result = GitMutationResult {
             workspace_id: self.workspace_id.clone(),
             repository_id: self.repository_id.clone(),
@@ -451,12 +594,7 @@ impl ServerLocalGit {
             commit_oid: None,
             reused: false,
         };
-        self.remember_result(
-            request.method.as_str(),
-            params.idempotency_key.as_deref(),
-            fingerprint,
-            &result,
-        )?;
+        self.complete_mutation(intent.as_ref(), &result)?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -469,20 +607,29 @@ impl ServerLocalGit {
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
         let fingerprint = mutation_request_fingerprint(&params)?;
-        if let Some(result) = self.reused_result(
+        let intent = match self.prepare_mutation(
             request.method.as_str(),
             params.idempotency_key.as_deref(),
             &fingerprint,
         )? {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
-        }
+            PreparedLocalGitMutation::Untracked => None,
+            PreparedLocalGitMutation::Execute(intent) => Some(intent),
+            PreparedLocalGitMutation::Reused(result) => {
+                return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+            }
+        };
         self.invalidate_status();
-        let generation = if stage {
+        let mutation = if stage {
             self.client.stage(&self.repository, &[])
         } else {
             self.client.unstage(&self.repository, &[])
-        }
-        .map_err(vcs_error)?;
+        };
+        let generation = match mutation {
+            Ok(generation) => generation,
+            Err(error) => {
+                return Err(self.reconcile_failed_mutation(intent.as_ref(), vcs_error(error)));
+            }
+        };
         let result = GitMutationResult {
             workspace_id: self.workspace_id.clone(),
             repository_id: self.repository_id.clone(),
@@ -491,12 +638,7 @@ impl ServerLocalGit {
             commit_oid: None,
             reused: false,
         };
-        self.remember_result(
-            request.method.as_str(),
-            params.idempotency_key.as_deref(),
-            fingerprint,
-            &result,
-        )?;
+        self.complete_mutation(intent.as_ref(), &result)?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -504,24 +646,30 @@ impl ServerLocalGit {
         let params: GitCommitParams = request.parse_params()?;
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
-        let fingerprint = mutation_request_fingerprint(&params)?;
-        if let Some(result) = self.reused_result(
-            request.method.as_str(),
-            params.idempotency_key.as_deref(),
-            &fingerprint,
-        )? {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
-        }
         if params.amend {
             return Err(invalid_request(
                 "Amend is not available through local server mode.",
             ));
         }
+        let fingerprint = mutation_request_fingerprint(&params)?;
+        let intent = match self.prepare_mutation(
+            request.method.as_str(),
+            params.idempotency_key.as_deref(),
+            &fingerprint,
+        )? {
+            PreparedLocalGitMutation::Untracked => None,
+            PreparedLocalGitMutation::Execute(intent) => Some(intent),
+            PreparedLocalGitMutation::Reused(result) => {
+                return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+            }
+        };
         self.invalidate_status();
-        let commit = self
-            .client
-            .commit(&self.repository, &params.message)
-            .map_err(vcs_error)?;
+        let commit = match self.client.commit(&self.repository, &params.message) {
+            Ok(commit) => commit,
+            Err(error) => {
+                return Err(self.reconcile_failed_mutation(intent.as_ref(), vcs_error(error)));
+            }
+        };
         let result = GitMutationResult {
             workspace_id: self.workspace_id.clone(),
             repository_id: self.repository_id.clone(),
@@ -530,12 +678,7 @@ impl ServerLocalGit {
             commit_oid: Some(commit.commit),
             reused: false,
         };
-        self.remember_result(
-            request.method.as_str(),
-            params.idempotency_key.as_deref(),
-            fingerprint,
-            &result,
-        )?;
+        self.complete_mutation(intent.as_ref(), &result)?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -577,71 +720,156 @@ impl ServerLocalGit {
         }
     }
 
-    fn reused_result(
-        &self,
+    fn prepare_mutation(
+        &mut self,
         method: &str,
         idempotency_key: Option<&str>,
         request_fingerprint: &str,
-    ) -> Result<Option<GitMutationResult>, ControlError> {
+    ) -> Result<PreparedLocalGitMutation, ControlError> {
         let Some(idempotency_key) = idempotency_key else {
-            return Ok(None);
+            return Ok(PreparedLocalGitMutation::Untracked);
         };
-        match self
+        let current_precondition =
+            mutation_precondition_fingerprint(&self.client, &self.repository).map_err(vcs_error)?;
+        let proposed = PersistedGitMutationIntent {
+            method: method.to_string(),
+            repository_id: self.repository_id.clone(),
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint: request_fingerprint.to_string(),
+            precondition_fingerprint: current_precondition.clone(),
+            created_at: refreshed_at(),
+        };
+        let lookup = self
             .receipt_store
-            .load_git_mutation_receipt(
-                method,
-                &self.repository_id,
-                idempotency_key,
-                request_fingerprint,
-            )
-            .map_err(receipt_store_error)?
-        {
-            GitMutationReceiptLookup::Missing => Ok(None),
+            .prepare_git_mutation(&proposed)
+            .map_err(receipt_store_error)?;
+        match lookup {
+            GitMutationReceiptLookup::Pending(intent)
+                if intent.precondition_fingerprint == current_precondition =>
+            {
+                Ok(PreparedLocalGitMutation::Execute(intent))
+            }
+            GitMutationReceiptLookup::Pending(intent) => Err(self.mark_mutation_indeterminate(
+                &intent,
+                "repository_precondition_changed",
+                Some(format!(
+                    "stored={}, current={current_precondition}",
+                    intent.precondition_fingerprint
+                )),
+            )),
             GitMutationReceiptLookup::Match(receipt) => {
                 let mut result = serde_json::from_str::<GitMutationResult>(&receipt.response_json)
                     .map_err(|_| receipt_store_error("stored response is invalid"))?;
                 result.reused = true;
-                Ok(Some(result))
+                Ok(PreparedLocalGitMutation::Reused(result))
             }
-            GitMutationReceiptLookup::FingerprintMismatch { .. } => Err(idempotency_conflict()),
+            GitMutationReceiptLookup::Indeterminate {
+                intent,
+                failure_json,
+            } => Err(indeterminate_conflict(
+                &intent,
+                "stored_indeterminate_outcome",
+                failure_json,
+                None,
+            )),
+            GitMutationReceiptLookup::FingerprintMismatch {
+                stored_request_fingerprint,
+            } => Err(idempotency_conflict(&stored_request_fingerprint)),
+            GitMutationReceiptLookup::Missing => {
+                Err(receipt_store_error("Git mutation intent was not persisted"))
+            }
         }
     }
 
-    fn remember_result(
+    fn complete_mutation(
         &mut self,
-        method: &str,
-        idempotency_key: Option<&str>,
-        request_fingerprint: String,
+        intent: Option<&PersistedGitMutationIntent>,
         result: &GitMutationResult,
     ) -> Result<(), ControlError> {
-        let Some(idempotency_key) = idempotency_key else {
+        let Some(intent) = intent else {
             return Ok(());
         };
-        let receipt = PersistedGitMutationReceipt {
-            method: method.to_string(),
-            repository_id: self.repository_id.clone(),
-            idempotency_key: idempotency_key.to_string(),
-            request_fingerprint,
-            response_json: serde_json::to_string(result)
-                .map_err(|_| receipt_store_error("could not encode the Git mutation response"))?,
-            created_at: refreshed_at(),
-        };
-        match self
-            .receipt_store
-            .create_or_load_git_mutation_receipt(&receipt)
-            .map_err(receipt_store_error)?
-        {
-            GitMutationReceiptLookup::Match(_) => {
-                self.receipt_store
-                    .prune_git_mutation_receipts(MAX_IDEMPOTENCY_RECEIPTS)
-                    .map_err(receipt_store_error)?;
+        let response_json = serde_json::to_string(result).map_err(|error| {
+            self.mark_mutation_indeterminate(
+                intent,
+                "response_encoding_failed_after_effect",
+                Some(error.to_string()),
+            )
+        })?;
+        let completion =
+            self.receipt_store
+                .complete_git_mutation(intent, &response_json, &refreshed_at());
+        match completion {
+            Ok(GitMutationReceiptLookup::Match(_)) => {
+                let _ = self
+                    .receipt_store
+                    .prune_git_mutation_receipts(MAX_IDEMPOTENCY_RECEIPTS);
                 Ok(())
             }
-            GitMutationReceiptLookup::FingerprintMismatch { .. } => Err(idempotency_conflict()),
-            GitMutationReceiptLookup::Missing => Err(receipt_store_error(
-                "successful Git mutation receipt was not persisted",
+            Ok(GitMutationReceiptLookup::FingerprintMismatch {
+                stored_request_fingerprint,
+            }) => Err(idempotency_conflict(&stored_request_fingerprint)),
+            Ok(GitMutationReceiptLookup::Indeterminate { failure_json, .. }) => Err(
+                indeterminate_conflict(intent, "stored_indeterminate_outcome", failure_json, None),
+            ),
+            Ok(GitMutationReceiptLookup::Pending(_)) | Ok(GitMutationReceiptLookup::Missing) => {
+                Err(self.mark_mutation_indeterminate(
+                    intent,
+                    "completion_transition_not_persisted",
+                    None,
+                ))
+            }
+            Err(error) => Err(self.mark_mutation_indeterminate(
+                intent,
+                "completion_persistence_failed_after_effect",
+                Some(error.to_string()),
             )),
         }
+    }
+
+    fn reconcile_failed_mutation(
+        &mut self,
+        intent: Option<&PersistedGitMutationIntent>,
+        error: ControlError,
+    ) -> ControlError {
+        let Some(intent) = intent else {
+            return error;
+        };
+        match mutation_precondition_fingerprint(&self.client, &self.repository) {
+            Ok(current) if current == intent.precondition_fingerprint => error,
+            Ok(current) => self.mark_mutation_indeterminate(
+                intent,
+                "git_error_changed_repository_state",
+                Some(format!("error={}; current={current}", error.message)),
+            ),
+            Err(fingerprint_error) => self.mark_mutation_indeterminate(
+                intent,
+                "git_error_precondition_unreadable",
+                Some(format!(
+                    "error={}; fingerprint_error={fingerprint_error}",
+                    error.message
+                )),
+            ),
+        }
+    }
+
+    fn mark_mutation_indeterminate(
+        &mut self,
+        intent: &PersistedGitMutationIntent,
+        reason: &str,
+        source: Option<String>,
+    ) -> ControlError {
+        let failure_json = serde_json::json!({
+            "reason": reason,
+            "source": source,
+        })
+        .to_string();
+        let persistence_error = self
+            .receipt_store
+            .mark_git_mutation_indeterminate(intent, &failure_json, &refreshed_at())
+            .err()
+            .map(|error| error.to_string());
+        indeterminate_conflict(intent, reason, Some(failure_json), persistence_error)
     }
 }
 
@@ -752,10 +980,139 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
-fn idempotency_conflict() -> ControlError {
+fn mutation_precondition_fingerprint(
+    git: &GitClient,
+    repository: &Repository,
+) -> Result<String, GitError> {
+    let snapshot = git.read_status(repository)?;
+    let mut hasher = StableMutationHasher::default();
+    snapshot.summary.head.hash(&mut hasher);
+    snapshot.files.len().hash(&mut hasher);
+    for change in &snapshot.files {
+        (
+            &change.path,
+            &change.original_path,
+            &change.index_status,
+            &change.worktree_status,
+            change.staged,
+            change.unstaged,
+            change.untracked,
+            change.conflict,
+        )
+            .hash(&mut hasher);
+        if change.staged {
+            let diff = git.diff(
+                repository,
+                &DiffRequest {
+                    path: change.path.clone(),
+                    staged: true,
+                    untracked: false,
+                },
+            )?;
+            if diff.truncated {
+                return Err(GitError::StateUnavailable(format!(
+                    "The staged diff for '{}' is too large to fingerprint safely.",
+                    change.path
+                )));
+            }
+            ("staged", &diff.patch).hash(&mut hasher);
+        }
+        if change.untracked {
+            let diff = git.diff(
+                repository,
+                &DiffRequest {
+                    path: change.path.clone(),
+                    staged: false,
+                    untracked: true,
+                },
+            )?;
+            if diff.truncated {
+                return Err(GitError::StateUnavailable(format!(
+                    "The untracked diff for '{}' is too large to fingerprint safely.",
+                    change.path
+                )));
+            }
+            ("untracked", &diff.patch).hash(&mut hasher);
+        } else if change.unstaged {
+            let diff = git.diff(
+                repository,
+                &DiffRequest {
+                    path: change.path.clone(),
+                    staged: false,
+                    untracked: false,
+                },
+            )?;
+            if diff.truncated {
+                return Err(GitError::StateUnavailable(format!(
+                    "The worktree diff for '{}' is too large to fingerprint safely.",
+                    change.path
+                )));
+            }
+            ("unstaged", &diff.patch).hash(&mut hasher);
+        }
+    }
+    Ok(format!("v1:{:016x}", hasher.finish()))
+}
+
+struct StableMutationHasher(u64);
+
+impl Default for StableMutationHasher {
+    fn default() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for StableMutationHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+fn idempotency_conflict(stored_request_fingerprint: &str) -> ControlError {
     ControlError::new(
         ErrorCode::Conflict,
         "idempotency_key was already used with a different Git mutation request.",
+    )
+    .with_details(
+        serde_json::json!({
+            "kind": "git_mutation_fingerprint_mismatch",
+            "stored_request_fingerprint": stored_request_fingerprint,
+            "safe_to_retry": false,
+        })
+        .to_string(),
+    )
+}
+
+fn indeterminate_conflict(
+    intent: &PersistedGitMutationIntent,
+    reason: &str,
+    failure_json: Option<String>,
+    persistence_error: Option<String>,
+) -> ControlError {
+    ControlError::new(
+        ErrorCode::Conflict,
+        "The Git mutation outcome is indeterminate; automatic replay was blocked.",
+    )
+    .with_details(
+        serde_json::json!({
+            "kind": "git_mutation_indeterminate",
+            "lifecycle_state": "indeterminate",
+            "method": intent.method,
+            "repository_id": intent.repository_id,
+            "idempotency_key": intent.idempotency_key,
+            "reason": reason,
+            "failure_json": failure_json,
+            "persistence_error": persistence_error,
+            "safe_to_retry": false,
+        })
+        .to_string(),
     )
 }
 
@@ -872,11 +1229,15 @@ fn change_matches_query(change: &GitFileChange, query: Option<&str>) -> bool {
         return true;
     };
     let query = query.to_ascii_lowercase();
-    change.path.to_ascii_lowercase().contains(&query)
+    change_matches_normalized_query(change, &query)
+}
+
+fn change_matches_normalized_query(change: &GitFileChange, query: &str) -> bool {
+    change.path.to_ascii_lowercase().contains(query)
         || change
             .original_path
             .as_deref()
-            .is_some_and(|path| path.to_ascii_lowercase().contains(&query))
+            .is_some_and(|path| path.to_ascii_lowercase().contains(query))
 }
 
 fn change_result(change: &GitFileChange) -> GitChangeSummaryResult {
@@ -980,6 +1341,47 @@ mod tests {
         let error = parse_cursor(Some(&cursor), 7, changed_query).unwrap_err();
         assert_eq!(error.code, ErrorCode::Conflict);
         assert!(parse_cursor(Some(&cursor), 8, fingerprint).is_err());
+    }
+
+    #[test]
+    fn local_status_paging_5k_reuses_prebuilt_state_index() {
+        let cached = LocalStatusSnapshot::new(synthetic_status_snapshot(5_000));
+        let filter = LocalStatusPageFilter::new(Some("staged"), None);
+        let first = cached.page_indexes.for_filter(&cached.snapshot, &filter);
+        let second = cached.page_indexes.for_filter(&cached.snapshot, &filter);
+
+        assert!(Arc::ptr_eq(&first, &cached.page_indexes.staged));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.len(), cached.snapshot.summary.staged_count);
+        assert_eq!(
+            first.chunks(250).map(<[usize]>::len).sum::<usize>(),
+            first.len()
+        );
+    }
+
+    #[test]
+    fn local_status_paging_10k_caches_query_index_across_scroll_pages() {
+        let cached = LocalStatusSnapshot::new(synthetic_status_snapshot(10_000));
+        let filter = LocalStatusPageFilter::new(Some("unstaged"), Some("needle"));
+        let first = cached.page_indexes.for_filter(&cached.snapshot, &filter);
+        let expected = cached
+            .snapshot
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, change)| change.unstaged && change.path.contains("needle"))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(first.as_ref(), &expected);
+
+        for page in first.chunks(137) {
+            assert!(page
+                .iter()
+                .all(|index| cached.snapshot.files[*index].path.contains("needle")));
+            let reused = cached.page_indexes.for_filter(&cached.snapshot, &filter);
+            assert!(Arc::ptr_eq(&first, &reused));
+        }
+        assert_eq!(cached.page_indexes.query_cache.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1399,6 +1801,48 @@ mod tests {
         assert_eq!(git.status_refresh_count, 2);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn synthetic_status_snapshot(file_count: usize) -> StatusSnapshot {
+        let files = (0..file_count)
+            .map(|index| {
+                let staged = index % 4 == 0;
+                let untracked = index % 5 == 0;
+                let conflict = index % 97 == 0;
+                let unstaged = !staged || untracked || conflict;
+                GitFileChange {
+                    path: if index % 10 == 0 {
+                        format!("src/needle/file-{index:05}.rs")
+                    } else {
+                        format!("src/generated/file-{index:05}.rs")
+                    },
+                    original_path: None,
+                    index_status: if staged { "M" } else { "." }.to_string(),
+                    worktree_status: if unstaged { "M" } else { "." }.to_string(),
+                    staged,
+                    unstaged,
+                    untracked,
+                    conflict,
+                }
+            })
+            .collect::<Vec<_>>();
+        StatusSnapshot {
+            summary: StatusSummary {
+                repository_root: r"D:\repo".to_string(),
+                branch: Some("main".to_string()),
+                head: Some("0123456789abcdef".to_string()),
+                upstream: Some("origin/main".to_string()),
+                ahead: 0,
+                behind: 0,
+                file_count,
+                staged_count: files.iter().filter(|change| change.staged).count(),
+                unstaged_count: files.iter().filter(|change| change.unstaged).count(),
+                untracked_count: files.iter().filter(|change| change.untracked).count(),
+                conflict_count: files.iter().filter(|change| change.conflict).count(),
+                generation: 7,
+            },
+            files,
+        }
     }
 
     fn run_git(root: &Path, args: &[&str]) {

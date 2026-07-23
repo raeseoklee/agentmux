@@ -43,7 +43,7 @@ use agentmux_ipc::{
     METHOD_GIT_STATUS_PAGE, METHOD_GIT_STATUS_SUMMARY, METHOD_GIT_UNSTAGE, METHOD_GIT_UNSTAGE_ALL,
 };
 use agentmux_store::{
-    GitMutationReceiptLookup, GitReviewDeliveryUpdate, PersistedGitMutationReceipt,
+    GitMutationReceiptLookup, GitReviewDeliveryUpdate, PersistedGitMutationIntent,
     PersistedGitReviewComment, PersistedGitReviewDeliveryAttempt, PersistedGitReviewThread,
     PersistedNotification, PersistedTeamMessage, PersistedVerifiedAgentHook,
     PersistedWorktreeOperation, WorktreeOperationState,
@@ -475,6 +475,12 @@ enum GitMutation {
     Stage,
     Unstage,
     Discard,
+}
+
+enum PreparedGitMutation {
+    Untracked,
+    Execute(PersistedGitMutationIntent),
+    Reused(IpcGitMutationResult),
 }
 
 fn vcs_error(error: GitError) -> DesktopHostError {
@@ -1123,30 +1129,35 @@ impl DesktopControlState {
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let request_fingerprint = git_mutation_request_fingerprint(&params)?;
         let _mutation_guard = self.lock_git_mutation(params.idempotency_key.as_deref())?;
-        if let Some(result) = self.reused_git_mutation(
+        let intent = match self.prepare_git_mutation(
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
             &request_fingerprint,
+            &repository,
         )? {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
-        }
+            PreparedGitMutation::Untracked => None,
+            PreparedGitMutation::Execute(intent) => Some(intent),
+            PreparedGitMutation::Reused(result) => {
+                return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+            }
+        };
 
         self.invalidate_status_snapshot(&repository_id);
-        let generation = match mutation {
+        let mutation_result = match mutation {
             GitMutation::Stage => self
                 .five_track
                 .shared
                 .git
                 .stage(&repository, &params.paths)
-                .map_err(vcs_error)?,
+                .map_err(vcs_error),
             GitMutation::Unstage => self
                 .five_track
                 .shared
                 .git
                 .unstage(&repository, &params.paths)
-                .map_err(vcs_error)?,
-            GitMutation::Discard => {
+                .map_err(vcs_error),
+            GitMutation::Discard => (|| {
                 validate_git_paths(&params.paths)?;
                 let mut args = vec![
                     "restore".to_string(),
@@ -1157,10 +1168,21 @@ impl DesktopControlState {
                 args.extend(params.paths.iter().cloned());
                 let output = run_git_command(&legacy_context, &args)?;
                 ensure_git_success(&output, "discard changes")?;
-                self.five_track
+                Ok(self
+                    .five_track
                     .shared
                     .git
-                    .mark_repository_changed(&repository)
+                    .mark_repository_changed(&repository))
+            })(),
+        };
+        let generation = match mutation_result {
+            Ok(generation) => generation,
+            Err(error) => {
+                return Err(self.reconcile_failed_git_mutation(
+                    intent.as_ref(),
+                    &repository,
+                    error,
+                ));
             }
         };
         let result = IpcGitMutationResult {
@@ -1171,13 +1193,7 @@ impl DesktopControlState {
             commit_oid: None,
             reused: false,
         };
-        self.remember_git_mutation(
-            request.method.as_str(),
-            &repository_id,
-            params.idempotency_key.as_deref(),
-            &request_fingerprint,
-            &result,
-        )?;
+        self.complete_git_mutation(intent.as_ref(), &result)?;
         self.git_repository_mutated(
             &params.workspace_id,
             &repository_id,
@@ -1204,29 +1220,44 @@ impl DesktopControlState {
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let request_fingerprint = git_mutation_request_fingerprint(&params)?;
         let _mutation_guard = self.lock_git_mutation(params.idempotency_key.as_deref())?;
-        if let Some(result) = self.reused_git_mutation(
+        let intent = match self.prepare_git_mutation(
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
             &request_fingerprint,
+            &repository,
         )? {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
-        }
+            PreparedGitMutation::Untracked => None,
+            PreparedGitMutation::Execute(intent) => Some(intent),
+            PreparedGitMutation::Reused(result) => {
+                return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+            }
+        };
         self.invalidate_status_snapshot(&repository_id);
-        let generation = match mutation {
+        let mutation_result = match mutation {
             GitMutation::Stage => self
                 .five_track
                 .shared
                 .git
                 .stage(&repository, &[])
-                .map_err(vcs_error)?,
+                .map_err(vcs_error),
             GitMutation::Unstage => self
                 .five_track
                 .shared
                 .git
                 .unstage(&repository, &[])
-                .map_err(vcs_error)?,
+                .map_err(vcs_error),
             GitMutation::Discard => unreachable!("discard-all is intentionally unsupported"),
+        };
+        let generation = match mutation_result {
+            Ok(generation) => generation,
+            Err(error) => {
+                return Err(self.reconcile_failed_git_mutation(
+                    intent.as_ref(),
+                    &repository,
+                    error,
+                ));
+            }
         };
         let result = IpcGitMutationResult {
             workspace_id: params.workspace_id.clone(),
@@ -1236,13 +1267,7 @@ impl DesktopControlState {
             commit_oid: None,
             reused: false,
         };
-        self.remember_git_mutation(
-            request.method.as_str(),
-            &repository_id,
-            params.idempotency_key.as_deref(),
-            &request_fingerprint,
-            &result,
-        )?;
+        self.complete_git_mutation(intent.as_ref(), &result)?;
         self.git_repository_mutated(
             &params.workspace_id,
             &repository_id,
@@ -1272,53 +1297,69 @@ impl DesktopControlState {
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let request_fingerprint = git_mutation_request_fingerprint(&params)?;
         let _mutation_guard = self.lock_git_mutation(params.idempotency_key.as_deref())?;
-        if let Some(result) = self.reused_git_mutation(
+        let intent = match self.prepare_git_mutation(
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
             &request_fingerprint,
+            &repository,
         )? {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
-        }
+            PreparedGitMutation::Untracked => None,
+            PreparedGitMutation::Execute(intent) => Some(intent),
+            PreparedGitMutation::Reused(result) => {
+                return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+            }
+        };
 
         self.invalidate_status_snapshot(&repository_id);
-        let (commit, summary, generation) = if params.amend {
-            let output = run_git_command(
-                &legacy_context,
-                &[
-                    "commit".to_string(),
-                    "--amend".to_string(),
-                    "-m".to_string(),
-                    params.message.clone(),
-                ],
-            )?;
-            ensure_git_success(&output, "amend commit")?;
-            let oid = run_git_read_command(
-                &legacy_context,
-                &[
-                    "rev-parse".to_string(),
-                    "--short".to_string(),
-                    "--verify".to_string(),
-                    "HEAD".to_string(),
-                ],
-            )?;
-            ensure_git_success(&oid, "read amended commit")?;
-            (
-                String::from_utf8_lossy(&oid.stdout).trim().to_string(),
-                String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                self.five_track
-                    .shared
-                    .git
-                    .mark_repository_changed(&repository),
-            )
-        } else {
+        let commit_result = (|| {
+            if params.amend {
+                let output = run_git_command(
+                    &legacy_context,
+                    &[
+                        "commit".to_string(),
+                        "--amend".to_string(),
+                        "-m".to_string(),
+                        params.message.clone(),
+                    ],
+                )?;
+                ensure_git_success(&output, "amend commit")?;
+                let oid = run_git_read_command(
+                    &legacy_context,
+                    &[
+                        "rev-parse".to_string(),
+                        "--short".to_string(),
+                        "--verify".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                )?;
+                ensure_git_success(&oid, "read amended commit")?;
+                return Ok((
+                    String::from_utf8_lossy(&oid.stdout).trim().to_string(),
+                    String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                    self.five_track
+                        .shared
+                        .git
+                        .mark_repository_changed(&repository),
+                ));
+            }
             let result = self
                 .five_track
                 .shared
                 .git
                 .commit(&repository, &params.message)
                 .map_err(vcs_error)?;
-            (result.commit, result.summary, result.generation)
+            Ok((result.commit, result.summary, result.generation))
+        })();
+        let (commit, summary, generation) = match commit_result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(self.reconcile_failed_git_mutation(
+                    intent.as_ref(),
+                    &repository,
+                    error,
+                ));
+            }
         };
         if is_legacy {
             self.git_repository_mutated(
@@ -1341,13 +1382,7 @@ impl DesktopControlState {
             commit_oid: Some(commit),
             reused: false,
         };
-        self.remember_git_mutation(
-            request.method.as_str(),
-            &repository_id,
-            params.idempotency_key.as_deref(),
-            &request_fingerprint,
-            &result,
-        )?;
+        self.complete_git_mutation(intent.as_ref(), &result)?;
         self.git_repository_mutated(
             &result.workspace_id,
             &repository_id,
@@ -1377,72 +1412,178 @@ impl DesktopControlState {
             })
     }
 
-    fn reused_git_mutation(
+    fn prepare_git_mutation(
         &self,
         method: &str,
         repository_id: &str,
         idempotency_key: Option<&str>,
         request_fingerprint: &str,
-    ) -> Result<Option<IpcGitMutationResult>, DesktopHostError> {
+        repository: &Repository,
+    ) -> Result<PreparedGitMutation, DesktopHostError> {
         let Some(idempotency_key) = idempotency_key else {
-            return Ok(None);
+            return Ok(PreparedGitMutation::Untracked);
         };
-        let store = self.store.lock().map_err(|_| {
-            DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
-        })?;
-        match store.load_git_mutation_receipt(
-            method,
-            repository_id,
-            idempotency_key,
-            request_fingerprint,
-        )? {
-            GitMutationReceiptLookup::Missing => Ok(None),
-            GitMutationReceiptLookup::Match(receipt) => {
-                let mut result =
-                    serde_json::from_str::<IpcGitMutationResult>(&receipt.response_json)?;
-                result.reused = true;
-                Ok(Some(result))
-            }
-            GitMutationReceiptLookup::FingerprintMismatch { .. } => {
-                Err(git_mutation_idempotency_conflict())
-            }
-        }
-    }
-
-    fn remember_git_mutation(
-        &self,
-        method: &str,
-        repository_id: &str,
-        idempotency_key: Option<&str>,
-        request_fingerprint: &str,
-        result: &IpcGitMutationResult,
-    ) -> Result<(), DesktopHostError> {
-        let Some(idempotency_key) = idempotency_key else {
-            return Ok(());
-        };
-        let receipt = PersistedGitMutationReceipt {
+        let current_precondition =
+            git_mutation_precondition_fingerprint(&self.five_track.shared.git, repository)
+                .map_err(vcs_error)?;
+        let proposed = PersistedGitMutationIntent {
             method: method.to_string(),
             repository_id: repository_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
             request_fingerprint: request_fingerprint.to_string(),
-            response_json: serde_json::to_string(result)?,
+            precondition_fingerprint: current_precondition.clone(),
             created_at: timestamp(),
         };
         let mut store = self.store.lock().map_err(|_| {
             DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
         })?;
-        match store.create_or_load_git_mutation_receipt(&receipt)? {
-            GitMutationReceiptLookup::Match(_) => {
-                store.prune_git_mutation_receipts(MAX_MUTATION_IDEMPOTENCY_RECEIPTS)?;
-                Ok(())
+        match store.prepare_git_mutation(&proposed)? {
+            GitMutationReceiptLookup::Pending(intent)
+                if intent.precondition_fingerprint == current_precondition =>
+            {
+                Ok(PreparedGitMutation::Execute(intent))
             }
-            GitMutationReceiptLookup::FingerprintMismatch { .. } => {
-                Err(git_mutation_idempotency_conflict())
+            GitMutationReceiptLookup::Pending(intent) => {
+                drop(store);
+                Err(self.mark_git_mutation_indeterminate(
+                    &intent,
+                    "repository_precondition_changed",
+                    Some(format!(
+                        "stored={}, current={current_precondition}",
+                        intent.precondition_fingerprint
+                    )),
+                ))
             }
+            GitMutationReceiptLookup::Match(receipt) => {
+                let mut result =
+                    serde_json::from_str::<IpcGitMutationResult>(&receipt.response_json)?;
+                result.reused = true;
+                Ok(PreparedGitMutation::Reused(result))
+            }
+            GitMutationReceiptLookup::Indeterminate {
+                intent,
+                failure_json,
+            } => Err(git_mutation_indeterminate_conflict(
+                &intent,
+                "stored_indeterminate_outcome",
+                failure_json,
+                None,
+            )),
+            GitMutationReceiptLookup::FingerprintMismatch {
+                stored_request_fingerprint,
+            } => Err(git_mutation_idempotency_conflict(
+                &stored_request_fingerprint,
+            )),
             GitMutationReceiptLookup::Missing => Err(DesktopHostError::StateUnavailable(
-                "Git mutation receipt was not persisted".to_string(),
+                "Git mutation intent was not persisted".to_string(),
             )),
         }
+    }
+
+    fn complete_git_mutation(
+        &self,
+        intent: Option<&PersistedGitMutationIntent>,
+        result: &IpcGitMutationResult,
+    ) -> Result<(), DesktopHostError> {
+        let Some(intent) = intent else {
+            return Ok(());
+        };
+        let response_json = serde_json::to_string(result).map_err(|error| {
+            self.mark_git_mutation_indeterminate(
+                intent,
+                "response_encoding_failed_after_effect",
+                Some(error.to_string()),
+            )
+        })?;
+        let completion = {
+            let mut store = self.store.lock().map_err(|_| {
+                self.mark_git_mutation_indeterminate(
+                    intent,
+                    "completion_store_lock_failed_after_effect",
+                    None,
+                )
+            })?;
+            let completion = store.complete_git_mutation(intent, &response_json, &timestamp());
+            if matches!(completion, Ok(GitMutationReceiptLookup::Match(_))) {
+                let _ = store.prune_git_mutation_receipts(MAX_MUTATION_IDEMPOTENCY_RECEIPTS);
+            }
+            completion
+        };
+        match completion {
+            Ok(GitMutationReceiptLookup::Match(_)) => Ok(()),
+            Ok(GitMutationReceiptLookup::FingerprintMismatch {
+                stored_request_fingerprint,
+            }) => Err(git_mutation_idempotency_conflict(
+                &stored_request_fingerprint,
+            )),
+            Ok(GitMutationReceiptLookup::Indeterminate { failure_json, .. }) => {
+                Err(git_mutation_indeterminate_conflict(
+                    intent,
+                    "stored_indeterminate_outcome",
+                    failure_json,
+                    None,
+                ))
+            }
+            Ok(GitMutationReceiptLookup::Pending(_)) | Ok(GitMutationReceiptLookup::Missing) => {
+                Err(self.mark_git_mutation_indeterminate(
+                    intent,
+                    "completion_transition_not_persisted",
+                    None,
+                ))
+            }
+            Err(error) => Err(self.mark_git_mutation_indeterminate(
+                intent,
+                "completion_persistence_failed_after_effect",
+                Some(error.to_string()),
+            )),
+        }
+    }
+
+    fn reconcile_failed_git_mutation(
+        &self,
+        intent: Option<&PersistedGitMutationIntent>,
+        repository: &Repository,
+        error: DesktopHostError,
+    ) -> DesktopHostError {
+        let Some(intent) = intent else {
+            return error;
+        };
+        match git_mutation_precondition_fingerprint(&self.five_track.shared.git, repository) {
+            Ok(current) if current == intent.precondition_fingerprint => error,
+            Ok(current) => self.mark_git_mutation_indeterminate(
+                intent,
+                "git_error_changed_repository_state",
+                Some(format!("error={error}; current={current}")),
+            ),
+            Err(fingerprint_error) => self.mark_git_mutation_indeterminate(
+                intent,
+                "git_error_precondition_unreadable",
+                Some(format!(
+                    "error={error}; fingerprint_error={fingerprint_error}"
+                )),
+            ),
+        }
+    }
+
+    fn mark_git_mutation_indeterminate(
+        &self,
+        intent: &PersistedGitMutationIntent,
+        reason: &str,
+        source: Option<String>,
+    ) -> DesktopHostError {
+        let failure_json = serde_json::json!({
+            "reason": reason,
+            "source": source,
+        })
+        .to_string();
+        let persistence_error = match self.store.lock() {
+            Ok(mut store) => store
+                .mark_git_mutation_indeterminate(intent, &failure_json, &timestamp())
+                .err()
+                .map(|error| error.to_string()),
+            Err(_) => Some("desktop store lock is unavailable".to_string()),
+        };
+        git_mutation_indeterminate_conflict(intent, reason, Some(failure_json), persistence_error)
     }
 
     fn git_repository_mutated(
@@ -1493,11 +1634,123 @@ fn git_mutation_request_fingerprint(
     serde_json::to_string(params).map_err(DesktopHostError::from)
 }
 
-fn git_mutation_idempotency_conflict() -> DesktopHostError {
-    DesktopHostError::Control(ControlError::new(
-        ErrorCode::Conflict,
-        "The Git idempotency key is already bound to a different request.",
-    ))
+fn git_mutation_precondition_fingerprint(
+    git: &GitClient,
+    repository: &Repository,
+) -> Result<String, GitError> {
+    let snapshot = git.read_status(repository)?;
+    let mut hasher = StableHasher::default();
+    snapshot.summary.head.hash(&mut hasher);
+    snapshot.files.len().hash(&mut hasher);
+    for change in &snapshot.files {
+        (
+            &change.path,
+            &change.original_path,
+            &change.index_status,
+            &change.worktree_status,
+            change.staged,
+            change.unstaged,
+            change.untracked,
+            change.conflict,
+        )
+            .hash(&mut hasher);
+        if change.staged {
+            let diff = git.diff(
+                repository,
+                &DiffRequest {
+                    path: change.path.clone(),
+                    staged: true,
+                    untracked: false,
+                },
+            )?;
+            if diff.truncated {
+                return Err(GitError::StateUnavailable(format!(
+                    "The staged diff for '{}' is too large to fingerprint safely.",
+                    change.path
+                )));
+            }
+            ("staged", &diff.patch).hash(&mut hasher);
+        }
+        if change.untracked {
+            let diff = git.diff(
+                repository,
+                &DiffRequest {
+                    path: change.path.clone(),
+                    staged: false,
+                    untracked: true,
+                },
+            )?;
+            if diff.truncated {
+                return Err(GitError::StateUnavailable(format!(
+                    "The untracked diff for '{}' is too large to fingerprint safely.",
+                    change.path
+                )));
+            }
+            ("untracked", &diff.patch).hash(&mut hasher);
+        } else if change.unstaged {
+            let diff = git.diff(
+                repository,
+                &DiffRequest {
+                    path: change.path.clone(),
+                    staged: false,
+                    untracked: false,
+                },
+            )?;
+            if diff.truncated {
+                return Err(GitError::StateUnavailable(format!(
+                    "The worktree diff for '{}' is too large to fingerprint safely.",
+                    change.path
+                )));
+            }
+            ("unstaged", &diff.patch).hash(&mut hasher);
+        }
+    }
+    Ok(format!("v1:{:016x}", hasher.finish()))
+}
+
+fn git_mutation_idempotency_conflict(stored_request_fingerprint: &str) -> DesktopHostError {
+    DesktopHostError::Control(
+        ControlError::new(
+            ErrorCode::Conflict,
+            "The Git idempotency key is already bound to a different request.",
+        )
+        .with_details(
+            serde_json::json!({
+                "kind": "git_mutation_fingerprint_mismatch",
+                "stored_request_fingerprint": stored_request_fingerprint,
+                "safe_to_retry": false,
+            })
+            .to_string(),
+        ),
+    )
+}
+
+fn git_mutation_indeterminate_conflict(
+    intent: &PersistedGitMutationIntent,
+    reason: &str,
+    failure_json: Option<String>,
+    persistence_error: Option<String>,
+) -> DesktopHostError {
+    DesktopHostError::Control(
+        ControlError::new(
+            ErrorCode::Conflict,
+            "The Git mutation outcome is indeterminate; automatic replay was blocked.",
+        )
+        .with_details(
+            serde_json::json!({
+                "kind": "git_mutation_indeterminate",
+                "lifecycle_state": "indeterminate",
+                "method": intent.method,
+                "repository_id": intent.repository_id,
+                "idempotency_key": intent.idempotency_key,
+                "reason": reason,
+                "failure_json": failure_json,
+                "persistence_error": persistence_error,
+                "safe_to_retry": false,
+            })
+            .to_string(),
+        ),
+    )
 }
 
 fn validate_workspace_id(workspace_id: &str) -> Result<(), DesktopHostError> {
