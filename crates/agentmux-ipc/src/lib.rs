@@ -1999,6 +1999,8 @@ pub struct ProfileListResult {
 pub struct GitRepositoryParams {
     pub workspace_id: String,
     #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
     pub repository_id: Option<String>,
 }
 
@@ -2009,6 +2011,8 @@ pub type GitStatusSummaryParams = GitRepositoryParams;
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitStatusPageParams {
     pub workspace_id: String,
+    #[serde(default)]
+    pub pane_id: Option<String>,
     #[serde(default)]
     pub repository_id: Option<String>,
     #[serde(default)]
@@ -2031,6 +2035,11 @@ impl GitStatusPageParams {
         validate_optional(
             "repository_id",
             self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional("state", self.state.as_deref(), 64)?;
@@ -2096,6 +2105,8 @@ pub struct GitStatusPageResult {
     pub workspace_id: String,
     pub repository_id: String,
     pub generation: u64,
+    #[serde(default)]
+    pub summary: Option<GitStatusSummaryResult>,
     pub changes: Vec<GitChangeSummaryResult>,
     #[serde(default)]
     pub next_cursor: Option<String>,
@@ -2114,6 +2125,8 @@ pub struct GitRepositoryChangedEvent {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitDiffParams {
     pub workspace_id: String,
+    #[serde(default)]
+    pub pane_id: Option<String>,
     #[serde(default)]
     pub repository_id: Option<String>,
     pub path: String,
@@ -2136,6 +2149,11 @@ impl GitDiffParams {
         validate_optional(
             "repository_id",
             self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional("stage", self.stage.as_deref(), 32)?;
@@ -2173,6 +2191,8 @@ pub struct GitDiffResult {
 pub struct GitPathMutationParams {
     pub workspace_id: String,
     #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
     pub repository_id: Option<String>,
     #[serde(default)]
     pub paths: Vec<String>,
@@ -2190,6 +2210,11 @@ impl GitPathMutationParams {
         validate_optional(
             "repository_id",
             self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional(
@@ -2213,6 +2238,8 @@ impl GitPathMutationParams {
 pub struct GitAllMutationParams {
     pub workspace_id: String,
     #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
     pub repository_id: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -2231,6 +2258,11 @@ impl GitAllMutationParams {
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
             "idempotency_key",
             self.idempotency_key.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
@@ -2241,6 +2273,8 @@ impl GitAllMutationParams {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitCommitParams {
     pub workspace_id: String,
+    #[serde(default)]
+    pub pane_id: Option<String>,
     #[serde(default)]
     pub repository_id: Option<String>,
     pub message: String,
@@ -2261,6 +2295,11 @@ impl GitCommitParams {
         validate_optional(
             "repository_id",
             self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional(

@@ -58,6 +58,26 @@ describe("TerminalResizeCoordinator", () => {
     expect(send).toHaveBeenLastCalledWith({ columns: 120, rows: 30 });
   });
 
+  it("flushes the final layout size immediately after an in-flight resize", async () => {
+    vi.useFakeTimers();
+    let resolveFirst: (() => void) | undefined;
+    const send = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveFirst ??= resolve;
+        }),
+    );
+    const coordinator = new TerminalResizeCoordinator({ delayMs: 160, send });
+
+    coordinator.request({ columns: 100, rows: 20 }, true);
+    coordinator.request({ columns: 132, rows: 34 }, true);
+    resolveFirst?.();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenLastCalledWith({ columns: 132, rows: 34 });
+  });
+
   it("drops an intermediate size when the viewport returns to the in-flight size", async () => {
     vi.useFakeTimers();
     let resolveFirst: (() => void) | undefined;

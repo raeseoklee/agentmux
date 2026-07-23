@@ -29,6 +29,7 @@ export class TerminalResizeCoordinator {
   private lastSuccessful: TerminalGridSize | null = null;
   private generation = 0;
   private disposed = false;
+  private flushPendingWhenReady = false;
 
   constructor(options: TerminalResizeCoordinatorOptions) {
     this.delayMs = options.delayMs;
@@ -46,6 +47,7 @@ export class TerminalResizeCoordinator {
       // cheap no-op after that request succeeds, while still preserving event
       // order if another size arrives before completion.
       this.pending = size;
+      this.flushPendingWhenReady ||= immediate;
       if (this.timer !== null) {
         clearTimeout(this.timer);
         this.timer = null;
@@ -54,6 +56,7 @@ export class TerminalResizeCoordinator {
     }
     if (sameSize(this.lastSuccessful, size)) {
       this.pending = null;
+      this.flushPendingWhenReady = false;
       if (this.timer !== null) {
         clearTimeout(this.timer);
         this.timer = null;
@@ -77,6 +80,7 @@ export class TerminalResizeCoordinator {
     this.disposed = true;
     this.generation++;
     this.pending = null;
+    this.flushPendingWhenReady = false;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -92,6 +96,7 @@ export class TerminalResizeCoordinator {
     this.pending = null;
     this.inFlight = null;
     this.lastSuccessful = null;
+    this.flushPendingWhenReady = false;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -115,6 +120,7 @@ export class TerminalResizeCoordinator {
     const next = this.pending;
     this.pending = null;
     if (!next || sameSize(this.lastSuccessful, next)) {
+      this.flushPendingWhenReady = false;
       return;
     }
 
@@ -136,7 +142,12 @@ export class TerminalResizeCoordinator {
         if (this.inFlight === operation) {
           this.inFlight = null;
           if (this.pending && !this.disposed) {
-            this.schedule();
+            if (this.flushPendingWhenReady) {
+              this.flushPendingWhenReady = false;
+              this.flush();
+            } else {
+              this.schedule();
+            }
           }
         }
       });

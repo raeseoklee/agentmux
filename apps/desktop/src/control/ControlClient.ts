@@ -334,6 +334,7 @@ export interface GitStatusPage {
   workspaceId: string;
   repositoryId: string;
   generation: number;
+  summary?: GitStatusSummary | null;
   changes: GitChangeSummary[];
   nextCursor?: string | null;
   totalCount?: number | null;
@@ -1087,6 +1088,7 @@ export interface ControlClient {
   getGitStatusSummary(
     workspaceId: string,
     repositoryId?: string | null,
+    paneId?: string | null,
   ): Promise<GitStatusSummary>;
   getGitStatusPage(
     workspaceId: string,
@@ -1096,6 +1098,7 @@ export interface ControlClient {
       cursor?: string | null;
       limit?: number;
       generation?: number | null;
+      paneId?: string | null;
     },
   ): Promise<GitStatusPage>;
   getGitDiff(
@@ -1111,16 +1114,18 @@ export interface ControlClient {
       stage?: "staged" | "working" | "untracked" | string | null;
       contextLines?: number;
       generation?: number | null;
+      paneId?: string | null;
     },
   ): Promise<GitPagedDiff>;
-  stageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
-  unstageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
-  discardGitFiles(workspaceId: string, paths: string[]): Promise<void>;
-  stageAllGitFiles(workspaceId: string): Promise<void>;
-  unstageAllGitFiles(workspaceId: string): Promise<void>;
+  stageGitFiles(workspaceId: string, paths?: string[], options?: { repositoryId?: string | null; paneId?: string | null }): Promise<void>;
+  unstageGitFiles(workspaceId: string, paths?: string[], options?: { repositoryId?: string | null; paneId?: string | null }): Promise<void>;
+  discardGitFiles(workspaceId: string, paths: string[], options?: { repositoryId?: string | null; paneId?: string | null }): Promise<void>;
+  stageAllGitFiles(workspaceId: string, options?: { repositoryId?: string | null; paneId?: string | null }): Promise<void>;
+  unstageAllGitFiles(workspaceId: string, options?: { repositoryId?: string | null; paneId?: string | null }): Promise<void>;
   commitGitChanges(
     workspaceId: string,
     message: string,
+    options?: { repositoryId?: string | null; paneId?: string | null },
   ): Promise<GitCommitResult>;
   listGitReviewThreads(
     workspaceId: string,
@@ -2697,10 +2702,12 @@ class TauriControlClient implements ControlClient {
   async getGitStatusSummary(
     workspaceId: string,
     repositoryId?: string | null,
+    paneId?: string | null,
   ): Promise<GitStatusSummary> {
     const result = await this.call<GitStatusSummaryWire>("git.status_summary", {
       workspace_id: workspaceId,
       repository_id: repositoryId ?? null,
+      pane_id: paneId ?? null,
     });
     return mapGitStatusSummary(result);
   }
@@ -2713,6 +2720,7 @@ class TauriControlClient implements ControlClient {
       cursor?: string | null;
       limit?: number;
       generation?: number | null;
+      paneId?: string | null;
     } = {},
   ): Promise<GitStatusPage> {
     const result = await this.call<GitStatusPageWire>("git.status_page", {
@@ -2722,6 +2730,7 @@ class TauriControlClient implements ControlClient {
       cursor: options.cursor ?? null,
       limit: options.limit ?? null,
       generation: options.generation ?? null,
+      pane_id: options.paneId ?? null,
     });
     return mapGitStatusPage(result);
   }
@@ -2729,7 +2738,7 @@ class TauriControlClient implements ControlClient {
   async getGitPagedDiff(
     workspaceId: string,
     path: string,
-    options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {},
+    options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null; paneId?: string | null } = {},
   ): Promise<GitPagedDiff> {
     const result = await this.call<GitPagedDiffWire>("git.diff", {
       workspace_id: workspaceId,
@@ -2738,6 +2747,7 @@ class TauriControlClient implements ControlClient {
       stage: options.stage ?? null,
       context_lines: options.contextLines ?? null,
       generation: options.generation ?? null,
+      pane_id: options.paneId ?? null,
     });
     return mapGitPagedDiff(result);
   }
@@ -2756,42 +2766,49 @@ class TauriControlClient implements ControlClient {
     return mapGitDiff(result);
   }
 
-  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
+  async stageGitFiles(workspaceId: string, paths: string[] = [], options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> {
     await this.call("git.stage", {
       workspace_id: workspaceId,
       paths,
+      repository_id: options.repositoryId ?? null,
+      pane_id: options.paneId ?? null,
     });
   }
 
   async unstageGitFiles(
     workspaceId: string,
     paths: string[] = [],
+    options: { repositoryId?: string | null; paneId?: string | null } = {},
   ): Promise<void> {
     await this.call("git.unstage", {
       workspace_id: workspaceId,
       paths,
+      repository_id: options.repositoryId ?? null,
+      pane_id: options.paneId ?? null,
     });
   }
 
-  async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> {
-    await this.call("git.discard", { workspace_id: workspaceId, paths });
+  async discardGitFiles(workspaceId: string, paths: string[], options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> {
+    await this.call("git.discard", { workspace_id: workspaceId, paths, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null });
   }
 
-  async stageAllGitFiles(workspaceId: string): Promise<void> {
-    await this.call("git.stage_all", { workspace_id: workspaceId });
+  async stageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> {
+    await this.call("git.stage_all", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null });
   }
 
-  async unstageAllGitFiles(workspaceId: string): Promise<void> {
-    await this.call("git.unstage_all", { workspace_id: workspaceId });
+  async unstageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> {
+    await this.call("git.unstage_all", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null });
   }
 
   async commitGitChanges(
     workspaceId: string,
     message: string,
+    options: { repositoryId?: string | null; paneId?: string | null } = {},
   ): Promise<GitCommitResult> {
     const result = await this.call<GitCommitResultWire>("git.commit", {
       workspace_id: workspaceId,
       message,
+      pane_id: options.paneId ?? null,
     });
     return {
       commit: result.commit,
@@ -2910,6 +2927,7 @@ class BrowserPreviewControlClient implements ControlClient {
     string,
     Array<{ columns: number; rows: number }>
   >();
+  private readonly gitRequestLog: Array<{ operation: string; paneId: string | null }> = [];
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
   private readonly browserActionLog: string[] = [];
@@ -2981,6 +2999,7 @@ class BrowserPreviewControlClient implements ControlClient {
         const id = sessionId ?? this.lastSessionId;
         return id ? [...(this.terminalResizeLog.get(id) ?? [])] : [];
       },
+      gitRequests: () => [...this.gitRequestLog],
     };
     window.__AGENTMUX_PREVIEW__ = previewApi;
     if (window.__AGENTMUX_PREVIEW_SEED_WORKSPACE__ === true) {
@@ -4342,7 +4361,9 @@ class BrowserPreviewControlClient implements ControlClient {
   async getGitStatusSummary(
     workspaceId: string,
     _repositoryId?: string | null,
+    _paneId?: string | null,
   ): Promise<GitStatusSummary> {
+    this.gitRequestLog.push({ operation: "summary", paneId: _paneId ?? null });
     const status = await this.getGitStatus(workspaceId);
     const files = status.files;
     return {
@@ -4371,11 +4392,13 @@ class BrowserPreviewControlClient implements ControlClient {
       cursor?: string | null;
       limit?: number;
       generation?: number | null;
+      paneId?: string | null;
     } = {},
   ): Promise<GitStatusPage> {
+    this.gitRequestLog.push({ operation: "page", paneId: options.paneId ?? null });
     const [status, summary] = await Promise.all([
       this.getGitStatus(workspaceId),
-      this.getGitStatusSummary(workspaceId, options.repositoryId),
+      this.getGitStatusSummary(workspaceId, options.repositoryId, options.paneId),
     ]);
     const filtered = status.files.filter((change) => {
       switch (options.state) {
@@ -4394,6 +4417,7 @@ class BrowserPreviewControlClient implements ControlClient {
       workspaceId,
       repositoryId: summary.repositoryId,
       generation: summary.generation,
+      summary,
       changes: page.map((change) => ({
         path: change.path,
         originalPath: change.originalPath ?? null,
@@ -4838,7 +4862,7 @@ class BrowserPreviewControlClient implements ControlClient {
     };
   }
 
-  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
+  async stageGitFiles(workspaceId: string, paths: string[] = [], _options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status) return;
     const selected = new Set(paths);
@@ -4866,6 +4890,7 @@ class BrowserPreviewControlClient implements ControlClient {
   async unstageGitFiles(
     workspaceId: string,
     paths: string[] = [],
+    _options: { repositoryId?: string | null; paneId?: string | null } = {},
   ): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status) return;
@@ -4890,6 +4915,7 @@ class BrowserPreviewControlClient implements ControlClient {
   async commitGitChanges(
     workspaceId: string,
     message: string,
+    _options: { repositoryId?: string | null; paneId?: string | null } = {},
   ): Promise<GitCommitResult> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status || !status.files.some((change) => change.staged)) {
@@ -4922,17 +4948,17 @@ class BrowserPreviewControlClient implements ControlClient {
     return this.readSidebarState(workspace.workspaceId);
   }
 
-  async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {}): Promise<GitPagedDiff> {
-    const [diff, summary] = await Promise.all([this.getGitDiff(workspaceId, path, { staged: options.stage === "staged" }), this.getGitStatusSummary(workspaceId, options.repositoryId)]);
+  async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null; paneId?: string | null } = {}): Promise<GitPagedDiff> {
+    const [diff, summary] = await Promise.all([this.getGitDiff(workspaceId, path, { staged: options.stage === "staged" }), this.getGitStatusSummary(workspaceId, options.repositoryId, options.paneId)]);
     return { ...diff, workspaceId, repositoryId: summary.repositoryId, generation: summary.generation, originalPath: null, isBinary: false, diffHash: `${summary.generation}:${diff.patch.length}` };
   }
 
-  async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> {
+  async discardGitFiles(workspaceId: string, paths: string[], _options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (status) status.files = status.files.filter((change) => !paths.includes(change.path) && !paths.includes(change.originalPath ?? ""));
   }
-  async stageAllGitFiles(workspaceId: string): Promise<void> { await this.stageGitFiles(workspaceId); }
-  async unstageAllGitFiles(workspaceId: string): Promise<void> { await this.unstageGitFiles(workspaceId); }
+  async stageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.stageGitFiles(workspaceId, [], options); }
+  async unstageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.unstageGitFiles(workspaceId, [], options); }
 
   async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
     return [...this.gitReviewThreads.values()].filter((thread) => thread.workspaceId === workspaceId).filter((thread) => !options.repositoryId || thread.repositoryId === options.repositoryId).filter((thread) => !options.path || thread.anchor.path === options.path).filter((thread) => options.includeResolved || !thread.resolved).filter((thread) => options.includeStale || !thread.stale).slice(0, options.limit ?? 500).map(cloneGitReviewThread);
@@ -6428,23 +6454,23 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return mapGitDiff(result);
   }
 
-  async getGitStatusSummary(workspaceId: string, repositoryId?: string | null): Promise<GitStatusSummary> {
-    return mapGitStatusSummary(await this.serverControl<GitStatusSummaryWire>("git.status_summary", { workspace_id: workspaceId, repository_id: repositoryId ?? null }));
+  async getGitStatusSummary(workspaceId: string, repositoryId?: string | null, paneId?: string | null): Promise<GitStatusSummary> {
+    return mapGitStatusSummary(await this.serverControl<GitStatusSummaryWire>("git.status_summary", { workspace_id: workspaceId, repository_id: repositoryId ?? null, pane_id: paneId ?? null }));
   }
 
-  async getGitStatusPage(workspaceId: string, options: { repositoryId?: string | null; state?: string | null; cursor?: string | null; limit?: number; generation?: number | null } = {}): Promise<GitStatusPage> {
-    return mapGitStatusPage(await this.serverControl<GitStatusPageWire>("git.status_page", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, state: options.state ?? null, cursor: options.cursor ?? null, limit: options.limit ?? null, generation: options.generation ?? null }));
+  async getGitStatusPage(workspaceId: string, options: { repositoryId?: string | null; state?: string | null; cursor?: string | null; limit?: number; generation?: number | null; paneId?: string | null } = {}): Promise<GitStatusPage> {
+    return mapGitStatusPage(await this.serverControl<GitStatusPageWire>("git.status_page", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, state: options.state ?? null, cursor: options.cursor ?? null, limit: options.limit ?? null, generation: options.generation ?? null, pane_id: options.paneId ?? null }));
   }
 
-  async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {}): Promise<GitPagedDiff> {
-    return mapGitPagedDiff(await this.serverControl<GitPagedDiffWire>("git.diff", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path, stage: options.stage ?? null, context_lines: options.contextLines ?? null, generation: options.generation ?? null }));
+  async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null; paneId?: string | null } = {}): Promise<GitPagedDiff> {
+    return mapGitPagedDiff(await this.serverControl<GitPagedDiffWire>("git.diff", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path, stage: options.stage ?? null, context_lines: options.contextLines ?? null, generation: options.generation ?? null, pane_id: options.paneId ?? null }));
   }
 
-  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> { await this.serverControl("git.stage", { workspace_id: workspaceId, paths }); }
-  async unstageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> { await this.serverControl("git.unstage", { workspace_id: workspaceId, paths }); }
-  async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> { await this.serverControl("git.discard", { workspace_id: workspaceId, paths }); }
-  async stageAllGitFiles(workspaceId: string): Promise<void> { await this.serverControl("git.stage_all", { workspace_id: workspaceId }); }
-  async unstageAllGitFiles(workspaceId: string): Promise<void> { await this.serverControl("git.unstage_all", { workspace_id: workspaceId }); }
+  async stageGitFiles(workspaceId: string, paths: string[] = [], options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.stage", { workspace_id: workspaceId, paths, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
+  async unstageGitFiles(workspaceId: string, paths: string[] = [], options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.unstage", { workspace_id: workspaceId, paths, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
+  async discardGitFiles(workspaceId: string, paths: string[], options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.discard", { workspace_id: workspaceId, paths, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
+  async stageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.stage_all", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
+  async unstageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.unstage_all", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
 
   async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
     const result = await this.serverControl<GitReviewThreadListWire>("git.review_thread.list", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path: options.path ?? null, include_resolved: options.includeResolved ?? false, include_stale: options.includeStale ?? false, limit: options.limit ?? null });
@@ -6843,6 +6869,7 @@ interface BrowserPreviewApi {
   browserDialog(detail?: SyntheticBrowserDialogDetail): string | null;
   terminalOutput(sessionId?: string): string | null;
   terminalResizes(sessionId?: string): Array<{ columns: number; rows: number }>;
+  gitRequests(): Array<{ operation: string; paneId: string | null }>;
 }
 
 interface WorkspaceSummaryWire {
@@ -7097,6 +7124,7 @@ interface GitStatusPageWire {
   workspace_id: string;
   repository_id: string;
   generation: number;
+  summary?: GitStatusSummaryWire | null;
   changes: GitChangeSummaryWire[];
   next_cursor?: string | null;
   total_count?: number | null;
@@ -7744,6 +7772,7 @@ function mapGitStatusPage(value: GitStatusPageWire): GitStatusPage {
     workspaceId: value.workspace_id,
     repositoryId: value.repository_id,
     generation: value.generation,
+    summary: value.summary ? mapGitStatusSummary(value.summary) : null,
     changes: value.changes.map(mapGitChangeSummary),
     nextCursor: value.next_cursor ?? null,
     totalCount: value.total_count ?? null,

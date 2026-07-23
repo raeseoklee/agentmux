@@ -6656,6 +6656,14 @@ impl DesktopControlState {
         &self,
         workspace_id: &str,
     ) -> Result<GitCommandContext, DesktopHostError> {
+        self.workspace_git_context_for_pane(workspace_id, None)
+    }
+
+    fn workspace_git_context_for_pane(
+        &self,
+        workspace_id: &str,
+        pane_id: Option<&str>,
+    ) -> Result<GitCommandContext, DesktopHostError> {
         let Ok(store) = self.store.lock() else {
             return Err(DesktopHostError::StateUnavailable(
                 "desktop store state is unavailable".to_string(),
@@ -6664,12 +6672,25 @@ impl DesktopControlState {
         let bundle = store
             .load_workspace_bundle(workspace_id)?
             .ok_or_else(|| workspace_not_found(workspace_id))?;
-        let launch_spec = active_session_id(&bundle)
+        let session_id = match pane_id {
+            Some(pane_id) => Some(
+                terminal_session_for_pane(&bundle, pane_id)
+                    .ok_or_else(|| {
+                        control_invalid_request(format!(
+                            "Pane '{pane_id}' does not contain a terminal session in workspace '{workspace_id}'."
+                        ))
+                    })?
+                    .session_id
+                    .clone(),
+            ),
+            None => active_session_id(&bundle),
+        };
+        let launch_spec = session_id
             .as_deref()
             .map(|session_id| store.load_session_launch_spec(session_id))
             .transpose()?
             .flatten();
-        workspace_git_context_with_launch_spec(&bundle, launch_spec.as_ref())
+        workspace_git_context_with_session(&bundle, launch_spec.as_ref(), session_id.as_deref())
     }
 
     fn handle_profile_list(
@@ -13233,19 +13254,28 @@ fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn workspace_git_context_with_launch_spec(
     bundle: &WorkspaceBundle,
     launch_spec: Option<&PersistedSessionLaunchSpec>,
 ) -> Result<GitCommandContext, DesktopHostError> {
     let active_session_id = active_session_id(bundle);
+    workspace_git_context_with_session(bundle, launch_spec, active_session_id.as_deref())
+}
+
+fn workspace_git_context_with_session(
+    bundle: &WorkspaceBundle,
+    launch_spec: Option<&PersistedSessionLaunchSpec>,
+    session_id: Option<&str>,
+) -> Result<GitCommandContext, DesktopHostError> {
     let active_session = bundle
         .sessions
         .iter()
-        .find(|session| Some(session.session_id.as_str()) == active_session_id.as_deref());
+        .find(|session| Some(session.session_id.as_str()) == session_id);
     let cwd = bundle
         .sessions
         .iter()
-        .find(|session| Some(session.session_id.as_str()) == active_session_id.as_deref())
+        .find(|session| Some(session.session_id.as_str()) == session_id)
         .and_then(|session| clean_optional_text(session.cwd.clone()))
         .or_else(|| clean_optional_text(bundle.workspace.project_root.clone()))
         .ok_or_else(|| control_invalid_request("The workspace has no directory to inspect."))?;
@@ -15032,6 +15062,49 @@ mod tests {
             .expect("native Git context should resolve");
         assert_eq!(context.host, GitHost::Native);
         assert_eq!(context.cwd, r"D:\Projects\sample");
+    }
+
+    #[test]
+    fn git_context_can_target_a_non_active_terminal_pane() {
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+        bundle.sessions[0].cwd = Some(r"D:\Projects\left".to_string());
+        bundle.panes[2].mounted_surface_id = Some("surf_right".to_string());
+        bundle.surfaces.push(PersistedSurface {
+            surface_id: "surf_right".to_string(),
+            workspace_id: "ws_surface".to_string(),
+            surface_type: "terminal".to_string(),
+            title: "Right terminal".to_string(),
+            session_id: Some("ses_right".to_string()),
+            browser_id: None,
+            created_at: "2026-06-18T00:00:00Z".to_string(),
+            last_visible_at: None,
+            updated_at: "2026-06-18T00:00:00Z".to_string(),
+        });
+        bundle.sessions.push(PersistedSession {
+            session_id: "ses_right".to_string(),
+            workspace_id: "ws_surface".to_string(),
+            backend_kind: "wsl-direct".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some(r"D:\Projects\right".to_string()),
+            command: vec!["bash".to_string(), "-l".to_string()],
+            state: "running".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "2026-06-18T00:00:00Z".to_string(),
+            last_seen_at: None,
+            updated_at: "2026-06-18T00:00:00Z".to_string(),
+        });
+
+        let right = terminal_session_for_pane(&bundle, "pane_right")
+            .expect("right pane should resolve to its mounted terminal");
+        let context = workspace_git_context_with_session(&bundle, None, Some(&right.session_id))
+            .expect("pane-targeted WSL Git context should resolve");
+
+        assert_eq!(context.cwd, "/mnt/d/Projects/right");
+        assert_eq!(context.host, GitHost::Wsl { distribution: None });
+        assert_eq!(bundle.workspace.active_pane_id, "pane_left");
     }
 
     #[test]

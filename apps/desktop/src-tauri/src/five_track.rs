@@ -394,8 +394,9 @@ impl DesktopControlState {
     fn workspace_vcs_context(
         &self,
         workspace_id: &str,
+        pane_id: Option<&str>,
     ) -> Result<(GitContext, GitCommandContext), DesktopHostError> {
-        let legacy = self.workspace_git_context(workspace_id)?;
+        let legacy = self.workspace_git_context_for_pane(workspace_id, pane_id)?;
         let context = match &legacy.host {
             GitHost::Native => GitContext::native(legacy.cwd.clone()),
             GitHost::Wsl { distribution } => {
@@ -408,8 +409,33 @@ impl DesktopControlState {
     fn resolve_vcs_repository(
         &self,
         workspace_id: &str,
+        pane_id: Option<&str>,
+        repository_selector: Option<&str>,
     ) -> Result<(GitCommandContext, Repository), DesktopHostError> {
-        let (context, legacy) = self.workspace_vcs_context(workspace_id)?;
+        let (context, legacy) = self.workspace_vcs_context(workspace_id, pane_id)?;
+        if let Some(repository_id) = repository_selector {
+            let observed_key = format!("{workspace_id}|{repository_id}");
+            let observed_here = self
+                .five_track
+                .shared
+                .observed_repositories
+                .lock()
+                .ok()
+                .is_some_and(|observed| observed.contains_key(&observed_key));
+            let cached_repository = self
+                .five_track
+                .shared
+                .git_status_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(repository_id).cloned())
+                .map(|cached| cached.repository);
+            if let Some(repository) = cached_repository.filter(|repository| {
+                observed_here && git_context_matches_repository_root(&context, repository)
+            }) {
+                return Ok((legacy, repository));
+            }
+        }
         let repository = self
             .five_track
             .shared
@@ -510,7 +536,7 @@ impl DesktopControlState {
         request: &RequestEnvelope,
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: GitWorkspaceParams = request.parse_params()?;
-        let (context, _) = self.workspace_vcs_context(&params.workspace_id)?;
+        let (context, _) = self.workspace_vcs_context(&params.workspace_id, None)?;
         let Some(repository) = self
             .five_track
             .shared
@@ -545,7 +571,11 @@ impl DesktopControlState {
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: GitRepositoryParams = request.parse_params()?;
         validate_workspace_id(&params.workspace_id)?;
-        let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (_, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            params.pane_id.as_deref(),
+            params.repository_id.as_deref(),
+        )?;
         let (repository_id, cached) = self.status_snapshot(&params.workspace_id, &repository)?;
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let summary = &cached.snapshot.summary;
@@ -576,7 +606,11 @@ impl DesktopControlState {
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: GitStatusPageParams = request.parse_params()?;
         params.validate()?;
-        let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (_, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            params.pane_id.as_deref(),
+            params.repository_id.as_deref(),
+        )?;
         let (repository_id, cached) = self.status_snapshot(&params.workspace_id, &repository)?;
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         validate_generation(params.generation, cached.snapshot.summary.generation)?;
@@ -598,9 +632,25 @@ impl DesktopControlState {
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &GitStatusPageResult {
-                workspace_id: params.workspace_id,
-                repository_id,
+                workspace_id: params.workspace_id.clone(),
+                repository_id: repository_id.clone(),
                 generation: cached.snapshot.summary.generation,
+                summary: Some(GitStatusSummaryResult {
+                    workspace_id: params.workspace_id,
+                    repository_id,
+                    repository_root: cached.snapshot.summary.repository_root.clone(),
+                    branch: cached.snapshot.summary.branch.clone(),
+                    head_oid: cached.snapshot.summary.head.clone(),
+                    upstream: cached.snapshot.summary.upstream.clone(),
+                    ahead: cached.snapshot.summary.ahead,
+                    behind: cached.snapshot.summary.behind,
+                    staged_count: cached.snapshot.summary.staged_count,
+                    unstaged_count: cached.snapshot.summary.unstaged_count,
+                    untracked_count: cached.snapshot.summary.untracked_count,
+                    conflicted_count: cached.snapshot.summary.conflict_count,
+                    generation: cached.snapshot.summary.generation,
+                    refreshed_at: timestamp(),
+                }),
                 changes,
                 next_cursor: (end < filtered.len()).then(|| end.to_string()),
                 total_count: Some(filtered.len()),
@@ -617,7 +667,7 @@ impl DesktopControlState {
         if is_legacy {
             let params: GitDiffParams = request.parse_params()?;
             validate_git_relative_path(&params.path)?;
-            let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+            let (_, repository) = self.resolve_vcs_repository(&params.workspace_id, None, None)?;
             let result = self
                 .five_track
                 .shared
@@ -644,7 +694,11 @@ impl DesktopControlState {
 
         let params: IpcGitDiffParams = request.parse_params()?;
         params.validate()?;
-        let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (_, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            params.pane_id.as_deref(),
+            params.repository_id.as_deref(),
+        )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         validate_generation(
@@ -723,7 +777,11 @@ impl DesktopControlState {
         if !legacy_all {
             params.validate()?;
         }
-        let (legacy_context, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (legacy_context, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            params.pane_id.as_deref(),
+            params.repository_id.as_deref(),
+        )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         if let Some(result) = self.reused_git_mutation(
@@ -795,7 +853,11 @@ impl DesktopControlState {
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: GitAllMutationParams = request.parse_params()?;
         params.validate()?;
-        let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (_, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            params.pane_id.as_deref(),
+            params.repository_id.as_deref(),
+        )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         if let Some(result) = self.reused_git_mutation(
@@ -854,7 +916,11 @@ impl DesktopControlState {
             && raw.get("amend").is_none();
         let params: IpcGitCommitParams = request.parse_params()?;
         params.validate()?;
-        let (legacy_context, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (legacy_context, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            params.pane_id.as_deref(),
+            params.repository_id.as_deref(),
+        )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         if let Some(result) = self.reused_git_mutation(
@@ -1129,6 +1195,23 @@ fn repository_id(repository: &Repository) -> String {
         }
     };
     format!("repo_{:016x}", stable_hash(&(host, repository.root())))
+}
+
+fn git_context_matches_repository_root(context: &GitContext, repository: &Repository) -> bool {
+    if &context.host != repository.host() {
+        return false;
+    }
+    let normalize = |value: &str| {
+        let normalized = value.replace('\\', "/").trim_end_matches('/').to_string();
+        if matches!(&context.host, VcsGitHost::Native) {
+            normalized.to_ascii_lowercase()
+        } else {
+            normalized
+        }
+    };
+    let cwd = normalize(&context.cwd);
+    let root = normalize(repository.root());
+    cwd == root
 }
 
 fn stable_hash(value: &impl Hash) -> u64 {
@@ -1577,7 +1660,7 @@ impl DesktopControlState {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
 
-        let (context, _) = self.workspace_vcs_context(&params.workspace_id)?;
+        let (context, _) = self.workspace_vcs_context(&params.workspace_id, None)?;
         let repository = self
             .five_track
             .shared
@@ -2489,7 +2572,11 @@ impl DesktopControlState {
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: GitReviewThreadListParams = request.parse_params()?;
         params.validate()?;
-        let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (_, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            None,
+            params.repository_id.as_deref(),
+        )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let store = self.store.lock().map_err(|_| {
@@ -2530,7 +2617,11 @@ impl DesktopControlState {
         let params: GitReviewThreadCreateParams = request.parse_params()?;
         params.validate()?;
         validate_git_relative_path(&params.anchor.path)?;
-        let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
+        let (_, repository) = self.resolve_vcs_repository(
+            &params.workspace_id,
+            None,
+            params.repository_id.as_deref(),
+        )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let now = timestamp();
@@ -3965,6 +4056,11 @@ mod tests {
     }
 
     #[test]
+    fn git_page_pipeline_handles_15k_files_within_budget() {
+        assert_large_git_page_pipeline(15_000);
+    }
+
+    #[test]
     fn git_status_pages_share_one_snapshot_until_change_signal() {
         let repository = create_git_repository("paging");
         fs::write(repository.join("tracked.txt"), "changed\n").expect("modified fixture");
@@ -3987,6 +4083,7 @@ mod tests {
             METHOD_GIT_STATUS_SUMMARY,
             &GitRepositoryParams {
                 workspace_id: "ws_git".to_string(),
+                pane_id: None,
                 repository_id: None,
             },
         )));
@@ -3998,6 +4095,7 @@ mod tests {
             METHOD_GIT_STATUS_PAGE,
             &GitStatusPageParams {
                 workspace_id: "ws_git".to_string(),
+                pane_id: None,
                 repository_id: Some(summary.repository_id.clone()),
                 generation: Some(summary.generation),
                 state: None,
@@ -4007,6 +4105,13 @@ mod tests {
         )));
         assert_eq!(first.changes.len(), 5);
         assert_eq!(first.total_count, Some(12));
+        assert_eq!(
+            first
+                .summary
+                .as_ref()
+                .map(|value| value.repository_id.as_str()),
+            Some(summary.repository_id.as_str())
+        );
 
         fs::write(repository.join("late.txt"), "late\n").expect("late fixture");
         let second: GitStatusPageResult = decode_ok(host.handle_request(test_request(
@@ -4014,6 +4119,7 @@ mod tests {
             METHOD_GIT_STATUS_PAGE,
             &GitStatusPageParams {
                 workspace_id: "ws_git".to_string(),
+                pane_id: None,
                 repository_id: Some(summary.repository_id.clone()),
                 generation: Some(summary.generation),
                 state: None,
@@ -4031,6 +4137,7 @@ mod tests {
             METHOD_GIT_STATUS_SUMMARY,
             &GitRepositoryParams {
                 workspace_id: "ws_git".to_string(),
+                pane_id: None,
                 repository_id: Some(summary.repository_id),
             },
         )));
@@ -4040,6 +4147,71 @@ mod tests {
         assert!(refreshed.generation > summary.generation);
 
         fs::remove_dir_all(repository).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn pane_repository_resolution_rejects_cached_parent_for_nested_repository() {
+        let parent = create_git_repository("nested_repository_parent");
+        let nested = parent.join("nested");
+        fs::create_dir_all(&nested).expect("nested repository directory");
+        run_git(&nested, &["init", "-q"]);
+        run_git(&nested, &["config", "user.name", "AgentMux Test"]);
+        run_git(
+            &nested,
+            &["config", "user.email", "agentmux@example.invalid"],
+        );
+        fs::write(nested.join("nested.txt"), "nested\n").expect("nested fixture");
+        run_git(&nested, &["add", "nested.txt"]);
+        run_git(&nested, &["commit", "-q", "-m", "nested"]);
+
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let mut bundle = workspace_bundle(
+            "ws_nested_git",
+            Some(parent.to_string_lossy().to_string()),
+            &[("pane_git", "surface_git", "session_git")],
+        );
+        save_bundle(&host, &bundle);
+        let parent_summary: GitStatusSummaryResult = decode_ok(host.handle_request(test_request(
+            "parent_summary",
+            METHOD_GIT_STATUS_SUMMARY,
+            &GitRepositoryParams {
+                workspace_id: "ws_nested_git".to_string(),
+                pane_id: Some("pane_git".to_string()),
+                repository_id: None,
+            },
+        )));
+
+        bundle.sessions[0].cwd = Some(nested.to_string_lossy().to_string());
+        save_bundle(&host, &bundle);
+        let stale_parent = host.handle_request(test_request(
+            "stale_parent_page",
+            METHOD_GIT_STATUS_PAGE,
+            &GitStatusPageParams {
+                workspace_id: "ws_nested_git".to_string(),
+                pane_id: Some("pane_git".to_string()),
+                repository_id: Some(parent_summary.repository_id),
+                generation: None,
+                state: None,
+                cursor: None,
+                limit: Some(25),
+            },
+        ));
+        assert_eq!(error_code(stale_parent), ErrorCode::InvalidRequest);
+
+        let nested_summary: GitStatusSummaryResult = decode_ok(host.handle_request(test_request(
+            "nested_summary",
+            METHOD_GIT_STATUS_SUMMARY,
+            &GitRepositoryParams {
+                workspace_id: "ws_nested_git".to_string(),
+                pane_id: Some("pane_git".to_string()),
+                repository_id: None,
+            },
+        )));
+        assert_eq!(
+            normalized_path_text(Path::new(&nested_summary.repository_root)),
+            normalized_path_text(&nested)
+        );
+        fs::remove_dir_all(parent).expect("temporary repository cleanup");
     }
 
     #[test]
@@ -4249,6 +4421,7 @@ mod tests {
             METHOD_GIT_DIFF,
             &IpcGitDiffParams {
                 workspace_id: "ws_review_stale".to_string(),
+                pane_id: None,
                 repository_id: None,
                 path: "tracked.txt".to_string(),
                 stage: Some("worktree".to_string()),
@@ -4283,6 +4456,7 @@ mod tests {
             METHOD_GIT_DIFF,
             &IpcGitDiffParams {
                 workspace_id: "ws_review_stale".to_string(),
+                pane_id: None,
                 repository_id: None,
                 path: "tracked.txt".to_string(),
                 stage: Some("worktree".to_string()),

@@ -86,6 +86,7 @@ const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
 // user compares adjacent tabs, while still releasing inactive contexts.
 const WEBGL_DISABLE_DEBOUNCE_MS = 1500;
 const TERMINAL_RESIZE_SETTLE_MS = 160;
+const TERMINAL_LAYOUT_SETTLE_MS = 90;
 const TERMINAL_LINE_HEIGHT = 1.0;
 const PREVIEW_CACHE_ENABLED_KEY = "agentmux.terminal.previewCache";
 const PREVIEW_CACHE_PREFIX = "agentmux.terminal.preview.v1.";
@@ -490,6 +491,7 @@ export function LiveTerminal({
   const inputLineRef = useRef("");
   const bootingRef = useRef(true);
   const pollNowRef = useRef<(() => void) | null>(null);
+  const synchronizeLayoutRef = useRef<(() => void) | null>(null);
   const checkpointViewStateRef = useRef<(() => void) | null>(null);
   const webglDisableTimerRef = useRef<number | null>(null);
   const [rendererEpoch, setRendererEpoch] = useState(0);
@@ -727,33 +729,50 @@ export function LiveTerminal({
       resizeCoordinator.request(size, immediate);
     };
     const unsubscribeResize = renderer.onResize((columns, rows) => {
-      if (!alive) {
+      if (!alive || !activeRef.current) {
         return;
       }
       resizeCoordinator.request({ columns, rows });
     });
-    reportRendererSize(true);
+    if (activeRef.current) {
+      reportRendererSize(true);
+    }
     const resizeRetryTimers = [120, 400].map((delay) =>
       window.setTimeout(() => {
-        if (!alive) {
+        if (!alive || !activeRef.current) {
           return;
         }
-        renderer.fit();
-        reportRendererSize(false);
+        renderer.refreshDisplayMetrics();
+        reportRendererSize(true);
       }, delay)
     );
     let fitFrame: number | null = null;
+    let layoutSettleTimer: number | null = null;
     let displayMetricsFrame: number | null = null;
-    const requestFit = () => {
-      if (fitFrame !== null) {
+    const synchronizeLayout = () => {
+      if (!alive || !activeRef.current) {
         return;
       }
-      fitFrame = window.requestAnimationFrame(() => {
-        fitFrame = null;
-        renderer.fit();
-        reportRendererSize(false);
-      });
+      if (layoutSettleTimer !== null) {
+        window.clearTimeout(layoutSettleTimer);
+      }
+      layoutSettleTimer = window.setTimeout(() => {
+        layoutSettleTimer = null;
+        if (fitFrame !== null) {
+          window.cancelAnimationFrame(fitFrame);
+        }
+        fitFrame = window.requestAnimationFrame(() => {
+          fitFrame = null;
+          if (!alive || !activeRef.current) {
+            return;
+          }
+          renderer.refreshDisplayMetrics();
+          reportRendererSize(true);
+        });
+      }, TERMINAL_LAYOUT_SETTLE_MS);
     };
+    synchronizeLayoutRef.current = synchronizeLayout;
+    const requestFit = () => synchronizeLayout();
     const requestDisplayMetricsRefresh = () => {
       if (displayMetricsFrame !== null) {
         return;
@@ -763,8 +782,11 @@ export function LiveTerminal({
         if (!alive) {
           return;
         }
+        if (!activeRef.current) {
+          return;
+        }
         renderer.refreshDisplayMetrics?.();
-        reportRendererSize(false);
+        reportRendererSize(true);
       });
     };
     const resizeObserver = new ResizeObserver(requestFit);
@@ -809,6 +831,12 @@ export function LiveTerminal({
       }
       window.clearTimeout(bootingBackstop);
       resizeCoordinator.dispose();
+      if (synchronizeLayoutRef.current === synchronizeLayout) {
+        synchronizeLayoutRef.current = null;
+      }
+      if (layoutSettleTimer !== null) {
+        window.clearTimeout(layoutSettleTimer);
+      }
       if (fitFrame !== null) {
         window.cancelAnimationFrame(fitFrame);
       }
@@ -1485,6 +1513,7 @@ export function LiveTerminal({
       setTerminalOutputForeground(renderer, active);
     }
     if (active) {
+      synchronizeLayoutRef.current?.();
       renderer?.focus();
       pollNowRef.current?.();
     } else {

@@ -1373,6 +1373,34 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "performance gate creates 15,000 files; run through tools/run-performance-gates.ps1"]
+    fn reads_15k_native_status_records_within_budget() {
+        let directory = TempDir::new().expect("temporary repository should be created");
+        let context = GitContext::native(directory.path().to_string_lossy());
+        let client = GitClient::default();
+        run_setup(&client, &context, &["init", "-q"]);
+        let generated = directory.path().join("generated");
+        fs::create_dir(&generated).expect("generated fixture directory should be created");
+        for index in 0..15_000 {
+            fs::write(generated.join(format!("file-{index:05}.txt")), b"x")
+                .expect("performance fixture should be written");
+        }
+
+        let started_at = Instant::now();
+        let repository = client
+            .require_repository(&context)
+            .expect("repository should resolve");
+        let snapshot = client.read_status(&repository).expect("status should load");
+        let elapsed = started_at.elapsed();
+        assert_eq!(snapshot.summary.file_count, 15_000);
+        assert_eq!(snapshot.summary.untracked_count, 15_000);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "read 15,000 native status records in {elapsed:?}, budget was 20s"
+        );
+    }
+
+    #[test]
     fn native_repository_flow_covers_status_diff_mutations_and_validation() {
         let directory = TempDir::new().expect("temporary repository should be created");
         let context = GitContext::native(directory.path().to_string_lossy());

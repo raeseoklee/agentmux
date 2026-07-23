@@ -290,12 +290,6 @@ body {
   color: var(--fg1);
   box-shadow: -4px 0 12px rgb(0 0 0 / 10%);
   font-family: var(--font-sans, system-ui, sans-serif);
-  animation: agentmux-source-control-enter 120ms ease-out;
-}
-
-@keyframes agentmux-source-control-enter {
-  from { transform: translateX(12px); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
 }
 
 .agentmux-source-control__header {

@@ -145,8 +145,10 @@ function Get-Benchmarks {
     @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery") },
     @{ Name = "git-status-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_5k_porcelain_records_within_generous_budget", "--", "--exact") },
     @{ Name = "git-status-10k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_10k_porcelain_records_within_generous_budget", "--", "--exact") },
+    @{ Name = "git-status-native-15k"; Args = @("test", "-p", "agentmux-vcs", "tests::reads_15k_native_status_records_within_budget", "--", "--ignored", "--exact") },
     @{ Name = "git-page-pipeline-5k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_5k_files_within_budget", "--", "--exact") },
     @{ Name = "git-page-pipeline-10k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_10k_files_within_budget", "--", "--exact") }
+    @{ Name = "git-page-pipeline-15k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_15k_files_within_budget", "--", "--exact") }
   )
 }
 

@@ -167,10 +167,6 @@ test("source control panel stages, previews, and commits workspace changes", asy
   await expect(
     panel.locator(".agentmux-source-control__directory").first(),
   ).toHaveCSS("font-size", "11.5px");
-  await expect(
-    panel.locator(".agentmux-source-control__diff-line").first(),
-  ).toHaveCSS("font-size", "11.5px");
-
   const changesPane = panel.locator(".agentmux-source-control__changes");
   const diffPane = panel.locator(".agentmux-source-control__diff");
   const splitter = panel.getByRole("separator", {
@@ -214,6 +210,9 @@ test("source control panel stages, previews, and commits workspace changes", asy
     .getByTestId("source-control-change-working")
     .locator(".agentmux-source-control__change-main")
     .click();
+  await expect(
+    panel.locator(".agentmux-source-control__diff-line").first(),
+  ).toHaveCSS("font-size", "11.5px");
   await expect(panel.locator(".agentmux-source-control__diff-lines")).toContainText(
     "AgentMux working tree preview",
   );
@@ -243,6 +242,30 @@ test("source control panel stages, previews, and commits workspace changes", asy
     "title",
     "Stage at least one change before committing.",
   );
+});
+
+test("source control panel follows the active terminal pane", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-pane-split-horizontal").click();
+
+  const panes = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(panes).toHaveCount(2);
+  await page.locator(".agentmux-status-git-button").click();
+  await expect(page.getByTestId("source-control-panel")).toBeVisible();
+
+  for (let index = 0; index < 2; index += 1) {
+    const pane = panes.nth(index);
+    const paneId = await pane.getAttribute("data-agentmux-pane");
+    expect(paneId).toBeTruthy();
+    await pane.click({ position: { x: 24, y: 24 } });
+    await expect.poll(() => page.evaluate(() => {
+      const requests = (window as unknown as {
+        __AGENTMUX_PREVIEW__?: { gitRequests(): Array<{ operation: string; paneId: string | null }> };
+      }).__AGENTMUX_PREVIEW__?.gitRequests() ?? [];
+      return requests.filter((request) => request.operation === "page").at(-1)?.paneId ?? null;
+    })).toBe(paneId);
+  }
 });
 
 test("status bar exposes the current folder as an Explorer action", async ({ page }) => {
@@ -1138,6 +1161,19 @@ test("terminal viewport resize bursts are coalesced", async ({ page }) => {
   const resizeDelta = (await resizeCount()) - before;
   expect(resizeDelta).toBeGreaterThanOrEqual(1);
   expect(resizeDelta).toBeLessThanOrEqual(2);
+
+  const beforePanelToggle = await resizeCount();
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await expect(panel).toBeVisible();
+  await page.waitForTimeout(250);
+  await panel.getByRole("button", { name: "Close" }).click();
+  await expect(panel).toBeHidden();
+  await page.waitForTimeout(250);
+
+  const panelResizeDelta = (await resizeCount()) - beforePanelToggle;
+  expect(panelResizeDelta).toBeGreaterThanOrEqual(2);
+  expect(panelResizeDelta).toBeLessThanOrEqual(4);
 });
 
 test("split pane surfaces can be swapped with explicit controls", async ({

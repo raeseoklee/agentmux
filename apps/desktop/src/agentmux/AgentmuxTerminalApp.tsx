@@ -9175,6 +9175,9 @@ export function AgentmuxTerminalApp() {
             <SourceControlPanel
               client={client}
               workspace={activeWorkspace}
+              activePaneId={activePaneId ?? null}
+              activeSessionId={activeTerminalSession?.sessionId ?? null}
+              activeCwd={sidebarState?.cwd ?? null}
               onClose={closeOverlay}
               onRepositoryChanged={ctl.refreshSidebar}
               t={t}
