@@ -4376,6 +4376,7 @@ fn review_thread_result(
         thread_id: thread.thread_id.clone(),
         workspace_id: thread.workspace_id.clone().unwrap_or_default(),
         repository_id: repository_id.to_string(),
+        author_session_id: (thread.author_id != "user").then(|| thread.author_id.clone()),
         anchor,
         resolved: thread.resolved_at.is_some(),
         stale: thread.stale,
@@ -6039,6 +6040,7 @@ mod tests {
             },
         )));
         assert_eq!(created.repository_id, summary_a.repository_id);
+        assert_eq!(created.author_session_id.as_deref(), Some("session_a"));
 
         let listed: GitReviewThreadListResult = decode_ok(host.handle_request(test_request(
             "review_focus_list_a",
@@ -6055,6 +6057,10 @@ mod tests {
         )));
         assert_eq!(listed.threads.len(), 1);
         assert_eq!(listed.threads[0].thread_id, created.thread_id);
+        assert_eq!(
+            listed.threads[0].author_session_id.as_deref(),
+            Some("session_a")
+        );
 
         let focus_pivot = host.handle_request(test_request(
             "review_focus_list_without_pane",
