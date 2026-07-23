@@ -3147,9 +3147,7 @@ fn normalized_posix_path_segments(path: &str) -> Option<Vec<&str>> {
 
 fn worktree_paths_equal(host: &VcsGitHost, left: &str, right: &str) -> bool {
     match host {
-        VcsGitHost::Native => left
-            .replace('/', "\\")
-            .eq_ignore_ascii_case(&right.replace('/', "\\")),
+        VcsGitHost::Native => paths_equivalent(Path::new(left), Path::new(right)),
         VcsGitHost::Wsl { .. } => left.trim_end_matches('/') == right.trim_end_matches('/'),
     }
 }
@@ -5419,10 +5417,10 @@ mod tests {
                 repository_id: None,
             },
         )));
-        assert_eq!(
-            normalized_path_text(Path::new(&nested_summary.repository_root)),
-            normalized_path_text(&nested)
-        );
+        assert!(paths_equivalent(
+            Path::new(&nested_summary.repository_root),
+            &nested
+        ));
         fs::remove_dir_all(parent).expect("temporary repository cleanup");
     }
 

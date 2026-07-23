@@ -395,7 +395,9 @@ test("status bar exposes the current folder as an Explorer action", async ({ pag
   });
 
   const path = page.locator(".agentmux-status-path");
-  await expect(path).toContainText("/mnt/d/Projects/sample");
+  await expect(path).toContainText("/mnt/d/Projects/sample", {
+    timeout: 1_000,
+  });
   await expect(path).toHaveAttribute(
     "title",
     "Open /mnt/d/Projects/sample in File Explorer",
