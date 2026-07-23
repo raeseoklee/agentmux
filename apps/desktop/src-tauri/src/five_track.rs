@@ -216,6 +216,8 @@ struct ObservedRepository {
     fallback_status_hash: Option<u64>,
     next_fallback_status_at: Instant,
     last_event_at: Option<Instant>,
+    pending_change_reason: Option<String>,
+    debounce_cancel: Option<Arc<AtomicBool>>,
     last_observed_at: Instant,
 }
 
@@ -693,6 +695,9 @@ impl DesktopControlState {
                     if let Some(cancel) = evicted.watch_cancel.take() {
                         cancel.request();
                     }
+                    if let Some(cancel) = evicted.debounce_cancel.take() {
+                        cancel.store(true, Ordering::Release);
+                    }
                 }
             }
         }
@@ -723,6 +728,8 @@ impl DesktopControlState {
                 fallback_status_hash: None,
                 next_fallback_status_at: Instant::now(),
                 last_event_at: None,
+                pending_change_reason: None,
+                debounce_cancel: None,
                 last_observed_at: Instant::now(),
             });
     }
@@ -1705,29 +1712,99 @@ fn reconcile_observed_repositories(shared: &Arc<FiveTrackShared>, app: Option<&t
 }
 
 fn signal_repository_changed(
-    shared: &FiveTrackShared,
+    shared: &Arc<FiveTrackShared>,
     key: &str,
     reason: &str,
     app: Option<&tauri::AppHandle>,
 ) {
-    let snapshot = shared
+    let cancellation = shared
         .observed_repositories
         .lock()
         .ok()
         .and_then(|mut observed| {
             let entry = observed.get_mut(key)?;
-            if entry
-                .last_event_at
-                .is_some_and(|last| last.elapsed() < REPOSITORY_EVENT_DEBOUNCE)
-            {
-                return None;
-            }
             entry.last_event_at = Some(Instant::now());
-            Some(entry.clone())
+            entry.pending_change_reason = Some(reason.to_string());
+            if entry.debounce_cancel.is_some() {
+                return Some(None);
+            }
+            let cancellation = Arc::new(AtomicBool::new(false));
+            entry.debounce_cancel = Some(Arc::clone(&cancellation));
+            Some(Some(cancellation))
         });
-    let Some(snapshot) = snapshot else {
+    let Some(cancellation) = cancellation else {
         return;
     };
+    let Some(cancellation) = cancellation else {
+        return;
+    };
+    let shared = Arc::clone(shared);
+    let key = key.to_string();
+    let app = app.cloned();
+    let worker_shared = Arc::clone(&shared);
+    let worker_key = key.clone();
+    let worker_app = app.clone();
+    let worker_cancellation = Arc::clone(&cancellation);
+    let spawn = thread::Builder::new()
+        .name("agentmux-git-debounce".to_string())
+        .spawn(move || {
+            flush_repository_change_after_debounce(
+                worker_shared,
+                worker_key,
+                worker_app,
+                worker_cancellation,
+            )
+        });
+    if spawn.is_err() {
+        flush_repository_change_after_debounce(shared, key, app, cancellation);
+    }
+}
+
+fn flush_repository_change_after_debounce(
+    shared: Arc<FiveTrackShared>,
+    key: String,
+    app: Option<tauri::AppHandle>,
+    cancellation: Arc<AtomicBool>,
+) {
+    let snapshot = loop {
+        if cancellation.load(Ordering::Acquire) {
+            return;
+        }
+        let next = shared
+            .observed_repositories
+            .lock()
+            .ok()
+            .and_then(|mut observed| {
+                let entry = observed.get_mut(&key)?;
+                if !entry
+                    .debounce_cancel
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &cancellation))
+                {
+                    return None;
+                }
+                let Some(last_event_at) = entry.last_event_at else {
+                    entry.debounce_cancel = None;
+                    return None;
+                };
+                let elapsed = last_event_at.elapsed();
+                if elapsed < REPOSITORY_EVENT_DEBOUNCE {
+                    return Some(Err(REPOSITORY_EVENT_DEBOUNCE - elapsed));
+                }
+                let reason = entry
+                    .pending_change_reason
+                    .take()
+                    .unwrap_or_else(|| "filesystem_watcher".to_string());
+                entry.debounce_cancel = None;
+                Some(Ok((entry.clone(), reason)))
+            });
+        match next {
+            Some(Err(wait)) => thread::sleep(wait),
+            Some(Ok(snapshot)) => break snapshot,
+            None => return,
+        }
+    };
+    let (snapshot, reason) = snapshot;
     let generation = shared.git.mark_repository_changed(&snapshot.repository);
     if let Ok(mut scans) = shared.git_status_scans.lock() {
         if let Some(active) = scans.remove(&snapshot.repository_id) {
@@ -1744,7 +1821,7 @@ fn signal_repository_changed(
                 workspace_id: snapshot.workspace_id,
                 repository_id: snapshot.repository_id,
                 generation,
-                reason: reason.to_string(),
+                reason,
             },
         );
     }
@@ -5243,6 +5320,29 @@ mod tests {
 
         let key = format!("ws_git|{}", summary.repository_id);
         signal_repository_changed(&host.five_track.shared, &key, "test", None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && host
+                .five_track
+                .shared
+                .observed_repositories
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|entry| entry.debounce_cancel.is_some())
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            host.five_track
+                .shared
+                .observed_repositories
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|entry| entry.debounce_cancel.is_none()),
+            "the trailing-edge change signal must finish before requesting a new snapshot"
+        );
         let refreshed: GitStatusSummaryResult = decode_ok(host.handle_request(test_request(
             "git_summary_refreshed",
             METHOD_GIT_STATUS_SUMMARY,
@@ -6211,6 +6311,69 @@ mod tests {
             thread::sleep(Duration::from_millis(25));
         }
         assert!(host.five_track.shared.git.generation(&repository) > generation);
+        fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn repository_watcher_coalesces_rapid_changes_at_the_trailing_edge() {
+        let repository_path = create_git_repository("watcher-trailing-edge");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .expect("resolved repository");
+        let repository_id = repository_id(&repository);
+        let key = format!("ws_watch_trailing|{repository_id}");
+        host.observe_repository("ws_watch_trailing", &repository_id, &repository);
+        let initial_generation = host.five_track.shared.git.generation(&repository);
+
+        signal_repository_changed(&host.five_track.shared, &key, "first_change", None);
+        thread::sleep(REPOSITORY_EVENT_DEBOUNCE / 2);
+        signal_repository_changed(&host.five_track.shared, &key, "second_change", None);
+        assert_eq!(
+            host.five_track
+                .shared
+                .observed_repositories
+                .lock()
+                .unwrap()
+                .get(&key)
+                .and_then(|entry| entry.pending_change_reason.as_deref()),
+            Some("second_change"),
+            "the most recent event must remain pending until the trailing refresh"
+        );
+
+        // A leading-edge implementation would have refreshed before the second event.
+        thread::sleep(REPOSITORY_EVENT_DEBOUNCE / 2);
+        assert_eq!(
+            host.five_track.shared.git.generation(&repository),
+            initial_generation,
+            "the refresh must wait until the last event in the burst"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && host.five_track.shared.git.generation(&repository) == initial_generation
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            host.five_track.shared.git.generation(&repository) == initial_generation + 1,
+            "the second rapid change must trigger the trailing refresh"
+        );
+        assert!(
+            host.five_track
+                .shared
+                .observed_repositories
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|entry| entry.debounce_cancel.is_none()),
+            "the completed debounce task must clean itself up"
+        );
         fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
     }
 }

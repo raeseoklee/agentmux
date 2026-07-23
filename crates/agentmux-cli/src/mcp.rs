@@ -644,6 +644,7 @@ impl ControlTransport for NamedPipeTransport {
 pub(super) struct AgentMuxMcpServer {
     profile: McpProfile,
     control: Arc<dyn ControlTransport>,
+    standard_caller_binding: Option<StandardCallerBinding>,
     team_operations: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<Self>,
 }
@@ -651,13 +652,22 @@ pub(super) struct AgentMuxMcpServer {
 #[tool_router]
 impl AgentMuxMcpServer {
     fn new(options: McpOptions) -> Self {
-        Self::with_transport(
+        Self::with_transport_and_binding(
             options.profile,
             Arc::new(NamedPipeTransport::for_mcp(options.invoke, options.profile)),
+            StandardCallerBinding::from_environment(),
         )
     }
 
     fn with_transport(profile: McpProfile, control: Arc<dyn ControlTransport>) -> Self {
+        Self::with_transport_and_binding(profile, control, None)
+    }
+
+    fn with_transport_and_binding(
+        profile: McpProfile,
+        control: Arc<dyn ControlTransport>,
+        standard_caller_binding: Option<StandardCallerBinding>,
+    ) -> Self {
         let mut tool_router = Self::tool_router();
         let denied = tool_router
             .list_all()
@@ -672,6 +682,7 @@ impl AgentMuxMcpServer {
         Self {
             profile,
             control,
+            standard_caller_binding,
             team_operations: Arc::new(tokio::sync::Mutex::new(())),
             tool_router,
         }
@@ -732,13 +743,36 @@ impl AgentMuxMcpServer {
                 "caller-scoped authorization is available only to the standard profile",
             ));
         }
+        let binding = self.standard_caller_binding.as_ref().ok_or_else(|| {
+            standard_scope_denied_result(
+                tool_name,
+                "the MCP connection is not bound to a verifiable AgentMux pane",
+            )
+        })?;
         let context = self
-            .resolve_context(None)
+            .invoke_value(
+                "system.identify",
+                json!({
+                    "workspace_id": binding.workspace_id,
+                    "pane_id": binding.pane_id,
+                    "surface_id": binding.surface_id,
+                }),
+            )
             .await
+            .and_then(|value| {
+                serde_json::from_value::<ResolvedContext>(value)
+                    .map_err(|error| format!("invalid system.identify response: {error}"))
+            })
             .map_err(|message| control_error_result("system.identify", message))?;
         let workspace_id = context
             .workspace_id
             .ok_or_else(|| missing_context_result("workspace_id"))?;
+        if workspace_id != binding.workspace_id {
+            return Err(standard_scope_denied_result(
+                tool_name,
+                "the resolved workspace does not match the MCP connection binding",
+            ));
+        }
         if requested_workspace_id.is_some_and(|requested| requested != workspace_id) {
             return Err(standard_scope_denied_result(
                 tool_name,
@@ -748,6 +782,12 @@ impl AgentMuxMcpServer {
         let pane_id = context
             .pane_id
             .ok_or_else(|| missing_context_result("pane_id"))?;
+        if pane_id != binding.pane_id {
+            return Err(standard_scope_denied_result(
+                tool_name,
+                "the resolved pane does not match the MCP connection binding",
+            ));
+        }
         if requested_pane_id.is_some_and(|requested| requested != pane_id) {
             return Err(standard_scope_denied_result(
                 tool_name,
@@ -757,6 +797,12 @@ impl AgentMuxMcpServer {
         let session_id = context
             .session_id
             .ok_or_else(|| missing_context_result("session_id"))?;
+        if context.surface_id.as_deref() != Some(binding.surface_id.as_str()) {
+            return Err(standard_scope_denied_result(
+                tool_name,
+                "the resolved surface does not match the MCP connection binding",
+            ));
+        }
         let summary = self
             .invoke_value(
                 METHOD_GIT_STATUS_SUMMARY,
@@ -5751,6 +5797,30 @@ struct ResolvedContext {
     cwd: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct StandardCallerBinding {
+    workspace_id: String,
+    pane_id: String,
+    surface_id: String,
+}
+
+impl StandardCallerBinding {
+    fn from_environment() -> Option<Self> {
+        let value = |primary: &str, fallback: &str| {
+            std::env::var(primary)
+                .ok()
+                .or_else(|| std::env::var(fallback).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+        Some(Self {
+            workspace_id: value("AGENTMUX_WORKSPACE_ID", "CMUX_WORKSPACE_ID")?,
+            pane_id: value("AGENTMUX_PANE_ID", "CMUX_PANE_ID")?,
+            surface_id: value("AGENTMUX_SURFACE_ID", "CMUX_SURFACE_ID")?,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct StandardCallerScope {
     workspace_id: String,
@@ -7039,9 +7109,10 @@ mod tests {
                 .collect(),
             calls: Mutex::new(Vec::new()),
         });
-        let server = AgentMuxMcpServer::with_transport(
+        let server = AgentMuxMcpServer::with_transport_and_binding(
             profile,
             Arc::clone(&transport) as Arc<dyn ControlTransport>,
+            (profile == McpProfile::Standard).then(standard_caller_binding),
         );
         (server, transport)
     }
@@ -7059,17 +7130,27 @@ mod tests {
             ),
             calls: Mutex::new(Vec::new()),
         });
-        let server = AgentMuxMcpServer::with_transport(
+        let server = AgentMuxMcpServer::with_transport_and_binding(
             profile,
             Arc::clone(&transport) as Arc<dyn ControlTransport>,
+            (profile == McpProfile::Standard).then(standard_caller_binding),
         );
         (server, transport)
+    }
+
+    fn standard_caller_binding() -> StandardCallerBinding {
+        StandardCallerBinding {
+            workspace_id: "workspace-1".to_string(),
+            pane_id: "pane-1".to_string(),
+            surface_id: "surface-1".to_string(),
+        }
     }
 
     fn standard_caller_context() -> Value {
         json!({
             "workspace_id": "workspace-1",
             "pane_id": "pane-1",
+            "surface_id": "surface-1",
             "session_id": "session-agent",
         })
     }
@@ -7362,6 +7443,7 @@ mod tests {
                     json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     }),
                 ),
@@ -7409,6 +7491,7 @@ mod tests {
                     json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     }),
                 )],
@@ -7447,6 +7530,7 @@ mod tests {
                     json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     }),
                 ),
@@ -7488,6 +7572,7 @@ mod tests {
                     json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     }),
                 ),
@@ -7567,6 +7652,10 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
         let calls = transport.calls.lock().expect("fake calls lock");
         assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "system.identify");
+        assert_eq!(calls[0].1["workspace_id"], "workspace-1");
+        assert_eq!(calls[0].1["pane_id"], "pane-1");
+        assert_eq!(calls[0].1["surface_id"], "surface-1");
         assert_eq!(calls[2].0, METHOD_GIT_REVIEW_THREAD_CREATE);
         assert_eq!(calls[2].1["workspace_id"], "workspace-1");
         assert_eq!(calls[2].1["repository_id"], "repo-1");
@@ -7648,6 +7737,83 @@ mod tests {
                 .iter()
                 .all(|(method, _)| method != METHOD_GIT_REVIEW_THREAD_CREATE));
         }
+    }
+
+    #[tokio::test]
+    async fn standard_review_authority_does_not_follow_pane_focus() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", Ok(standard_caller_context())),
+                ("pane.focus", Ok(json!({"focused": true}))),
+                (
+                    "system.identify",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-peer",
+                        "surface_id": "surface-peer",
+                        "session_id": "session-peer",
+                    })),
+                ),
+            ],
+        );
+
+        let focused = server
+            .pane_focus(Parameters(PaneFocusToolParams {
+                workspace_id: Some("workspace-1".to_string()),
+                pane_id: Some("pane-peer".to_string()),
+            }))
+            .await;
+        assert_eq!(focused.is_error, Some(false));
+
+        let denied = server
+            .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                thread_id: "review-peer".to_string(),
+                resolved: Some(true),
+                anchor: None,
+            }))
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+        assert!(denied.structured_content.as_ref().is_some_and(|value| value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("does not match the MCP connection binding"))));
+
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls[1].0, "pane.focus");
+        assert_eq!(calls[2].0, "system.identify");
+        assert_eq!(calls[2].1["workspace_id"], "workspace-1");
+        assert_eq!(calls[2].1["pane_id"], "pane-1");
+        assert_eq!(calls[2].1["surface_id"], "surface-1");
+        assert!(calls
+            .iter()
+            .all(|(method, _)| method != METHOD_GIT_REVIEW_THREAD_UPDATE));
+    }
+
+    #[tokio::test]
+    async fn standard_review_mutation_without_verified_pane_binding_fails_closed() {
+        let transport = Arc::new(FakeTransport {
+            responses: HashMap::new(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let server = AgentMuxMcpServer::with_transport(
+            McpProfile::Standard,
+            Arc::clone(&transport) as Arc<dyn ControlTransport>,
+        );
+
+        let denied = server
+            .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                thread_id: "review-forged".to_string(),
+                resolved: Some(true),
+                anchor: None,
+            }))
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+        assert!(denied.structured_content.as_ref().is_some_and(|value| value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("not bound to a verifiable AgentMux pane"))));
+        assert!(transport.calls.lock().expect("fake calls lock").is_empty());
     }
 
     #[tokio::test]
@@ -7930,6 +8096,7 @@ mod tests {
                     Ok(json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     })),
                 ),
@@ -7994,6 +8161,7 @@ mod tests {
                     Ok(json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     })),
                 ),
@@ -8046,6 +8214,7 @@ mod tests {
                     Ok(json!({
                         "workspace_id": "workspace-1",
                         "pane_id": "pane-1",
+                        "surface_id": "surface-1",
                         "session_id": "session-agent",
                     })),
                 ),

@@ -7403,7 +7403,10 @@ fn parse_identify_options(args: &[String]) -> Result<IdentifyOptions, CliError> 
     }
     Ok(IdentifyOptions {
         invoke,
-        params: SystemIdentifyParams { workspace_id },
+        params: SystemIdentifyParams {
+            workspace_id,
+            ..SystemIdentifyParams::default()
+        },
     })
 }
 
@@ -8385,7 +8388,7 @@ impl ServerState {
             && constant_time_eq(&ticket.origin, origin)
     }
 
-    fn allow_websocket_mutation(
+    fn allow_websocket_frame(
         &mut self,
         client_ip: Option<IpAddr>,
         frame_bytes: usize,
@@ -9049,28 +9052,30 @@ fn handle_server_websocket(
 
     loop {
         match socket.read() {
-            Ok(WsMessage::Text(text)) => {
-                let now = Instant::now();
-                let frame_bytes = text.len();
-                let global_allowed = state
-                    .lock()
-                    .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?
-                    .allow_websocket_mutation(client_ip, frame_bytes, now);
-                if frame_bytes > SERVER_WEBSOCKET_MAX_MESSAGE_BYTES
-                    || !connection_rate.allow(frame_bytes, now)
-                    || !global_allowed
-                {
+            Ok(message) => {
+                if !allow_server_websocket_inbound_frame(
+                    &state,
+                    client_ip,
+                    &mut connection_rate,
+                    &message,
+                    Instant::now(),
+                )? {
                     let _ = socket.close(None);
                     return Ok(());
                 }
-                if handle_server_websocket_message(&session_id, &text, &state).is_err() {
-                    let _ = socket.close(None);
-                    return Ok(());
+
+                match message {
+                    WsMessage::Text(text) => {
+                        if handle_server_websocket_message(&session_id, &text, &state).is_err() {
+                            let _ = socket.close(None);
+                            return Ok(());
+                        }
+                    }
+                    WsMessage::Binary(_) | WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                    WsMessage::Close(_) => break,
+                    WsMessage::Frame(_) => {}
                 }
             }
-            Ok(WsMessage::Binary(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
-            Ok(WsMessage::Close(_)) => break,
-            Ok(WsMessage::Frame(_)) => {}
             Err(WsError::Io(error))
                 if matches!(
                     error.kind(),
@@ -9086,6 +9091,23 @@ fn handle_server_websocket(
     }
 
     Ok(())
+}
+
+fn allow_server_websocket_inbound_frame(
+    state: &Arc<Mutex<ServerState>>,
+    client_ip: Option<IpAddr>,
+    connection_rate: &mut ServerWebSocketRateWindow,
+    message: &WsMessage,
+    now: Instant,
+) -> Result<bool, CliError> {
+    let frame_bytes = message.len();
+    let within_message_limit = frame_bytes <= SERVER_WEBSOCKET_MAX_MESSAGE_BYTES;
+    let connection_allowed = connection_rate.allow(frame_bytes, now);
+    let client_allowed = state
+        .lock()
+        .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?
+        .allow_websocket_frame(client_ip, frame_bytes, now);
+    Ok(within_message_limit && connection_allowed && client_allowed)
 }
 
 fn websocket_error(error: WsError) -> CliError {
@@ -11254,6 +11276,7 @@ where
 {
     let params = SystemIdentifyParams {
         workspace_id: options.workspace_id,
+        ..SystemIdentifyParams::default()
     };
     let response = invoke_control("system.identify", &params, &options.invoke)?;
     if options.invoke.json {
@@ -14625,7 +14648,10 @@ fn identify_context(
 ) -> Result<SystemIdentifyResult, CliError> {
     let response = invoke_control(
         "system.identify",
-        &SystemIdentifyParams { workspace_id },
+        &SystemIdentifyParams {
+            workspace_id,
+            ..SystemIdentifyParams::default()
+        },
         invoke,
     )?;
     response_result(&response)
@@ -18567,7 +18593,7 @@ mod tests {
     }
 
     #[test]
-    fn server_websocket_mutation_rate_is_bounded_per_connection_and_client() {
+    fn server_websocket_frame_rate_is_bounded_per_connection_and_client() {
         let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
         let mut state = ServerState::new(options);
         let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
@@ -18576,17 +18602,100 @@ mod tests {
 
         for _ in 0..SERVER_WEBSOCKET_RATE_FRAMES {
             assert!(connection.allow(1, now));
-            assert!(state.allow_websocket_mutation(Some(client_ip), 1, now));
+            assert!(state.allow_websocket_frame(Some(client_ip), 1, now));
         }
         assert!(!connection.allow(1, now));
-        assert!(!state.allow_websocket_mutation(Some(client_ip), 1, now));
+        assert!(!state.allow_websocket_frame(Some(client_ip), 1, now));
 
         let reset_at = now + SERVER_WEBSOCKET_RATE_WINDOW + Duration::from_millis(1);
         assert!(connection.allow(1, reset_at));
-        assert!(state.allow_websocket_mutation(Some(client_ip), 1, reset_at));
+        assert!(state.allow_websocket_frame(Some(client_ip), 1, reset_at));
 
         let mut byte_limited = ServerWebSocketRateWindow::new(now);
         assert!(!byte_limited.allow(SERVER_WEBSOCKET_RATE_BYTES + 1, now));
+    }
+
+    #[test]
+    fn server_websocket_binary_frames_share_connection_and_client_budgets() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new(options)));
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut connection = ServerWebSocketRateWindow::new(now);
+
+        for _ in 0..SERVER_WEBSOCKET_RATE_FRAMES {
+            assert!(allow_server_websocket_inbound_frame(
+                &state,
+                Some(client_ip),
+                &mut connection,
+                &WsMessage::Binary(vec![0x42]),
+                now,
+            )
+            .unwrap());
+        }
+        assert!(!allow_server_websocket_inbound_frame(
+            &state,
+            Some(client_ip),
+            &mut connection,
+            &WsMessage::Binary(vec![0x42]),
+            now,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn server_websocket_rejects_oversized_binary_and_allows_normal_control_frames() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new(options)));
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut connection = ServerWebSocketRateWindow::new(now);
+
+        assert!(!allow_server_websocket_inbound_frame(
+            &state,
+            Some(client_ip),
+            &mut connection,
+            &WsMessage::Binary(vec![0; SERVER_WEBSOCKET_MAX_MESSAGE_BYTES + 1]),
+            now,
+        )
+        .unwrap());
+        assert_eq!(connection.frame_count, 1);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .websocket_rate_limits
+                .get(&client_ip)
+                .unwrap()
+                .frame_count,
+            1
+        );
+
+        for control in [
+            WsMessage::Ping(vec![1, 2, 3]),
+            WsMessage::Pong(vec![4, 5, 6]),
+            WsMessage::Close(None),
+        ] {
+            assert!(allow_server_websocket_inbound_frame(
+                &state,
+                Some(client_ip),
+                &mut connection,
+                &control,
+                now,
+            )
+            .unwrap());
+        }
+        assert_eq!(connection.frame_count, 4);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .websocket_rate_limits
+                .get(&client_ip)
+                .unwrap()
+                .frame_count,
+            4
+        );
     }
 
     #[test]

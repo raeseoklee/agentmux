@@ -5974,15 +5974,43 @@ impl DesktopControlState {
         let bundle = store
             .load_workspace_bundle(&workspace_id)?
             .ok_or_else(|| workspace_not_found(&workspace_id))?;
-        let pane_id = bundle.workspace.active_pane_id.clone();
+        if params.pane_id.is_some() != params.surface_id.is_some() {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Caller-bound identification requires both pane_id and surface_id.",
+            )));
+        }
+        let caller_bound = params.pane_id.is_some();
+        let pane_id = params
+            .pane_id
+            .unwrap_or_else(|| bundle.workspace.active_pane_id.clone());
         let active_pane = bundle.panes.iter().find(|pane| pane.pane_id == pane_id);
-        let surface_id = active_pane.and_then(|pane| pane.mounted_surface_id.clone());
+        if caller_bound && active_pane.is_none() {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Unauthorized,
+                "The caller-bound pane is not part of the requested workspace.",
+            )));
+        }
+        let mounted_surface_id = active_pane.and_then(|pane| pane.mounted_surface_id.clone());
+        if caller_bound && mounted_surface_id.as_deref() != params.surface_id.as_deref() {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Unauthorized,
+                "The caller-bound surface is not mounted in the requested pane.",
+            )));
+        }
+        let surface_id = params.surface_id.or(mounted_surface_id);
         let surface = surface_id.as_deref().and_then(|surface_id| {
             bundle
                 .surfaces
                 .iter()
                 .find(|surface| surface.surface_id == surface_id)
         });
+        if caller_bound && surface.is_none() {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Unauthorized,
+                "The caller-bound surface does not exist in the requested workspace.",
+            )));
+        }
         let session = surface
             .and_then(|surface| surface.session_id.as_deref())
             .and_then(|session_id| {
@@ -5991,6 +6019,12 @@ impl DesktopControlState {
                     .iter()
                     .find(|session| session.session_id == session_id)
             });
+        if caller_bound && session.is_none() {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Unauthorized,
+                "The caller-bound surface is not attached to an AgentMux session.",
+            )));
+        }
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &SystemIdentifyResult {
@@ -19635,6 +19669,89 @@ mod tests {
             state.agent_action_cwd(&workspace).unwrap().as_deref(),
             Some("/mnt/d/projects/agentmux")
         );
+    }
+
+    #[test]
+    fn system_identify_caller_binding_ignores_mutable_active_pane() {
+        let state = DesktopControlState::new();
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+        bundle.panes[2].mounted_surface_id = Some("surf_peer".to_string());
+        bundle.workspace.active_pane_id = "pane_right".to_string();
+        bundle.surfaces.push(PersistedSurface {
+            surface_id: "surf_peer".to_string(),
+            workspace_id: "ws_surface".to_string(),
+            surface_type: "terminal".to_string(),
+            title: "Peer terminal".to_string(),
+            session_id: Some("ses_peer".to_string()),
+            browser_id: None,
+            created_at: "before".to_string(),
+            last_visible_at: None,
+            updated_at: "before".to_string(),
+        });
+        bundle.sessions.push(PersistedSession {
+            session_id: "ses_peer".to_string(),
+            workspace_id: "ws_surface".to_string(),
+            backend_kind: "conpty".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("D:\\peer".to_string()),
+            command: vec!["powershell.exe".to_string()],
+            state: "running".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        });
+        state
+            .store
+            .lock()
+            .unwrap()
+            .save_workspace_bundle(&bundle)
+            .unwrap();
+
+        let bound = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_bound_identify",
+                "system.identify",
+                r#"{"workspace_id":"ws_surface","pane_id":"pane_left","surface_id":"surf_terminal"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let value = response_value(&bound);
+        assert_eq!(value["pane_id"], "pane_left");
+        assert_eq!(value["surface_id"], "surf_terminal");
+        assert_eq!(value["session_id"], "ses_surface");
+
+        let active = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_active_identify",
+                "system.identify",
+                r#"{"workspace_id":"ws_surface"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&active)["pane_id"], "pane_right");
+
+        let forged = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_forged_identify",
+                "system.identify",
+                r#"{"workspace_id":"ws_surface","pane_id":"pane_left","surface_id":"surf_peer"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert!(matches!(
+            forged.outcome,
+            ResponseOutcome::Error(ControlError {
+                code: ErrorCode::Unauthorized,
+                ..
+            })
+        ));
     }
 
     #[test]
