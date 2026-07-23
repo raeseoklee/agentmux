@@ -12,6 +12,7 @@ members = [
   "crates/agentmux-ipc",
   "crates/agentmux-store",
   "crates/agentmux-telemetry",
+  "crates/agentmux-vcs",
   "apps/desktop/src-tauri",
   "benches/support",
   "benches/single-terminal-latency",
