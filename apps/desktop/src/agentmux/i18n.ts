@@ -176,7 +176,23 @@ export type I18nKey =
   | "sourceControl.worktreeCreateDescription"
   | "sourceControl.worktreeCreateTitle"
   | "sourceControl.worktreeDestination"
+  | "sourceControl.worktreeList"
+  | "sourceControl.worktreeRecover"
+  | "sourceControl.worktreeRemove"
+  | "sourceControl.worktreeRemoveDescription"
+  | "sourceControl.worktreeRemoveTitle"
   | "sourceControl.worktreeStarted"
+  | "sourceControl.reviewAdd"
+  | "sourceControl.reviewCommentOn"
+  | "sourceControl.reviewDelete"
+  | "sourceControl.reviewDeleteDescription"
+  | "sourceControl.reviewDeleteTitle"
+  | "sourceControl.reviewDoNotDeliver"
+  | "sourceControl.reviewMailbox"
+  | "sourceControl.reviewPlaceholder"
+  | "sourceControl.reviewReopen"
+  | "sourceControl.reviewResolve"
+  | "sourceControl.reviewTerminal"
   | "devServer.detectedTitle"
   | "devServer.detectedDescription"
   | "devServer.openInSplit"
@@ -453,7 +469,23 @@ const en: Record<I18nKey, string> = {
   "sourceControl.worktreeCreateDescription": "Creates an AgentMux-owned worktree, workspace, and optional agent session as one recoverable operation.",
   "sourceControl.worktreeCreateTitle": "Create isolated agent worktree",
   "sourceControl.worktreeDestination": "Destination",
+  "sourceControl.worktreeList": "Agent worktrees",
+  "sourceControl.worktreeRecover": "Recover operation",
+  "sourceControl.worktreeRemove": "Remove",
+  "sourceControl.worktreeRemoveDescription": "Only AgentMux-owned worktree resources will be removed.",
+  "sourceControl.worktreeRemoveTitle": "Remove isolated worktree?",
   "sourceControl.worktreeStarted": "Worktree operation started",
+  "sourceControl.reviewAdd": "Add comment",
+  "sourceControl.reviewCommentOn": "Comment on {side} line {line}",
+  "sourceControl.reviewDelete": "Delete",
+  "sourceControl.reviewDeleteDescription": "This removes stored review comments.",
+  "sourceControl.reviewDeleteTitle": "Delete review thread?",
+  "sourceControl.reviewDoNotDeliver": "Do not deliver yet",
+  "sourceControl.reviewMailbox": "Mailbox",
+  "sourceControl.reviewPlaceholder": "Write review feedback",
+  "sourceControl.reviewReopen": "Reopen",
+  "sourceControl.reviewResolve": "Resolve",
+  "sourceControl.reviewTerminal": "Terminal",
   "devServer.detectedTitle": "Development server detected",
   "devServer.detectedDescription": "{url} is ready to open beside the terminal.",
   "devServer.openInSplit": "Open in split",
@@ -809,7 +841,23 @@ const ko: Record<I18nKey, string> = {
   "sourceControl.worktreeCreateDescription": "AgentMux 소유 worktree, 워크스페이스, 선택적 에이전트 세션을 하나의 복구 가능한 작업으로 만듭니다.",
   "sourceControl.worktreeCreateTitle": "격리된 에이전트 worktree 만들기",
   "sourceControl.worktreeDestination": "대상 경로",
+  "sourceControl.worktreeList": "에이전트 worktree",
+  "sourceControl.worktreeRecover": "작업 복구",
+  "sourceControl.worktreeRemove": "제거",
+  "sourceControl.worktreeRemoveDescription": "AgentMux가 소유한 worktree 리소스만 제거됩니다.",
+  "sourceControl.worktreeRemoveTitle": "격리된 worktree를 제거할까요?",
   "sourceControl.worktreeStarted": "worktree 작업 시작됨",
+  "sourceControl.reviewAdd": "코멘트 추가",
+  "sourceControl.reviewCommentOn": "{side} {line}번 줄에 코멘트",
+  "sourceControl.reviewDelete": "삭제",
+  "sourceControl.reviewDeleteDescription": "저장된 리뷰 코멘트를 제거합니다.",
+  "sourceControl.reviewDeleteTitle": "리뷰 thread를 삭제할까요?",
+  "sourceControl.reviewDoNotDeliver": "아직 전달하지 않음",
+  "sourceControl.reviewMailbox": "메일박스",
+  "sourceControl.reviewPlaceholder": "리뷰 피드백 작성",
+  "sourceControl.reviewReopen": "다시 열기",
+  "sourceControl.reviewResolve": "해결",
+  "sourceControl.reviewTerminal": "터미널",
   "devServer.detectedTitle": "개발 서버 감지됨",
   "devServer.detectedDescription": "{url}을(를) 터미널 옆에서 열 수 있습니다.",
   "devServer.openInSplit": "분할로 열기",
