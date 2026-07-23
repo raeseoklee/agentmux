@@ -36,7 +36,7 @@ pub(crate) struct ServerLocalGit {
     repository: Repository,
     repository_id: String,
     workspace_id: String,
-    idempotency_results: HashMap<String, GitMutationResult>,
+    idempotency_results: HashMap<String, CachedMutationResult>,
     status_snapshot: Option<Arc<StatusSnapshot>>,
     status_scan: Option<LocalStatusScan>,
     status_refresh_count: u64,
@@ -46,6 +46,12 @@ pub(crate) struct ServerLocalGit {
 struct LocalStatusScan {
     generation: u64,
     scan: StatusScan,
+}
+
+#[derive(Clone)]
+struct CachedMutationResult {
+    request_fingerprint: String,
+    result: GitMutationResult,
 }
 
 impl ServerLocalGit {
@@ -408,9 +414,12 @@ impl ServerLocalGit {
         let params: GitPathMutationParams = request.parse_params()?;
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
-        if let Some(result) =
-            self.reused_result(request.method.as_str(), params.idempotency_key.as_deref())
-        {
+        let fingerprint = mutation_request_fingerprint(&params)?;
+        if let Some(result) = self.reused_result(
+            request.method.as_str(),
+            params.idempotency_key.as_deref(),
+            &fingerprint,
+        )? {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
         self.invalidate_status();
@@ -431,6 +440,7 @@ impl ServerLocalGit {
         self.remember_result(
             request.method.as_str(),
             params.idempotency_key.as_deref(),
+            fingerprint,
             &result,
         );
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
@@ -444,9 +454,12 @@ impl ServerLocalGit {
         let params: GitAllMutationParams = request.parse_params()?;
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
-        if let Some(result) =
-            self.reused_result(request.method.as_str(), params.idempotency_key.as_deref())
-        {
+        let fingerprint = mutation_request_fingerprint(&params)?;
+        if let Some(result) = self.reused_result(
+            request.method.as_str(),
+            params.idempotency_key.as_deref(),
+            &fingerprint,
+        )? {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
         self.invalidate_status();
@@ -467,6 +480,7 @@ impl ServerLocalGit {
         self.remember_result(
             request.method.as_str(),
             params.idempotency_key.as_deref(),
+            fingerprint,
             &result,
         );
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
@@ -476,15 +490,18 @@ impl ServerLocalGit {
         let params: GitCommitParams = request.parse_params()?;
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
+        let fingerprint = mutation_request_fingerprint(&params)?;
+        if let Some(result) = self.reused_result(
+            request.method.as_str(),
+            params.idempotency_key.as_deref(),
+            &fingerprint,
+        )? {
+            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
+        }
         if params.amend {
             return Err(invalid_request(
                 "Amend is not available through local server mode.",
             ));
-        }
-        if let Some(result) =
-            self.reused_result(request.method.as_str(), params.idempotency_key.as_deref())
-        {
-            return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
         self.invalidate_status();
         let commit = self
@@ -502,6 +519,7 @@ impl ServerLocalGit {
         self.remember_result(
             request.method.as_str(),
             params.idempotency_key.as_deref(),
+            fingerprint,
             &result,
         );
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
@@ -549,21 +567,31 @@ impl ServerLocalGit {
         &self,
         method: &str,
         idempotency_key: Option<&str>,
-    ) -> Option<GitMutationResult> {
-        let key = mutation_key(method, &self.repository_id, idempotency_key?);
-        self.idempotency_results
-            .get(&key)
-            .cloned()
-            .map(|mut result| {
-                result.reused = true;
-                result
-            })
+        request_fingerprint: &str,
+    ) -> Result<Option<GitMutationResult>, ControlError> {
+        let Some(idempotency_key) = idempotency_key else {
+            return Ok(None);
+        };
+        let key = mutation_key(method, &self.repository_id, idempotency_key);
+        let Some(cached) = self.idempotency_results.get(&key) else {
+            return Ok(None);
+        };
+        if cached.request_fingerprint != request_fingerprint {
+            return Err(ControlError::new(
+                ErrorCode::Conflict,
+                "idempotency_key was already used with a different Git mutation request.",
+            ));
+        }
+        let mut result = cached.result.clone();
+        result.reused = true;
+        Ok(Some(result))
     }
 
     fn remember_result(
         &mut self,
         method: &str,
         idempotency_key: Option<&str>,
+        request_fingerprint: String,
         result: &GitMutationResult,
     ) {
         let Some(idempotency_key) = idempotency_key else {
@@ -576,7 +604,10 @@ impl ServerLocalGit {
         }
         self.idempotency_results.insert(
             mutation_key(method, &self.repository_id, idempotency_key),
-            result.clone(),
+            CachedMutationResult {
+                request_fingerprint,
+                result: result.clone(),
+            },
         );
     }
 }
@@ -690,6 +721,18 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
 
 fn mutation_key(method: &str, repository_id: &str, idempotency_key: &str) -> String {
     format!("{method}|{repository_id}|{idempotency_key}")
+}
+
+fn mutation_request_fingerprint<T>(params: &T) -> Result<String, ControlError>
+where
+    T: serde::Serialize,
+{
+    serde_json::to_string(params).map_err(|_| {
+        ControlError::new(
+            ErrorCode::InvalidRequest,
+            "Could not fingerprint Git mutation request.",
+        )
+    })
 }
 
 fn validate_generation(requested: Option<u64>, actual: u64) -> Result<(), ControlError> {
@@ -966,6 +1009,103 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "runs native Git and creates an idempotency fixture"]
+    fn local_git_path_mutation_idempotency_binds_the_request_payload() {
+        let Some((root, mut git)) = idempotency_fixture("path") else {
+            return;
+        };
+
+        let first: GitMutationResult = decode(git.handle_request(RequestEnvelope::new(
+            "stage-first",
+            "git.stage",
+            r#"{"workspace_id":"ws_server","paths":["first.txt"],"idempotency_key":"path-key"}"#,
+            "token",
+        )));
+        assert!(!first.reused);
+
+        let replay: GitMutationResult = decode(git.handle_request(RequestEnvelope::new(
+            "stage-first-replay",
+            "git.stage",
+            r#"{"workspace_id":"ws_server","paths":["first.txt"],"idempotency_key":"path-key"}"#,
+            "token",
+        )));
+        assert!(replay.reused);
+        assert_eq!(replay.generation, first.generation);
+
+        let error = control_error(git.handle_request(RequestEnvelope::new(
+            "stage-second-with-reused-key",
+            "git.stage",
+            r#"{"workspace_id":"ws_server","paths":["second.txt"],"idempotency_key":"path-key"}"#,
+            "token",
+        )));
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            error.message,
+            "idempotency_key was already used with a different Git mutation request."
+        );
+        assert_eq!(
+            git_output(&root, &["diff", "--cached", "--name-only"]).trim(),
+            "first.txt"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "runs native Git and creates an idempotency fixture"]
+    fn local_git_commit_idempotency_binds_the_request_payload() {
+        let Some((root, mut git)) = idempotency_fixture("commit") else {
+            return;
+        };
+
+        let _: GitMutationResult = decode(git.handle_request(RequestEnvelope::new(
+            "stage",
+            "git.stage",
+            r#"{"workspace_id":"ws_server","paths":["first.txt"]}"#,
+            "token",
+        )));
+        let commit: GitMutationResult = decode(git.handle_request(RequestEnvelope::new(
+            "commit-first",
+            "git.commit",
+            r#"{"workspace_id":"ws_server","message":"first server commit","idempotency_key":"commit-key"}"#,
+            "token",
+        )));
+        assert!(!commit.reused);
+        assert!(commit.commit_oid.is_some());
+
+        let replay: GitMutationResult = decode(git.handle_request(RequestEnvelope::new(
+            "commit-first-replay",
+            "git.commit",
+            r#"{"workspace_id":"ws_server","message":"first server commit","idempotency_key":"commit-key"}"#,
+            "token",
+        )));
+        assert!(replay.reused);
+        assert_eq!(replay.commit_oid, commit.commit_oid);
+
+        let error = control_error(git.handle_request(RequestEnvelope::new(
+            "commit-second-with-reused-key",
+            "git.commit",
+            r#"{"workspace_id":"ws_server","message":"different server commit","idempotency_key":"commit-key"}"#,
+            "token",
+        )));
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            error.message,
+            "idempotency_key was already used with a different Git mutation request."
+        );
+        assert_eq!(
+            git_output(&root, &["log", "-1", "--format=%s"]).trim(),
+            "first server commit"
+        );
+        assert_eq!(
+            git_output(&root, &["rev-list", "--count", "HEAD"]).trim(),
+            "2"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[ignore = "runs native Git and creates a paging fixture"]
     fn local_git_pages_reuse_one_snapshot_across_external_changes() {
         if Command::new("git").arg("--version").status().is_err() {
@@ -1090,6 +1230,58 @@ mod tests {
             .status()
             .expect("git command");
         assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git command output");
+        assert!(output.status.success(), "git command failed: {args:?}");
+        String::from_utf8(output.stdout).expect("UTF-8 git output")
+    }
+
+    fn idempotency_fixture(label: &str) -> Option<(std::path::PathBuf, ServerLocalGit)> {
+        if Command::new("git").arg("--version").status().is_err() {
+            return None;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-server-local-git-idempotency-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "AgentMux Test"]);
+        run_git(&root, &["config", "user.email", "agentmux@example.invalid"]);
+        fs::write(root.join("first.txt"), "base\n").unwrap();
+        fs::write(root.join("second.txt"), "base\n").unwrap();
+        run_git(&root, &["add", "first.txt", "second.txt"]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        fs::write(root.join("first.txt"), "first changed\n").unwrap();
+        fs::write(root.join("second.txt"), "second changed\n").unwrap();
+        let git = ServerLocalGit::probe(
+            "ws_server",
+            Some("conpty"),
+            None,
+            Some(&root.to_string_lossy()),
+        )
+        .expect("repository probe");
+        Some((root, git))
+    }
+
+    fn control_error(response: ResponseEnvelope) -> ControlError {
+        match response.outcome {
+            ResponseOutcome::Error(error) => error,
+            ResponseOutcome::Ok { result_json } => {
+                panic!("expected control error, received result: {result_json}")
+            }
+        }
     }
 
     fn decode<T: serde::de::DeserializeOwned>(response: ResponseEnvelope) -> T {
