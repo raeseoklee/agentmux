@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 30
+        equals: 34
       - kind: contains
         path: $.tools[*].name
         value: terminal_open
@@ -29,12 +29,38 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: agent_worker_start
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_start
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_spawn
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_reflow
   - id: standard-profile-denies-full-call
     description: Dispatch rejects a full tool even when a client calls it directly
     act:
       method: tools/call
       tool: workspace_close
       args: {}
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'full' MCP profile
+  - id: standard-profile-denies-team-release
+    description: Releasing a worker terminates a session and requires the full profile
+    act:
+      method: tools/call
+      tool: agent_team_release
+      args:
+        team_id: team-example
     assert:
       - kind: status
         equals: success

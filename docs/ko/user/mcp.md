@@ -29,7 +29,7 @@ agentmux mcp setup --help
 | --- | --- | --- |
 | `read` | 워크스페이스, 세션, 에이전트 주의 상태, 페인 워커, 통합 준비 상태, 팀 메시지와 태스크 조회, 터미널 출력, 브라우저 스냅샷, 이벤트, 컨텍스트 및 진단 읽기 | 모니터링과 최초 설정 |
 | `standard` | `read` 권한과 함께 페인 포커스, 터미널 열기/분할/입력, 페인 워커 시작/전달, 브라우저 열기/이동/클릭/입력, 팀 메시지와 태스크 갱신, 에이전트 상태 갱신. 임의 명령 실행과 외부 시스템 변경이 가능한 신뢰된 쓰기 프로필 | 명령 실행이나 쓰기가 필요한 신뢰된 대화형 에이전트 작업 |
-| `full` | `standard` 권한과 함께 페인 워커 종료, 통합 shim 설치, 워크스페이스/페인/서피스 닫기, 세션 종료, 설정 변경, 브라우저 JavaScript 실행, 액션 실행, 알림 삭제 | 파괴적이거나 영향이 큰 작업이 필요한 신뢰된 자동화 |
+| `full` | `standard` 권한과 함께 적응형 팀 워커 회수, 페인 워커 종료, 통합 shim 설치, 워크스페이스/페인/서피스 닫기, 세션 종료, 설정 변경, 브라우저 JavaScript 실행, 액션 실행, 알림 삭제 | 파괴적이거나 영향이 큰 작업이 필요한 신뢰된 자동화 |
 
 `standard`는 안전하거나 비파괴적인 프로필이 아닙니다. 명령 실행과 터미널,
 브라우저, 공유 협업 상태 변경을 허용할 수 있는 클라이언트에만 부여하세요.
@@ -54,36 +54,143 @@ AgentMux는 에이전트용 페인을 위한 typed MCP 도구를 제공합니다
 | --- | --- | --- |
 | `agent_worker_list` | `read` | AgentMux가 관리하는 tmux 통합 워커와 독립 Codex 페인 워커 조회 |
 | `agent_integration_status` | `read` | 선택한 워크스페이스의 기본 WSL 배포판을 우선하여 Claude Teams, OMO, OMX, OMC wrapper와 WSL 준비 상태 진단 |
+| `agent_team_list` | `read` | 저장된 에이전트 텔레메트리에서 적응형 팀과 현재 구성원 조회 |
 | `agent_worker_start` | `standard` | 현재 페인을 분할하거나 새 탭을 만들고 `claude-teams`, `omo`, `omx`, `omc`, `codex-pane` 시작 |
+| `agent_team_start` | `standard` | 현재 터미널을 중심으로 적응형 팀 매니페스트 생성. 초기 워커는 선택 사항 |
+| `agent_team_spawn` | `standard` | 세대 및 멱등성 보호를 적용해 워커 한 개를 추가하고 관리 레이아웃 재배치 |
+| `agent_team_release` | `full` | 선택한 팀이 소유한 워커 한 개를 종료·회수하고 남은 워커 재배치 |
+| `agent_team_reflow` | `standard` | 외부 페인을 이동하지 않고 관리 영역 비율 재계산. `dry_run` 지원 |
 | `agent_worker_send` | `standard` | 워커에 리터럴 지시를 보내고 선택적으로 Enter 입력 |
 | `agent_worker_stop` | `full` | 워커 세션 종료 |
 | `agent_integration_setup` | `full` | 공용 tmux 호환 wrapper 설치 및 선택적으로 Windows 사용자 PATH 등록 |
 
-Claude Code Agent Teams에는 `kind: "claude-teams"`를 사용합니다. Lead
-프로세스는 AgentMux tmux shim을 사용하며, `tmux split-window`로 생성된 자식은
-통합 환경을 이어받고 데스크톱 호스트가 새 페인에 맞는 `TMUX`와 `TMUX_PANE`
-값을 다시 생성합니다.
+### 화면에서 동시에 확인하는 적응형 팀
 
-`kind: "codex-pane"`은 별도의 AgentMux 페인에서 독립 Codex CLI 프로세스를
-시작합니다. 이것은 Codex 내장 서브에이전트가 아닙니다. Codex의 `/agent`
-스레드는 Codex가 소유하므로 AgentMux가 페인처럼 이동하거나 종료할 수 없습니다.
+일반적인 흐름에서는 에이전트 수를 미리 등록하지 않습니다. 리드 터미널을 중심으로
+빈 적응형 팀을 시작한 뒤, 작업 그래프가 바뀔 때 리드 에이전트가 워커를 추가하거나
+회수합니다. AgentMux는 수명 주기, 화면 가시성, 최대 용량과 충돌 제어를 담당하고,
+새 워커가 필요한지는 현재 프로젝트를 이해하는 리드 모델이 판단합니다.
 
-`agent_worker_send`와 `agent_worker_stop`은 일반 터미널 세션을 거부합니다.
-워커 실행 후 메타데이터 등록이 실패하면 AgentMux는 새 세션을 종료하고 페인을
-닫아 추적되지 않는 워커가 남지 않도록 보상 정리합니다.
+```json
+{
+  "workspace_id": "workspace-id",
+  "pane_id": "main-pane-id",
+  "mode": "adaptive",
+  "layout": "main-left-workers-right",
+  "main_ratio": 0.55,
+  "max_workers": 6,
+  "default_worker_kind": "codex-pane",
+  "distribution": "Ubuntu",
+  "idempotency_key": "release-0.2.0-analysis",
+  "workers": []
+}
+```
 
-먼저 `agent_integration_status`로 확인하고, 승인된 `full` 클라이언트에서만
-`agent_integration_setup`을 사용한 뒤 `agent_worker_start`를 호출하세요.
-`team_message_send`는 AgentMux 공유 mailbox에 쓰며, 임의의 터미널 TUI에
-직접 지시할 때는 `agent_worker_send` 또는 하위 터미널 입력 도구를 사용합니다.
+`workers`는 생략할 수 있습니다. `max_workers`는 요청 개수가 아니라 안전 상한이며,
+tmux에서 자동 편입된 descendant를 포함한 모든 관리 대상 non-main 멤버를 계산합니다.
+응답의 `team_id`와 `generation`은 저장되므로 후속 변경 전에 `agent_team_list`로 최신
+팀 상태를 읽고 사용합니다.
+
+데스크톱 host는 main session 소유권과 generation을 하나의 제어 평면 잠금 안에서
+선점합니다. 동시에 시작한 다른 팀이 기존 소유권을 덮어쓸 수 없고, 같은 비어 있지 않은
+`idempotency_key` 재시도는 진행 중 claim을 재사용하여 초기 워커를 중복 생성하지 않습니다.
+
+각 MCP 서버는 자체 팀 변경을 직렬화하고, 데스크톱 host는 예약 소유자를 저장한 뒤 generation과
+mutation ID를 함께 비교하는 CAS 방식으로 완료를 반영합니다. 살아 있는 같은 예약을 재호출하면
+분할·리사이즈·종료를 반복하지 않고 `provisioning`을 반환합니다. 예약을 소유한 MCP 프로세스가
+종료되면 다음 클라이언트가 해당 예약을 `layout_dirty`로 복구하고 화면의 페인을 확인한 뒤 계속할
+수 있습니다. 살아 있는 소유자의 예약은 인수할 수 없습니다.
+
+독립적으로 진행할 작업이 생기면 워커를 정확히 한 개 추가합니다.
+
+```json
+{
+  "team_id": "team-id",
+  "expected_generation": 1,
+  "idempotency_key": "release-0.2.0-docs",
+  "name": "docs",
+  "args": ["릴리스 문서를 검토하고 누락을 보고해줘."]
+}
+```
+
+AgentMux는 토폴로지를 바꾸기 전에 다음 세대를 원자적으로 예약합니다. 오래된
+`expected_generation`은 페인을 열지 않고 `generation_conflict`를 반환합니다.
+같은 `idempotency_key`를 재전송하면 중복 생성 대신 기존 워커를 반환합니다.
+성공하면 메인 터미널은 왼쪽, 워커는 오른쪽 동일 높이 스택에 배치됩니다.
+
+완료된 워커는 `full` 프로필을 사용하는 클라이언트에서 회수할 수 있습니다.
+
+```json
+{
+  "team_id": "team-id",
+  "expected_generation": 2,
+  "name": "docs",
+  "mode": "soft"
+}
+```
+
+`agent_team_release`는 선택한 팀이 소유한 구성원만 받지만 프로세스 종료와 페인 닫기를
+수행하므로 `full` 프로필이 필요합니다. 세션 종료에 성공한 뒤에만 팀 멤버십을 제거합니다.
+종료가 실패하면 페인과 멤버십을 그대로 유지하므로 안전하게 다시 시도할 수 있습니다.
+완료 반영은 CAS로 보호되어 오래된 요청이 더 새로운 팀 generation을 덮어쓸 수 없습니다.
+
+### 레이아웃과 tmux 자동 편입
+
+각 워커 페인은 독립적인 라이브 터미널 출력 구독을 가지므로 포커스되지 않아도
+렌더링과 주의 상태 보고를 계속합니다. 팀 구성은 `agent_team_list`, 프로세스 상태는
+`agent_worker_list`, 입력 대기는 `agent_attention_list`, 공유 진행은
+`team_task_list`로 확인합니다.
+
+`auto_adopt_tmux`가 활성화되면 AgentMux tmux shim의 관리 대상 `split-window` 하위
+워커가 팀 ID와 메인 세션 기준점을 이어받습니다. 팀 환경만 있으면 별도 integration
+marker 없이 편입됩니다. 첫 자식은 메인 오른쪽, 이후 자식은 워커 스택에 추가되고
+자동으로 같은 높이로 재배치됩니다. 새 탭과 새 세션은 관리 레이아웃에 조용히 편입하지
+않습니다. 따라서 Claude Code Agent Teams와 OMO/OMX/OMC 통합은 최종 워커 수를
+미리 알 필요가 없습니다.
+
+tmux shim 프로세스가 generation을 예약한 뒤 페인을 등록하기 전에 종료되면, 다음 관리
+대상 split은 기록된 소유자 프로세스가 종료됐는지 확인하고 중단된 예약을
+`layout_dirty`로 회수합니다. 이어서 최신 토폴로지를 다시 읽고 같은 호출 안에서 split을
+계속합니다. 살아 있는 소유자는 충돌로 보호되므로 진행 중인 워커가 중복 생성되지
+않습니다.
+
+AgentMux는 관리되는 하위 트리만 크기를 바꿉니다. 사용자 페인이 섞였거나 split 축이
+관리 레이아웃과 다르면 `layout_conflict`를 반환하고 어떤 비율도 변경하지 않으며,
+명시적인 운영자 결정을 위해 레이아웃을 dirty 상태로 표시합니다. 변경 없이 계획만
+확인하려면 다음과 같이 호출합니다.
+
+```json
+{
+  "team_id": "team-id",
+  "expected_generation": 3,
+  "dry_run": true
+}
+```
+
+실제 reflow는 비율을 적용하기 전에 다음 generation을 예약하므로 MCP spawn/release와
+tmux 자동 편입 사이에서도 직렬화됩니다. `dry_run`은 generation을 예약하지 않고
+토폴로지도 변경하지 않습니다.
+
+### 고정 초기 팀과 보상 정책
+
+작업 수가 완전히 정해진 배치는 `mode`를 `fixed`로 설정하고 1-8개의 명명된 초기
+워커를 전달할 수 있습니다. 적응형 팀에도 초기 워커를 넣은 뒤 추가 확장할 수 있습니다.
+워커 이름은 1-64자이며 팀 안에서 고유해야 합니다.
+
+여러 제어 호출을 데이터베이스 트랜잭션처럼 가장하지 않고 보상 정책을 사용합니다.
+MCP로 만든 워커가 실패하면 세션을 종료하고 페인을 닫으며, 초기 워커는 역순으로
+정리합니다. tmux가 만든 하위 워커는 자동 재배치만 실패한 경우 종료하지 않고
+레이아웃을 dirty로 보고합니다.
+
+`codex-pane`은 독립 Codex CLI 프로세스이며 Codex 내장 `/agent` 스레드는 아닙니다.
+`claude-teams`, `omo`, `omx`, `omc`는 하위 프로세스를 자동 편입할 수 있는 tmux
+호환 lead를 시작합니다. `agent_worker_send`와 범용 `agent_worker_stop`은 일반
+터미널 세션을 거부합니다.
 
 shim은 WSL에서 Windows `agentmux.exe`로 넘어갈 때 Linux 쪽 `PATH`를 별도
 변수로 캡처하며 Windows 프로세스의 `PATH`를 Linux 자식에 복사하지 않습니다.
-데스크톱은 각 통합 자식 안에서 캡처한 WSL 경로를 복원하므로 중첩된
-`tmux split-window`도 AgentMux shim을 계속 찾을 수 있습니다. 재시작 시에는
-통합 실행 설정을 재사용하고, 연결이 끊긴 tmux 하위 워커를 원래 페인에 다시
-실행합니다. 저장된 명령과 작업 디렉터리도 각각 복원되므로 빈 워커 페인이
-남지 않습니다.
+데스크톱은 재시작 뒤 캡처한 WSL 경로와 저장된 팀 텔레메트리를 복원하므로 중첩 split도
+같은 팀에 귀속됩니다.
 
 ## 로컬 stdio 서버 실행
 

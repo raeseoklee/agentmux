@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 40
+        equals: 45
       - kind: contains
         path: $.tools[*].name
         value: agent_worker_list
@@ -29,6 +29,21 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: agent_worker_start
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_start
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_list
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_spawn
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_release
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_reflow
       - kind: contains
         path: $.tools[*].name
         value: agent_worker_send

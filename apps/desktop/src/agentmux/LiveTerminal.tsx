@@ -81,7 +81,10 @@ const ACTIVITY_HOT_POLLS = 12;
 const MAX_PENDING_STREAM_FRAMES = 256;
 const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
-const WEBGL_DISABLE_DEBOUNCE_MS = 250;
+// Retain a recently visible terminal's GPU context through ordinary tab
+// switching. This avoids tearing down and rebuilding the renderer while the
+// user compares adjacent tabs, while still releasing inactive contexts.
+const WEBGL_DISABLE_DEBOUNCE_MS = 1500;
 const TERMINAL_RESIZE_SETTLE_MS = 160;
 const TERMINAL_LINE_HEIGHT = 1.0;
 const PREVIEW_CACHE_ENABLED_KEY = "agentmux.terminal.previewCache";

@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 14
+        equals: 15
       - kind: contains
         path: $.tools[*].name
         value: agentmux_context
@@ -29,6 +29,9 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: agent_worker_list
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_team_list
   - id: read-profile-denies-standard-call
     description: Dispatch rejects a standard tool even when a client calls it directly
     act:

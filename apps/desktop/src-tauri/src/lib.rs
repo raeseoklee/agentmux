@@ -33,14 +33,16 @@ use agentmux_core::{
 use agentmux_ipc::{
     AckResult, ActionListParams, ActionListResult, ActionRunParams, ActionRunResult,
     ActionSummaryResult, AgentAttentionListResult, AgentListAttentionParams, AgentStateResult,
-    AgentTelemetry, AppConfigActions, AppConfigAppearance, AppConfigCustomAction,
-    AppConfigDiagnosticsEntry, AppConfigDiagnosticsParams, AppConfigDiagnosticsResult,
-    AppConfigExportParams, AppConfigExportResult, AppConfigGetParams, AppConfigImportParams,
-    AppConfigLocale, AppConfigMigrateProjectParams, AppConfigMigrateProjectResult,
-    AppConfigNotifications, AppConfigResetParams, AppConfigResult, AppConfigShortcuts, AppConfigUi,
-    AppConfigUpdateParams, AppConfigUpdates, BrowserActionResult, BrowserCheckParams,
-    BrowserClickParams, BrowserConsoleMessageResult, BrowserConsoleParams, BrowserConsoleResult,
-    BrowserCookieResult, BrowserCookiesResult, BrowserDiagnosticResult, BrowserDiagnosticsParams,
+    AgentTeamRecoverParams, AgentTeamRecoverResult, AgentTeamReserveParams, AgentTeamReserveResult,
+    AgentTeamSettleParams, AgentTeamSettleResult, AgentTelemetry, AppConfigActions,
+    AppConfigAppearance, AppConfigCustomAction, AppConfigDiagnosticsEntry,
+    AppConfigDiagnosticsParams, AppConfigDiagnosticsResult, AppConfigExportParams,
+    AppConfigExportResult, AppConfigGetParams, AppConfigImportParams, AppConfigLocale,
+    AppConfigMigrateProjectParams, AppConfigMigrateProjectResult, AppConfigNotifications,
+    AppConfigResetParams, AppConfigResult, AppConfigShortcuts, AppConfigUi, AppConfigUpdateParams,
+    AppConfigUpdates, BrowserActionResult, BrowserCheckParams, BrowserClickParams,
+    BrowserConsoleMessageResult, BrowserConsoleParams, BrowserConsoleResult, BrowserCookieResult,
+    BrowserCookiesResult, BrowserDiagnosticResult, BrowserDiagnosticsParams,
     BrowserDiagnosticsResult, BrowserDialogCancelParams, BrowserDialogHandledResult,
     BrowserDialogMessageResult, BrowserDialogRespondParams, BrowserDialogsParams,
     BrowserDialogsResult, BrowserDomSnapshotParams, BrowserDomSnapshotResult,
@@ -1053,6 +1055,16 @@ impl DesktopControlState {
             return self.handle_actions_run_request(request);
         }
 
+        if request.method == "agent.team.reserve" {
+            return self.handle_agent_team_reserve(request);
+        }
+        if request.method == "agent.team.settle" {
+            return self.handle_agent_team_settle(request);
+        }
+        if request.method == "agent.team.recover" {
+            return self.handle_agent_team_recover(request);
+        }
+
         if is_desktop_store_method(&request.method) {
             return self.handle_desktop_store_request(request);
         }
@@ -1352,18 +1364,10 @@ impl DesktopControlState {
                             params.command.clone()
                         },
                         cwd: params.cwd.clone().or_else(|| session.cwd.clone()),
-                        env: launch_spec
-                            .as_ref()
-                            .map(|spec| {
-                                spec.env
-                                    .iter()
-                                    .map(|(key, value)| EnvVarParam {
-                                        key: key.clone(),
-                                        value: value.clone(),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
+                        env: merge_terminal_split_environment(
+                            launch_spec.as_ref().map(|spec| spec.env.as_slice()),
+                            &params.env,
+                        ),
                         columns: Some(columns),
                         rows: Some(rows),
                         durability: params
@@ -2875,6 +2879,378 @@ impl DesktopControlState {
             store.upsert_agent_state(&persisted_agent_state_from_result(&result, &timestamp()))?;
         }
         self.persist_notifications_from_control(control, Some(&result.workspace_id))
+    }
+
+    fn handle_agent_team_reserve(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        let id = request.id.clone();
+        let result = (|| {
+            validate_desktop_request(&request, &self.control_token)?;
+            let params: AgentTeamReserveParams = request.parse_params()?;
+            let mutation_id = params
+                .mutation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    DesktopHostError::Control(ControlError::new(
+                        ErrorCode::InvalidRequest,
+                        "agent.team.reserve requires a non-empty mutation_id.",
+                    ))
+                })?;
+            let owner_id = agent_team_mutation_owner_id(&request, mutation_id);
+            if params.next_generation != params.expected_generation.saturating_add(1) {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    "agent.team.reserve next_generation must equal expected_generation + 1.",
+                )));
+            }
+            let Ok(mut control) = self.control.lock() else {
+                return Err(DesktopHostError::StateUnavailable(
+                    "desktop control state is unavailable".to_string(),
+                ));
+            };
+            control.collect_events();
+            let get = control.handle_request(RequestEnvelope::new(
+                format!("{}_get", request.id),
+                "agent.get_state",
+                serde_json::json!({ "session_id": params.main_session_id }).to_string(),
+                self.control_token.clone(),
+            ));
+            let current: AgentStateResult = response_result_json(&get)?;
+            let mut telemetry = current.telemetry.clone().unwrap_or_default();
+            let is_unclaimed = telemetry.team_id.is_none() && telemetry.team_role.is_none();
+            if params.claim && is_unclaimed {
+                if params.expected_generation != 0 || params.next_generation != 1 {
+                    return Err(DesktopHostError::Control(ControlError::new(
+                        ErrorCode::InvalidRequest,
+                        "an initial team claim must reserve generation 1 from generation 0",
+                    )));
+                }
+                if let Some(claim_telemetry) = params.claim_telemetry.clone() {
+                    telemetry = claim_telemetry;
+                }
+                telemetry.team_id = Some(params.team_id.clone());
+                telemetry.team_role = Some("main".to_string());
+                telemetry.team_generation = Some(1);
+                telemetry.team_mutation_id = params.mutation_id.clone();
+                telemetry.team_mutation_owner_id = Some(owner_id.clone());
+                telemetry.team_status = Some("provisioning".to_string());
+                let set = control.handle_request(RequestEnvelope::new(
+                    format!("{}_claim", request.id),
+                    "agent.set_state",
+                    serde_json::json!({
+                        "session_id": params.main_session_id,
+                        "state": current.state,
+                        "reason": current.reason,
+                        "telemetry": telemetry,
+                    })
+                    .to_string(),
+                    self.control_token.clone(),
+                ));
+                self.persist_agent_set_state(&mut control, &set)?;
+                return Ok(AgentTeamReserveResult {
+                    team_id: params.team_id,
+                    main_session_id: params.main_session_id,
+                    generation: 1,
+                    mutation_id: params.mutation_id,
+                    reused: false,
+                    acquired: true,
+                    recovered: false,
+                });
+            }
+            if params.claim
+                && telemetry.team_role.as_deref() == Some("main")
+                && telemetry.team_status.as_deref() == Some("provisioning")
+                && params.mutation_id.is_some()
+                && telemetry.team_mutation_id.as_deref() == params.mutation_id.as_deref()
+            {
+                let recovered = agent_team_reservation_can_be_recovered(
+                    telemetry.team_mutation_owner_id.as_deref(),
+                    &owner_id,
+                );
+                if !recovered
+                    && telemetry.team_mutation_owner_id.as_deref() != Some(owner_id.as_str())
+                {
+                    return Err(agent_team_mutation_in_progress_error(
+                        telemetry
+                            .team_id
+                            .as_deref()
+                            .unwrap_or(params.team_id.as_str()),
+                    ));
+                }
+                if recovered {
+                    telemetry.team_mutation_owner_id = Some(owner_id.clone());
+                    let set = control.handle_request(RequestEnvelope::new(
+                        format!("{}_recover_claim", request.id),
+                        "agent.set_state",
+                        serde_json::json!({
+                            "session_id": params.main_session_id,
+                            "state": current.state,
+                            "reason": current.reason,
+                            "telemetry": telemetry,
+                        })
+                        .to_string(),
+                        self.control_token.clone(),
+                    ));
+                    self.persist_agent_set_state(&mut control, &set)?;
+                }
+                return Ok(AgentTeamReserveResult {
+                    team_id: telemetry.team_id.clone().unwrap_or(params.team_id),
+                    main_session_id: params.main_session_id,
+                    generation: telemetry.team_generation.unwrap_or(1),
+                    mutation_id: params.mutation_id,
+                    reused: true,
+                    acquired: recovered,
+                    recovered,
+                });
+            }
+            if telemetry.team_id.as_deref() != Some(params.team_id.as_str())
+                || telemetry.team_role.as_deref() != Some("main")
+            {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "session '{}' is not the main session for team '{}'",
+                        params.main_session_id, params.team_id
+                    ),
+                )));
+            }
+            let current_generation = telemetry.team_generation.unwrap_or(1);
+            if current_generation == params.next_generation
+                && telemetry.team_mutation_id.as_deref() == params.mutation_id.as_deref()
+            {
+                let recovered = agent_team_reservation_can_be_recovered(
+                    telemetry.team_mutation_owner_id.as_deref(),
+                    &owner_id,
+                );
+                if !recovered
+                    && telemetry.team_mutation_owner_id.as_deref() != Some(owner_id.as_str())
+                {
+                    return Err(agent_team_mutation_in_progress_error(&params.team_id));
+                }
+                if recovered {
+                    telemetry.team_mutation_owner_id = Some(owner_id.clone());
+                    let set = control.handle_request(RequestEnvelope::new(
+                        format!("{}_recover", request.id),
+                        "agent.set_state",
+                        serde_json::json!({
+                            "session_id": params.main_session_id,
+                            "state": current.state,
+                            "reason": current.reason,
+                            "telemetry": telemetry,
+                        })
+                        .to_string(),
+                        self.control_token.clone(),
+                    ));
+                    self.persist_agent_set_state(&mut control, &set)?;
+                }
+                return Ok(AgentTeamReserveResult {
+                    team_id: params.team_id,
+                    main_session_id: params.main_session_id,
+                    generation: current_generation,
+                    mutation_id: params.mutation_id,
+                    reused: true,
+                    acquired: recovered,
+                    recovered,
+                });
+            }
+            if telemetry.team_status.as_deref() == Some("provisioning") {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "team '{}' already has a mutation in progress",
+                        params.team_id
+                    ),
+                )));
+            }
+            if current_generation != params.expected_generation {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "team '{}' generation conflict: expected {}, current {}",
+                        params.team_id, params.expected_generation, current_generation
+                    ),
+                )));
+            }
+            telemetry.team_generation = Some(params.next_generation);
+            telemetry.team_mutation_id = params.mutation_id.clone();
+            telemetry.team_mutation_owner_id = Some(owner_id);
+            telemetry.team_status = Some("provisioning".to_string());
+            let set = control.handle_request(RequestEnvelope::new(
+                format!("{}_set", request.id),
+                "agent.set_state",
+                serde_json::json!({
+                    "session_id": params.main_session_id,
+                    "state": current.state,
+                    "reason": current.reason,
+                    "telemetry": telemetry,
+                })
+                .to_string(),
+                self.control_token.clone(),
+            ));
+            self.persist_agent_set_state(&mut control, &set)?;
+            Ok(AgentTeamReserveResult {
+                team_id: params.team_id,
+                main_session_id: params.main_session_id,
+                generation: params.next_generation,
+                mutation_id: params.mutation_id,
+                reused: false,
+                acquired: true,
+                recovered: false,
+            })
+        })();
+        match result {
+            Ok(result) => ResponseEnvelope::ok_typed(id, &result),
+            Err(error) => ResponseEnvelope::error(id, control_error_from_host(error)),
+        }
+    }
+
+    fn handle_agent_team_settle(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        let id = request.id.clone();
+        let result = (|| {
+            validate_desktop_request(&request, &self.control_token)?;
+            let params: AgentTeamSettleParams = request.parse_params()?;
+            let owner_id = agent_team_mutation_owner_id(&request, &params.mutation_id);
+            let Ok(mut control) = self.control.lock() else {
+                return Err(DesktopHostError::StateUnavailable(
+                    "desktop control state is unavailable".to_string(),
+                ));
+            };
+            control.collect_events();
+            let current = self.load_agent_team_main_state(
+                &mut control,
+                &request.id,
+                &params.main_session_id,
+            )?;
+            validate_agent_team_mutation_owner(
+                &current,
+                &params.team_id,
+                params.generation,
+                &params.mutation_id,
+                &owner_id,
+            )?;
+            let status = params
+                .telemetry
+                .team_status
+                .as_deref()
+                .filter(|status| *status != "provisioning")
+                .ok_or_else(|| {
+                    DesktopHostError::Control(ControlError::new(
+                        ErrorCode::InvalidRequest,
+                        "agent.team.settle requires a non-provisioning team_status.",
+                    ))
+                })?
+                .to_string();
+            if params.telemetry.team_id.as_deref() != Some(params.team_id.as_str())
+                || params.telemetry.team_role.as_deref() != Some("main")
+                || params.telemetry.team_generation != Some(params.generation)
+            {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    "agent.team.settle telemetry does not match the reserved team generation.",
+                )));
+            }
+            let mut telemetry = params.telemetry;
+            telemetry.team_mutation_id = None;
+            telemetry.team_mutation_owner_id = None;
+            let set = control.handle_request(RequestEnvelope::new(
+                format!("{}_settle", request.id),
+                "agent.set_state",
+                serde_json::json!({
+                    "session_id": params.main_session_id,
+                    "state": current.state,
+                    "reason": current.reason,
+                    "telemetry": telemetry,
+                })
+                .to_string(),
+                self.control_token.clone(),
+            ));
+            self.persist_agent_set_state(&mut control, &set)?;
+            Ok(AgentTeamSettleResult {
+                team_id: params.team_id,
+                main_session_id: params.main_session_id,
+                generation: params.generation,
+                status,
+            })
+        })();
+        match result {
+            Ok(result) => ResponseEnvelope::ok_typed(id, &result),
+            Err(error) => ResponseEnvelope::error(id, control_error_from_host(error)),
+        }
+    }
+
+    fn handle_agent_team_recover(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        let id = request.id.clone();
+        let result = (|| {
+            validate_desktop_request(&request, &self.control_token)?;
+            let params: AgentTeamRecoverParams = request.parse_params()?;
+            let owner_id = agent_team_mutation_owner_id(&request, &params.mutation_id);
+            let Ok(mut control) = self.control.lock() else {
+                return Err(DesktopHostError::StateUnavailable(
+                    "desktop control state is unavailable".to_string(),
+                ));
+            };
+            control.collect_events();
+            let current = self.load_agent_team_main_state(
+                &mut control,
+                &request.id,
+                &params.main_session_id,
+            )?;
+            let mut telemetry = current.telemetry.clone().unwrap_or_default();
+            validate_agent_team_mutation_identity(
+                &telemetry,
+                &params.team_id,
+                params.generation,
+                &params.mutation_id,
+            )?;
+            let previous_owner = telemetry.team_mutation_owner_id.as_deref();
+            if previous_owner != Some(owner_id.as_str())
+                && !agent_team_reservation_can_be_recovered(previous_owner, &owner_id)
+            {
+                return Err(agent_team_mutation_in_progress_error(&params.team_id));
+            }
+            telemetry.team_status = Some("layout_dirty".to_string());
+            telemetry.team_mutation_id = None;
+            telemetry.team_mutation_owner_id = None;
+            let set = control.handle_request(RequestEnvelope::new(
+                format!("{}_recover", request.id),
+                "agent.set_state",
+                serde_json::json!({
+                    "session_id": params.main_session_id,
+                    "state": current.state,
+                    "reason": current.reason,
+                    "telemetry": telemetry,
+                })
+                .to_string(),
+                self.control_token.clone(),
+            ));
+            self.persist_agent_set_state(&mut control, &set)?;
+            Ok(AgentTeamRecoverResult {
+                team_id: params.team_id,
+                main_session_id: params.main_session_id,
+                generation: params.generation,
+                recovered: true,
+            })
+        })();
+        match result {
+            Ok(result) => ResponseEnvelope::ok_typed(id, &result),
+            Err(error) => ResponseEnvelope::error(id, control_error_from_host(error)),
+        }
+    }
+
+    fn load_agent_team_main_state(
+        &self,
+        control: &mut DesktopRuntimeControl,
+        request_id: &str,
+        main_session_id: &str,
+    ) -> Result<AgentStateResult, DesktopHostError> {
+        let get = control.handle_request(RequestEnvelope::new(
+            format!("{request_id}_get"),
+            "agent.get_state",
+            serde_json::json!({ "session_id": main_session_id }).to_string(),
+            self.control_token.clone(),
+        ));
+        response_result_json(&get)
     }
 
     fn persist_agent_clear_attention(
@@ -7325,6 +7701,9 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "session.terminate",
         "session.read_recent",
         "agent.set_state",
+        "agent.team.reserve",
+        "agent.team.settle",
+        "agent.team.recover",
         "agent.get_state",
         "agent.list_attention",
         "agent.clear_attention",
@@ -8842,6 +9221,34 @@ fn normalize_terminal_split_behavior(value: &str) -> Result<String, DesktopHostE
                 "Config ui.terminal_split_behavior must be 'clone_current' or 'empty'; got '{other}'."
             ),
         ))),
+    }
+}
+
+fn merge_terminal_split_environment(
+    launch_environment: Option<&[(String, String)]>,
+    overrides: &[EnvVarParam],
+) -> Vec<EnvVarParam> {
+    let mut merged = Vec::new();
+    for (key, value) in launch_environment.unwrap_or_default() {
+        merge_terminal_environment_entry(
+            &mut merged,
+            EnvVarParam {
+                key: key.clone(),
+                value: value.clone(),
+            },
+        );
+    }
+    for override_entry in overrides {
+        merge_terminal_environment_entry(&mut merged, override_entry.clone());
+    }
+    merged
+}
+
+fn merge_terminal_environment_entry(environment: &mut Vec<EnvVarParam>, entry: EnvVarParam) {
+    if let Some(existing) = environment.iter_mut().find(|item| item.key == entry.key) {
+        existing.value = entry.value;
+    } else {
+        environment.push(entry);
     }
 }
 
@@ -10681,6 +11088,113 @@ fn control_error_from_host(error: DesktopHostError) -> ControlError {
             ControlError::new(ErrorCode::Conflict, message)
         }
     }
+}
+
+fn agent_team_mutation_owner_id(request: &RequestEnvelope, mutation_id: &str) -> String {
+    request
+        .caller
+        .as_ref()
+        .and_then(|caller| caller.client_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| mutation_id.to_string())
+}
+
+fn agent_team_mutation_in_progress_error(team_id: &str) -> DesktopHostError {
+    DesktopHostError::Control(ControlError::new(
+        ErrorCode::Conflict,
+        format!("team '{team_id}' already has a live mutation owner"),
+    ))
+}
+
+fn validate_agent_team_mutation_identity(
+    telemetry: &AgentTelemetry,
+    team_id: &str,
+    generation: u64,
+    mutation_id: &str,
+) -> Result<(), DesktopHostError> {
+    if telemetry.team_id.as_deref() != Some(team_id)
+        || telemetry.team_role.as_deref() != Some("main")
+        || telemetry.team_generation != Some(generation)
+        || telemetry.team_status.as_deref() != Some("provisioning")
+        || telemetry.team_mutation_id.as_deref() != Some(mutation_id)
+    {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::Conflict,
+            format!(
+                "team '{team_id}' mutation '{mutation_id}' no longer owns generation {generation}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_team_mutation_owner(
+    current: &AgentStateResult,
+    team_id: &str,
+    generation: u64,
+    mutation_id: &str,
+    owner_id: &str,
+) -> Result<(), DesktopHostError> {
+    let telemetry = current.telemetry.as_ref().ok_or_else(|| {
+        DesktopHostError::Control(ControlError::new(
+            ErrorCode::Conflict,
+            format!("team '{team_id}' has no reservation telemetry"),
+        ))
+    })?;
+    validate_agent_team_mutation_identity(telemetry, team_id, generation, mutation_id)?;
+    if telemetry.team_mutation_owner_id.as_deref() != Some(owner_id) {
+        return Err(agent_team_mutation_in_progress_error(team_id));
+    }
+    Ok(())
+}
+
+fn agent_team_reservation_can_be_recovered(
+    previous_owner: Option<&str>,
+    requesting_owner: &str,
+) -> bool {
+    let Some(previous_owner) = previous_owner else {
+        return true;
+    };
+    if previous_owner == requesting_owner {
+        return false;
+    }
+    agent_team_owner_process_id(previous_owner).is_some_and(|pid| !process_id_is_alive(pid))
+}
+
+fn agent_team_owner_process_id(owner: &str) -> Option<u32> {
+    owner
+        .strip_prefix("mcp-")
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            owner
+                .strip_prefix("tmux:")
+                .and_then(|rest| rest.rsplit_once(':').map(|(prefix, _)| prefix))
+                .and_then(|prefix| prefix.rsplit_once(':').map(|(_, pid)| pid))
+                .and_then(|value| value.parse().ok())
+        })
+}
+
+#[cfg(windows)]
+fn process_id_is_alive(process_id: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn process_id_is_alive(_process_id: u32) -> bool {
+    false
 }
 
 fn terminal_placement_failure_error(
@@ -12573,6 +13087,9 @@ fn is_mutating_control_method(method: &str) -> bool {
             | "session.resize"
             | "session.terminate"
             | "agent.set_state"
+            | "agent.team.reserve"
+            | "agent.team.settle"
+            | "agent.team.recover"
             | "agent.clear_attention"
             | "actions.run"
             | "notification.create"
@@ -16685,6 +17202,326 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn agent_team_generation_reservation_is_atomic() {
+        let state = DesktopControlState::new();
+        let dead_owner = "mcp-4294967294-dead-owner";
+        let live_owner = format!("mcp-{}-replacement", std::process::id());
+        let spawn = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_spawn_team_generation",
+                "session.spawn",
+                r#"{"workspace_id":"ws_team_generation","command":["cmd.exe","/d","/q"],"cwd":null,"columns":120,"rows":30,"durability":"ephemeral"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let session_id = response_string_field(&spawn, "session_id");
+        let set = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_set_team_generation",
+                "agent.set_state",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "state": "running",
+                    "reason": "adaptive team active",
+                    "telemetry": {
+                        "activity": "agent",
+                        "team_id": "team-generation",
+                        "team_role": "main",
+                        "team_status": "active",
+                        "team_generation": 1,
+                        "layout_root_pane_id": "pane-main"
+                    }
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_string_field(&set, "session_id"), session_id);
+
+        let reserve = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_reserve_team_generation",
+                "agent.team.reserve",
+                serde_json::json!({
+                    "team_id": "team-generation",
+                    "main_session_id": session_id,
+                    "expected_generation": 1,
+                    "next_generation": 2,
+                    "mutation_id": "spawn-docs"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some(dead_owner.to_string()),
+            }),
+        );
+        assert_eq!(response_value(&reserve)["generation"], 2);
+        assert_eq!(response_value(&reserve)["acquired"], true);
+        assert_eq!(response_value(&reserve)["reused"], false);
+
+        let retry = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_retry_team_generation",
+                "agent.team.reserve",
+                serde_json::json!({
+                    "team_id": "team-generation",
+                    "main_session_id": session_id,
+                    "expected_generation": 1,
+                    "next_generation": 2,
+                    "mutation_id": "spawn-docs"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some(dead_owner.to_string()),
+            }),
+        );
+        assert_eq!(response_value(&retry)["generation"], 2);
+        assert_eq!(response_value(&retry)["acquired"], false);
+        assert_eq!(response_value(&retry)["reused"], true);
+
+        let takeover = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_takeover_team_generation",
+                "agent.team.reserve",
+                serde_json::json!({
+                    "team_id": "team-generation",
+                    "main_session_id": session_id,
+                    "expected_generation": 1,
+                    "next_generation": 2,
+                    "mutation_id": "spawn-docs"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some(live_owner.clone()),
+            }),
+        );
+        assert_eq!(response_value(&takeover)["generation"], 2);
+        assert_eq!(response_value(&takeover)["acquired"], true);
+        assert_eq!(response_value(&takeover)["reused"], true);
+        assert_eq!(response_value(&takeover)["recovered"], true);
+
+        let stale = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_stale_team_generation",
+                "agent.team.reserve",
+                serde_json::json!({
+                    "team_id": "team-generation",
+                    "main_session_id": session_id,
+                    "expected_generation": 1,
+                    "next_generation": 2,
+                    "mutation_id": "spawn-tests"
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_error_code(&stale), ErrorCode::Conflict);
+
+        let current = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_get_team_generation",
+                "agent.get_state",
+                serde_json::json!({"session_id": session_id}).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&current)["telemetry"]["team_generation"], 2);
+        assert_eq!(
+            response_value(&current)["telemetry"]["team_mutation_id"],
+            "spawn-docs"
+        );
+        assert_eq!(
+            response_value(&current)["telemetry"]["team_status"],
+            "provisioning"
+        );
+
+        let settled = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_settle_team_generation",
+                "agent.team.settle",
+                serde_json::json!({
+                    "team_id": "team-generation",
+                    "main_session_id": session_id,
+                    "generation": 2,
+                    "mutation_id": "spawn-docs",
+                    "telemetry": {
+                        "activity": "agent",
+                        "team_id": "team-generation",
+                        "team_role": "main",
+                        "team_status": "ready",
+                        "team_generation": 2,
+                        "layout_root_pane_id": "pane-main"
+                    }
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some(live_owner.clone()),
+            }),
+        );
+        assert_eq!(response_value(&settled)["status"], "ready");
+
+        let stale_settle = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_stale_settle_team_generation",
+                "agent.team.settle",
+                serde_json::json!({
+                    "team_id": "team-generation",
+                    "main_session_id": session_id,
+                    "generation": 2,
+                    "mutation_id": "spawn-docs",
+                    "telemetry": {
+                        "activity": "agent",
+                        "team_id": "team-generation",
+                        "team_role": "main",
+                        "team_status": "ready",
+                        "team_generation": 2
+                    }
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            )
+            .with_caller(agentmux_ipc::ControlCaller {
+                source: "mcp".to_string(),
+                profile: Some("standard".to_string()),
+                client_session_id: Some(live_owner),
+            }),
+        );
+        assert_eq!(response_error_code(&stale_settle), ErrorCode::Conflict);
+
+        let _ = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_stop_team_generation",
+                "session.terminate",
+                serde_json::json!({"session_id": session_id, "mode": "kill"}).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn agent_team_initial_claim_is_atomic_and_idempotent() {
+        let state = DesktopControlState::new();
+        let spawn = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_spawn_team_claim",
+                "session.spawn",
+                r#"{"workspace_id":"ws_team_claim","command":["cmd.exe","/d","/q"],"cwd":null,"columns":120,"rows":30,"durability":"ephemeral"}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let session_id = response_string_field(&spawn, "session_id");
+        let claim_params = serde_json::json!({
+            "team_id": "team-claim",
+            "main_session_id": session_id,
+            "expected_generation": 0,
+            "next_generation": 1,
+            "mutation_id": "start-team-claim",
+            "claim": true
+        })
+        .to_string();
+        let claim = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_team_claim",
+                "agent.team.reserve",
+                claim_params.clone(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&claim)["generation"], 1);
+        assert_eq!(response_value(&claim)["acquired"], true);
+
+        let retry = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_team_claim_retry",
+                "agent.team.reserve",
+                claim_params,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&retry)["generation"], 1);
+        assert_eq!(response_value(&retry)["acquired"], false);
+
+        let concurrent_retry = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_team_claim_concurrent_retry",
+                "agent.team.reserve",
+                serde_json::json!({
+                    "team_id": "newly-generated-team-id",
+                    "main_session_id": session_id,
+                    "expected_generation": 0,
+                    "next_generation": 1,
+                    "mutation_id": "start-team-claim",
+                    "claim": true
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_value(&concurrent_retry)["team_id"], "team-claim");
+        assert_eq!(response_value(&concurrent_retry)["reused"], true);
+
+        let conflicting = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_team_claim_conflict",
+                "agent.team.reserve",
+                serde_json::json!({
+                    "team_id": "other-team",
+                    "main_session_id": session_id,
+                    "expected_generation": 0,
+                    "next_generation": 1,
+                    "mutation_id": "start-other-team",
+                    "claim": true
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert_eq!(response_error_code(&conflicting), ErrorCode::Conflict);
+
+        let _ = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_stop_team_claim",
+                "session.terminate",
+                serde_json::json!({"session_id": session_id, "mode": "kill"}).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn workspace_close_policies_coordinate_live_backend_sessions() {
         let state = DesktopControlState::new();
         let workspace_id = "ws_close_policy";
@@ -18172,6 +19009,45 @@ mod tests {
         assert!(!parts.contains(&"WSLENV"));
         assert!(!parts.contains(&"TMUX"));
         assert!(!parts.contains(&"TMUX_PANE"));
+    }
+
+    #[test]
+    fn terminal_split_environment_overrides_launch_values_by_key() {
+        let launch_environment = vec![
+            ("AGENTMUX_TEAM_ID".to_string(), "team-original".to_string()),
+            ("UNCHANGED".to_string(), "source".to_string()),
+        ];
+        let merged = merge_terminal_split_environment(
+            Some(&launch_environment),
+            &[
+                EnvVarParam {
+                    key: "AGENTMUX_TEAM_ID".to_string(),
+                    value: "team-override".to_string(),
+                },
+                EnvVarParam {
+                    key: "AGENTMUX_TEAM_WORKER_NAME".to_string(),
+                    value: "worker-2".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                EnvVarParam {
+                    key: "AGENTMUX_TEAM_ID".to_string(),
+                    value: "team-override".to_string(),
+                },
+                EnvVarParam {
+                    key: "UNCHANGED".to_string(),
+                    value: "source".to_string(),
+                },
+                EnvVarParam {
+                    key: "AGENTMUX_TEAM_WORKER_NAME".to_string(),
+                    value: "worker-2".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
