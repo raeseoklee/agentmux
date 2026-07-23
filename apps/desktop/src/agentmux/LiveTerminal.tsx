@@ -490,6 +490,7 @@ export function LiveTerminal({
   const inputLineRef = useRef("");
   const bootingRef = useRef(true);
   const pollNowRef = useRef<(() => void) | null>(null);
+  const checkpointViewStateRef = useRef<(() => void) | null>(null);
   const webglDisableTimerRef = useRef<number | null>(null);
   const [rendererEpoch, setRendererEpoch] = useState(0);
   const margin = Math.min(32, Math.max(0, Math.round(innerMargin)));
@@ -585,6 +586,7 @@ export function LiveTerminal({
     void initialStateReady.then(() => {
       if (alive) {
         restoredViewReady = true;
+        renderer.restoreViewportY(restoredViewState?.viewportY);
       }
     });
     let renderedOutputOffset = restoredViewState?.outputOffset ?? null;
@@ -608,9 +610,11 @@ export function LiveTerminal({
       terminalViewStateCache.write(sessionId, {
         serialized,
         outputOffset: renderedOutputOffset,
+        viewportY: renderer.viewportY() ?? undefined,
         updatedAt: Date.now(),
       });
     };
+    checkpointViewStateRef.current = () => checkpointRendererViewState();
     const scheduleViewCheckpoint = () => {
       if (viewCheckpointTimer !== null) {
         window.clearTimeout(viewCheckpointTimer);
@@ -826,6 +830,9 @@ export function LiveTerminal({
       // Keep the last parsed checkpoint when an output burst is still queued;
       // replacing it with a partial framebuffer would create an offset gap.
       checkpointRendererViewState(true);
+      if (checkpointViewStateRef.current) {
+        checkpointViewStateRef.current = null;
+      }
       discardTerminalOutput(renderer);
       renderer.dispose();
       flushPreviewCache();
@@ -1480,6 +1487,10 @@ export function LiveTerminal({
     if (active) {
       renderer?.focus();
       pollNowRef.current?.();
+    } else {
+      // Capture before this tree becomes eligible for cold parking. Cleanup
+      // retains the last complete checkpoint if xterm is still parsing.
+      checkpointViewStateRef.current?.();
     }
   }, [active]);
 

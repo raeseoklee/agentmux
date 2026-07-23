@@ -1896,6 +1896,41 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))
     }
 
+    pub fn update_worktree_operation_resources(
+        &mut self,
+        operation_id: &str,
+        workspace_id: Option<&str>,
+        surface_id: Option<&str>,
+        session_id: Option<&str>,
+        ownership_json: Option<&str>,
+        updated_at: &str,
+    ) -> StoreResult<PersistedWorktreeOperation> {
+        let updated = self.connection.execute(
+            "UPDATE worktree_operations
+             SET workspace_id = COALESCE(?2, workspace_id),
+                 surface_id = COALESCE(?3, surface_id),
+                 session_id = COALESCE(?4, session_id),
+                 ownership_json = COALESCE(?5, ownership_json),
+                 updated_at = ?6
+             WHERE operation_id = ?1",
+            params![
+                operation_id,
+                workspace_id,
+                surface_id,
+                session_id,
+                ownership_json,
+                updated_at
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::WorktreeOperationNotFound(
+                operation_id.to_string(),
+            ));
+        }
+        self.load_worktree_operation(operation_id)?
+            .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))
+    }
+
     pub fn record_worktree_operation_recovery(
         &mut self,
         operation_id: &str,
@@ -2014,6 +2049,20 @@ impl SqliteStore {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn delete_git_review_thread(&mut self, thread_id: &str) -> StoreResult<bool> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "DELETE FROM git_review_comments WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM git_review_threads WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted > 0)
     }
 
     pub fn list_git_review_threads(
@@ -2146,6 +2195,31 @@ impl SqliteStore {
         )?;
         let rows = statement.query_map([thread_id], git_review_comment_from_row)?;
         collect_rows(rows)
+    }
+
+    pub fn load_git_review_comment(
+        &self,
+        comment_id: &str,
+    ) -> StoreResult<Option<PersistedGitReviewComment>> {
+        self.connection
+            .query_row(
+                "SELECT comment_id, thread_id, author_id, body, target_kind, target_id,
+                        delivery_state, delivery_error, delivered_at, created_at, updated_at
+                 FROM git_review_comments
+                 WHERE comment_id = ?1",
+                [comment_id],
+                git_review_comment_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delete_git_review_comment(&mut self, comment_id: &str) -> StoreResult<bool> {
+        let deleted = self.connection.execute(
+            "DELETE FROM git_review_comments WHERE comment_id = ?1",
+            [comment_id],
+        )?;
+        Ok(deleted > 0)
     }
 
     pub fn update_git_review_comment_delivery(
@@ -3196,6 +3270,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(workspace.state, WorktreeOperationState::WorkspaceCreated);
+        let resources = store
+            .update_worktree_operation_resources(
+                "op_1",
+                Some("ws_agent"),
+                Some("surface_agent"),
+                Some("session_agent"),
+                Some(r#"{"owned":true}"#),
+                "2026-07-23T00:02:30Z",
+            )
+            .unwrap();
+        assert_eq!(resources.workspace_id.as_deref(), Some("ws_agent"));
+        assert_eq!(resources.surface_id.as_deref(), Some("surface_agent"));
+        assert_eq!(resources.session_id.as_deref(), Some("session_agent"));
+        assert_eq!(resources.ownership_json, r#"{"owned":true}"#);
         store
             .transition_worktree_operation(
                 "op_1",
@@ -3381,6 +3469,24 @@ mod tests {
             comments[0].delivered_at.as_deref(),
             Some("2026-07-23T00:00:02Z")
         );
+        assert_eq!(
+            store
+                .load_git_review_comment("comment_1")
+                .unwrap()
+                .unwrap()
+                .body,
+            "Please cover the rollback path."
+        );
+        assert!(store.delete_git_review_comment("comment_1").unwrap());
+        assert!(store
+            .list_git_review_comments("thread_old")
+            .unwrap()
+            .is_empty());
+        assert!(store.delete_git_review_thread("thread_old").unwrap());
+        assert!(store
+            .load_git_review_thread("thread_old")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

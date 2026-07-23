@@ -86,6 +86,10 @@ import type {
 } from "../terminal/TerminalWebglPolicy";
 import { terminalViewStateCache } from "../terminal/TerminalViewStateCache";
 import {
+  decideTerminalWarmRetain,
+  type TerminalWarmRetainTab,
+} from "../terminal/TerminalWarmRetainPolicy";
+import {
   ACCENTS,
   buildRootVars,
   THEMES,
@@ -3308,6 +3312,146 @@ export function AgentmuxTerminalApp() {
     }
     return ordered;
   }, [panes, rootPaneForPane, rootPaneId, tabSurfaces]);
+
+  const activeTabRootRef = useRef<string | null>(null);
+  const [lastActiveTabRootId, setLastActiveTabRootId] = useState<string | null>(
+    null,
+  );
+  const [tabWarmActivity, setTabWarmActivity] = useState<
+    Map<string, { lastActiveAt: number; hiddenSince: number | null }>
+  >(() => new Map());
+  const [warmRetainNow, setWarmRetainNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const now = Date.now();
+    const previousActiveRoot = activeTabRootRef.current;
+    const activeRootChanged = previousActiveRoot !== rootPaneId;
+    if (rootPaneId && previousActiveRoot && activeRootChanged) {
+      setLastActiveTabRootId(previousActiveRoot);
+    }
+    activeTabRootRef.current = rootPaneId;
+
+    setTabWarmActivity((previous) => {
+      const next = new Map<
+        string,
+        { lastActiveAt: number; hiddenSince: number | null }
+      >();
+      let changed = previous.size !== tabRootPaneIds.length;
+      for (const tabId of tabRootPaneIds) {
+        const existing = previous.get(tabId);
+        if (tabId === rootPaneId) {
+          if (!existing || existing.hiddenSince !== null) {
+            next.set(tabId, { lastActiveAt: now, hiddenSince: null });
+            changed = true;
+          } else {
+            next.set(tabId, existing);
+          }
+          continue;
+        }
+        if (!existing) {
+          next.set(tabId, { lastActiveAt: now, hiddenSince: now });
+          changed = true;
+        } else if (existing.hiddenSince === null) {
+          next.set(tabId, { ...existing, hiddenSince: now });
+          changed = true;
+        } else {
+          next.set(tabId, existing);
+        }
+      }
+      return changed ? next : previous;
+    });
+    if (activeRootChanged) {
+      setWarmRetainNow(now);
+    }
+  }, [rootPaneId, tabRootPaneIds]);
+
+  const terminalWarmRetainTabs = useMemo<TerminalWarmRetainTab[]>(() => {
+    const isProtectedFromParking = (rootId: string) => {
+      const visited = new Set<string>();
+      let hasSplit = false;
+      let hasBrowser = false;
+      let hasRestoring = false;
+      let hasRunningAgent = false;
+      let hasUncapturedTerminal = false;
+      const visit = (paneId: string) => {
+        if (visited.has(paneId)) return;
+        visited.add(paneId);
+        const pane = paneById.get(paneId);
+        if (!pane) return;
+        if (pane.kind === "split") {
+          hasSplit = true;
+          for (const child of childrenByParent.get(paneId) ?? []) {
+            visit(child.paneId);
+          }
+          return;
+        }
+        const surface = surfaceForPane(pane);
+        if (surface?.surfaceType === "browser") hasBrowser = true;
+        const session = surface?.sessionId
+          ? sessionById.get(surface.sessionId)
+          : undefined;
+        if (
+          session &&
+          isLiveSession(session) &&
+          !terminalViewStateCache.read(session.sessionId)
+        ) {
+          hasUncapturedTerminal = true;
+        }
+        if (session?.state === "recovering" || session?.state === "starting") {
+          hasRestoring = true;
+        }
+        const agent = session ? agentBySession.get(session.sessionId) : undefined;
+        if (agent && ["running", "working", "busy"].includes(agent.state)) {
+          hasRunningAgent = true;
+        }
+      };
+      visit(rootId);
+      return (
+        hasSplit ||
+        hasBrowser ||
+        hasRestoring ||
+        hasRunningAgent ||
+        hasUncapturedTerminal
+      );
+    };
+
+    return tabRootPaneIds.map((tabId) => {
+      const activity = tabWarmActivity.get(tabId);
+      return {
+        tabId,
+        active: tabId === rootPaneId,
+        lastActive: tabId === lastActiveTabRootId,
+        lastActiveAt: activity?.lastActiveAt ?? null,
+        hiddenSince:
+          tabId === rootPaneId ? null : (activity?.hiddenSince ?? warmRetainNow),
+        protectedFromParking: isProtectedFromParking(tabId),
+      };
+    });
+  }, [
+    agentBySession,
+    childrenByParent,
+    lastActiveTabRootId,
+    paneById,
+    rootPaneId,
+    sessionById,
+    surfaceById,
+    tabRootPaneIds,
+    tabWarmActivity,
+    warmRetainNow,
+  ]);
+  const terminalWarmRetainDecision = useMemo(
+    () => decideTerminalWarmRetain(terminalWarmRetainTabs, warmRetainNow),
+    [terminalWarmRetainTabs, warmRetainNow],
+  );
+  useEffect(() => {
+    const nextTransitionAt = terminalWarmRetainDecision.nextTransitionAt;
+    if (!nextTransitionAt) return;
+    const timer = window.setTimeout(
+      () => setWarmRetainNow(Date.now()),
+      Math.max(0, nextTransitionAt - Date.now()) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [terminalWarmRetainDecision.nextTransitionAt]);
 
   const activeWorkspace = workspaces.find(
     (ws) => ws.workspaceId === activeWorkspaceId,
@@ -8969,7 +9113,11 @@ export function AgentmuxTerminalApp() {
                   제어 플레인에 연결 중…
                 </div>
               ) : rootPaneId ? (
-                tabRootPaneIds.map((tabRootPaneId) => {
+                tabRootPaneIds
+                  .filter((tabRootPaneId) =>
+                    terminalWarmRetainDecision.warmTabIds.has(tabRootPaneId),
+                  )
+                  .map((tabRootPaneId) => {
                   const tabActive = tabRootPaneId === rootPaneId;
                   return (
                     <div
@@ -8978,6 +9126,7 @@ export function AgentmuxTerminalApp() {
                       data-agentmux-pane-tree={tabRootPaneId}
                       data-agentmux-tab-pane-tree={tabRootPaneId}
                       data-agentmux-tab-active={tabActive ? "true" : "false"}
+                      data-agentmux-tab-warm="true"
                       data-agentmux-zoomed-pane={
                         tabActive && zoomedPaneId && paneById.get(zoomedPaneId)
                           ? zoomedPaneId
