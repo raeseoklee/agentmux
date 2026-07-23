@@ -3258,7 +3258,10 @@ class BrowserPreviewControlClient implements ControlClient {
     ];
     const previewApi: BrowserPreviewApi = {
       syntheticAgentState: (detail) => this.applySyntheticAgentState(detail),
-      sidebarState: (detail) => this.applySyntheticSidebarState(detail),
+      sidebarState: (detail) => {
+        this.applySyntheticSidebarState(detail);
+        window.dispatchEvent(new Event("agentmux:synthetic-sidebar-state"));
+      },
       teamTask: (detail) => this.applySyntheticTeamTask(detail),
       teamMessage: (detail) => this.applySyntheticTeamMessage(detail),
       browserUrl: (surfaceId?: string) => {

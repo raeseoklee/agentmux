@@ -719,6 +719,19 @@ export function useAgentmuxControl(): AgentmuxControl {
     }
   }, [client]);
 
+  // Browser preview state changes should follow the same push-first contract as
+  // Tauri's sidebar-changed event. This also keeps preview tests independent of
+  // the five-second fallback poll.
+  useEffect(() => {
+    const handler = () => {
+      void refreshSidebar();
+    };
+    window.addEventListener("agentmux:synthetic-sidebar-state", handler);
+    return () => {
+      window.removeEventListener("agentmux:synthetic-sidebar-state", handler);
+    };
+  }, [refreshSidebar]);
+
   // RT-1/RT-2: Subscribe to host-pushed sidebar-changed signals so a `cd` in
   // a terminal reflects in the footer immediately instead of up to 5 s.
   // Only active under Tauri; in plain-browser preview the event never fires so
