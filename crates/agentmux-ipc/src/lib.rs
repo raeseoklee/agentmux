@@ -11,6 +11,54 @@ pub const DEFAULT_CONTROL_PIPE_NAME: &str = r"\\.\pipe\agentmux-control";
 pub const DEFAULT_LOCAL_CONTROL_TOKEN: &str = "desktop-bootstrap-token";
 pub const DEFAULT_CONTROL_TOKEN_FILE_NAME: &str = "control.token";
 
+/// Stable control-plane method names for the Git operations surface. Keeping
+/// these in the IPC crate prevents the desktop, server, CLI, and MCP adapters
+/// from silently drifting into separate APIs.
+pub const METHOD_GIT_STATUS_SUMMARY: &str = "git.status_summary";
+pub const METHOD_GIT_STATUS_PAGE: &str = "git.status_page";
+pub const METHOD_GIT_DIFF: &str = "git.diff";
+pub const METHOD_GIT_STAGE: &str = "git.stage";
+pub const METHOD_GIT_UNSTAGE: &str = "git.unstage";
+pub const METHOD_GIT_STAGE_ALL: &str = "git.stage_all";
+pub const METHOD_GIT_UNSTAGE_ALL: &str = "git.unstage_all";
+pub const METHOD_GIT_DISCARD: &str = "git.discard";
+pub const METHOD_GIT_COMMIT: &str = "git.commit";
+pub const EVENT_GIT_REPOSITORY_CHANGED: &str = "git.repository_changed";
+
+pub const METHOD_AGENT_WORKTREE_CREATE: &str = "agent.worktree.create";
+pub const METHOD_AGENT_WORKTREE_LIST: &str = "agent.worktree.list";
+pub const METHOD_AGENT_WORKTREE_RECOVER: &str = "agent.worktree.recover";
+pub const METHOD_AGENT_WORKTREE_REMOVE: &str = "agent.worktree.remove";
+pub const EVENT_AGENT_WORKTREE_PROGRESS: &str = "agent.worktree.progress";
+
+pub const METHOD_GIT_REVIEW_THREAD_LIST: &str = "git.review_thread.list";
+pub const METHOD_GIT_REVIEW_THREAD_CREATE: &str = "git.review_thread.create";
+pub const METHOD_GIT_REVIEW_THREAD_UPDATE: &str = "git.review_thread.update";
+pub const METHOD_GIT_REVIEW_THREAD_DELETE: &str = "git.review_thread.delete";
+pub const METHOD_GIT_REVIEW_THREAD_MARK_STALE: &str = "git.review_thread.mark_stale";
+pub const METHOD_GIT_REVIEW_THREAD_DELIVER: &str = "git.review_thread.deliver";
+pub const METHOD_GIT_REVIEW_COMMENT_LIST: &str = "git.review_comment.list";
+pub const METHOD_GIT_REVIEW_COMMENT_CREATE: &str = "git.review_comment.create";
+pub const METHOD_GIT_REVIEW_COMMENT_UPDATE: &str = "git.review_comment.update";
+pub const METHOD_GIT_REVIEW_COMMENT_DELETE: &str = "git.review_comment.delete";
+
+pub const METHOD_AGENT_HOOK_STATE: &str = "agent.hook_state";
+pub const EVENT_AGENT_HOOK_STATE_CHANGED: &str = "agent.hook_state_changed";
+pub const METHOD_DEV_SERVER_CANDIDATE_DETECTED: &str = "dev_server.candidate_detected";
+pub const METHOD_DEV_SERVER_CANDIDATE_LIST: &str = "dev_server.candidate.list";
+pub const METHOD_DEV_SERVER_CANDIDATE_DISMISS: &str = "dev_server.candidate.dismiss";
+pub const METHOD_DEV_SERVER_CANDIDATE_OPEN_IN_SPLIT: &str = "dev_server.candidate.open_in_split";
+pub const EVENT_DEV_SERVER_CANDIDATE_DETECTED: &str = "dev_server.candidate_detected";
+
+pub const MAX_GIT_STATUS_PAGE_SIZE: usize = 500;
+pub const MAX_GIT_PATHS_PER_MUTATION: usize = 500;
+pub const MAX_GIT_DIFF_CONTEXT_LINES: u16 = 200;
+pub const MAX_GIT_COMMIT_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_REVIEW_BODY_BYTES: usize = 32 * 1024;
+pub const MAX_REVIEW_COMMENTS_PER_THREAD: usize = 500;
+pub const MAX_DEV_SERVER_CANDIDATES: usize = 500;
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Auth {
     pub token: String,
@@ -1943,6 +1991,974 @@ pub struct ProfileListResult {
     pub profiles: Vec<ProfileSummaryResult>,
 }
 
+// ---------------------------------------------------------------------------
+// Git operations
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitRepositoryParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+}
+
+/// Parameters for [`METHOD_GIT_STATUS_SUMMARY`]. The alias intentionally keeps
+/// the common repository selector identical across the summary and diff APIs.
+pub type GitStatusSummaryParams = GitRepositoryParams;
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitStatusPageParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+}
+
+impl GitStatusPageParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional("state", self.state.as_deref(), 64)?;
+        validate_optional("cursor", self.cursor.as_deref(), 1024)?;
+        if let Some(limit) = self.limit {
+            validate_range("limit", limit, 1, MAX_GIT_STATUS_PAGE_SIZE)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitChangeSummaryResult {
+    pub path: String,
+    #[serde(default)]
+    pub original_path: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub unstaged: bool,
+    #[serde(default)]
+    pub untracked: bool,
+    #[serde(default)]
+    pub conflicted: bool,
+    #[serde(default)]
+    pub is_binary: bool,
+    #[serde(default)]
+    pub additions: Option<u64>,
+    #[serde(default)]
+    pub deletions: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitStatusSummaryResult {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub repository_root: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub head_oid: Option<String>,
+    #[serde(default)]
+    pub upstream: Option<String>,
+    #[serde(default)]
+    pub ahead: u64,
+    #[serde(default)]
+    pub behind: u64,
+    #[serde(default)]
+    pub staged_count: usize,
+    #[serde(default)]
+    pub unstaged_count: usize,
+    #[serde(default)]
+    pub untracked_count: usize,
+    #[serde(default)]
+    pub conflicted_count: usize,
+    pub generation: u64,
+    pub refreshed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitStatusPageResult {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub generation: u64,
+    pub changes: Vec<GitChangeSummaryResult>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub total_count: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitRepositoryChangedEvent {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub generation: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitDiffParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    pub path: String,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub context_lines: Option<u16>,
+    #[serde(default)]
+    pub generation: Option<u64>,
+}
+
+impl GitDiffParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_required("path", &self.path, 4096)?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional("stage", self.stage.as_deref(), 32)?;
+        if let Some(context_lines) = self.context_lines {
+            validate_range(
+                "context_lines",
+                context_lines,
+                0,
+                MAX_GIT_DIFF_CONTEXT_LINES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitDiffResult {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub generation: u64,
+    pub path: String,
+    #[serde(default)]
+    pub original_path: Option<String>,
+    #[serde(default)]
+    pub diff: String,
+    #[serde(default)]
+    pub is_binary: bool,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitPathMutationParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+impl GitPathMutationParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "idempotency_key",
+            self.idempotency_key.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        if self.paths.is_empty() || self.paths.len() > MAX_GIT_PATHS_PER_MUTATION {
+            return Err(invalid_request(format!(
+                "paths must contain between 1 and {MAX_GIT_PATHS_PER_MUTATION} entries"
+            )));
+        }
+        for path in &self.paths {
+            validate_required("paths[]", path, 4096)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitAllMutationParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+impl GitAllMutationParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "idempotency_key",
+            self.idempotency_key.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitCommitParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub amend: bool,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+impl GitCommitParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_required("message", &self.message, MAX_GIT_COMMIT_MESSAGE_BYTES)?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "idempotency_key",
+            self.idempotency_key.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitMutationResult {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub generation: u64,
+    #[serde(default)]
+    pub affected_paths: Vec<String>,
+    #[serde(default)]
+    pub commit_oid: Option<String>,
+    #[serde(default)]
+    pub reused: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Atomic agent worktrees
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeCreateParams {
+    pub workspace_id: String,
+    pub branch: String,
+    pub destination: String,
+    #[serde(default)]
+    pub base_revision: Option<String>,
+    #[serde(default)]
+    pub create_branch: bool,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub backend_profile: Option<String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: String,
+}
+
+impl AgentWorktreeCreateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_required("branch", &self.branch, 512)?;
+        validate_required("destination", &self.destination, 4096)?;
+        validate_required(
+            "idempotency_key",
+            &self.idempotency_key,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional("base_revision", self.base_revision.as_deref(), 512)?;
+        validate_optional("backend", self.backend.as_deref(), 128)?;
+        validate_optional("backend_profile", self.backend_profile.as_deref(), 512)?;
+        validate_optional("cwd", self.cwd.as_deref(), 4096)?;
+        if self.command.len() > 128 {
+            return Err(invalid_request("command may contain at most 128 arguments"));
+        }
+        for argument in &self.command {
+            validate_required("command[]", argument, 16 * 1024)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeListParams {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub include_completed: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeRecoverParams {
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+impl AgentWorktreeRecoverParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_optional(
+            "operation_id",
+            self.operation_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "idempotency_key",
+            self.idempotency_key.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        if self.operation_id.is_none() && self.idempotency_key.is_none() {
+            return Err(invalid_request(
+                "operation_id or idempotency_key is required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeRemoveParams {
+    pub worktree_id: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+impl AgentWorktreeRemoveParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("worktree_id", &self.worktree_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_optional(
+            "idempotency_key",
+            self.idempotency_key.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeProgressResult {
+    pub operation_id: String,
+    pub worktree_id: Option<String>,
+    pub workspace_id: String,
+    pub state: String,
+    pub step: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub completed: bool,
+    #[serde(default)]
+    pub rolled_back: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeResult {
+    pub operation_id: String,
+    pub worktree_id: String,
+    pub workspace_id: String,
+    pub branch: String,
+    pub path: String,
+    pub state: String,
+    #[serde(default)]
+    pub surface_id: Option<String>,
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub reused: bool,
+    #[serde(default)]
+    pub recovered: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentWorktreeListResult {
+    pub worktrees: Vec<AgentWorktreeResult>,
+}
+
+// ---------------------------------------------------------------------------
+// Diff review comments
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewLineAnchor {
+    pub path: String,
+    pub side: String,
+    pub line: u32,
+    #[serde(default)]
+    pub start_line: Option<u32>,
+    #[serde(default)]
+    pub base_revision: Option<String>,
+    #[serde(default)]
+    pub head_revision: Option<String>,
+    #[serde(default)]
+    pub hunk_header: Option<String>,
+    #[serde(default)]
+    pub diff_hash: Option<String>,
+}
+
+impl GitReviewLineAnchor {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("anchor.path", &self.path, 4096)?;
+        validate_required("anchor.side", &self.side, 32)?;
+        if self.line == 0 {
+            return Err(invalid_request("anchor.line must be greater than 0"));
+        }
+        if let Some(start_line) = self.start_line {
+            if start_line == 0 || start_line > self.line {
+                return Err(invalid_request(
+                    "anchor.start_line must be between 1 and anchor.line",
+                ));
+            }
+        }
+        validate_optional("anchor.base_revision", self.base_revision.as_deref(), 512)?;
+        validate_optional("anchor.head_revision", self.head_revision.as_deref(), 512)?;
+        validate_optional("anchor.hunk_header", self.hunk_header.as_deref(), 4096)?;
+        validate_optional("anchor.diff_hash", self.diff_hash.as_deref(), 512)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadListParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub include_resolved: bool,
+    #[serde(default)]
+    pub include_stale: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl GitReviewThreadListParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional("path", self.path.as_deref(), 4096)?;
+        if let Some(limit) = self.limit {
+            validate_range("limit", limit, 1, MAX_REVIEW_COMMENTS_PER_THREAD)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadCreateParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
+    pub anchor: GitReviewLineAnchor,
+    pub body: String,
+    #[serde(default)]
+    pub author_session_id: Option<String>,
+}
+
+impl GitReviewThreadCreateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "repository_id",
+            self.repository_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_required("body", &self.body, MAX_REVIEW_BODY_BYTES)?;
+        validate_optional(
+            "author_session_id",
+            self.author_session_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        self.anchor.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadUpdateParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub resolved: Option<bool>,
+    #[serde(default)]
+    pub anchor: Option<GitReviewLineAnchor>,
+}
+
+impl GitReviewThreadUpdateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("thread_id", &self.thread_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        if self.resolved.is_none() && self.anchor.is_none() {
+            return Err(invalid_request("resolved or anchor is required"));
+        }
+        if let Some(anchor) = &self.anchor {
+            anchor.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadIdParams {
+    pub thread_id: String,
+}
+
+impl GitReviewThreadIdParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("thread_id", &self.thread_id, MAX_IDEMPOTENCY_KEY_BYTES)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadMarkStaleParams {
+    pub thread_id: String,
+    pub stale: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl GitReviewThreadMarkStaleParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("thread_id", &self.thread_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_optional("reason", self.reason.as_deref(), 4096)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadDeliverParams {
+    pub thread_id: String,
+    pub target: String,
+    #[serde(default)]
+    pub target_session_id: Option<String>,
+    #[serde(default)]
+    pub include_context: bool,
+}
+
+impl GitReviewThreadDeliverParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("thread_id", &self.thread_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_required("target", &self.target, 64)?;
+        validate_optional(
+            "target_session_id",
+            self.target_session_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewCommentListParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl GitReviewCommentListParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("thread_id", &self.thread_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        if let Some(limit) = self.limit {
+            validate_range("limit", limit, 1, MAX_REVIEW_COMMENTS_PER_THREAD)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewCommentCreateParams {
+    pub thread_id: String,
+    pub body: String,
+    #[serde(default)]
+    pub author_session_id: Option<String>,
+}
+
+impl GitReviewCommentCreateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("thread_id", &self.thread_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_required("body", &self.body, MAX_REVIEW_BODY_BYTES)?;
+        validate_optional(
+            "author_session_id",
+            self.author_session_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewCommentUpdateParams {
+    pub comment_id: String,
+    pub body: String,
+}
+
+impl GitReviewCommentUpdateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("comment_id", &self.comment_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_required("body", &self.body, MAX_REVIEW_BODY_BYTES)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewCommentIdParams {
+    pub comment_id: String,
+}
+
+impl GitReviewCommentIdParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required("comment_id", &self.comment_id, MAX_IDEMPOTENCY_KEY_BYTES)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewCommentResult {
+    pub comment_id: String,
+    pub thread_id: String,
+    pub body: String,
+    #[serde(default)]
+    pub author_session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadResult {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub anchor: GitReviewLineAnchor,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default)]
+    pub stale: bool,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub comments: Vec<GitReviewCommentResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewThreadListResult {
+    pub threads: Vec<GitReviewThreadResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewCommentListResult {
+    pub comments: Vec<GitReviewCommentResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitReviewDeliveryResult {
+    pub thread_id: String,
+    pub target: String,
+    #[serde(default)]
+    pub target_session_id: Option<String>,
+    pub delivered_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Normalized agent hooks and detected development servers
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentHookStateParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub source: String,
+    pub observed_at: String,
+    #[serde(default)]
+    pub telemetry: Option<AgentTelemetry>,
+}
+
+impl AgentHookStateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_required("session_id", &self.session_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_required("state", &self.state, 128)?;
+        validate_required("source", &self.source, 128)?;
+        validate_required("observed_at", &self.observed_at, 128)?;
+        validate_optional("reason", self.reason.as_deref(), 4096)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentHookStateResult {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub state: String,
+    #[serde(default)]
+    pub accepted: bool,
+    #[serde(default)]
+    pub deduplicated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateParams {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub url: String,
+    pub source: String,
+    pub detected_at: String,
+    #[serde(default)]
+    pub process_id: Option<u32>,
+}
+
+impl DevelopmentServerCandidateParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "workspace_id",
+            &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_required("session_id", &self.session_id, MAX_IDEMPOTENCY_KEY_BYTES)?;
+        validate_required("url", &self.url, 4096)?;
+        validate_required("source", &self.source, 128)?;
+        validate_required("detected_at", &self.detected_at, 128)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateListParams {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub include_dismissed: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+impl DevelopmentServerCandidateListParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_optional(
+            "workspace_id",
+            self.workspace_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "session_id",
+            self.session_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        if let Some(limit) = self.limit {
+            validate_range("limit", limit, 1, MAX_DEV_SERVER_CANDIDATES)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateIdParams {
+    pub candidate_id: String,
+}
+
+impl DevelopmentServerCandidateIdParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "candidate_id",
+            &self.candidate_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateDismissParams {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl DevelopmentServerCandidateDismissParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "candidate_id",
+            &self.candidate_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional("reason", self.reason.as_deref(), 4096)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateOpenInSplitParams {
+    pub candidate_id: String,
+    #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
+    pub axis: Option<String>,
+    #[serde(default)]
+    pub ratio: Option<f64>,
+}
+
+impl DevelopmentServerCandidateOpenInSplitParams {
+    pub fn validate(&self) -> Result<(), ControlError> {
+        validate_required(
+            "candidate_id",
+            &self.candidate_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional("axis", self.axis.as_deref(), 32)?;
+        if let Some(ratio) = self.ratio {
+            if !(0.05..=0.95).contains(&ratio) {
+                return Err(invalid_request("ratio must be between 0.05 and 0.95"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateResult {
+    pub candidate_id: String,
+    pub workspace_id: String,
+    pub session_id: String,
+    pub url: String,
+    pub source: String,
+    pub detected_at: String,
+    #[serde(default)]
+    pub process_id: Option<u32>,
+    #[serde(default)]
+    pub dismissed: bool,
+    #[serde(default)]
+    pub opened_surface_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateListResult {
+    pub candidates: Vec<DevelopmentServerCandidateResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateOpenInSplitResult {
+    pub candidate: DevelopmentServerCandidateResult,
+    pub pane_id: String,
+    pub surface_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevelopmentServerCandidateDismissResult {
+    pub candidate_id: String,
+    pub dismissed: bool,
+}
+
+fn invalid_request(message: impl Into<String>) -> ControlError {
+    ControlError::new(ErrorCode::InvalidRequest, message)
+}
+
+fn validate_required(name: &str, value: &str, max_bytes: usize) -> Result<(), ControlError> {
+    if value.trim().is_empty() {
+        return Err(invalid_request(format!("{name} is required")));
+    }
+    if value.len() > max_bytes {
+        return Err(invalid_request(format!("{name} exceeds {max_bytes} bytes")));
+    }
+    Ok(())
+}
+
+fn validate_optional(
+    name: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), ControlError> {
+    if let Some(value) = value {
+        validate_required(name, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_range<T>(name: &str, value: T, min: T, max: T) -> Result<(), ControlError>
+where
+    T: std::fmt::Display + PartialOrd,
+{
+    if value < min || value > max {
+        return Err(invalid_request(format!(
+            "{name} must be between {min} and {max}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AckResult {
     pub ok: bool,
@@ -3318,5 +4334,211 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.caller, None);
+    }
+
+    #[test]
+    fn git_operation_contracts_round_trip_and_validate() {
+        let page: GitStatusPageParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","repository_id":"repo_1","state":"unstaged","cursor":"cursor_1","limit":100,"generation":8}"#,
+        )
+        .unwrap();
+        page.validate().unwrap();
+        assert_eq!(serde_json::to_value(&page).unwrap()["limit"], 100);
+
+        let diff: GitDiffParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","path":"src/main.rs","stage":"working_tree","context_lines":12}"#,
+        )
+        .unwrap();
+        diff.validate().unwrap();
+
+        let mutation: GitPathMutationParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","paths":["src/main.rs"],"idempotency_key":"git-stage-1"}"#,
+        )
+        .unwrap();
+        mutation.validate().unwrap();
+
+        let summary = GitStatusSummaryResult {
+            workspace_id: "ws_1".to_string(),
+            repository_id: "repo_1".to_string(),
+            repository_root: "D:/work/repo".to_string(),
+            branch: Some("main".to_string()),
+            head_oid: Some("abc123".to_string()),
+            upstream: Some("origin/main".to_string()),
+            ahead: 1,
+            behind: 0,
+            staged_count: 2,
+            unstaged_count: 3,
+            untracked_count: 4,
+            conflicted_count: 0,
+            generation: 9,
+            refreshed_at: "2026-07-23T00:00:00Z".to_string(),
+        };
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert_eq!(
+            serde_json::from_str::<GitStatusSummaryResult>(&encoded).unwrap(),
+            summary
+        );
+
+        let invalid: GitStatusPageParams =
+            serde_json::from_str(r#"{"workspace_id":"ws_1","limit":501}"#).unwrap();
+        assert_eq!(
+            invalid.validate().unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn worktree_contracts_require_safe_operation_identity() {
+        let create: AgentWorktreeCreateParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","branch":"agent/fix-scroll","destination":"D:/worktrees/fix-scroll","base_revision":"main","create_branch":true,"backend":"wsl-direct","backend_profile":"Ubuntu","command":["claude","-c"],"idempotency_key":"worktree-create-1"}"#,
+        )
+        .unwrap();
+        create.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentWorktreeCreateParams>(
+                &serde_json::to_string(&create).unwrap()
+            )
+            .unwrap(),
+            create
+        );
+
+        let missing_identity: AgentWorktreeRecoverParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            missing_identity.validate().unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+
+        let result = AgentWorktreeResult {
+            operation_id: "op_1".to_string(),
+            worktree_id: "wt_1".to_string(),
+            workspace_id: "ws_2".to_string(),
+            branch: "agent/fix-scroll".to_string(),
+            path: "D:/worktrees/fix-scroll".to_string(),
+            state: "completed".to_string(),
+            surface_id: Some("surface_1".to_string()),
+            pane_id: Some("pane_1".to_string()),
+            session_id: Some("session_1".to_string()),
+            reused: false,
+            recovered: false,
+        };
+        assert_eq!(
+            serde_json::from_str::<AgentWorktreeResult>(&serde_json::to_string(&result).unwrap())
+                .unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn review_contracts_preserve_anchor_and_comment_history() {
+        let create: GitReviewThreadCreateParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","repository_id":"repo_1","anchor":{"path":"src/lib.rs","side":"right","line":42,"start_line":40,"base_revision":"base","head_revision":"head","hunk_header":"@@ -40,3 +40,5 @@","diff_hash":"hash"},"body":"Please handle the error path.","author_session_id":"ses_1"}"#,
+        )
+        .unwrap();
+        create.validate().unwrap();
+
+        let invalid_anchor: GitReviewThreadCreateParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","anchor":{"path":"src/lib.rs","side":"right","line":7,"start_line":8},"body":"note"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            invalid_anchor.validate().unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+
+        let comment = GitReviewCommentResult {
+            comment_id: "comment_1".to_string(),
+            thread_id: "thread_1".to_string(),
+            body: "Please handle the error path.".to_string(),
+            author_session_id: Some("ses_1".to_string()),
+            created_at: "2026-07-23T00:00:00Z".to_string(),
+            updated_at: "2026-07-23T00:00:00Z".to_string(),
+        };
+        let thread = GitReviewThreadResult {
+            thread_id: "thread_1".to_string(),
+            workspace_id: "ws_1".to_string(),
+            repository_id: "repo_1".to_string(),
+            anchor: create.anchor,
+            resolved: false,
+            stale: false,
+            stale_reason: None,
+            created_at: "2026-07-23T00:00:00Z".to_string(),
+            updated_at: "2026-07-23T00:00:00Z".to_string(),
+            comments: vec![comment],
+        };
+        assert_eq!(
+            serde_json::from_str::<GitReviewThreadResult>(&serde_json::to_string(&thread).unwrap())
+                .unwrap(),
+            thread
+        );
+    }
+
+    #[test]
+    fn agent_hook_and_development_server_contracts_round_trip() {
+        let hook: AgentHookStateParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","session_id":"ses_1","sequence":4,"state":"waiting_for_input","reason":"approval needed","source":"claude_hook","observed_at":"2026-07-23T00:00:00Z"}"#,
+        )
+        .unwrap();
+        hook.validate().unwrap();
+
+        let candidate: DevelopmentServerCandidateParams = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","session_id":"ses_1","url":"http://127.0.0.1:5173","source":"vite","detected_at":"2026-07-23T00:00:00Z","process_id":1234}"#,
+        )
+        .unwrap();
+        candidate.validate().unwrap();
+
+        let open: DevelopmentServerCandidateOpenInSplitParams = serde_json::from_str(
+            r#"{"candidate_id":"dev_1","pane_id":"pane_1","axis":"vertical","ratio":0.4}"#,
+        )
+        .unwrap();
+        open.validate().unwrap();
+
+        let invalid: DevelopmentServerCandidateOpenInSplitParams =
+            serde_json::from_str(r#"{"candidate_id":"dev_1","ratio":1.0}"#).unwrap();
+        assert_eq!(
+            invalid.validate().unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn five_track_method_names_are_stable_control_fixtures() {
+        let methods = [
+            METHOD_GIT_STATUS_SUMMARY,
+            METHOD_GIT_STATUS_PAGE,
+            METHOD_GIT_DIFF,
+            METHOD_GIT_STAGE,
+            METHOD_GIT_UNSTAGE,
+            METHOD_GIT_STAGE_ALL,
+            METHOD_GIT_UNSTAGE_ALL,
+            METHOD_GIT_DISCARD,
+            METHOD_GIT_COMMIT,
+            METHOD_AGENT_WORKTREE_CREATE,
+            METHOD_AGENT_WORKTREE_LIST,
+            METHOD_AGENT_WORKTREE_RECOVER,
+            METHOD_AGENT_WORKTREE_REMOVE,
+            METHOD_GIT_REVIEW_THREAD_LIST,
+            METHOD_GIT_REVIEW_THREAD_CREATE,
+            METHOD_GIT_REVIEW_THREAD_UPDATE,
+            METHOD_GIT_REVIEW_THREAD_DELETE,
+            METHOD_GIT_REVIEW_THREAD_MARK_STALE,
+            METHOD_GIT_REVIEW_THREAD_DELIVER,
+            METHOD_GIT_REVIEW_COMMENT_LIST,
+            METHOD_GIT_REVIEW_COMMENT_CREATE,
+            METHOD_GIT_REVIEW_COMMENT_UPDATE,
+            METHOD_GIT_REVIEW_COMMENT_DELETE,
+            METHOD_AGENT_HOOK_STATE,
+            METHOD_DEV_SERVER_CANDIDATE_DETECTED,
+            METHOD_DEV_SERVER_CANDIDATE_LIST,
+            METHOD_DEV_SERVER_CANDIDATE_DISMISS,
+            METHOD_DEV_SERVER_CANDIDATE_OPEN_IN_SPLIT,
+        ];
+        assert!(methods.iter().all(|method| method.contains('.')));
+        assert_eq!(EVENT_GIT_REPOSITORY_CHANGED, "git.repository_changed");
+        assert_eq!(EVENT_AGENT_WORKTREE_PROGRESS, "agent.worktree.progress");
+        assert_eq!(EVENT_AGENT_HOOK_STATE_CHANGED, "agent.hook_state_changed");
+        assert_eq!(
+            EVENT_DEV_SERVER_CANDIDATE_DETECTED,
+            "dev_server.candidate_detected"
+        );
     }
 }
