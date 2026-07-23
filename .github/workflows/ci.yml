@@ -64,15 +64,13 @@ jobs:
       - run: npm run tauri:build -- --debug --no-bundle --ci
         working-directory: apps/desktop
 
-  desktop-ui-and-performance-gates:
+  desktop-ui:
     runs-on: windows-latest
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
         working-directory: apps/desktop
       - name: Install Playwright Chromium
@@ -81,6 +79,20 @@ jobs:
       - name: Run complete desktop Playwright UI suite
         run: npm run test:ui
         working-directory: apps/desktop
+
+  desktop-performance-gates:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-performance-gates
+          cache-on-failure: true
       - name: Run performance gates
         run: npm run perf:gates:ci
 

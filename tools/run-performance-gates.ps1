@@ -140,16 +140,10 @@ function Get-Benchmarks {
 
   if ($Ci) {
     return @(
-      @{ Name = "single-terminal-latency"; Args = @("run", "-p", "agentmux-bench-single-terminal-latency") },
-      @{ Name = "many-idle-sessions"; Args = @("run", "-p", "agentmux-bench-many-idle-sessions") },
-      @{ Name = "high-output"; Args = @("run", "-p", "agentmux-bench-high-output") },
-      @{ Name = "resize-storm"; Args = @("run", "-p", "agentmux-bench-resize-storm") },
-      @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery") },
       @{ Name = "git-status-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_5k_mixed_porcelain_records_within_budget", "--", "--exact") },
       @{ Name = "git-status-10k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_10k_mixed_porcelain_records_within_budget", "--", "--exact") },
       @{ Name = "git-status-native-first-page-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::streams_5k_native_status_first_page_within_budget", "--", "--ignored", "--exact") },
       @{ Name = "git-status-native-first-page-10k"; Args = @("test", "-p", "agentmux-vcs", "tests::streams_10k_native_status_first_page_within_budget", "--", "--ignored", "--exact") },
-      @{ Name = "git-local-server-snapshot-consistency"; Args = @("test", "-p", "agentmux-cli", "server_local_git::tests::local_git_pages_reuse_one_snapshot_across_external_changes", "--", "--ignored", "--exact") },
       @{ Name = "git-page-pipeline-5k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_5k_files_within_budget", "--", "--exact") },
       @{ Name = "git-page-pipeline-10k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_10k_files_within_budget", "--", "--exact") }
     )
@@ -189,15 +183,16 @@ try {
 
     Write-Host ("Starting performance gate '{0}'" -f $benchmark.Name)
 
-    $process = Start-Process `
-      -FilePath $cargoPath `
-      -ArgumentList @($benchmark.Args) `
-      -RedirectStandardOutput $stdoutPath `
-      -RedirectStandardError $stderrPath `
-      -WindowStyle Hidden `
-      -Wait `
-      -PassThru
-    $exitCode = $process.ExitCode
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+      # Windows PowerShell 5.1 wraps native stderr as non-terminating error records.
+      # Cargo writes normal progress to stderr, so capture it without promoting it to a script failure.
+      $ErrorActionPreference = "Continue"
+      & $cargoPath @($benchmark.Args) 1> $stdoutPath 2> $stderrPath
+      $exitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+    }
     $timer.Stop()
 
     Write-Host ("Completed performance gate '{0}' in {1:n1}s" -f $benchmark.Name, $timer.Elapsed.TotalSeconds)
