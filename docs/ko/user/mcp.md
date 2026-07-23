@@ -27,9 +27,9 @@ agentmux mcp setup --help
 
 | 프로필 | 권한 | 권장 용도 |
 | --- | --- | --- |
-| `read` | 워크스페이스, 세션, 에이전트 주의 상태, 페인 워커, 통합 준비 상태, 팀 메시지와 태스크 조회, 터미널 출력, 브라우저 스냅샷, 이벤트, 컨텍스트 및 진단 읽기 | 모니터링과 최초 설정 |
-| `standard` | `read` 권한과 함께 페인 포커스, 터미널 열기/분할/입력, 페인 워커 시작/전달, 브라우저 열기/이동/클릭/입력, 팀 메시지와 태스크 갱신, 에이전트 상태 갱신. 임의 명령 실행과 외부 시스템 변경이 가능한 신뢰된 쓰기 프로필 | 명령 실행이나 쓰기가 필요한 신뢰된 대화형 에이전트 작업 |
-| `full` | `standard` 권한과 함께 적응형 팀 워커 회수, 페인 워커 종료, 통합 shim 설치, 워크스페이스/페인/서피스 닫기, 세션 종료, 설정 변경, 브라우저 JavaScript 실행, 액션 실행, 알림 삭제 | 파괴적이거나 영향이 큰 작업이 필요한 신뢰된 자동화 |
+| `read` | 워크스페이스, 세션, 에이전트 주의 상태, 페인 워커, 통합 준비 상태, worktree 작업, Git 상태/diff/review, 개발 서버 후보, 팀 메시지와 태스크 조회, 터미널 출력, 브라우저 스냅샷, 이벤트, 컨텍스트 및 진단 읽기 | 모니터링, 검토와 최초 설정 |
+| `standard` | `read` 권한과 함께 페인 포커스, 터미널 열기/분할/입력, 페인 워커 시작/전달, worktree 생성/복구, 리뷰 작성, 개발 서버 분할 열기, 브라우저 조작, 팀 메시지와 태스크 갱신, 에이전트 상태 갱신 | 명령 실행이나 추가형 쓰기가 필요한 신뢰된 대화형 에이전트 작업 |
+| `full` | `standard` 권한과 함께 워커 회수, worktree 제거, Git 스테이징/폐기/커밋, 리뷰 전달/삭제, 통합 shim 설치, 워크스페이스/페인/서피스 닫기, 세션 종료, 설정 변경, 브라우저 JavaScript 실행, 액션 실행, 알림 삭제 | 파괴적이거나 영향이 큰 작업이 필요한 신뢰된 자동화 |
 
 `standard`는 안전하거나 비파괴적인 프로필이 아닙니다. 명령 실행과 터미널,
 브라우저, 공유 협업 상태 변경을 허용할 수 있는 클라이언트에만 부여하세요.
@@ -45,6 +45,25 @@ agentmux mcp setup --help
 남지 않습니다. 이 도구는 `AGENTMUX_CMUXTERM_HOME`, 호환 변수인
 `CMUXTERM_HOME`, 또는 기본 사용자 디렉터리로 선택된 통합 디렉터리에 shim을
 기록합니다. `add_to_user_path: true`이면 Windows 사용자 `PATH`도 변경합니다.
+
+## Git, worktree, 리뷰와 개발 서버 도구
+
+5개 트랙 워크플로는 다음 MCP 표면을 추가합니다. 읽기 도구는 모니터링에
+사용할 수 있지만 모든 쓰기는 선택한 프로필과 데스크톱 제어 플레인 감사
+기록의 적용을 받습니다.
+
+| 워크플로 | `read` | `standard` | `full` |
+| --- | --- | --- | --- |
+| Git | `git_status_summary`, `git_status_page`, `git_diff` | - | `git_stage`, `git_unstage`, `git_stage_all`, `git_unstage_all`, `git_discard`, `git_commit` |
+| 에이전트 worktree | `agent_worktree_list` | `agent_worktree_create`, `agent_worktree_recover` | `agent_worktree_remove` |
+| Diff 리뷰 | `git_review_thread_list`, `git_review_comment_list` | thread/comment 생성·수정, thread stale 표시 | thread 전달·삭제, comment 삭제 |
+| 개발 서버 | `development_server_candidate_list` | 후보 무시 또는 브라우저 분할로 열기 | - |
+
+worktree 생성은 복구 가능한 saga입니다. Git worktree, AgentMux 워크스페이스,
+터미널과 에이전트 실행 중 뒤 단계가 실패하면 앞 단계를 역순으로 보상합니다.
+리뷰 전달은 에이전트 mailbox나 터미널에 입력하므로 명시적으로 수행하며 `full`
+권한이 필요합니다. 예제와 복구 절차는
+[고급 에이전트 워크플로](./advanced-agent-workflows.md)를 참고하십시오.
 
 ## 에이전트 페인 워커와 tmux 통합
 

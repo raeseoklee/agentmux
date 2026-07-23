@@ -7010,11 +7010,13 @@ mod tests {
             }))
             .await;
         assert_eq!(result.is_error, Some(false));
-        let calls = transport.calls.lock().expect("fake calls lock");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, METHOD_GIT_STATUS_PAGE);
-        assert_eq!(calls[0].1["repository_id"], "repo-1");
-        assert_eq!(calls[0].1["generation"], 7);
+        {
+            let calls = transport.calls.lock().expect("fake calls lock");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, METHOD_GIT_STATUS_PAGE);
+            assert_eq!(calls[0].1["repository_id"], "repo-1");
+            assert_eq!(calls[0].1["generation"], 7);
+        }
 
         let (server, transport) = test_server([]);
         let result = server

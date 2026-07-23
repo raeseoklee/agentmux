@@ -159,7 +159,7 @@ impl AgentHookNormalizer {
             }
         }
         let event_name = string_field(object, event_name_keys(provider))?;
-        let state = state_from_payload(provider, &event_name, object)?;
+        let state = state_from_payload(provider, event_name, object)?;
         let sequence = optional_u64(object, &["sequence", "seq"])?;
         let sequence_key = (provider, session_id.to_string());
         if let Some(sequence) = sequence {

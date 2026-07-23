@@ -3581,14 +3581,20 @@ mod tests {
 
     #[test]
     fn repository_monitor_policy_is_change_driven_and_bounded() {
-        assert!(STATUS_CACHE_MAX_AGE >= Duration::from_secs(5 * 60));
+        let status_cache_max_age = std::hint::black_box(STATUS_CACHE_MAX_AGE);
+        let fallback_interval = std::hint::black_box(REPOSITORY_FALLBACK_STATUS_INTERVAL);
+        let watcher_starts = std::hint::black_box(MAX_WATCHER_STARTS_PER_TICK);
+        let fallback_reads = std::hint::black_box(MAX_FALLBACK_STATUS_READS_PER_TICK);
+        let event_debounce = std::hint::black_box(REPOSITORY_EVENT_DEBOUNCE);
+
+        assert!(status_cache_max_age >= Duration::from_secs(5 * 60));
         assert!(
-            REPOSITORY_FALLBACK_STATUS_INTERVAL >= Duration::from_secs(30),
+            fallback_interval >= Duration::from_secs(30),
             "fallback Git status must remain low-frequency"
         );
-        assert!(MAX_WATCHER_STARTS_PER_TICK <= 2);
-        assert_eq!(MAX_FALLBACK_STATUS_READS_PER_TICK, 1);
-        assert!(REPOSITORY_EVENT_DEBOUNCE >= Duration::from_millis(200));
+        assert!(watcher_starts <= 2);
+        assert_eq!(fallback_reads, 1);
+        assert!(event_debounce >= Duration::from_millis(200));
     }
 
     #[test]
