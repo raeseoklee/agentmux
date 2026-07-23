@@ -5,7 +5,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agentmux_core::{
@@ -75,6 +75,7 @@ struct FiveTrackShared {
     observed_repositories: Mutex<HashMap<String, ObservedRepository>>,
     mutation_results: Mutex<MutationResultCache>,
     monitor_started: AtomicBool,
+    monitor_app: OnceLock<tauri::AppHandle>,
     worktree_saga_guard: Mutex<()>,
     review_delivery_guard: Mutex<()>,
     hook_normalizer: Mutex<AgentHookNormalizer>,
@@ -230,15 +231,27 @@ enum RepositoryMonitorMode {
 
 struct RepositoryWatchCancellation {
     requested: AtomicBool,
+    failed: AtomicBool,
     handles: Mutex<HashSet<usize>>,
+    #[cfg(windows)]
+    cancel_event: usize,
 }
 
 impl RepositoryWatchCancellation {
-    fn new() -> Self {
-        Self {
-            requested: AtomicBool::new(false),
-            handles: Mutex::new(HashSet::new()),
+    #[cfg(windows)]
+    fn new() -> Result<Self, String> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let cancel_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if cancel_event.is_null() {
+            return Err("failed to create repository watcher cancellation event".to_string());
         }
+        Ok(Self {
+            requested: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            handles: Mutex::new(HashSet::new()),
+            cancel_event: cancel_event as usize,
+        })
     }
 
     #[cfg(windows)]
@@ -261,14 +274,35 @@ impl RepositoryWatchCancellation {
     }
 
     fn request(&self) {
-        if self.requested.swap(true, Ordering::AcqRel) {
-            return;
-        }
+        self.requested.store(true, Ordering::Release);
         #[cfg(windows)]
-        if let Ok(handles) = self.handles.lock() {
-            for handle in handles.iter().copied() {
-                cancel_directory_io(handle);
-            }
+        unsafe {
+            windows_sys::Win32::System::Threading::SetEvent(
+                self.cancel_event as *mut std::ffi::c_void,
+            );
+        }
+    }
+
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.request();
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    #[cfg(windows)]
+    fn cancel_event(&self) -> *mut std::ffi::c_void {
+        self.cancel_event as *mut std::ffi::c_void
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RepositoryWatchCancellation {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.cancel_event as *mut std::ffi::c_void);
         }
     }
 }
@@ -300,6 +334,7 @@ impl FiveTrackState {
                 observed_repositories: Mutex::new(HashMap::new()),
                 mutation_results: Mutex::new(MutationResultCache::default()),
                 monitor_started: AtomicBool::new(false),
+                monitor_app: OnceLock::new(),
                 worktree_saga_guard: Mutex::new(()),
                 review_delivery_guard: Mutex::new(()),
                 hook_normalizer: Mutex::new(AgentHookNormalizer::new(
@@ -313,6 +348,7 @@ impl FiveTrackState {
     }
 
     pub(super) fn start_repository_monitor(&self, app: tauri::AppHandle) {
+        let _ = self.shared.monitor_app.set(app.clone());
         if self.shared.monitor_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -537,6 +573,7 @@ impl DesktopControlState {
         requested_generation: Option<u64>,
     ) -> Result<(String, CachedStatusSnapshot), DesktopHostError> {
         let repository_id = repository_id(repository);
+        self.observe_and_arm_repository(workspace_id, &repository_id, repository);
         let generation = self.five_track.shared.git.generation(repository);
         if let Ok(cache) = self.five_track.shared.git_status_cache.lock() {
             if let Some(entry) = cache.get(&repository_id) {
@@ -545,7 +582,6 @@ impl DesktopControlState {
                         || entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE)
                 {
                     validate_generation(requested_generation, generation)?;
-                    self.observe_repository(workspace_id, &repository_id, &entry.repository);
                     return Ok((repository_id, entry.clone()));
                 }
             }
@@ -734,6 +770,21 @@ impl DesktopControlState {
             });
     }
 
+    fn observe_and_arm_repository(
+        &self,
+        workspace_id: &str,
+        repository_id: &str,
+        repository: &Repository,
+    ) {
+        self.observe_repository(workspace_id, repository_id, repository);
+        let key = format!("{workspace_id}|{repository_id}");
+        arm_observed_repository(
+            &self.five_track.shared,
+            self.five_track.shared.monitor_app.get(),
+            &key,
+        );
+    }
+
     fn handle_legacy_git_status(
         &self,
         request: &RequestEnvelope,
@@ -820,6 +871,7 @@ impl DesktopControlState {
             ));
         }
         let repository_id = repository_id(&repository);
+        self.observe_and_arm_repository(&params.workspace_id, &repository_id, &repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         let limit = params.limit.unwrap_or(250).clamp(1, 500);
 
@@ -837,7 +889,6 @@ impl DesktopControlState {
                         && entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE
                 });
             if let Some(cached) = cached {
-                self.observe_repository(&params.workspace_id, &repository_id, &repository);
                 return self.complete_status_page_response(
                     request,
                     &params,
@@ -859,7 +910,6 @@ impl DesktopControlState {
                         .filter(|change| status_change_matches_filter(change, &filter))
                         .map(git_change_result)
                         .collect();
-                    self.observe_repository(&params.workspace_id, &repository_id, &repository);
                     Ok(ResponseEnvelope::ok_typed(
                         request.id.clone(),
                         &GitStatusPageResult {
@@ -1631,40 +1681,13 @@ fn reconcile_observed_repositories(shared: &Arc<FiveTrackShared>, app: Option<&t
                 .iter()
                 .filter(|(_, entry)| entry.monitor_mode == RepositoryMonitorMode::Pending)
                 .take(MAX_WATCHER_STARTS_PER_TICK)
-                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    for (key, snapshot) in pending {
-        let watcher = snapshot
-            .scan_root
-            .as_deref()
-            .ok_or_else(|| "repository has no Windows-visible watch root".to_string())
-            .and_then(|root| {
-                start_repository_native_watchers(
-                    Arc::clone(shared),
-                    app.cloned(),
-                    key.clone(),
-                    root,
-                )
-            })
-            .ok();
-        let mode = if watcher.is_some() {
-            RepositoryMonitorMode::NativeWatcher
-        } else {
-            RepositoryMonitorMode::FallbackStatus
-        };
-        if let Ok(mut observed) = shared.observed_repositories.lock() {
-            if let Some(entry) = observed.get_mut(&key) {
-                if entry.monitor_mode == RepositoryMonitorMode::Pending {
-                    entry.monitor_mode = mode;
-                    entry.watch_cancel = watcher;
-                    entry.next_fallback_status_at =
-                        Instant::now() + REPOSITORY_FALLBACK_STATUS_INTERVAL;
-                }
-            }
-        }
+    for key in pending {
+        arm_observed_repository(shared, app, &key);
     }
 
     let now = Instant::now();
@@ -1688,20 +1711,23 @@ fn reconcile_observed_repositories(shared: &Arc<FiveTrackShared>, app: Option<&t
         .unwrap_or_default();
 
     for (key, snapshot) in fallback {
-        let Ok(status) = shared.git.read_status(&snapshot.repository) else {
-            continue;
-        };
-        let digest = status_content_hash(&status);
+        let status = shared.git.read_status(&snapshot.repository).ok();
+        let digest = status.as_ref().map(status_content_hash);
         let changed = shared
             .observed_repositories
             .lock()
             .ok()
             .and_then(|mut observed| {
                 let entry = observed.get_mut(&key)?;
-                let changed = entry
-                    .fallback_status_hash
-                    .is_some_and(|previous| previous != digest);
-                entry.fallback_status_hash = Some(digest);
+                let changed = digest.is_some_and(|digest| {
+                    entry
+                        .fallback_status_hash
+                        .is_some_and(|previous| previous != digest)
+                });
+                if let Some(digest) = digest {
+                    entry.fallback_status_hash = Some(digest);
+                }
+                entry.monitor_mode = RepositoryMonitorMode::Pending;
                 Some(changed)
             })
             .unwrap_or(false);
@@ -1709,6 +1735,74 @@ fn reconcile_observed_repositories(shared: &Arc<FiveTrackShared>, app: Option<&t
             signal_repository_changed(shared, &key, "fallback_status", app);
         }
     }
+}
+
+fn arm_observed_repository(
+    shared: &Arc<FiveTrackShared>,
+    app: Option<&tauri::AppHandle>,
+    key: &str,
+) {
+    let snapshot = shared
+        .observed_repositories
+        .lock()
+        .ok()
+        .and_then(|observed| observed.get(key).cloned())
+        .filter(|entry| entry.monitor_mode == RepositoryMonitorMode::Pending);
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let watcher = snapshot
+        .scan_root
+        .as_deref()
+        .ok_or_else(|| "repository has no Windows-visible watch root".to_string())
+        .and_then(|root| {
+            start_repository_native_watchers(
+                Arc::clone(shared),
+                app.cloned(),
+                key.to_string(),
+                root,
+            )
+        })
+        .ok();
+    let adopted = shared
+        .observed_repositories
+        .lock()
+        .map(|mut observed| {
+            adopt_repository_watcher(&mut observed, key, &snapshot, watcher.as_ref())
+        })
+        .unwrap_or(false);
+    if !adopted {
+        if let Some(watcher) = watcher {
+            watcher.request();
+        }
+    }
+}
+
+fn adopt_repository_watcher(
+    observed: &mut HashMap<String, ObservedRepository>,
+    key: &str,
+    snapshot: &ObservedRepository,
+    watcher: Option<&Arc<RepositoryWatchCancellation>>,
+) -> bool {
+    let Some(entry) = observed.get_mut(key) else {
+        return false;
+    };
+    if entry.monitor_mode != RepositoryMonitorMode::Pending || entry.scan_root != snapshot.scan_root
+    {
+        return false;
+    }
+
+    let watcher_started = watcher
+        .map(|cancellation| !cancellation.failed())
+        .unwrap_or(false);
+    entry.monitor_mode = if watcher_started {
+        RepositoryMonitorMode::NativeWatcher
+    } else {
+        RepositoryMonitorMode::FallbackStatus
+    };
+    entry.watch_cancel = watcher.cloned().filter(|_| watcher_started);
+    entry.next_fallback_status_at = Instant::now() + REPOSITORY_FALLBACK_STATUS_INTERVAL;
+    watcher_started
 }
 
 fn signal_repository_changed(
@@ -1870,12 +1964,14 @@ fn start_repository_native_watchers(
     root: &Path,
 ) -> Result<Arc<RepositoryWatchCancellation>, String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        FindCloseChangeNotification, FindFirstChangeNotificationW, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
     };
 
+    let cancellation = Arc::new(RepositoryWatchCancellation::new()?);
     let mut handles = Vec::new();
     for path in repository_watch_roots(root) {
         let wide = path
@@ -1884,20 +1980,21 @@ fn start_repository_native_watchers(
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         let handle = unsafe {
-            CreateFileW(
+            FindFirstChangeNotificationW(
                 wide.as_ptr(),
-                FILE_LIST_DIRECTORY,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                std::ptr::null_mut(),
+                1,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_DIR_NAME
+                    | FILE_NOTIFY_CHANGE_ATTRIBUTES
+                    | FILE_NOTIFY_CHANGE_SIZE
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE
+                    | FILE_NOTIFY_CHANGE_CREATION,
             )
         };
         if handle == INVALID_HANDLE_VALUE {
             for handle in handles {
                 unsafe {
-                    CloseHandle(handle as *mut std::ffi::c_void);
+                    FindCloseChangeNotification(handle as *mut std::ffi::c_void);
                 }
             }
             return Err(format!("failed to watch {}", path.display()));
@@ -1905,12 +2002,12 @@ fn start_repository_native_watchers(
         handles.push(handle as usize);
     }
 
-    let cancellation = Arc::new(RepositoryWatchCancellation::new());
+    let expected = handles.len();
     let mut started = 0usize;
     for handle in handles {
         if !cancellation.register(handle) {
             unsafe {
-                CloseHandle(handle as *mut std::ffi::c_void);
+                FindCloseChangeNotification(handle as *mut std::ffi::c_void);
             }
             continue;
         }
@@ -1926,26 +2023,16 @@ fn start_repository_native_watchers(
             Err(_) => {
                 cancellation.unregister(handle);
                 unsafe {
-                    CloseHandle(handle as *mut std::ffi::c_void);
+                    FindCloseChangeNotification(handle as *mut std::ffi::c_void);
                 }
             }
         }
     }
-    if started == 0 {
-        Err("failed to start repository watcher thread".to_string())
+    if started != expected {
+        cancellation.request();
+        Err("failed to start every repository watcher thread".to_string())
     } else {
         Ok(cancellation)
-    }
-}
-
-#[cfg(windows)]
-fn cancel_directory_io(handle: usize) {
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn CancelIoEx(handle: *mut std::ffi::c_void, overlapped: *const std::ffi::c_void) -> i32;
-    }
-    unsafe {
-        CancelIoEx(handle as *mut std::ffi::c_void, std::ptr::null());
     }
 }
 
@@ -1957,45 +2044,61 @@ fn watch_repository_directory(
     key: String,
     cancellation: Arc<RepositoryWatchCancellation>,
 ) {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::Storage::FileSystem::{
-        ReadDirectoryChangesW, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
-        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-        FILE_NOTIFY_CHANGE_SIZE,
+        FindCloseChangeNotification, FindNextChangeNotification,
     };
+    use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
 
     let handle = handle as *mut std::ffi::c_void;
     let handle_id = handle as usize;
-    let mut buffer = vec![0u8; 64 * 1024];
+    let wait_handles = [handle, cancellation.cancel_event()];
     loop {
-        let mut bytes_returned = 0u32;
-        let ok = unsafe {
-            ReadDirectoryChangesW(
-                handle,
-                buffer.as_mut_ptr().cast(),
-                buffer.len() as u32,
-                1,
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_DIR_NAME
-                    | FILE_NOTIFY_CHANGE_ATTRIBUTES
-                    | FILE_NOTIFY_CHANGE_SIZE
-                    | FILE_NOTIFY_CHANGE_LAST_WRITE
-                    | FILE_NOTIFY_CHANGE_CREATION,
-                &mut bytes_returned,
-                std::ptr::null_mut(),
-                None,
-            )
-        };
-        if ok == 0 || cancellation.requested.load(Ordering::Acquire) {
-            break;
-        }
-        if bytes_returned > 0 {
-            signal_repository_changed(&shared, &key, "filesystem_watcher", app.as_ref());
+        match unsafe { WaitForMultipleObjects(2, wait_handles.as_ptr(), 0, INFINITE) } {
+            WAIT_OBJECT_0 => {
+                if cancellation.requested.load(Ordering::Acquire) {
+                    break;
+                }
+                signal_repository_changed(&shared, &key, "filesystem_watcher", app.as_ref());
+                if unsafe { FindNextChangeNotification(handle) } == 0 {
+                    mark_repository_watcher_failed(&shared, &key, &cancellation);
+                    break;
+                }
+            }
+            result if result == WAIT_OBJECT_0 + 1 => break,
+            _ => {
+                mark_repository_watcher_failed(&shared, &key, &cancellation);
+                break;
+            }
         }
     }
     cancellation.unregister(handle_id);
     unsafe {
-        CloseHandle(handle);
+        FindCloseChangeNotification(handle);
+    }
+}
+
+fn mark_repository_watcher_failed(
+    shared: &Arc<FiveTrackShared>,
+    key: &str,
+    cancellation: &Arc<RepositoryWatchCancellation>,
+) {
+    cancellation.fail();
+    let Ok(mut observed) = shared.observed_repositories.lock() else {
+        return;
+    };
+    let Some(entry) = observed.get_mut(key) else {
+        return;
+    };
+    let is_current = entry
+        .watch_cancel
+        .as_ref()
+        .map(|current| Arc::ptr_eq(current, cancellation))
+        .unwrap_or(false);
+    if is_current {
+        entry.watch_cancel = None;
+        entry.monitor_mode = RepositoryMonitorMode::Pending;
+        entry.next_fallback_status_at = Instant::now();
     }
 }
 
@@ -6310,6 +6413,228 @@ mod tests {
         }
         assert!(host.five_track.shared.git.generation(&repository) > generation);
         fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn status_snapshot_arms_native_watcher_before_returning_cached_state() {
+        let repository_path = create_git_repository("watcher-before-snapshot");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .expect("resolved repository");
+        let (repository_id, cached) = host
+            .status_snapshot("ws_watch_before_snapshot", &repository)
+            .expect("status snapshot");
+        let key = format!("ws_watch_before_snapshot|{repository_id}");
+        let mode = host
+            .five_track
+            .shared
+            .observed_repositories
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("observed repository")
+            .monitor_mode;
+        assert_eq!(mode, RepositoryMonitorMode::NativeWatcher);
+
+        fs::write(repository_path.join("after-snapshot.txt"), "changed\n").expect("watch fixture");
+        let generation = cached.snapshot.summary.generation;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && host.five_track.shared.git.generation(&repository) == generation
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(host.five_track.shared.git.generation(&repository) > generation);
+        fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn repository_watcher_cancellation_releases_worker_handles() {
+        let repository_path = create_git_repository("watcher-cancel-event");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let cancellation = start_repository_native_watchers(
+            Arc::clone(&host.five_track.shared),
+            None,
+            "ws_watch_cancel|repository".to_string(),
+            &repository_path,
+        )
+        .expect("native watcher");
+        assert!(!cancellation.handles.lock().unwrap().is_empty());
+        cancellation.request();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !cancellation.handles.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(cancellation.handles.lock().unwrap().is_empty());
+        fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stale_repository_watcher_is_not_adopted_after_root_change() {
+        let first_path = create_git_repository("watcher-root-first");
+        let second_path = create_git_repository("watcher-root-second");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let first_repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                first_path.to_string_lossy().to_string(),
+            ))
+            .expect("first repository");
+        let second_repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                second_path.to_string_lossy().to_string(),
+            ))
+            .expect("second repository");
+        let repository_id = repository_id(&first_repository);
+        let key = format!("ws_watch_root|{repository_id}");
+        host.observe_repository("ws_watch_root", &repository_id, &first_repository);
+        let snapshot = host
+            .five_track
+            .shared
+            .observed_repositories
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .expect("first snapshot");
+        host.observe_repository("ws_watch_root", &repository_id, &second_repository);
+        let watcher = Arc::new(RepositoryWatchCancellation::new().expect("cancellation event"));
+
+        let adopted = adopt_repository_watcher(
+            &mut host.five_track.shared.observed_repositories.lock().unwrap(),
+            &key,
+            &snapshot,
+            Some(&watcher),
+        );
+        assert!(!adopted);
+        watcher.request();
+        assert!(watcher.requested.load(Ordering::Acquire));
+        let observed = host.five_track.shared.observed_repositories.lock().unwrap();
+        let entry = observed.get(&key).expect("current repository");
+        assert_eq!(entry.monitor_mode, RepositoryMonitorMode::Pending);
+        assert_eq!(entry.scan_root, repository_scan_root(&second_repository));
+        assert!(entry.watch_cancel.is_none());
+        drop(observed);
+        fs::remove_dir_all(first_path).expect("first repository cleanup");
+        fs::remove_dir_all(second_path).expect("second repository cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn root_change_cancels_live_worker_before_rearming_new_repository() {
+        let first_path = create_git_repository("watcher-live-root-first");
+        let second_path = create_git_repository("watcher-live-root-second");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let first_repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                first_path.to_string_lossy().to_string(),
+            ))
+            .expect("first repository");
+        let second_repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                second_path.to_string_lossy().to_string(),
+            ))
+            .expect("second repository");
+        let repository_id = repository_id(&first_repository);
+        let key = format!("ws_watch_live_root|{repository_id}");
+        host.observe_repository("ws_watch_live_root", &repository_id, &first_repository);
+        arm_observed_repository(&host.five_track.shared, None, &key);
+        let first_watcher = host
+            .five_track
+            .shared
+            .observed_repositories
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|entry| entry.watch_cancel.clone())
+            .expect("first watcher");
+        assert!(!first_watcher.handles.lock().unwrap().is_empty());
+
+        host.observe_repository("ws_watch_live_root", &repository_id, &second_repository);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !first_watcher.handles.lock().unwrap().is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(first_watcher.handles.lock().unwrap().is_empty());
+        arm_observed_repository(&host.five_track.shared, None, &key);
+        let observed = host.five_track.shared.observed_repositories.lock().unwrap();
+        let entry = observed.get(&key).expect("current repository");
+        assert_eq!(entry.monitor_mode, RepositoryMonitorMode::NativeWatcher);
+        let second_watcher = entry.watch_cancel.as_ref().expect("second watcher");
+        assert!(!Arc::ptr_eq(&first_watcher, second_watcher));
+        assert_eq!(entry.scan_root, repository_scan_root(&second_repository));
+        drop(observed);
+        fs::remove_dir_all(first_path).expect("first repository cleanup");
+        fs::remove_dir_all(second_path).expect("second repository cleanup");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn repository_watcher_failure_only_requeues_the_current_watcher() {
+        let repository_path = create_git_repository("watcher-failure");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .expect("repository");
+        let repository_id = repository_id(&repository);
+        let key = format!("ws_watch_failure|{repository_id}");
+        host.observe_repository("ws_watch_failure", &repository_id, &repository);
+        let current = Arc::new(RepositoryWatchCancellation::new().expect("current watcher"));
+        let stale = Arc::new(RepositoryWatchCancellation::new().expect("stale watcher"));
+        {
+            let mut observed = host.five_track.shared.observed_repositories.lock().unwrap();
+            let entry = observed.get_mut(&key).expect("observed repository");
+            entry.monitor_mode = RepositoryMonitorMode::NativeWatcher;
+            entry.watch_cancel = Some(Arc::clone(&current));
+        }
+
+        mark_repository_watcher_failed(&host.five_track.shared, &key, &stale);
+        {
+            let observed = host.five_track.shared.observed_repositories.lock().unwrap();
+            let entry = observed.get(&key).expect("observed repository");
+            assert_eq!(entry.monitor_mode, RepositoryMonitorMode::NativeWatcher);
+            assert!(Arc::ptr_eq(
+                entry
+                    .watch_cancel
+                    .as_ref()
+                    .expect("current watcher retained"),
+                &current
+            ));
+        }
+
+        mark_repository_watcher_failed(&host.five_track.shared, &key, &current);
+        let observed = host.five_track.shared.observed_repositories.lock().unwrap();
+        let entry = observed.get(&key).expect("observed repository");
+        assert_eq!(entry.monitor_mode, RepositoryMonitorMode::Pending);
+        assert!(entry.watch_cancel.is_none());
+        assert!(current.failed());
+        drop(observed);
+        fs::remove_dir_all(repository_path).expect("repository cleanup");
     }
 
     #[test]
