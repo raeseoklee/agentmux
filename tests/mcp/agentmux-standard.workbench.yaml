@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 34
+        equals: 43
       - kind: contains
         path: $.tools[*].name
         value: terminal_open
@@ -38,6 +38,15 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: agent_team_reflow
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worktree_create
+      - kind: contains
+        path: $.tools[*].name
+        value: git_review_thread_create
+      - kind: contains
+        path: $.tools[*].name
+        value: development_server_candidate_open_in_split
   - id: standard-profile-denies-full-call
     description: Dispatch rejects a full tool even when a client calls it directly
     act:
@@ -61,6 +70,22 @@ tests:
       tool: agent_team_release
       args:
         team_id: team-example
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'full' MCP profile
+  - id: standard-profile-denies-git-commit
+    description: Committing repository changes is intentionally reserved for the full profile
+    act:
+      method: tools/call
+      tool: git_commit
+      args: {}
     assert:
       - kind: status
         equals: success

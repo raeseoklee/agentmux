@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 45
+        equals: 71
       - kind: contains
         path: $.tools[*].name
         value: agent_worker_list
@@ -53,6 +53,15 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: agent_integration_setup
+      - kind: contains
+        path: $.tools[*].name
+        value: git_commit
+      - kind: contains
+        path: $.tools[*].name
+        value: agent_worktree_remove
+      - kind: contains
+        path: $.tools[*].name
+        value: git_review_thread_deliver
       - kind: count
         path: $.tools[*].inputSchema.$defs.AgentWorkerKindParam.enum
         equals: 5

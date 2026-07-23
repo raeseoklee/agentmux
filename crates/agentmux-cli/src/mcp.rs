@@ -12,7 +12,27 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use agentmux_ipc::ControlCaller;
+use agentmux_ipc::{
+    AgentWorktreeCreateParams, AgentWorktreeListParams, AgentWorktreeRecoverParams,
+    AgentWorktreeRemoveParams, ControlCaller, DevelopmentServerCandidateDismissParams,
+    DevelopmentServerCandidateListParams, DevelopmentServerCandidateOpenInSplitParams,
+    GitAllMutationParams, GitCommitParams, GitDiffParams, GitPathMutationParams,
+    GitRepositoryParams, GitReviewCommentCreateParams, GitReviewCommentIdParams,
+    GitReviewCommentListParams, GitReviewCommentUpdateParams, GitReviewLineAnchor,
+    GitReviewThreadCreateParams, GitReviewThreadDeliverParams, GitReviewThreadIdParams,
+    GitReviewThreadListParams, GitReviewThreadMarkStaleParams, GitReviewThreadUpdateParams,
+    GitStatusPageParams, METHOD_AGENT_WORKTREE_CREATE, METHOD_AGENT_WORKTREE_LIST,
+    METHOD_AGENT_WORKTREE_RECOVER, METHOD_AGENT_WORKTREE_REMOVE,
+    METHOD_DEV_SERVER_CANDIDATE_DISMISS, METHOD_DEV_SERVER_CANDIDATE_LIST,
+    METHOD_DEV_SERVER_CANDIDATE_OPEN_IN_SPLIT, METHOD_GIT_COMMIT, METHOD_GIT_DIFF,
+    METHOD_GIT_DISCARD, METHOD_GIT_REVIEW_COMMENT_CREATE, METHOD_GIT_REVIEW_COMMENT_DELETE,
+    METHOD_GIT_REVIEW_COMMENT_LIST, METHOD_GIT_REVIEW_COMMENT_UPDATE,
+    METHOD_GIT_REVIEW_THREAD_CREATE, METHOD_GIT_REVIEW_THREAD_DELETE,
+    METHOD_GIT_REVIEW_THREAD_DELIVER, METHOD_GIT_REVIEW_THREAD_LIST,
+    METHOD_GIT_REVIEW_THREAD_MARK_STALE, METHOD_GIT_REVIEW_THREAD_UPDATE, METHOD_GIT_STAGE,
+    METHOD_GIT_STAGE_ALL, METHOD_GIT_STATUS_PAGE, METHOD_GIT_STATUS_SUMMARY, METHOD_GIT_UNSTAGE,
+    METHOD_GIT_UNSTAGE_ALL,
+};
 
 use super::mcp_config::{
     self, McpClient, McpConfigRequest, McpConfigStatus, McpProfile as McpConfigProfile,
@@ -48,6 +68,13 @@ const READ_TOOL_NAMES: &[&str] = &[
     "team_task_list",
     "team_message_list",
     "diagnostics_summary",
+    "agent_worktree_list",
+    "git_status_summary",
+    "git_status_page",
+    "git_diff",
+    "git_review_thread_list",
+    "git_review_comment_list",
+    "development_server_candidate_list",
 ];
 const STANDARD_TOOL_NAMES: &[&str] = &[
     "pane_focus",
@@ -69,6 +96,15 @@ const STANDARD_TOOL_NAMES: &[&str] = &[
     "agent_team_spawn",
     "agent_team_reflow",
     "agent_worker_send",
+    "agent_worktree_create",
+    "agent_worktree_recover",
+    "git_review_thread_create",
+    "git_review_thread_update",
+    "git_review_thread_mark_stale",
+    "git_review_comment_create",
+    "git_review_comment_update",
+    "development_server_candidate_dismiss",
+    "development_server_candidate_open_in_split",
 ];
 #[cfg(test)]
 const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
@@ -89,9 +125,21 @@ const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
     "agent_team_spawn",
     "agent_team_reflow",
     "agent_worker_send",
+    "agent_worktree_create",
+    "agent_worktree_recover",
+    "development_server_candidate_open_in_split",
 ];
 #[cfg(test)]
-const STANDARD_ADDITIVE_TOOL_NAMES: &[&str] = &["pane_focus", "team_message_send"];
+const STANDARD_ADDITIVE_TOOL_NAMES: &[&str] = &[
+    "pane_focus",
+    "team_message_send",
+    "git_review_thread_create",
+    "git_review_thread_update",
+    "git_review_thread_mark_stale",
+    "git_review_comment_create",
+    "git_review_comment_update",
+    "development_server_candidate_dismiss",
+];
 const FULL_TOOL_NAMES: &[&str] = &[
     "workspace_close",
     "pane_close",
@@ -104,6 +152,16 @@ const FULL_TOOL_NAMES: &[&str] = &[
     "agent_worker_stop",
     "agent_team_release",
     "agent_integration_setup",
+    "agent_worktree_remove",
+    "git_stage",
+    "git_unstage",
+    "git_stage_all",
+    "git_unstage_all",
+    "git_discard",
+    "git_commit",
+    "git_review_thread_delete",
+    "git_review_thread_deliver",
+    "git_review_comment_delete",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1162,6 +1220,694 @@ impl AgentMuxMcpServer {
             Err(message) => return control_error_result("diagnostics.control_audit", message),
         };
         summarize_diagnostics(diagnostics, audit)
+    }
+
+    /// List AgentMux-managed worktree operations and their recovery state.
+    #[tool(
+        name = "agent_worktree_list",
+        annotations(
+            title = "List agent worktrees",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_worktree_list(
+        &self,
+        Parameters(params): Parameters<AgentWorktreeListToolParams>,
+    ) -> CallToolResult {
+        let request = AgentWorktreeListParams {
+            workspace_id: params.workspace_id,
+            include_completed: params.include_completed,
+        };
+        self.call(METHOD_AGENT_WORKTREE_LIST, json!(request)).await
+    }
+
+    /// Read a compact Git repository summary including branch, counts, generation, and refresh time.
+    #[tool(
+        name = "git_status_summary",
+        annotations(
+            title = "Get Git status summary",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn git_status_summary(
+        &self,
+        Parameters(params): Parameters<GitRepositoryToolParams>,
+    ) -> CallToolResult {
+        if let Err(error) = validate_git_repository(&params) {
+            return invalid_ipc_params_result(METHOD_GIT_STATUS_SUMMARY, error);
+        }
+        self.call(
+            METHOD_GIT_STATUS_SUMMARY,
+            json!(GitRepositoryParams {
+                workspace_id: params.workspace_id,
+                repository_id: params.repository_id,
+            }),
+        )
+        .await
+    }
+
+    /// Page through Git changes using the repository generation and opaque cursor returned by Git status APIs.
+    #[tool(
+        name = "git_status_page",
+        annotations(
+            title = "Page Git changes",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn git_status_page(
+        &self,
+        Parameters(params): Parameters<GitStatusPageToolParams>,
+    ) -> CallToolResult {
+        let request = GitStatusPageParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            state: params.state,
+            cursor: params.cursor,
+            limit: params.limit,
+            generation: params.generation,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_STATUS_PAGE, error);
+        }
+        self.call(METHOD_GIT_STATUS_PAGE, json!(request)).await
+    }
+
+    /// Read one bounded Git diff for a changed repository path.
+    #[tool(
+        name = "git_diff",
+        annotations(
+            title = "Read Git diff",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn git_diff(&self, Parameters(params): Parameters<GitDiffToolParams>) -> CallToolResult {
+        let request = GitDiffParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            path: params.path,
+            stage: params.stage,
+            context_lines: params.context_lines,
+            generation: params.generation,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_DIFF, error);
+        }
+        self.call(METHOD_GIT_DIFF, json!(request)).await
+    }
+
+    /// List persisted review threads for a repository or path.
+    #[tool(
+        name = "git_review_thread_list",
+        annotations(
+            title = "List Git review threads",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_thread_list(
+        &self,
+        Parameters(params): Parameters<GitReviewThreadListToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewThreadListParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            path: params.path,
+            include_resolved: params.include_resolved,
+            include_stale: params.include_stale,
+            limit: params.limit,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_LIST, error);
+        }
+        self.call(METHOD_GIT_REVIEW_THREAD_LIST, json!(request))
+            .await
+    }
+
+    /// List comments belonging to one persisted Git review thread.
+    #[tool(
+        name = "git_review_comment_list",
+        annotations(
+            title = "List Git review comments",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_comment_list(
+        &self,
+        Parameters(params): Parameters<GitReviewCommentListToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewCommentListParams {
+            thread_id: params.thread_id,
+            limit: params.limit,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_LIST, error);
+        }
+        self.call(METHOD_GIT_REVIEW_COMMENT_LIST, json!(request))
+            .await
+    }
+
+    /// List detected local development servers without opening a browser surface.
+    #[tool(
+        name = "development_server_candidate_list",
+        annotations(
+            title = "List development servers",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn development_server_candidate_list(
+        &self,
+        Parameters(params): Parameters<DevelopmentServerCandidateListToolParams>,
+    ) -> CallToolResult {
+        let request = DevelopmentServerCandidateListParams {
+            workspace_id: params.workspace_id,
+            session_id: params.session_id,
+            include_dismissed: params.include_dismissed,
+            limit: params.limit,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_DEV_SERVER_CANDIDATE_LIST, error);
+        }
+        self.call(METHOD_DEV_SERVER_CANDIDATE_LIST, json!(request))
+            .await
+    }
+
+    /// Create an isolated Git worktree, AgentMux workspace surface, terminal, and optional agent command as one host-side saga.
+    #[tool(
+        name = "agent_worktree_create",
+        annotations(
+            title = "Create agent worktree",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_worktree_create(
+        &self,
+        Parameters(params): Parameters<AgentWorktreeCreateToolParams>,
+    ) -> CallToolResult {
+        let request = AgentWorktreeCreateParams {
+            workspace_id: params.workspace_id,
+            branch: params.branch,
+            destination: params.destination,
+            base_revision: params.base_revision,
+            create_branch: params.create_branch,
+            backend: params.backend,
+            backend_profile: params.backend_profile,
+            command: params.command,
+            cwd: params.cwd,
+            idempotency_key: params.idempotency_key,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_AGENT_WORKTREE_CREATE, error);
+        }
+        self.call(METHOD_AGENT_WORKTREE_CREATE, json!(request))
+            .await
+    }
+
+    /// Resume an interrupted AgentMux-owned worktree operation by operation or idempotency key.
+    #[tool(
+        name = "agent_worktree_recover",
+        annotations(
+            title = "Recover agent worktree",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_worktree_recover(
+        &self,
+        Parameters(params): Parameters<AgentWorktreeRecoverToolParams>,
+    ) -> CallToolResult {
+        let request = AgentWorktreeRecoverParams {
+            operation_id: params.operation_id,
+            idempotency_key: params.idempotency_key,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_AGENT_WORKTREE_RECOVER, error);
+        }
+        self.call(METHOD_AGENT_WORKTREE_RECOVER, json!(request))
+            .await
+    }
+
+    /// Add a line-anchored review thread to the local AgentMux review store.
+    #[tool(
+        name = "git_review_thread_create",
+        annotations(
+            title = "Create Git review thread",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_thread_create(
+        &self,
+        Parameters(params): Parameters<GitReviewThreadCreateToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewThreadCreateParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            anchor: params.anchor.into(),
+            body: params.body,
+            author_session_id: params.author_session_id,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_CREATE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_THREAD_CREATE, json!(request))
+            .await
+    }
+
+    /// Resolve or re-anchor an existing local Git review thread.
+    #[tool(
+        name = "git_review_thread_update",
+        annotations(
+            title = "Update Git review thread",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_thread_update(
+        &self,
+        Parameters(params): Parameters<GitReviewThreadUpdateToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewThreadUpdateParams {
+            thread_id: params.thread_id,
+            resolved: params.resolved,
+            anchor: params.anchor.map(Into::into),
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_UPDATE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_THREAD_UPDATE, json!(request))
+            .await
+    }
+
+    /// Mark a review thread stale when its diff anchor no longer matches current Git content.
+    #[tool(
+        name = "git_review_thread_mark_stale",
+        annotations(
+            title = "Mark Git review thread stale",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_thread_mark_stale(
+        &self,
+        Parameters(params): Parameters<GitReviewThreadMarkStaleToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewThreadMarkStaleParams {
+            thread_id: params.thread_id,
+            stale: params.stale,
+            reason: params.reason,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_MARK_STALE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_THREAD_MARK_STALE, json!(request))
+            .await
+    }
+
+    /// Add a comment to an existing local Git review thread.
+    #[tool(
+        name = "git_review_comment_create",
+        annotations(
+            title = "Create Git review comment",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_comment_create(
+        &self,
+        Parameters(params): Parameters<GitReviewCommentCreateToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewCommentCreateParams {
+            thread_id: params.thread_id,
+            body: params.body,
+            author_session_id: params.author_session_id,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_CREATE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_COMMENT_CREATE, json!(request))
+            .await
+    }
+
+    /// Edit the body of a local Git review comment.
+    #[tool(
+        name = "git_review_comment_update",
+        annotations(
+            title = "Update Git review comment",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_comment_update(
+        &self,
+        Parameters(params): Parameters<GitReviewCommentUpdateToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewCommentUpdateParams {
+            comment_id: params.comment_id,
+            body: params.body,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_UPDATE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_COMMENT_UPDATE, json!(request))
+            .await
+    }
+
+    /// Dismiss a local development-server candidate without stopping the detected server process.
+    #[tool(
+        name = "development_server_candidate_dismiss",
+        annotations(
+            title = "Dismiss development server",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn development_server_candidate_dismiss(
+        &self,
+        Parameters(params): Parameters<DevelopmentServerCandidateDismissToolParams>,
+    ) -> CallToolResult {
+        let request = DevelopmentServerCandidateDismissParams {
+            candidate_id: params.candidate_id,
+            reason: params.reason,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_DEV_SERVER_CANDIDATE_DISMISS, error);
+        }
+        self.call(METHOD_DEV_SERVER_CANDIDATE_DISMISS, json!(request))
+            .await
+    }
+
+    /// Split a pane and open a detected local development server in the embedded browser.
+    #[tool(
+        name = "development_server_candidate_open_in_split",
+        annotations(
+            title = "Open development server in split",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn development_server_candidate_open_in_split(
+        &self,
+        Parameters(params): Parameters<DevelopmentServerCandidateOpenInSplitToolParams>,
+    ) -> CallToolResult {
+        let request = DevelopmentServerCandidateOpenInSplitParams {
+            candidate_id: params.candidate_id,
+            pane_id: params.pane_id,
+            axis: params.axis,
+            ratio: params.ratio,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_DEV_SERVER_CANDIDATE_OPEN_IN_SPLIT, error);
+        }
+        self.call(METHOD_DEV_SERVER_CANDIDATE_OPEN_IN_SPLIT, json!(request))
+            .await
+    }
+
+    /// Remove an AgentMux-owned worktree and the resources created for it. This cannot remove arbitrary directories.
+    #[tool(
+        name = "agent_worktree_remove",
+        annotations(
+            title = "Remove agent worktree",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_worktree_remove(
+        &self,
+        Parameters(params): Parameters<AgentWorktreeRemoveToolParams>,
+    ) -> CallToolResult {
+        let request = AgentWorktreeRemoveParams {
+            worktree_id: params.worktree_id,
+            force: params.force,
+            idempotency_key: params.idempotency_key,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_AGENT_WORKTREE_REMOVE, error);
+        }
+        self.call(METHOD_AGENT_WORKTREE_REMOVE, json!(request))
+            .await
+    }
+
+    /// Stage selected paths in a repository.
+    #[tool(
+        name = "git_stage",
+        annotations(
+            title = "Stage Git paths",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_stage(
+        &self,
+        Parameters(params): Parameters<GitPathMutationToolParams>,
+    ) -> CallToolResult {
+        self.git_path_mutation(METHOD_GIT_STAGE, params).await
+    }
+
+    /// Unstage selected paths without discarding working-tree content.
+    #[tool(
+        name = "git_unstage",
+        annotations(
+            title = "Unstage Git paths",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_unstage(
+        &self,
+        Parameters(params): Parameters<GitPathMutationToolParams>,
+    ) -> CallToolResult {
+        self.git_path_mutation(METHOD_GIT_UNSTAGE, params).await
+    }
+
+    /// Discard selected working-tree paths. This operation is irreversible through AgentMux.
+    #[tool(
+        name = "git_discard",
+        annotations(
+            title = "Discard Git paths",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_discard(
+        &self,
+        Parameters(params): Parameters<GitPathMutationToolParams>,
+    ) -> CallToolResult {
+        self.git_path_mutation(METHOD_GIT_DISCARD, params).await
+    }
+
+    /// Stage every changed path in a repository.
+    #[tool(
+        name = "git_stage_all",
+        annotations(
+            title = "Stage all Git changes",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_stage_all(
+        &self,
+        Parameters(params): Parameters<GitAllMutationToolParams>,
+    ) -> CallToolResult {
+        self.git_all_mutation(METHOD_GIT_STAGE_ALL, params).await
+    }
+
+    /// Unstage every staged path in a repository without discarding working-tree content.
+    #[tool(
+        name = "git_unstage_all",
+        annotations(
+            title = "Unstage all Git changes",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_unstage_all(
+        &self,
+        Parameters(params): Parameters<GitAllMutationToolParams>,
+    ) -> CallToolResult {
+        self.git_all_mutation(METHOD_GIT_UNSTAGE_ALL, params).await
+    }
+
+    /// Create a Git commit from staged changes using the supplied commit message.
+    #[tool(
+        name = "git_commit",
+        annotations(
+            title = "Commit Git changes",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_commit(
+        &self,
+        Parameters(params): Parameters<GitCommitToolParams>,
+    ) -> CallToolResult {
+        let request = GitCommitParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            message: params.message,
+            amend: params.amend,
+            idempotency_key: params.idempotency_key,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_COMMIT, error);
+        }
+        self.call(METHOD_GIT_COMMIT, json!(request)).await
+    }
+
+    /// Permanently delete a local Git review thread and its comments.
+    #[tool(
+        name = "git_review_thread_delete",
+        annotations(
+            title = "Delete Git review thread",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_thread_delete(
+        &self,
+        Parameters(params): Parameters<GitReviewThreadIdToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewThreadIdParams {
+            thread_id: params.thread_id,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_DELETE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_THREAD_DELETE, json!(request))
+            .await
+    }
+
+    /// Deliver a review thread to a selected AgentMux mailbox or terminal target.
+    #[tool(
+        name = "git_review_thread_deliver",
+        annotations(
+            title = "Deliver Git review thread",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn git_review_thread_deliver(
+        &self,
+        Parameters(params): Parameters<GitReviewThreadDeliverToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewThreadDeliverParams {
+            thread_id: params.thread_id,
+            target: params.target,
+            target_session_id: params.target_session_id,
+            include_context: params.include_context,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_DELIVER, error);
+        }
+        self.call(METHOD_GIT_REVIEW_THREAD_DELIVER, json!(request))
+            .await
+    }
+
+    /// Permanently delete a local Git review comment.
+    #[tool(
+        name = "git_review_comment_delete",
+        annotations(
+            title = "Delete Git review comment",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn git_review_comment_delete(
+        &self,
+        Parameters(params): Parameters<GitReviewCommentIdToolParams>,
+    ) -> CallToolResult {
+        let request = GitReviewCommentIdParams {
+            comment_id: params.comment_id,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_DELETE, error);
+        }
+        self.call(METHOD_GIT_REVIEW_COMMENT_DELETE, json!(request))
+            .await
+    }
+
+    async fn git_path_mutation(
+        &self,
+        method: &'static str,
+        params: GitPathMutationToolParams,
+    ) -> CallToolResult {
+        let request = GitPathMutationParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            paths: params.paths,
+            idempotency_key: params.idempotency_key,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(method, error);
+        }
+        self.call(method, json!(request)).await
+    }
+
+    async fn git_all_mutation(
+        &self,
+        method: &'static str,
+        params: GitAllMutationToolParams,
+    ) -> CallToolResult {
+        let request = GitAllMutationParams {
+            workspace_id: params.workspace_id,
+            repository_id: params.repository_id,
+            idempotency_key: params.idempotency_key,
+        };
+        if let Err(error) = request.validate() {
+            return invalid_ipc_params_result(method, error);
+        }
+        self.call(method, json!(request)).await
     }
 
     /// Focus an AgentMux pane, resolving the current caller context when IDs are omitted.
@@ -4347,6 +5093,31 @@ fn control_error_result(method: &str, message: String) -> CallToolResult {
     }))
 }
 
+fn invalid_ipc_params_result(method: &str, error: agentmux_ipc::ControlError) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": {
+            "code": error.code.as_str(),
+            "method": method,
+            "message": format!("invalid tool input: {}", error.message),
+            "details": error.details_json,
+        }
+    }))
+}
+
+fn validate_git_repository(
+    params: &GitRepositoryToolParams,
+) -> Result<(), agentmux_ipc::ControlError> {
+    GitStatusPageParams {
+        workspace_id: params.workspace_id.clone(),
+        repository_id: params.repository_id.clone(),
+        state: None,
+        cursor: None,
+        limit: None,
+        generation: None,
+    }
+    .validate()
+}
+
 fn call_tool_result_error_message(result: &CallToolResult) -> String {
     result
         .structured_content
@@ -5525,6 +6296,239 @@ struct NotificationClearToolParams {
     severity: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct GitRepositoryToolParams {
+    /// AgentMux workspace containing the repository.
+    workspace_id: String,
+    /// Optional repository identity when a workspace contains more than one repository.
+    repository_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct GitStatusPageToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    /// Filter by a host-defined change state such as staged or unstaged.
+    state: Option<String>,
+    /// Opaque cursor from a previous git_status_page response.
+    cursor: Option<String>,
+    /// Page size between 1 and 500.
+    limit: Option<usize>,
+    /// Repository generation to keep pages coherent while the repository changes.
+    generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitDiffToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    /// Repository-relative path from git_status_page.
+    path: String,
+    /// Optional host-defined diff stage selector.
+    stage: Option<String>,
+    /// Context lines, from 0 through 200.
+    context_lines: Option<u16>,
+    generation: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitPathMutationToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    /// One to 500 repository-relative paths.
+    paths: Vec<String>,
+    /// Optional client-generated idempotency key.
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitAllMutationToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitCommitToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    /// Commit message for already staged changes.
+    message: String,
+    #[serde(default)]
+    amend: bool,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentWorktreeCreateToolParams {
+    workspace_id: String,
+    /// New or existing Git branch name for the isolated worktree.
+    branch: String,
+    /// Empty destination path owned by the AgentMux worktree operation.
+    destination: String,
+    base_revision: Option<String>,
+    #[serde(default)]
+    create_branch: bool,
+    backend: Option<String>,
+    backend_profile: Option<String>,
+    /// Optional agent command; arguments are passed without shell interpolation.
+    #[serde(default)]
+    command: Vec<String>,
+    cwd: Option<String>,
+    /// Required client-generated idempotency key for safe retries.
+    idempotency_key: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentWorktreeListToolParams {
+    workspace_id: Option<String>,
+    #[serde(default)]
+    include_completed: bool,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentWorktreeRecoverToolParams {
+    operation_id: Option<String>,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentWorktreeRemoveToolParams {
+    worktree_id: String,
+    #[serde(default)]
+    force: bool,
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewLineAnchorToolParams {
+    /// Repository-relative file path.
+    path: String,
+    /// Diff side, typically old or new.
+    side: String,
+    /// One-based line number on the selected side.
+    line: u32,
+    start_line: Option<u32>,
+    base_revision: Option<String>,
+    head_revision: Option<String>,
+    hunk_header: Option<String>,
+    diff_hash: Option<String>,
+}
+
+impl From<GitReviewLineAnchorToolParams> for GitReviewLineAnchor {
+    fn from(value: GitReviewLineAnchorToolParams) -> Self {
+        Self {
+            path: value.path,
+            side: value.side,
+            line: value.line,
+            start_line: value.start_line,
+            base_revision: value.base_revision,
+            head_revision: value.head_revision,
+            hunk_header: value.hunk_header,
+            diff_hash: value.diff_hash,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct GitReviewThreadListToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    path: Option<String>,
+    #[serde(default)]
+    include_resolved: bool,
+    #[serde(default)]
+    include_stale: bool,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewThreadCreateToolParams {
+    workspace_id: String,
+    repository_id: Option<String>,
+    anchor: GitReviewLineAnchorToolParams,
+    body: String,
+    author_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewThreadUpdateToolParams {
+    thread_id: String,
+    resolved: Option<bool>,
+    anchor: Option<GitReviewLineAnchorToolParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewThreadIdToolParams {
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewThreadMarkStaleToolParams {
+    thread_id: String,
+    stale: bool,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewThreadDeliverToolParams {
+    thread_id: String,
+    /// Host-supported delivery target, such as mailbox or terminal.
+    target: String,
+    target_session_id: Option<String>,
+    #[serde(default)]
+    include_context: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewCommentListToolParams {
+    thread_id: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewCommentCreateToolParams {
+    thread_id: String,
+    body: String,
+    author_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewCommentUpdateToolParams {
+    comment_id: String,
+    body: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct GitReviewCommentIdToolParams {
+    comment_id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct DevelopmentServerCandidateListToolParams {
+    workspace_id: Option<String>,
+    session_id: Option<String>,
+    #[serde(default)]
+    include_dismissed: bool,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct DevelopmentServerCandidateDismissToolParams {
+    candidate_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct DevelopmentServerCandidateOpenInSplitToolParams {
+    candidate_id: String,
+    pane_id: Option<String>,
+    /// Split axis accepted by the desktop host.
+    axis: Option<String>,
+    /// Split ratio from 0.05 through 0.95.
+    ratio: Option<f64>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
@@ -5672,11 +6676,18 @@ mod tests {
                 "agent_integration_status",
                 "agent_team_list",
                 "agent_worker_list",
+                "agent_worktree_list",
                 "agentmux_context",
                 "browser_get",
                 "browser_snapshot",
+                "development_server_candidate_list",
                 "diagnostics_summary",
                 "event_poll",
+                "git_diff",
+                "git_review_comment_list",
+                "git_review_thread_list",
+                "git_status_page",
+                "git_status_summary",
                 "session_list",
                 "team_message_list",
                 "team_task_list",
@@ -5835,16 +6846,22 @@ mod tests {
     #[test]
     fn profiles_authorize_each_tool_call_independently_of_router_visibility() {
         assert!(McpProfile::Read.allows_tool("workspace_list"));
+        assert!(McpProfile::Read.allows_tool("git_status_page"));
         assert!(!McpProfile::Read.allows_tool("terminal_open"));
+        assert!(!McpProfile::Read.allows_tool("agent_worktree_create"));
         assert!(!McpProfile::Read.allows_tool("workspace_close"));
 
         assert!(McpProfile::Standard.allows_tool("workspace_list"));
         assert!(McpProfile::Standard.allows_tool("terminal_open"));
+        assert!(McpProfile::Standard.allows_tool("agent_worktree_create"));
+        assert!(!McpProfile::Standard.allows_tool("git_discard"));
         assert!(!McpProfile::Standard.allows_tool("workspace_close"));
         assert!(!McpProfile::Standard.allows_tool("agent_team_release"));
 
         assert!(McpProfile::Full.allows_tool("workspace_list"));
         assert!(McpProfile::Full.allows_tool("terminal_open"));
+        assert!(McpProfile::Full.allows_tool("git_commit"));
+        assert!(McpProfile::Full.allows_tool("agent_worktree_remove"));
         assert!(McpProfile::Full.allows_tool("workspace_close"));
         assert!(McpProfile::Full.allows_tool("agent_team_release"));
         assert!(!McpProfile::Full.allows_tool("unclassified_future_tool"));
@@ -5868,6 +6885,10 @@ mod tests {
             "agent_worker_start",
             "agent_team_start",
             "agent_worker_send",
+            "agent_worktree_create",
+            "agent_worktree_recover",
+            "development_server_candidate_open_in_split",
+            "git_review_thread_deliver",
         ] {
             let tool = full
                 .tool_router
@@ -5970,6 +6991,99 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "session.read_recent");
         assert_eq!(calls[0].1["max_bytes"], MAX_TERMINAL_READ_BYTES);
+    }
+
+    #[tokio::test]
+    async fn git_status_page_validates_and_delegates_the_shared_ipc_contract() {
+        let (server, transport) = test_server([(
+            METHOD_GIT_STATUS_PAGE,
+            json!({"workspace_id": "workspace-1", "changes": []}),
+        )]);
+        let result = server
+            .git_status_page(Parameters(GitStatusPageToolParams {
+                workspace_id: "workspace-1".to_string(),
+                repository_id: Some("repo-1".to_string()),
+                state: Some("unstaged".to_string()),
+                cursor: Some("cursor-1".to_string()),
+                limit: Some(100),
+                generation: Some(7),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, METHOD_GIT_STATUS_PAGE);
+        assert_eq!(calls[0].1["repository_id"], "repo-1");
+        assert_eq!(calls[0].1["generation"], 7);
+
+        let (server, transport) = test_server([]);
+        let result = server
+            .git_status_page(Parameters(GitStatusPageToolParams {
+                workspace_id: " ".to_string(),
+                repository_id: None,
+                state: None,
+                cursor: None,
+                limit: Some(501),
+                generation: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn worktree_and_review_tools_delegate_to_the_exact_ipc_methods() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    METHOD_AGENT_WORKTREE_CREATE,
+                    json!({"operation_id": "op-1"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_THREAD_CREATE,
+                    json!({"thread_id": "review-1"}),
+                ),
+            ],
+        );
+        let worktree = server
+            .agent_worktree_create(Parameters(AgentWorktreeCreateToolParams {
+                workspace_id: "workspace-1".to_string(),
+                branch: "agent/review".to_string(),
+                destination: "D:\\worktrees\\review".to_string(),
+                base_revision: Some("HEAD".to_string()),
+                create_branch: true,
+                backend: Some("wsl-direct".to_string()),
+                backend_profile: None,
+                command: vec!["codex".to_string()],
+                cwd: None,
+                idempotency_key: "worktree-1".to_string(),
+            }))
+            .await;
+        assert_eq!(worktree.is_error, Some(false));
+        let review = server
+            .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
+                workspace_id: "workspace-1".to_string(),
+                repository_id: None,
+                anchor: GitReviewLineAnchorToolParams {
+                    path: "src/lib.rs".to_string(),
+                    side: "new".to_string(),
+                    line: 42,
+                    start_line: None,
+                    base_revision: None,
+                    head_revision: None,
+                    hunk_header: None,
+                    diff_hash: None,
+                },
+                body: "Please handle the error path.".to_string(),
+                author_session_id: None,
+            }))
+            .await;
+        assert_eq!(review.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls[0].0, METHOD_AGENT_WORKTREE_CREATE);
+        assert_eq!(calls[1].0, METHOD_GIT_REVIEW_THREAD_CREATE);
+        assert_eq!(calls[1].1["anchor"]["line"], 42);
     }
 
     #[tokio::test]
@@ -7652,7 +8766,10 @@ mod tests {
         let listed: Value =
             serde_json::from_str(&read_protocol_message(&mut lines, "tools/list response").await)
                 .expect("parse tools");
-        assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(15));
+        assert_eq!(
+            listed["result"]["tools"].as_array().map(Vec::len),
+            Some(READ_TOOL_NAMES.len())
+        );
 
         write_protocol_message(
             &mut client_write,
