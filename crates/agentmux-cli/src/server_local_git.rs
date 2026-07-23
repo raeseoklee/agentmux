@@ -1,6 +1,7 @@
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentmux_backend_wsl::fallback_windows_path_to_wsl;
@@ -11,7 +12,8 @@ use agentmux_ipc::{
     ResponseEnvelope,
 };
 use agentmux_vcs::{
-    DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost, Repository, StatusSummary,
+    DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost, Repository, StatusScan,
+    StatusScanFirstPage, StatusSnapshot, StatusSummary,
 };
 
 const LOCAL_GIT_READ_METHODS: &[&str] = &[
@@ -35,6 +37,15 @@ pub(crate) struct ServerLocalGit {
     repository_id: String,
     workspace_id: String,
     idempotency_results: HashMap<String, GitMutationResult>,
+    status_snapshot: Option<Arc<StatusSnapshot>>,
+    status_scan: Option<LocalStatusScan>,
+    status_refresh_count: u64,
+}
+
+#[derive(Clone)]
+struct LocalStatusScan {
+    generation: u64,
+    scan: StatusScan,
 }
 
 impl ServerLocalGit {
@@ -54,6 +65,9 @@ impl ServerLocalGit {
             repository_id,
             workspace_id: workspace_id.to_string(),
             idempotency_results: HashMap::new(),
+            status_snapshot: None,
+            status_scan: None,
+            status_refresh_count: 0,
         })
     }
 
@@ -105,21 +119,18 @@ impl ServerLocalGit {
         }
     }
 
-    fn status(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, ControlError> {
+    fn status(&mut self, request: &RequestEnvelope) -> Result<ResponseEnvelope, ControlError> {
         let params: GitRepositoryParams = request.parse_params()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
-        let snapshot = self
-            .client
-            .read_status(&self.repository)
-            .map_err(vcs_error)?;
+        let snapshot = self.completed_snapshot(None)?;
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &LegacyGitStatusResult {
                 is_repository: true,
-                repository_root: Some(snapshot.summary.repository_root),
-                branch: snapshot.summary.branch,
-                head: snapshot.summary.head,
-                upstream: snapshot.summary.upstream,
+                repository_root: Some(snapshot.summary.repository_root.clone()),
+                branch: snapshot.summary.branch.clone(),
+                head: snapshot.summary.head.clone(),
+                upstream: snapshot.summary.upstream.clone(),
                 ahead: snapshot.summary.ahead,
                 behind: snapshot.summary.behind,
                 files: snapshot
@@ -131,27 +142,73 @@ impl ServerLocalGit {
         ))
     }
 
-    fn status_summary(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, ControlError> {
+    fn status_summary(
+        &mut self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, ControlError> {
         let params: GitRepositoryParams = request.parse_params()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
-        let summary = self
-            .client
-            .status_summary(&self.repository)
-            .map_err(vcs_error)?;
+        let summary = self.completed_snapshot(None)?.summary.clone();
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &self.summary_result(summary),
         ))
     }
 
-    fn status_page(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, ControlError> {
+    fn status_page(&mut self, request: &RequestEnvelope) -> Result<ResponseEnvelope, ControlError> {
         let params: GitStatusPageParams = request.parse_params()?;
         params.validate()?;
         self.validate_selector(&params.workspace_id, params.repository_id.as_deref())?;
-        let snapshot = self
-            .client
-            .read_status(&self.repository)
-            .map_err(vcs_error)?;
+        if params.cursor.is_some() && params.generation.is_none() {
+            return Err(invalid_request(
+                "Git status cursors require their snapshot generation.",
+            ));
+        }
+        let limit = params.limit.unwrap_or(250).clamp(1, 500);
+        if params.cursor.is_none() && params.generation.is_none() {
+            let active = self.refresh_scan(limit)?;
+            return match active.scan.wait_for_first_page().map_err(vcs_error)? {
+                StatusScanFirstPage::Prefix(prefix) => {
+                    let changes = prefix
+                        .changes
+                        .iter()
+                        .filter(|change| {
+                            change_matches_state(change, params.state.as_deref())
+                                && change_matches_query(change, params.query.as_deref())
+                        })
+                        .map(change_result)
+                        .collect();
+                    Ok(ResponseEnvelope::ok_typed(
+                        request.id.clone(),
+                        &GitStatusPageResult {
+                            workspace_id: self.workspace_id.clone(),
+                            repository_id: self.repository_id.clone(),
+                            generation: prefix.generation,
+                            summary: None,
+                            changes,
+                            next_cursor: None,
+                            total_count: None,
+                        },
+                    ))
+                }
+                StatusScanFirstPage::Complete(result) => {
+                    let snapshot = self.install_completed_scan(active.generation, result)?;
+                    self.complete_page(request, &params, &snapshot, limit)
+                }
+            };
+        }
+
+        let snapshot = self.completed_snapshot(params.generation)?;
+        self.complete_page(request, &params, &snapshot, limit)
+    }
+
+    fn complete_page(
+        &self,
+        request: &RequestEnvelope,
+        params: &GitStatusPageParams,
+        snapshot: &StatusSnapshot,
+        limit: usize,
+    ) -> Result<ResponseEnvelope, ControlError> {
         validate_generation(params.generation, snapshot.summary.generation)?;
         let matching = snapshot
             .files
@@ -174,13 +231,12 @@ impl ServerLocalGit {
                 matching.len()
             )));
         }
-        let limit = params.limit.unwrap_or(250).clamp(1, 500);
         let end = offset.saturating_add(limit).min(matching.len());
         let changes = matching[offset..end]
             .iter()
             .map(|change| change_result(change))
             .collect();
-        let summary = self.summary_result(snapshot.summary);
+        let summary = self.summary_result(snapshot.summary.clone());
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &GitStatusPageResult {
@@ -194,6 +250,79 @@ impl ServerLocalGit {
                 total_count: Some(matching.len()),
             },
         ))
+    }
+
+    fn refresh_scan(&mut self, first_page_limit: usize) -> Result<LocalStatusScan, ControlError> {
+        if let Some(active) = self.status_scan.clone() {
+            return Ok(active);
+        }
+        self.status_snapshot = None;
+        let generation = self.client.mark_repository_changed(&self.repository);
+        let scan = self
+            .client
+            .start_status_scan(&self.repository, first_page_limit)
+            .map_err(vcs_error)?;
+        let active = LocalStatusScan { generation, scan };
+        self.status_refresh_count = self.status_refresh_count.saturating_add(1);
+        self.status_scan = Some(active.clone());
+        Ok(active)
+    }
+
+    fn completed_snapshot(
+        &mut self,
+        requested_generation: Option<u64>,
+    ) -> Result<Arc<StatusSnapshot>, ControlError> {
+        if let Some(snapshot) = self.status_snapshot.clone() {
+            validate_generation(requested_generation, snapshot.summary.generation)?;
+            return Ok(snapshot);
+        }
+        let active = if let Some(active) = self.status_scan.clone() {
+            active
+        } else {
+            if requested_generation.is_some() {
+                return Err(ControlError::new(
+                    ErrorCode::Conflict,
+                    "Git status snapshot is no longer available; refresh page zero.",
+                ));
+            }
+            self.refresh_scan(250)?
+        };
+        validate_generation(requested_generation, active.generation)?;
+        let result = active.scan.wait_for_completion().map_err(vcs_error)?;
+        self.install_completed_scan(active.generation, result)
+    }
+
+    fn install_completed_scan(
+        &mut self,
+        generation: u64,
+        result: Arc<agentmux_vcs::StatusReadResult>,
+    ) -> Result<Arc<StatusSnapshot>, ControlError> {
+        if result.snapshot.summary.generation != generation
+            || self.client.generation(&self.repository) != generation
+        {
+            self.status_scan = None;
+            return Err(ControlError::new(
+                ErrorCode::Conflict,
+                "Git repository changed while its status snapshot was loading; refresh and retry.",
+            ));
+        }
+        let snapshot = Arc::new(result.snapshot.clone());
+        self.status_snapshot = Some(snapshot.clone());
+        if self
+            .status_scan
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            self.status_scan = None;
+        }
+        Ok(snapshot)
+    }
+
+    fn invalidate_status(&mut self) {
+        if let Some(active) = self.status_scan.take() {
+            active.scan.cancel();
+        }
+        self.status_snapshot = None;
     }
 
     fn diff(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, ControlError> {
@@ -284,6 +413,7 @@ impl ServerLocalGit {
         {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
+        self.invalidate_status();
         let generation = if stage {
             self.client.stage(&self.repository, &params.paths)
         } else {
@@ -319,6 +449,7 @@ impl ServerLocalGit {
         {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
+        self.invalidate_status();
         let generation = if stage {
             self.client.stage(&self.repository, &[])
         } else {
@@ -355,6 +486,7 @@ impl ServerLocalGit {
         {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
+        self.invalidate_status();
         let commit = self
             .client
             .commit(&self.repository, &params.message)
@@ -829,6 +961,123 @@ mod tests {
             "token",
         )));
         assert!(commit.commit_oid.is_some());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "runs native Git and creates a paging fixture"]
+    fn local_git_pages_reuse_one_snapshot_across_external_changes() {
+        if Command::new("git").arg("--version").status().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-server-local-git-paging-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        for index in 0..600 {
+            fs::write(root.join(format!("file-{index:04}.txt")), "fixture\n").unwrap();
+        }
+        let mut git = ServerLocalGit::probe(
+            "ws_server",
+            Some("conpty"),
+            None,
+            Some(&root.to_string_lossy()),
+        )
+        .expect("repository probe");
+
+        let prefix: GitStatusPageResult = decode(git.handle_request(RequestEnvelope::new(
+            "prefix",
+            "git.status_page",
+            r#"{"workspace_id":"ws_server","limit":25}"#,
+            "token",
+        )));
+        assert!(!prefix.changes.is_empty());
+        assert_eq!(git.status_refresh_count, 1);
+
+        let summary: GitStatusSummaryResult = decode(git.handle_request(RequestEnvelope::new(
+            "summary",
+            "git.status_summary",
+            r#"{"workspace_id":"ws_server"}"#,
+            "token",
+        )));
+        let first: GitStatusPageResult = decode(
+            git.handle_request(RequestEnvelope::new(
+                "first-complete",
+                "git.status_page",
+                serde_json::json!({
+                    "workspace_id": "ws_server",
+                    "repository_id": summary.repository_id,
+                    "generation": prefix.generation,
+                    "limit": 25
+                })
+                .to_string(),
+                "token",
+            )),
+        );
+        assert_eq!(first.total_count, Some(600));
+        assert_eq!(git.status_refresh_count, 1);
+
+        fs::write(root.join("late-external.txt"), "late\n").unwrap();
+        let second: GitStatusPageResult = decode(
+            git.handle_request(RequestEnvelope::new(
+                "second",
+                "git.status_page",
+                serde_json::json!({
+                    "workspace_id": "ws_server",
+                    "repository_id": first.repository_id,
+                    "generation": first.generation,
+                    "cursor": first.next_cursor,
+                    "limit": 25
+                })
+                .to_string(),
+                "token",
+            )),
+        );
+        assert_eq!(second.total_count, Some(600));
+        assert!(second
+            .changes
+            .iter()
+            .all(|change| change.path != "late-external.txt"));
+        assert_eq!(git.status_refresh_count, 1);
+
+        let refreshed_prefix: GitStatusPageResult =
+            decode(git.handle_request(RequestEnvelope::new(
+                "refresh-prefix",
+                "git.status_page",
+                r#"{"workspace_id":"ws_server","limit":25}"#,
+                "token",
+            )));
+        assert!(refreshed_prefix.generation > first.generation);
+        let _: GitStatusSummaryResult = decode(git.handle_request(RequestEnvelope::new(
+            "refresh-summary",
+            "git.status_summary",
+            r#"{"workspace_id":"ws_server"}"#,
+            "token",
+        )));
+        let late: GitStatusPageResult = decode(
+            git.handle_request(RequestEnvelope::new(
+                "late-query",
+                "git.status_page",
+                serde_json::json!({
+                    "workspace_id": "ws_server",
+                    "generation": refreshed_prefix.generation,
+                    "query": "late-external",
+                    "limit": 25
+                })
+                .to_string(),
+                "token",
+            )),
+        );
+        assert_eq!(late.total_count, Some(1));
+        assert_eq!(late.changes[0].path, "late-external.txt");
+        assert_eq!(git.status_refresh_count, 2);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -68,6 +68,9 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: git_review_thread_deliver
+      - kind: contains
+        path: $.tools[*].name
+        value: git_review_comment_delete
       - kind: count
         path: $.tools[*].inputSchema.$defs.AgentWorkerKindParam.enum
         equals: 5

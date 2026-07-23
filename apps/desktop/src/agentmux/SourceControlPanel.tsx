@@ -161,6 +161,7 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
   const refreshSequence = useRef(0);
   const threadSequence = useRef(0);
   const loadedGeneration = useRef<number | null>(null);
+  const loadedRepositoryId = useRef<string | null>(null);
   const lastRefresh = useRef(0);
   const eventTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const targetKey = `${workspace.workspaceId}:${activePaneId ?? "none"}:${activeSessionId ?? "none"}:${activeCwd ?? ""}`;
@@ -204,15 +205,39 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
     }
   }, [captureTarget, client, isCurrentTarget, workspace.workspaceId]);
 
-  const refresh = useCallback(async (showLoading = false) => {
+  const refresh = useCallback(async (showLoading = false, reuseLoadedSnapshot = false) => {
     const sequence = ++refreshSequence.current;
     const expectedTarget = captureTarget();
     const query = serverQueryRef.current;
+    const requestedGeneration = reuseLoadedSnapshot ? loadedGeneration.current : null;
+    const requestedRepositoryId = reuseLoadedSnapshot ? loadedRepositoryId.current : null;
     if (showLoading) setLoading(true);
     try {
-      const page = await client.getGitStatusPage(workspace.workspaceId, {
+      let page = await client.getGitStatusPage(workspace.workspaceId, {
         paneId: activePaneId, limit: PAGE_SIZE, query,
+        repositoryId: requestedRepositoryId,
+        generation: requestedGeneration,
       });
+      if (sequence !== refreshSequence.current || !isCurrentTarget(expectedTarget) || query !== serverQueryRef.current) return;
+      loadedGeneration.current = page.generation;
+      loadedRepositoryId.current = page.repositoryId;
+      if (!page.summary) {
+        setSummary(null);
+        setChanges(page.changes);
+        setNextCursor(null);
+        setFilteredCount(null);
+        setError(null);
+        setLoading(false);
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+        if (sequence !== refreshSequence.current || !isCurrentTarget(expectedTarget) || query !== serverQueryRef.current) return;
+        page = await client.getGitStatusPage(workspace.workspaceId, {
+          repositoryId: page.repositoryId,
+          generation: page.generation,
+          paneId: activePaneId,
+          limit: PAGE_SIZE,
+          query,
+        });
+      }
       const nextSummary = page.summary ?? await client.getGitStatusSummary(
         workspace.workspaceId,
         page.repositoryId,
@@ -221,7 +246,8 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
       if (sequence !== refreshSequence.current || !isCurrentTarget(expectedTarget) || query !== serverQueryRef.current) return;
       if (shouldReloadGitPage(nextSummary.generation, page.generation)) {
         loadedGeneration.current = null;
-        void refresh(showLoading);
+        loadedRepositoryId.current = null;
+        void refresh(showLoading, false);
         return;
       }
       const scrollTop = scrollRef.current?.scrollTop ?? 0;
@@ -230,6 +256,7 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
       setNextCursor(page.nextCursor ?? null);
       setFilteredCount(page.totalCount ?? null);
       loadedGeneration.current = page.generation;
+      loadedRepositoryId.current = page.repositoryId;
       lastRefresh.current = Date.now();
       setError(null);
       void loadWorktrees();
@@ -271,9 +298,11 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
   useEffect(() => {
     threadSequence.current++;
     const expectedTarget = captureTarget();
+    loadedGeneration.current = null;
+    loadedRepositoryId.current = null;
     setLoadingMore(false);
     setSummary(null); setChanges([]); setNextCursor(null); setFilteredCount(null); setSelection(null); setDiff(null); setThreads([]); setReviewAnchor(null); setCommitMessage(""); setError(null);
-    void refresh(true);
+    void refresh(true, false);
     void client.getWorkspace(workspace.workspaceId)
       .then((detail) => { if (isCurrentTarget(expectedTarget)) setSessions(detail.sessions); })
       .catch(() => { if (isCurrentTarget(expectedTarget)) setSessions([]); });
@@ -287,7 +316,7 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
     setChanges([]);
     setNextCursor(null);
     setFilteredCount(null);
-    void refresh(true);
+    void refresh(true, true);
   }, [refresh, serverQuery]);
 
   useEffect(() => {

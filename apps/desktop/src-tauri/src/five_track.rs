@@ -49,7 +49,7 @@ use agentmux_store::{
 };
 use agentmux_vcs::{
     DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost as VcsGitHost, Repository,
-    StatusSnapshot,
+    StatusReadResult, StatusScan, StatusScanFirstPage, StatusSnapshot,
 };
 const LEGACY_GIT_STATUS: &str = "git.status";
 const STATUS_CACHE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
@@ -71,6 +71,7 @@ pub(super) struct FiveTrackState {
 struct FiveTrackShared {
     git: GitClient,
     git_status_cache: Mutex<HashMap<String, CachedStatusSnapshot>>,
+    git_status_scans: Mutex<HashMap<String, CachedStatusScan>>,
     observed_repositories: Mutex<HashMap<String, ObservedRepository>>,
     mutation_results: Mutex<MutationResultCache>,
     monitor_started: AtomicBool,
@@ -88,6 +89,13 @@ struct CachedStatusSnapshot {
     snapshot: Arc<StatusSnapshot>,
     page_indexes: Arc<GitStatusPageIndexes>,
     captured_at: Instant,
+}
+
+#[derive(Clone)]
+struct CachedStatusScan {
+    generation: u64,
+    scan: StatusScan,
+    started_at: Instant,
 }
 
 type GitStatusQueryCache = Arc<Mutex<VecDeque<(GitStatusPageFilter, Arc<Vec<usize>>)>>>;
@@ -286,6 +294,7 @@ impl FiveTrackState {
             shared: Arc::new(FiveTrackShared {
                 git: GitClient::default(),
                 git_status_cache: Mutex::new(HashMap::new()),
+                git_status_scans: Mutex::new(HashMap::new()),
                 observed_repositories: Mutex::new(HashMap::new()),
                 mutation_results: Mutex::new(MutationResultCache::default()),
                 monitor_started: AtomicBool::new(false),
@@ -516,36 +525,157 @@ impl DesktopControlState {
         workspace_id: &str,
         repository: &Repository,
     ) -> Result<(String, CachedStatusSnapshot), DesktopHostError> {
+        self.completed_status_snapshot(workspace_id, repository, None)
+    }
+
+    fn completed_status_snapshot(
+        &self,
+        workspace_id: &str,
+        repository: &Repository,
+        requested_generation: Option<u64>,
+    ) -> Result<(String, CachedStatusSnapshot), DesktopHostError> {
         let repository_id = repository_id(repository);
         let generation = self.five_track.shared.git.generation(repository);
         if let Ok(cache) = self.five_track.shared.git_status_cache.lock() {
             if let Some(entry) = cache.get(&repository_id) {
-                if entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE
-                    && entry.snapshot.summary.generation == generation
+                if entry.snapshot.summary.generation == generation
+                    && (requested_generation.is_some()
+                        || entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE)
                 {
+                    validate_generation(requested_generation, generation)?;
                     self.observe_repository(workspace_id, &repository_id, &entry.repository);
                     return Ok((repository_id, entry.clone()));
                 }
             }
         }
+        let active = if let Ok(scans) = self.five_track.shared.git_status_scans.lock() {
+            scans.get(&repository_id).cloned()
+        } else {
+            None
+        };
+        let active = match active {
+            Some(active) => {
+                validate_generation(requested_generation, active.generation)?;
+                active
+            }
+            None if requested_generation.is_some() => {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::Conflict,
+                    "Git status snapshot is no longer available; refresh page zero.",
+                )))
+            }
+            None => self.start_status_scan(repository, &repository_id, 250)?,
+        };
+        let result = active.scan.wait_for_completion().map_err(vcs_error)?;
+        let cached = self.install_completed_status_scan(
+            workspace_id,
+            repository,
+            &repository_id,
+            active.generation,
+            result,
+        )?;
+        Ok((repository_id, cached))
+    }
 
-        let snapshot = self
+    fn start_status_scan(
+        &self,
+        repository: &Repository,
+        repository_id: &str,
+        first_page_limit: usize,
+    ) -> Result<CachedStatusScan, DesktopHostError> {
+        let mut scans = self
+            .five_track
+            .shared
+            .git_status_scans
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable(
+                    "Git status scan state is unavailable".to_string(),
+                )
+            })?;
+        if let Some(active) = scans.get(repository_id) {
+            return Ok(active.clone());
+        }
+        if scans.len() >= MAX_OBSERVED_REPOSITORIES {
+            if let Some(oldest) = scans
+                .iter()
+                .min_by_key(|(_, active)| active.started_at)
+                .map(|(key, _)| key.clone())
+            {
+                if let Some(evicted) = scans.remove(&oldest) {
+                    evicted.scan.cancel();
+                }
+            }
+        }
+        let generation = self
             .five_track
             .shared
             .git
-            .read_status(repository)
+            .mark_repository_changed(repository);
+        let scan = self
+            .five_track
+            .shared
+            .git
+            .start_status_scan(repository, first_page_limit)
             .map_err(vcs_error)?;
+        let active = CachedStatusScan {
+            generation,
+            scan,
+            started_at: Instant::now(),
+        };
+        scans.insert(repository_id.to_string(), active.clone());
+        Ok(active)
+    }
+
+    fn install_completed_status_scan(
+        &self,
+        workspace_id: &str,
+        repository: &Repository,
+        repository_id: &str,
+        generation: u64,
+        result: Arc<StatusReadResult>,
+    ) -> Result<CachedStatusSnapshot, DesktopHostError> {
+        if result.snapshot.summary.generation != generation
+            || self.five_track.shared.git.generation(repository) != generation
+        {
+            if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
+                scans.remove(repository_id);
+            }
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Git repository changed while its status snapshot was loading; refresh and retry.",
+            )));
+        }
         let cached = CachedStatusSnapshot {
             repository: repository.clone(),
-            page_indexes: Arc::new(GitStatusPageIndexes::from_snapshot(&snapshot)),
-            snapshot: Arc::new(snapshot),
+            page_indexes: Arc::new(GitStatusPageIndexes::from_snapshot(&result.snapshot)),
+            snapshot: Arc::new(result.snapshot.clone()),
             captured_at: Instant::now(),
         };
         if let Ok(mut cache) = self.five_track.shared.git_status_cache.lock() {
-            cache.insert(repository_id.clone(), cached.clone());
+            cache.insert(repository_id.to_string(), cached.clone());
         }
-        self.observe_repository(workspace_id, &repository_id, repository);
-        Ok((repository_id, cached))
+        if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
+            if scans
+                .get(repository_id)
+                .is_some_and(|active| active.generation == generation)
+            {
+                scans.remove(repository_id);
+            }
+        }
+        self.observe_repository(workspace_id, repository_id, repository);
+        Ok(cached)
+    }
+
+    fn invalidate_status_snapshot(&self, repository_id: &str) {
+        if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
+            if let Some(active) = scans.remove(repository_id) {
+                active.scan.cancel();
+            }
+        }
+        if let Ok(mut cache) = self.five_track.shared.git_status_cache.lock() {
+            cache.remove(repository_id);
+        }
     }
 
     fn observe_repository(&self, workspace_id: &str, repository_id: &str, repository: &Repository) {
@@ -677,8 +807,90 @@ impl DesktopControlState {
             params.pane_id.as_deref(),
             params.repository_id.as_deref(),
         )?;
-        let (repository_id, cached) = self.status_snapshot(&params.workspace_id, &repository)?;
+        if params.cursor.is_some() && params.generation.is_none() {
+            return Err(control_invalid_request(
+                "Git status cursors require their snapshot generation.",
+            ));
+        }
+        let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
+        let limit = params.limit.unwrap_or(250).clamp(1, 500);
+
+        if params.cursor.is_none() && params.generation.is_none() {
+            let generation = self.five_track.shared.git.generation(&repository);
+            let cached = self
+                .five_track
+                .shared
+                .git_status_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&repository_id).cloned())
+                .filter(|entry| {
+                    entry.snapshot.summary.generation == generation
+                        && entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE
+                });
+            if let Some(cached) = cached {
+                self.observe_repository(&params.workspace_id, &repository_id, &repository);
+                return self.complete_status_page_response(
+                    request,
+                    &params,
+                    &repository_id,
+                    &cached,
+                );
+            }
+
+            let active = self.start_status_scan(&repository, &repository_id, limit)?;
+            return match active.scan.wait_for_first_page().map_err(vcs_error)? {
+                StatusScanFirstPage::Prefix(prefix) => {
+                    let filter = GitStatusPageFilter::from_request(
+                        params.state.as_deref(),
+                        params.query.as_deref(),
+                    );
+                    let changes = prefix
+                        .changes
+                        .iter()
+                        .filter(|change| status_change_matches_filter(change, &filter))
+                        .map(git_change_result)
+                        .collect();
+                    self.observe_repository(&params.workspace_id, &repository_id, &repository);
+                    Ok(ResponseEnvelope::ok_typed(
+                        request.id.clone(),
+                        &GitStatusPageResult {
+                            workspace_id: params.workspace_id,
+                            repository_id,
+                            generation: prefix.generation,
+                            summary: None,
+                            changes,
+                            next_cursor: None,
+                            total_count: None,
+                        },
+                    ))
+                }
+                StatusScanFirstPage::Complete(result) => {
+                    let cached = self.install_completed_status_scan(
+                        &params.workspace_id,
+                        &repository,
+                        &repository_id,
+                        active.generation,
+                        result,
+                    )?;
+                    self.complete_status_page_response(request, &params, &repository_id, &cached)
+                }
+            };
+        }
+
+        let (_, cached) =
+            self.completed_status_snapshot(&params.workspace_id, &repository, params.generation)?;
+        self.complete_status_page_response(request, &params, &repository_id, &cached)
+    }
+
+    fn complete_status_page_response(
+        &self,
+        request: &RequestEnvelope,
+        params: &GitStatusPageParams,
+        repository_id: &str,
+        cached: &CachedStatusSnapshot,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
         validate_generation(params.generation, cached.snapshot.summary.generation)?;
 
         let filter =
@@ -705,11 +917,11 @@ impl DesktopControlState {
             request.id.clone(),
             &GitStatusPageResult {
                 workspace_id: params.workspace_id.clone(),
-                repository_id: repository_id.clone(),
+                repository_id: repository_id.to_string(),
                 generation: cached.snapshot.summary.generation,
                 summary: Some(GitStatusSummaryResult {
-                    workspace_id: params.workspace_id,
-                    repository_id,
+                    workspace_id: params.workspace_id.clone(),
+                    repository_id: repository_id.to_string(),
                     repository_root: cached.snapshot.summary.repository_root.clone(),
                     branch: cached.snapshot.summary.branch.clone(),
                     head_oid: cached.snapshot.summary.head.clone(),
@@ -865,6 +1077,7 @@ impl DesktopControlState {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
 
+        self.invalidate_status_snapshot(&repository_id);
         let generation = match mutation {
             GitMutation::Stage => self
                 .five_track
@@ -940,6 +1153,7 @@ impl DesktopControlState {
         ) {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
+        self.invalidate_status_snapshot(&repository_id);
         let generation = match mutation {
             GitMutation::Stage => self
                 .five_track
@@ -1004,6 +1218,7 @@ impl DesktopControlState {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
 
+        self.invalidate_status_snapshot(&repository_id);
         let (commit, summary, generation) = if params.amend {
             let output = run_git_command(
                 &legacy_context,
@@ -1118,9 +1333,7 @@ impl DesktopControlState {
         generation: u64,
         reason: &str,
     ) {
-        if let Ok(mut cache) = self.five_track.shared.git_status_cache.lock() {
-            cache.remove(repository_id);
-        }
+        self.invalidate_status_snapshot(repository_id);
         self.observe_repository(workspace_id, repository_id, repository);
         let event = GitRepositoryChangedEvent {
             workspace_id: workspace_id.to_string(),
@@ -1194,6 +1407,18 @@ fn status_change_matches_query(change: &GitFileChange, query: &str) -> bool {
             .original_path
             .as_deref()
             .is_some_and(|path| path.to_lowercase().contains(query))
+}
+
+fn status_change_matches_filter(change: &GitFileChange, filter: &GitStatusPageFilter) -> bool {
+    let state_matches = match filter.state.as_str() {
+        "all" => true,
+        "staged" => change.staged,
+        "unstaged" => change.unstaged,
+        "untracked" => change.untracked,
+        "conflicted" | "conflict" => change.conflict,
+        _ => false,
+    };
+    state_matches && (filter.query.is_empty() || status_change_matches_query(change, &filter.query))
 }
 
 fn git_cursor_fingerprint(generation: u64, filter: &GitStatusPageFilter) -> u64 {
@@ -1504,6 +1729,11 @@ fn signal_repository_changed(
         return;
     };
     let generation = shared.git.mark_repository_changed(&snapshot.repository);
+    if let Ok(mut scans) = shared.git_status_scans.lock() {
+        if let Some(active) = scans.remove(&snapshot.repository_id) {
+            active.scan.cancel();
+        }
+    }
     if let Ok(mut cache) = shared.git_status_cache.lock() {
         cache.remove(&snapshot.repository_id);
     }
@@ -4821,6 +5051,74 @@ mod tests {
     #[test]
     fn git_page_pipeline_handles_15k_files_within_budget() {
         assert_large_git_page_pipeline(15_000, Duration::from_secs(1));
+    }
+
+    #[test]
+    #[ignore = "performance gate creates 15,000 files; run through tools/run-performance-gates.ps1"]
+    fn git_status_native_15k_returns_first_visible_page_before_completion() {
+        let repository = create_git_repository("native-first-visible-15k");
+        let generated = repository.join("generated");
+        fs::create_dir(&generated).expect("generated fixture directory");
+        for index in 0..15_000 {
+            fs::write(generated.join(format!("file-{index:05}.txt")), "x")
+                .expect("performance fixture");
+        }
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        save_bundle(
+            &host,
+            &workspace_bundle(
+                "ws_native_first_visible",
+                Some(repository.to_string_lossy().to_string()),
+                &[],
+            ),
+        );
+
+        let started = Instant::now();
+        let first: GitStatusPageResult = decode_ok(host.handle_request(test_request(
+            "git_native_first",
+            METHOD_GIT_STATUS_PAGE,
+            &GitStatusPageParams {
+                workspace_id: "ws_native_first_visible".to_string(),
+                pane_id: None,
+                repository_id: None,
+                generation: None,
+                state: None,
+                query: None,
+                cursor: None,
+                limit: Some(250),
+            },
+        )));
+        let first_visible_after = started.elapsed();
+        assert!(!first.changes.is_empty());
+        assert!(
+            first_visible_after < Duration::from_millis(900),
+            "desktop request-to-first-visible-row was {first_visible_after:?}, budget was 900ms"
+        );
+        let completed: GitStatusPageResult = decode_ok(host.handle_request(test_request(
+            "git_native_complete",
+            METHOD_GIT_STATUS_PAGE,
+            &GitStatusPageParams {
+                workspace_id: "ws_native_first_visible".to_string(),
+                pane_id: None,
+                repository_id: Some(first.repository_id),
+                generation: Some(first.generation),
+                state: None,
+                query: None,
+                cursor: None,
+                limit: Some(250),
+            },
+        )));
+        let completed_after = started.elapsed();
+        assert_eq!(completed.total_count, Some(15_000));
+        assert!(completed.summary.is_some());
+        assert!(
+            completed_after < Duration::from_secs(10),
+            "desktop full 15k snapshot completed in {completed_after:?}, budget was 10s"
+        );
+        eprintln!(
+            "desktop native Git 15k: first_visible={first_visible_after:?}, completed={completed_after:?}"
+        );
+        fs::remove_dir_all(repository).expect("temporary repository cleanup");
     }
 
     #[test]

@@ -6,7 +6,7 @@ pub enum OutputStream {
     Stderr,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitError {
     Io {
         operation: String,

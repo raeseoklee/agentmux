@@ -78,6 +78,25 @@ describe("TerminalResizeCoordinator", () => {
     expect(send).toHaveBeenLastCalledWith({ columns: 132, rows: 34 });
   });
 
+  it("keeps simultaneously visible terminal grids independently coalesced", async () => {
+    vi.useFakeTimers();
+    const firstSend = vi.fn(async () => {});
+    const secondSend = vi.fn(async () => {});
+    const first = new TerminalResizeCoordinator({ delayMs: 100, send: firstSend });
+    const second = new TerminalResizeCoordinator({ delayMs: 100, send: secondSend });
+
+    first.request({ columns: 88, rows: 22 });
+    first.request({ columns: 96, rows: 22 });
+    second.request({ columns: 88, rows: 21 });
+    second.request({ columns: 96, rows: 21 });
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(firstSend).toHaveBeenCalledTimes(1);
+    expect(firstSend).toHaveBeenLastCalledWith({ columns: 96, rows: 22 });
+    expect(secondSend).toHaveBeenCalledTimes(1);
+    expect(secondSend).toHaveBeenLastCalledWith({ columns: 96, rows: 21 });
+  });
+
   it("drops an intermediate size when the viewport returns to the in-flight size", async () => {
     vi.useFakeTimers();
     let resolveFirst: (() => void) | undefined;

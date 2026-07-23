@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 54
+        equals: 55
       - kind: contains
         path: $.tools[*].name
         value: terminal_open
@@ -56,6 +56,9 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: git_review_thread_deliver
+      - kind: contains
+        path: $.tools[*].name
+        value: git_review_comment_delete
       - kind: contains
         path: $.tools[*].name
         value: development_server_candidate_open_in_split

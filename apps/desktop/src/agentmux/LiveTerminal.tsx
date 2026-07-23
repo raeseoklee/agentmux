@@ -320,6 +320,12 @@ function writeTerminalPreviewCache(sessionId: string, bytes: Uint8Array): void {
 interface LiveTerminalProps {
   client: ControlClient;
   sessionId: string;
+  /**
+   * The terminal is laid out in the current tab and can consume geometry
+   * changes. This intentionally differs from `active`, which represents
+   * keyboard focus and the sole WebGL-eligible pane.
+   */
+  visible: boolean;
   active: boolean;
   terminalGpuAcceleration: TerminalGpuAccelerationMode;
   agentKind?: "claude" | "codex" | null;
@@ -470,6 +476,7 @@ export function TerminalRestorePreview({
 export function LiveTerminal({
   client,
   sessionId,
+  visible,
   active,
   terminalGpuAcceleration,
   agentKind,
@@ -483,6 +490,7 @@ export function LiveTerminal({
 }: LiveTerminalProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
+  const visibleRef = useRef(visible);
   const activeRef = useRef(active);
   const agentKindRef = useRef(agentKind ?? null);
   const onOpenLinkRef = useRef(onOpenLink);
@@ -729,17 +737,17 @@ export function LiveTerminal({
       resizeCoordinator.request(size, immediate);
     };
     const unsubscribeResize = renderer.onResize((columns, rows) => {
-      if (!alive || !activeRef.current) {
+      if (!alive || !visibleRef.current) {
         return;
       }
       resizeCoordinator.request({ columns, rows });
     });
-    if (activeRef.current) {
+    if (visibleRef.current) {
       reportRendererSize(true);
     }
     const resizeRetryTimers = [120, 400].map((delay) =>
       window.setTimeout(() => {
-        if (!alive || !activeRef.current) {
+        if (!alive || !visibleRef.current) {
           return;
         }
         renderer.refreshDisplayMetrics();
@@ -750,7 +758,7 @@ export function LiveTerminal({
     let layoutSettleTimer: number | null = null;
     let displayMetricsFrame: number | null = null;
     const synchronizeLayout = () => {
-      if (!alive || !activeRef.current) {
+      if (!alive || !visibleRef.current) {
         return;
       }
       if (layoutSettleTimer !== null) {
@@ -763,7 +771,7 @@ export function LiveTerminal({
         }
         fitFrame = window.requestAnimationFrame(() => {
           fitFrame = null;
-          if (!alive || !activeRef.current) {
+          if (!alive || !visibleRef.current) {
             return;
           }
           renderer.refreshDisplayMetrics();
@@ -782,7 +790,7 @@ export function LiveTerminal({
         if (!alive) {
           return;
         }
-        if (!activeRef.current) {
+        if (!visibleRef.current) {
           return;
         }
         renderer.refreshDisplayMetrics?.();
@@ -1505,6 +1513,21 @@ export function LiveTerminal({
     agentKindRef.current = normalized;
     rendererRef.current?.setAlternateWheelMode(terminalWheelMode(normalized));
   }, [agentKind]);
+
+  useEffect(() => {
+    visibleRef.current = visible;
+    if (visible) {
+      // Every pane visible in the active tab owns a live terminal grid. A
+      // focused-only policy leaves sibling WSL/tmux PTYs at stale dimensions
+      // when docked UI or the window changes size.
+      synchronizeLayoutRef.current?.();
+      pollNowRef.current?.();
+    } else {
+      // A warm-retained background tab stays mounted for instant switching but
+      // must not react to its off-screen layout box.
+      checkpointViewStateRef.current?.();
+    }
+  }, [visible]);
 
   useEffect(() => {
     activeRef.current = active;

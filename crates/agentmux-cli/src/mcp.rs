@@ -104,6 +104,7 @@ const STANDARD_TOOL_NAMES: &[&str] = &[
     "git_review_thread_mark_stale",
     "git_review_comment_create",
     "git_review_comment_update",
+    "git_review_comment_delete",
     "git_stage",
     "git_unstage",
     "git_commit",
@@ -136,6 +137,7 @@ const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
     "git_unstage",
     "git_commit",
     "git_review_thread_deliver",
+    "git_review_comment_delete",
     "development_server_candidate_open_in_split",
 ];
 #[cfg(test)]
@@ -166,7 +168,6 @@ const FULL_TOOL_NAMES: &[&str] = &[
     "git_unstage_all",
     "git_discard",
     "git_review_thread_delete",
-    "git_review_comment_delete",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -719,12 +720,11 @@ impl AgentMuxMcpServer {
             .map_err(|error| format!("invalid system.identify response: {error}"))
     }
 
-    async fn authorize_standard_git_scope(
+    async fn resolve_standard_caller_scope(
         &self,
         tool_name: &'static str,
-        workspace_id: &str,
-        pane_id: Option<&str>,
-        repository_id: Option<&str>,
+        requested_workspace_id: Option<&str>,
+        requested_pane_id: Option<&str>,
     ) -> Result<StandardCallerScope, CallToolResult> {
         if self.profile != McpProfile::Standard {
             return Err(standard_scope_denied_result(
@@ -736,93 +736,33 @@ impl AgentMuxMcpServer {
             .resolve_context(None)
             .await
             .map_err(|message| control_error_result("system.identify", message))?;
-        let caller_workspace_id = context
+        let workspace_id = context
             .workspace_id
             .ok_or_else(|| missing_context_result("workspace_id"))?;
-        if workspace_id != caller_workspace_id {
+        if requested_workspace_id.is_some_and(|requested| requested != workspace_id) {
             return Err(standard_scope_denied_result(
                 tool_name,
                 "the requested workspace is not the caller's active workspace",
             ));
         }
-        let caller_pane_id = context
+        let pane_id = context
             .pane_id
             .ok_or_else(|| missing_context_result("pane_id"))?;
-        if pane_id.is_some_and(|pane_id| pane_id != caller_pane_id) {
+        if requested_pane_id.is_some_and(|requested| requested != pane_id) {
             return Err(standard_scope_denied_result(
                 tool_name,
                 "the requested pane is not the caller's active pane",
             ));
         }
-        let _caller_session_id = context
-            .session_id
-            .ok_or_else(|| missing_context_result("session_id"))?;
-        let summary = self
-            .invoke_value(
-                METHOD_GIT_STATUS_SUMMARY,
-                json!(GitRepositoryParams {
-                    workspace_id: caller_workspace_id.clone(),
-                    pane_id: Some(caller_pane_id.clone()),
-                    repository_id: None,
-                }),
-            )
-            .await
-            .map_err(|message| control_error_result(METHOD_GIT_STATUS_SUMMARY, message))?;
-        let active_repository_id = summary
-            .get("repository_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                standard_scope_denied_result(
-                    tool_name,
-                    "the caller's active pane does not resolve to a Git repository",
-                )
-            })?;
-        if summary.get("workspace_id").and_then(Value::as_str) != Some(caller_workspace_id.as_str())
-        {
-            return Err(standard_scope_denied_result(
-                tool_name,
-                "the resolved repository does not belong to the caller's active workspace",
-            ));
-        }
-        if repository_id.is_some_and(|repository_id| repository_id != active_repository_id) {
-            return Err(standard_scope_denied_result(
-                tool_name,
-                "the requested repository is not selected by the caller's active pane",
-            ));
-        }
-        Ok(StandardCallerScope {
-            workspace_id: caller_workspace_id,
-            pane_id: caller_pane_id,
-            repository_id: active_repository_id.to_string(),
-        })
-    }
-
-    async fn authorize_standard_review_delivery(
-        &self,
-        tool_name: &'static str,
-        request: &GitReviewThreadDeliverParams,
-    ) -> Result<(), CallToolResult> {
-        let context = self
-            .resolve_context(None)
-            .await
-            .map_err(|message| control_error_result("system.identify", message))?;
-        let workspace_id = context
-            .workspace_id
-            .ok_or_else(|| missing_context_result("workspace_id"))?;
-        let pane_id = context
-            .pane_id
-            .ok_or_else(|| missing_context_result("pane_id"))?;
         let session_id = context
             .session_id
             .ok_or_else(|| missing_context_result("session_id"))?;
-
         let summary = self
             .invoke_value(
                 METHOD_GIT_STATUS_SUMMARY,
                 json!(GitRepositoryParams {
                     workspace_id: workspace_id.clone(),
-                    pane_id: Some(pane_id),
+                    pane_id: Some(pane_id.clone()),
                     repository_id: None,
                 }),
             )
@@ -844,13 +784,46 @@ impl AgentMuxMcpServer {
                 "the resolved repository does not belong to the caller's active workspace",
             ));
         }
+        Ok(StandardCallerScope {
+            workspace_id,
+            pane_id,
+            session_id,
+            repository_id: repository_id.to_string(),
+        })
+    }
 
-        let threads = self
+    async fn authorize_standard_git_scope(
+        &self,
+        tool_name: &'static str,
+        workspace_id: &str,
+        pane_id: Option<&str>,
+        repository_id: Option<&str>,
+    ) -> Result<StandardCallerScope, CallToolResult> {
+        let scope = self
+            .resolve_standard_caller_scope(tool_name, Some(workspace_id), pane_id)
+            .await?;
+        if repository_id.is_some_and(|repository_id| repository_id != scope.repository_id) {
+            return Err(standard_scope_denied_result(
+                tool_name,
+                "the requested repository is not selected by the caller's active pane",
+            ));
+        }
+        Ok(scope)
+    }
+
+    async fn standard_owned_review_threads(
+        &self,
+        tool_name: &'static str,
+    ) -> Result<(StandardCallerScope, Vec<Value>), CallToolResult> {
+        let scope = self
+            .resolve_standard_caller_scope(tool_name, None, None)
+            .await?;
+        let result = self
             .invoke_value(
                 METHOD_GIT_REVIEW_THREAD_LIST,
                 json!(GitReviewThreadListParams {
-                    workspace_id: workspace_id.clone(),
-                    repository_id: Some(repository_id.to_string()),
+                    workspace_id: scope.workspace_id.clone(),
+                    repository_id: Some(scope.repository_id.clone()),
                     path: None,
                     include_resolved: true,
                     include_stale: true,
@@ -859,39 +832,110 @@ impl AgentMuxMcpServer {
             )
             .await
             .map_err(|message| control_error_result(METHOD_GIT_REVIEW_THREAD_LIST, message))?;
-        let Some(thread) = threads
+        let threads = result
             .get("threads")
             .and_then(Value::as_array)
-            .and_then(|threads| {
-                threads.iter().find(|thread| {
-                    thread.get("thread_id").and_then(Value::as_str)
-                        == Some(request.thread_id.as_str())
-                })
-            })
+            .cloned()
+            .ok_or_else(|| {
+                control_error_result(
+                    METHOD_GIT_REVIEW_THREAD_LIST,
+                    "invalid review thread list response".to_string(),
+                )
+            })?;
+        Ok((scope, threads))
+    }
+
+    async fn authorize_standard_review_thread(
+        &self,
+        tool_name: &'static str,
+        thread_id: &str,
+    ) -> Result<StandardCallerScope, CallToolResult> {
+        let (scope, threads) = self.standard_owned_review_threads(tool_name).await?;
+        let Some(thread) = threads
+            .iter()
+            .find(|thread| thread.get("thread_id").and_then(Value::as_str) == Some(thread_id))
         else {
             return Err(standard_scope_denied_result(
                 tool_name,
                 "the review thread is outside the caller's active repository",
             ));
         };
-        let owner_session_id = thread
-            .get("comments")
-            .and_then(Value::as_array)
-            .and_then(|comments| comments.first())
-            .and_then(|comment| comment.get("author_session_id"))
-            .and_then(Value::as_str);
-        if owner_session_id != Some(session_id.as_str()) {
+        if !review_thread_matches_scope(thread, &scope) {
+            return Err(standard_scope_denied_result(
+                tool_name,
+                "the review thread is outside the caller's active workspace or repository",
+            ));
+        }
+        if review_thread_owner_session_id(thread) != Some(scope.session_id.as_str()) {
             return Err(standard_scope_denied_result(
                 tool_name,
                 "the review thread was not created by the caller's active agent session",
             ));
         }
+        Ok(scope)
+    }
+
+    async fn authorize_standard_review_comment(
+        &self,
+        tool_name: &'static str,
+        comment_id: &str,
+    ) -> Result<StandardCallerScope, CallToolResult> {
+        let (scope, threads) = self.standard_owned_review_threads(tool_name).await?;
+        for thread in &threads {
+            if !review_thread_matches_scope(thread, &scope) {
+                continue;
+            }
+            let Some(comment) =
+                thread
+                    .get("comments")
+                    .and_then(Value::as_array)
+                    .and_then(|comments| {
+                        comments.iter().find(|comment| {
+                            comment.get("comment_id").and_then(Value::as_str) == Some(comment_id)
+                        })
+                    })
+            else {
+                continue;
+            };
+            if review_thread_owner_session_id(thread) != Some(scope.session_id.as_str()) {
+                return Err(standard_scope_denied_result(
+                    tool_name,
+                    "the review comment belongs to a thread not owned by the caller's active agent session",
+                ));
+            }
+            if comment.get("author_session_id").and_then(Value::as_str)
+                != Some(scope.session_id.as_str())
+            {
+                return Err(standard_scope_denied_result(
+                    tool_name,
+                    "the review comment was not authored by the caller's active agent session",
+                ));
+            }
+            return Ok(scope);
+        }
+        Err(standard_scope_denied_result(
+            tool_name,
+            "the review comment is outside the caller's active repository",
+        ))
+    }
+
+    async fn authorize_standard_review_delivery(
+        &self,
+        tool_name: &'static str,
+        request: &GitReviewThreadDeliverParams,
+    ) -> Result<(), CallToolResult> {
+        let scope = self
+            .authorize_standard_review_thread(tool_name, &request.thread_id)
+            .await?;
 
         let target_session_id = request.target_session_id.as_deref().ok_or_else(|| {
             control_error_result(tool_name, "target_session_id is required".to_string())
         })?;
         let sessions = self
-            .invoke_value("session.list", json!({ "workspace_id": workspace_id }))
+            .invoke_value(
+                "session.list",
+                json!({ "workspace_id": scope.workspace_id }),
+            )
             .await
             .map_err(|message| control_error_result("session.list", message))?;
         let target_is_owned = sessions
@@ -1680,7 +1724,7 @@ impl AgentMuxMcpServer {
         &self,
         Parameters(params): Parameters<GitReviewThreadCreateToolParams>,
     ) -> CallToolResult {
-        let request = GitReviewThreadCreateParams {
+        let mut request = GitReviewThreadCreateParams {
             workspace_id: params.workspace_id,
             repository_id: params.repository_id,
             anchor: params.anchor.into(),
@@ -1689,6 +1733,33 @@ impl AgentMuxMcpServer {
         };
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_CREATE, error);
+        }
+        if self.profile == McpProfile::Standard {
+            let scope = match self
+                .authorize_standard_git_scope(
+                    "git_review_thread_create",
+                    &request.workspace_id,
+                    None,
+                    request.repository_id.as_deref(),
+                )
+                .await
+            {
+                Ok(scope) => scope,
+                Err(result) => return result,
+            };
+            if request
+                .author_session_id
+                .as_deref()
+                .is_some_and(|author| author != scope.session_id)
+            {
+                return standard_scope_denied_result(
+                    "git_review_thread_create",
+                    "the requested author is not the caller's active agent session",
+                );
+            }
+            request.workspace_id = scope.workspace_id;
+            request.repository_id = Some(scope.repository_id);
+            request.author_session_id = Some(scope.session_id);
         }
         self.call(METHOD_GIT_REVIEW_THREAD_CREATE, json!(request))
             .await
@@ -1717,6 +1788,14 @@ impl AgentMuxMcpServer {
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_UPDATE, error);
         }
+        if self.profile == McpProfile::Standard {
+            if let Err(result) = self
+                .authorize_standard_review_thread("git_review_thread_update", &request.thread_id)
+                .await
+            {
+                return result;
+            }
+        }
         self.call(METHOD_GIT_REVIEW_THREAD_UPDATE, json!(request))
             .await
     }
@@ -1744,6 +1823,17 @@ impl AgentMuxMcpServer {
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_MARK_STALE, error);
         }
+        if self.profile == McpProfile::Standard {
+            if let Err(result) = self
+                .authorize_standard_review_thread(
+                    "git_review_thread_mark_stale",
+                    &request.thread_id,
+                )
+                .await
+            {
+                return result;
+            }
+        }
         self.call(METHOD_GIT_REVIEW_THREAD_MARK_STALE, json!(request))
             .await
     }
@@ -1763,13 +1853,33 @@ impl AgentMuxMcpServer {
         &self,
         Parameters(params): Parameters<GitReviewCommentCreateToolParams>,
     ) -> CallToolResult {
-        let request = GitReviewCommentCreateParams {
+        let mut request = GitReviewCommentCreateParams {
             thread_id: params.thread_id,
             body: params.body,
             author_session_id: params.author_session_id,
         };
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_CREATE, error);
+        }
+        if self.profile == McpProfile::Standard {
+            let scope = match self
+                .authorize_standard_review_thread("git_review_comment_create", &request.thread_id)
+                .await
+            {
+                Ok(scope) => scope,
+                Err(result) => return result,
+            };
+            if request
+                .author_session_id
+                .as_deref()
+                .is_some_and(|author| author != scope.session_id)
+            {
+                return standard_scope_denied_result(
+                    "git_review_comment_create",
+                    "the requested author is not the caller's active agent session",
+                );
+            }
+            request.author_session_id = Some(scope.session_id);
         }
         self.call(METHOD_GIT_REVIEW_COMMENT_CREATE, json!(request))
             .await
@@ -1796,6 +1906,14 @@ impl AgentMuxMcpServer {
         };
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_UPDATE, error);
+        }
+        if self.profile == McpProfile::Standard {
+            if let Err(result) = self
+                .authorize_standard_review_comment("git_review_comment_update", &request.comment_id)
+                .await
+            {
+                return result;
+            }
         }
         self.call(METHOD_GIT_REVIEW_COMMENT_UPDATE, json!(request))
             .await
@@ -2105,6 +2223,14 @@ impl AgentMuxMcpServer {
         };
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_COMMENT_DELETE, error);
+        }
+        if self.profile == McpProfile::Standard {
+            if let Err(result) = self
+                .authorize_standard_review_comment("git_review_comment_delete", &request.comment_id)
+                .await
+            {
+                return result;
+            }
         }
         self.call(METHOD_GIT_REVIEW_COMMENT_DELETE, json!(request))
             .await
@@ -5364,6 +5490,20 @@ fn standard_scope_denied_result(tool_name: &str, reason: &str) -> CallToolResult
     )
 }
 
+fn review_thread_matches_scope(thread: &Value, scope: &StandardCallerScope) -> bool {
+    thread.get("workspace_id").and_then(Value::as_str) == Some(scope.workspace_id.as_str())
+        && thread.get("repository_id").and_then(Value::as_str) == Some(scope.repository_id.as_str())
+}
+
+fn review_thread_owner_session_id(thread: &Value) -> Option<&str> {
+    thread
+        .get("comments")
+        .and_then(Value::as_array)
+        .and_then(|comments| comments.first())
+        .and_then(|comment| comment.get("author_session_id"))
+        .and_then(Value::as_str)
+}
+
 fn invalid_ipc_params_result(method: &str, error: agentmux_ipc::ControlError) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "error": {
@@ -5615,6 +5755,7 @@ struct ResolvedContext {
 struct StandardCallerScope {
     workspace_id: String,
     pane_id: String,
+    session_id: String,
     repository_id: String,
 }
 
@@ -6742,6 +6883,7 @@ struct GitReviewThreadCreateToolParams {
     repository_id: Option<String>,
     anchor: GitReviewLineAnchorToolParams,
     body: String,
+    /// Full profile may name an author. Standard requires this to match the caller and always records the active caller session.
     author_session_id: Option<String>,
 }
 
@@ -6784,6 +6926,7 @@ struct GitReviewCommentListToolParams {
 struct GitReviewCommentCreateToolParams {
     thread_id: String,
     body: String,
+    /// Full profile may name an author. Standard requires this to match the caller and always records the active caller session.
     author_session_id: Option<String>,
 }
 
@@ -6921,6 +7064,45 @@ mod tests {
             Arc::clone(&transport) as Arc<dyn ControlTransport>,
         );
         (server, transport)
+    }
+
+    fn standard_caller_context() -> Value {
+        json!({
+            "workspace_id": "workspace-1",
+            "pane_id": "pane-1",
+            "session_id": "session-agent",
+        })
+    }
+
+    fn standard_active_repository() -> Value {
+        json!({
+            "workspace_id": "workspace-1",
+            "repository_id": "repo-1",
+        })
+    }
+
+    fn standard_owned_review_threads() -> Value {
+        json!({
+            "threads": [{
+                "thread_id": "review-owned",
+                "workspace_id": "workspace-1",
+                "repository_id": "repo-1",
+                "comments": [
+                    {
+                        "comment_id": "comment-root",
+                        "author_session_id": "session-agent"
+                    },
+                    {
+                        "comment_id": "comment-owned",
+                        "author_session_id": "session-agent"
+                    },
+                    {
+                        "comment_id": "comment-peer",
+                        "author_session_id": "session-peer"
+                    }
+                ],
+            }],
+        })
     }
 
     #[test]
@@ -7155,6 +7337,7 @@ mod tests {
         assert!(McpProfile::Standard.allows_tool("git_unstage"));
         assert!(McpProfile::Standard.allows_tool("git_commit"));
         assert!(McpProfile::Standard.allows_tool("git_review_thread_deliver"));
+        assert!(McpProfile::Standard.allows_tool("git_review_comment_delete"));
         assert!(!McpProfile::Standard.allows_tool("git_stage_all"));
         assert!(!McpProfile::Standard.allows_tool("git_discard"));
         assert!(!McpProfile::Standard.allows_tool("workspace_close"));
@@ -7348,6 +7531,393 @@ mod tests {
             .and_then(Value::as_str)
             .is_some_and(|message| message.contains("requires the 'full' MCP profile"))));
         assert!(transport.calls.lock().expect("fake calls lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn standard_review_create_binds_workspace_repository_and_author_to_caller() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (
+                    METHOD_GIT_REVIEW_THREAD_CREATE,
+                    json!({"thread_id": "review-owned"}),
+                ),
+            ],
+        );
+        let result = server
+            .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
+                workspace_id: "workspace-1".to_string(),
+                repository_id: None,
+                anchor: GitReviewLineAnchorToolParams {
+                    path: "src/lib.rs".to_string(),
+                    side: "new".to_string(),
+                    line: 42,
+                    start_line: None,
+                    base_revision: None,
+                    head_revision: None,
+                    hunk_header: None,
+                    diff_hash: None,
+                },
+                body: "Caller-owned review".to_string(),
+                author_session_id: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, METHOD_GIT_REVIEW_THREAD_CREATE);
+        assert_eq!(calls[2].1["workspace_id"], "workspace-1");
+        assert_eq!(calls[2].1["repository_id"], "repo-1");
+        assert_eq!(calls[2].1["author_session_id"], "session-agent");
+    }
+
+    #[tokio::test]
+    async fn standard_review_create_rejects_forged_author_and_foreign_scope() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+            ],
+        );
+        let forged = server
+            .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
+                workspace_id: "workspace-1".to_string(),
+                repository_id: Some("repo-1".to_string()),
+                anchor: GitReviewLineAnchorToolParams {
+                    path: "src/lib.rs".to_string(),
+                    side: "new".to_string(),
+                    line: 1,
+                    start_line: None,
+                    base_revision: None,
+                    head_revision: None,
+                    hunk_header: None,
+                    diff_hash: None,
+                },
+                body: "Forged author".to_string(),
+                author_session_id: Some("session-peer".to_string()),
+            }))
+            .await;
+        assert_eq!(forged.is_error, Some(true));
+        assert!(forged.structured_content.as_ref().is_some_and(|value| value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("requested author"))));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 2);
+
+        for (workspace_id, repository_id, expected) in [
+            ("workspace-foreign", None, "active workspace"),
+            ("workspace-1", Some("repo-foreign"), "active pane"),
+        ] {
+            let (server, transport) = test_server_for_profile(
+                McpProfile::Standard,
+                [
+                    ("system.identify", standard_caller_context()),
+                    (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                ],
+            );
+            let result = server
+                .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
+                    workspace_id: workspace_id.to_string(),
+                    repository_id: repository_id.map(ToString::to_string),
+                    anchor: GitReviewLineAnchorToolParams {
+                        path: "src/lib.rs".to_string(),
+                        side: "new".to_string(),
+                        line: 1,
+                        start_line: None,
+                        base_revision: None,
+                        head_revision: None,
+                        hunk_header: None,
+                        diff_hash: None,
+                    },
+                    body: "Foreign scope".to_string(),
+                    author_session_id: None,
+                }))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(result.structured_content.as_ref().is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains(expected))));
+            assert!(transport
+                .calls
+                .lock()
+                .expect("fake calls lock")
+                .iter()
+                .all(|(method, _)| method != METHOD_GIT_REVIEW_THREAD_CREATE));
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_review_mutations_allow_only_caller_owned_threads_and_comments() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (
+                    METHOD_GIT_REVIEW_THREAD_LIST,
+                    standard_owned_review_threads(),
+                ),
+                (
+                    METHOD_GIT_REVIEW_THREAD_UPDATE,
+                    json!({"thread_id": "review-owned"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_THREAD_MARK_STALE,
+                    json!({"thread_id": "review-owned"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_COMMENT_CREATE,
+                    json!({"comment_id": "comment-new"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_COMMENT_UPDATE,
+                    json!({"comment_id": "comment-owned"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_COMMENT_DELETE,
+                    json!({"comment_id": "comment-owned"}),
+                ),
+            ],
+        );
+
+        let update = server
+            .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                thread_id: "review-owned".to_string(),
+                resolved: Some(true),
+                anchor: None,
+            }))
+            .await;
+        let stale = server
+            .git_review_thread_mark_stale(Parameters(GitReviewThreadMarkStaleToolParams {
+                thread_id: "review-owned".to_string(),
+                stale: true,
+                reason: Some("head changed".to_string()),
+            }))
+            .await;
+        let create = server
+            .git_review_comment_create(Parameters(GitReviewCommentCreateToolParams {
+                thread_id: "review-owned".to_string(),
+                body: "Follow-up".to_string(),
+                author_session_id: None,
+            }))
+            .await;
+        let update_comment = server
+            .git_review_comment_update(Parameters(GitReviewCommentUpdateToolParams {
+                comment_id: "comment-owned".to_string(),
+                body: "Updated".to_string(),
+            }))
+            .await;
+        let delete_comment = server
+            .git_review_comment_delete(Parameters(GitReviewCommentIdToolParams {
+                comment_id: "comment-owned".to_string(),
+            }))
+            .await;
+
+        for result in [update, stale, create, update_comment, delete_comment] {
+            assert_eq!(result.is_error, Some(false));
+        }
+        let calls = transport.calls.lock().expect("fake calls lock");
+        let create_call = calls
+            .iter()
+            .find(|(method, _)| method == METHOD_GIT_REVIEW_COMMENT_CREATE)
+            .expect("comment create call");
+        assert_eq!(create_call.1["author_session_id"], "session-agent");
+        assert!(calls
+            .iter()
+            .any(|(method, _)| method == METHOD_GIT_REVIEW_COMMENT_DELETE));
+    }
+
+    #[tokio::test]
+    async fn standard_review_mutations_reject_foreign_thread_repository_and_comment() {
+        let foreign_repository_threads = json!({
+            "threads": [{
+                "thread_id": "review-foreign-repo",
+                "workspace_id": "workspace-1",
+                "repository_id": "repo-foreign",
+                "comments": [{
+                    "comment_id": "comment-foreign-repo",
+                    "author_session_id": "session-agent"
+                }],
+            }],
+        });
+        let foreign_owner_threads = json!({
+            "threads": [{
+                "thread_id": "review-peer",
+                "workspace_id": "workspace-1",
+                "repository_id": "repo-1",
+                "comments": [{
+                    "comment_id": "comment-peer-root",
+                    "author_session_id": "session-peer"
+                }],
+            }],
+        });
+        for (thread_id, threads, expected) in [
+            (
+                "review-missing",
+                standard_owned_review_threads(),
+                "outside the caller's active repository",
+            ),
+            (
+                "review-foreign-repo",
+                foreign_repository_threads,
+                "active workspace or repository",
+            ),
+            (
+                "review-peer",
+                foreign_owner_threads,
+                "not created by the caller",
+            ),
+        ] {
+            let (server, transport) = test_server_for_profile(
+                McpProfile::Standard,
+                [
+                    ("system.identify", standard_caller_context()),
+                    (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                    (METHOD_GIT_REVIEW_THREAD_LIST, threads),
+                ],
+            );
+            let result = server
+                .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                    thread_id: thread_id.to_string(),
+                    resolved: Some(true),
+                    anchor: None,
+                }))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(result.structured_content.as_ref().is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains(expected))));
+            assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
+        }
+
+        for tool in ["update", "delete"] {
+            let (server, transport) = test_server_for_profile(
+                McpProfile::Standard,
+                [
+                    ("system.identify", standard_caller_context()),
+                    (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                    (
+                        METHOD_GIT_REVIEW_THREAD_LIST,
+                        standard_owned_review_threads(),
+                    ),
+                ],
+            );
+            let result = if tool == "update" {
+                server
+                    .git_review_comment_update(Parameters(GitReviewCommentUpdateToolParams {
+                        comment_id: "comment-peer".to_string(),
+                        body: "Forged edit".to_string(),
+                    }))
+                    .await
+            } else {
+                server
+                    .git_review_comment_delete(Parameters(GitReviewCommentIdToolParams {
+                        comment_id: "comment-peer".to_string(),
+                    }))
+                    .await
+            };
+            assert_eq!(result.is_error, Some(true));
+            assert!(result.structured_content.as_ref().is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("not authored by the caller"))));
+            assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
+        }
+
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (
+                    METHOD_GIT_REVIEW_THREAD_LIST,
+                    standard_owned_review_threads(),
+                ),
+            ],
+        );
+        let forged_comment = server
+            .git_review_comment_create(Parameters(GitReviewCommentCreateToolParams {
+                thread_id: "review-owned".to_string(),
+                body: "Forged author".to_string(),
+                author_session_id: Some("session-peer".to_string()),
+            }))
+            .await;
+        assert_eq!(forged_comment.is_error, Some(true));
+        assert!(forged_comment
+            .structured_content
+            .as_ref()
+            .is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("requested author"))));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn full_review_mutations_preserve_cross_workspace_and_author_authority() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Full,
+            [
+                (
+                    METHOD_GIT_REVIEW_THREAD_CREATE,
+                    json!({"thread_id": "review-admin"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_THREAD_UPDATE,
+                    json!({"thread_id": "review-foreign"}),
+                ),
+                (
+                    METHOD_GIT_REVIEW_COMMENT_DELETE,
+                    json!({"comment_id": "comment-foreign"}),
+                ),
+            ],
+        );
+        let result = server
+            .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
+                workspace_id: "workspace-foreign".to_string(),
+                repository_id: Some("repo-foreign".to_string()),
+                anchor: GitReviewLineAnchorToolParams {
+                    path: "src/admin.rs".to_string(),
+                    side: "new".to_string(),
+                    line: 9,
+                    start_line: None,
+                    base_revision: None,
+                    head_revision: None,
+                    hunk_header: None,
+                    diff_hash: None,
+                },
+                body: "Administrative review".to_string(),
+                author_session_id: Some("session-foreign".to_string()),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let update = server
+            .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                thread_id: "review-foreign".to_string(),
+                resolved: Some(true),
+                anchor: None,
+            }))
+            .await;
+        assert_eq!(update.is_error, Some(false));
+        let delete = server
+            .git_review_comment_delete(Parameters(GitReviewCommentIdToolParams {
+                comment_id: "comment-foreign".to_string(),
+            }))
+            .await;
+        assert_eq!(delete.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, METHOD_GIT_REVIEW_THREAD_CREATE);
+        assert_eq!(calls[0].1["workspace_id"], "workspace-foreign");
+        assert_eq!(calls[0].1["repository_id"], "repo-foreign");
+        assert_eq!(calls[0].1["author_session_id"], "session-foreign");
+        assert_eq!(calls[1].0, METHOD_GIT_REVIEW_THREAD_UPDATE);
+        assert_eq!(calls[2].0, METHOD_GIT_REVIEW_COMMENT_DELETE);
     }
 
     #[tokio::test]
@@ -7728,7 +8298,7 @@ mod tests {
     #[tokio::test]
     async fn worktree_and_review_tools_delegate_to_the_exact_ipc_methods() {
         let (server, transport) = test_server_for_profile(
-            McpProfile::Standard,
+            McpProfile::Full,
             [
                 (
                     METHOD_AGENT_WORKTREE_CREATE,

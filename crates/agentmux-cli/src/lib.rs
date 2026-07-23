@@ -63,7 +63,10 @@ use agentmux_ipc::{
     WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
     DEFAULT_CONTROL_PIPE_NAME,
 };
-use tungstenite::{accept_hdr, Error as WsError, Message as WsMessage};
+use tungstenite::handshake::server::ErrorResponse as WsErrorResponse;
+use tungstenite::http::StatusCode as WsStatusCode;
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::{accept_hdr_with_config, Error as WsError, Message as WsMessage};
 
 mod agent_hooks;
 mod mcp;
@@ -994,6 +997,11 @@ struct ServerResizeRequest {
 #[derive(Debug, serde::Deserialize)]
 struct ServerTmuxCheckRequest {
     distribution: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ServerWebSocketTicketRequest {
+    session_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -6791,6 +6799,14 @@ fn generate_server_auth_token() -> String {
     format!("srv_{nanos:x}_{pid:x}_{stack_marker:x}")
 }
 
+fn generate_websocket_ticket() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        return format!("wst_{}", bytes_to_hex(&bytes));
+    }
+    generate_server_auth_token().replacen("srv_", "wst_", 1)
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -8132,6 +8148,18 @@ const SERVER_LOCAL_TOKEN: &str = "server-local-token";
 const SERVER_LOCAL_WORKSPACE_ID: &str = "ws_server";
 const SERVER_MUTATION_RATE_LIMIT: usize = 1_200;
 const SERVER_MUTATION_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SERVER_WEBSOCKET_TICKET_TTL: Duration = Duration::from_secs(20);
+const SERVER_WEBSOCKET_MAX_TICKETS: usize = 2_048;
+const SERVER_WEBSOCKET_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SERVER_WEBSOCKET_RATE_FRAMES: usize = 6_000;
+const SERVER_WEBSOCKET_RATE_BYTES: usize = 16 * 1024 * 1024;
+const SERVER_WEBSOCKET_MAX_MESSAGE_BYTES: usize = 1024 * 1024 + 4096;
+const SERVER_WEBSOCKET_MAX_INPUT_BYTES: usize = 64 * 1024;
+const SERVER_WEBSOCKET_MAX_PASTE_BYTES: usize = 1024 * 1024;
+const SERVER_WEBSOCKET_MAX_KEY_BYTES: usize = 64;
+const SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION: u16 = 2_000;
+const SERVER_WEBSOCKET_MAX_PRESSURE_BYTES: u64 = 1024 * 1024 * 1024;
+const SERVER_WEBSOCKET_MAX_BACKPRESSURE_EVENTS: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServerRequestAccess {
@@ -8146,11 +8174,55 @@ struct ServerRateWindow {
     request_count: usize,
 }
 
+#[derive(Debug)]
+struct ServerWebSocketTicket {
+    session_id: String,
+    client_ip: Option<IpAddr>,
+    origin: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerWebSocketRateWindow {
+    started_at: Instant,
+    frame_count: usize,
+    byte_count: usize,
+}
+
+impl ServerWebSocketRateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            frame_count: 0,
+            byte_count: 0,
+        }
+    }
+
+    fn allow(&mut self, frame_bytes: usize, now: Instant) -> bool {
+        if now.saturating_duration_since(self.started_at) >= SERVER_WEBSOCKET_RATE_WINDOW {
+            *self = Self::new(now);
+        }
+        let Some(next_bytes) = self.byte_count.checked_add(frame_bytes) else {
+            return false;
+        };
+        if self.frame_count >= SERVER_WEBSOCKET_RATE_FRAMES
+            || next_bytes > SERVER_WEBSOCKET_RATE_BYTES
+        {
+            return false;
+        }
+        self.frame_count += 1;
+        self.byte_count = next_bytes;
+        true
+    }
+}
+
 struct ServerState {
     options: ServerOptions,
     local_control: Option<LocalServerControl>,
     local_git: Option<ServerLocalGit>,
     mutation_rate_limits: HashMap<IpAddr, ServerRateWindow>,
+    websocket_tickets: HashMap<String, ServerWebSocketTicket>,
+    websocket_rate_limits: HashMap<IpAddr, ServerWebSocketRateWindow>,
 }
 
 impl ServerState {
@@ -8176,6 +8248,8 @@ impl ServerState {
             local_control,
             local_git,
             mutation_rate_limits: HashMap::new(),
+            websocket_tickets: HashMap::new(),
+            websocket_rate_limits: HashMap::new(),
         }
     }
 
@@ -8255,6 +8329,78 @@ impl ServerState {
         }
         window.request_count += 1;
         true
+    }
+
+    fn issue_websocket_ticket(
+        &mut self,
+        session_id: &str,
+        client_ip: Option<IpAddr>,
+        origin: &str,
+        now: Instant,
+    ) -> Result<String, CliError> {
+        self.websocket_tickets
+            .retain(|_, ticket| ticket.expires_at > now);
+        if self.websocket_tickets.len() >= SERVER_WEBSOCKET_MAX_TICKETS {
+            return Err(CliError::Control(
+                "Too many pending WebSocket tickets.".to_string(),
+            ));
+        }
+        for _ in 0..4 {
+            let ticket = generate_websocket_ticket();
+            if self.websocket_tickets.contains_key(&ticket) {
+                continue;
+            }
+            self.websocket_tickets.insert(
+                ticket.clone(),
+                ServerWebSocketTicket {
+                    session_id: session_id.to_string(),
+                    client_ip,
+                    origin: origin.to_string(),
+                    expires_at: now + SERVER_WEBSOCKET_TICKET_TTL,
+                },
+            );
+            return Ok(ticket);
+        }
+        Err(CliError::Control(
+            "Failed to allocate a unique WebSocket ticket.".to_string(),
+        ))
+    }
+
+    fn consume_websocket_ticket(
+        &mut self,
+        ticket: &str,
+        session_id: &str,
+        client_ip: Option<IpAddr>,
+        origin: &str,
+        now: Instant,
+    ) -> bool {
+        self.websocket_tickets
+            .retain(|_, ticket| ticket.expires_at > now);
+        let Some(ticket) = self.websocket_tickets.remove(ticket) else {
+            return false;
+        };
+        ticket.expires_at > now
+            && ticket.session_id == session_id
+            && ticket.client_ip == client_ip
+            && constant_time_eq(&ticket.origin, origin)
+    }
+
+    fn allow_websocket_mutation(
+        &mut self,
+        client_ip: Option<IpAddr>,
+        frame_bytes: usize,
+        now: Instant,
+    ) -> bool {
+        let Some(client_ip) = client_ip else {
+            return true;
+        };
+        self.websocket_rate_limits.retain(|_, window| {
+            now.saturating_duration_since(window.started_at) < SERVER_WEBSOCKET_RATE_WINDOW
+        });
+        self.websocket_rate_limits
+            .entry(client_ip)
+            .or_insert_with(|| ServerWebSocketRateWindow::new(now))
+            .allow(frame_bytes, now)
     }
 }
 
@@ -8717,7 +8863,7 @@ fn handle_server_stream(
     let client_ip = stream.peer_addr().ok().map(|address| address.ip());
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     if is_websocket_upgrade(&stream)? {
-        return handle_server_websocket(stream, state);
+        return handle_server_websocket(stream, state, client_ip);
     }
 
     let mut request = match read_http_request(&mut stream).and_then(|raw| parse_http_request(&raw))
@@ -8748,6 +8894,72 @@ fn is_websocket_upgrade(stream: &TcpStream) -> Result<bool, CliError> {
         && head.contains("\r\nsec-websocket-key:"))
 }
 
+#[derive(Debug)]
+struct AuthorizedServerWebSocket {
+    session_id: String,
+    query: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerWebSocketHandshakeRejection {
+    status: WsStatusCode,
+    message: &'static str,
+}
+
+fn authorize_server_websocket_target(
+    target: &str,
+    host: Option<&str>,
+    origin: Option<&str>,
+    client_ip: Option<IpAddr>,
+    state: &mut ServerState,
+    now: Instant,
+) -> Result<AuthorizedServerWebSocket, ServerWebSocketHandshakeRejection> {
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (target.to_string(), None),
+    };
+    if query_param(query.as_deref(), "token").is_some() {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::UNAUTHORIZED,
+            message: "Reusable query credentials are not accepted.",
+        });
+    }
+    let Some(session_id) = session_id_from_path(&path, "/stream") else {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::NOT_FOUND,
+            message: "WebSocket terminal session was not found.",
+        });
+    };
+    let Some(origin) = normalized_allowed_server_origin(origin, host, &state.options) else {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::FORBIDDEN,
+            message: "WebSocket origin is not allowed.",
+        });
+    };
+    let Some(ticket) = query_param(query.as_deref(), "ticket") else {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::UNAUTHORIZED,
+            message: "A short-lived WebSocket ticket is required.",
+        });
+    };
+    if !state.consume_websocket_ticket(&ticket, &session_id, client_ip, &origin, now) {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::UNAUTHORIZED,
+            message: "The WebSocket ticket is invalid, expired, or already used.",
+        });
+    }
+    Ok(AuthorizedServerWebSocket { session_id, query })
+}
+
+fn websocket_handshake_error(rejection: ServerWebSocketHandshakeRejection) -> WsErrorResponse {
+    tungstenite::http::Response::builder()
+        .status(rejection.status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(Some(rejection.message.to_string()))
+        .unwrap_or_else(|_| tungstenite::http::Response::new(None))
+}
+
 // The accept_hdr handshake callback must return tungstenite's
 // Result<Response, ErrorResponse>; that Err variant (an http::Response) is
 // large and imposed by the upstream API, so the large-Err lint can't be
@@ -8756,19 +8968,65 @@ fn is_websocket_upgrade(stream: &TcpStream) -> Result<bool, CliError> {
 fn handle_server_websocket(
     stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
+    client_ip: Option<IpAddr>,
 ) -> Result<(), CliError> {
-    let target = Arc::new(Mutex::new(None::<String>));
-    let captured_target = Arc::clone(&target);
-    let mut socket = accept_hdr(
+    let authorized = Arc::new(Mutex::new(None::<AuthorizedServerWebSocket>));
+    let captured_authorized = Arc::clone(&authorized);
+    let handshake_state = Arc::clone(&state);
+    let websocket_config = WebSocketConfig {
+        max_message_size: Some(SERVER_WEBSOCKET_MAX_MESSAGE_BYTES),
+        max_frame_size: Some(SERVER_WEBSOCKET_MAX_MESSAGE_BYTES),
+        ..WebSocketConfig::default()
+    };
+    let mut socket = match accept_hdr_with_config(
         stream,
         move |request: &tungstenite::handshake::server::Request, response| {
-            if let Ok(mut target) = captured_target.lock() {
-                *target = Some(request.uri().to_string());
-            }
+            let host = request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok());
+            let origin = request
+                .headers()
+                .get("origin")
+                .and_then(|value| value.to_str().ok());
+            let authorization = handshake_state
+                .lock()
+                .map_err(|_| {
+                    websocket_handshake_error(ServerWebSocketHandshakeRejection {
+                        status: WsStatusCode::SERVICE_UNAVAILABLE,
+                        message: "Server state is unavailable.",
+                    })
+                })
+                .and_then(|mut state| {
+                    authorize_server_websocket_target(
+                        &request.uri().to_string(),
+                        host,
+                        origin,
+                        client_ip,
+                        &mut state,
+                        Instant::now(),
+                    )
+                    .map_err(websocket_handshake_error)
+                })?;
+            let mut captured = captured_authorized.lock().map_err(|_| {
+                websocket_handshake_error(ServerWebSocketHandshakeRejection {
+                    status: WsStatusCode::SERVICE_UNAVAILABLE,
+                    message: "WebSocket authorization state is unavailable.",
+                })
+            })?;
+            *captured = Some(authorization);
             Ok(response)
         },
-    )
-    .map_err(|error| CliError::Control(format!("websocket handshake error: {error}")))?;
+        Some(websocket_config),
+    ) {
+        Ok(socket) => socket,
+        Err(tungstenite::HandshakeError::Failure(WsError::Http(_))) => return Ok(()),
+        Err(error) => {
+            return Err(CliError::Control(format!(
+                "websocket handshake error: {error}"
+            )))
+        }
+    };
 
     let _ = socket
         .get_mut()
@@ -8777,36 +9035,38 @@ fn handle_server_websocket(
         .get_mut()
         .set_write_timeout(Some(Duration::from_secs(5)));
 
-    let target = target
+    let authorized = authorized
         .lock()
         .ok()
-        .and_then(|target| target.clone())
-        .unwrap_or_else(|| "/".to_string());
-    let (path, query) = match target.split_once('?') {
-        Some((path, query)) => (path.to_string(), Some(query.to_string())),
-        None => (target, None),
-    };
-    let authorized = {
-        let state = state
-            .lock()
-            .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?;
-        query_param(query.as_deref(), "token")
-            .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token))
-    };
-    if !authorized {
-        let _ = socket.close(None);
-        return Ok(());
-    }
-    let Some(session_id) = session_id_from_path(&path, "/stream") else {
-        let _ = socket.close(None);
-        return Ok(());
-    };
-    let mut offset = initial_websocket_output_offset(&session_id, query.as_deref(), &state)?;
+        .and_then(|mut authorized| authorized.take())
+        .ok_or_else(|| {
+            CliError::Control("WebSocket authorization was not captured.".to_string())
+        })?;
+    let session_id = authorized.session_id;
+    let mut offset =
+        initial_websocket_output_offset(&session_id, authorized.query.as_deref(), &state)?;
+    let mut connection_rate = ServerWebSocketRateWindow::new(Instant::now());
 
     loop {
         match socket.read() {
             Ok(WsMessage::Text(text)) => {
-                handle_server_websocket_message(&session_id, &text, &state)?;
+                let now = Instant::now();
+                let frame_bytes = text.len();
+                let global_allowed = state
+                    .lock()
+                    .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?
+                    .allow_websocket_mutation(client_ip, frame_bytes, now);
+                if frame_bytes > SERVER_WEBSOCKET_MAX_MESSAGE_BYTES
+                    || !connection_rate.allow(frame_bytes, now)
+                    || !global_allowed
+                {
+                    let _ = socket.close(None);
+                    return Ok(());
+                }
+                if handle_server_websocket_message(&session_id, &text, &state).is_err() {
+                    let _ = socket.close(None);
+                    return Ok(());
+                }
             }
             Ok(WsMessage::Binary(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
             Ok(WsMessage::Close(_)) => break,
@@ -8902,6 +9162,11 @@ fn handle_server_websocket_message(
     text: &str,
     state: &Arc<Mutex<ServerState>>,
 ) -> Result<(), CliError> {
+    if text.len() > SERVER_WEBSOCKET_MAX_MESSAGE_BYTES {
+        return Err(CliError::InvalidArgs(
+            "websocket message exceeds the configured size limit.".to_string(),
+        ));
+    }
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| CliError::InvalidArgs(format!("invalid websocket message: {error}")))?;
     let Some(message_type) = value.get("type").and_then(|value| value.as_str()) else {
@@ -8912,6 +9177,11 @@ fn handle_server_websocket_message(
             let Some(text) = value.get("text").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
+            if text.len() > SERVER_WEBSOCKET_MAX_INPUT_BYTES {
+                return Err(CliError::InvalidArgs(
+                    "websocket input exceeds 64 KiB.".to_string(),
+                ));
+            }
             (
                 "session.send_text",
                 serde_json::to_value(SessionSendTextParams {
@@ -8925,6 +9195,11 @@ fn handle_server_websocket_message(
             let Some(text) = value.get("text").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
+            if text.len() > SERVER_WEBSOCKET_MAX_PASTE_BYTES {
+                return Err(CliError::InvalidArgs(
+                    "websocket paste exceeds 1 MiB.".to_string(),
+                ));
+            }
             (
                 "session.send_paste",
                 serde_json::to_value(SessionSendPasteParams {
@@ -8942,6 +9217,11 @@ fn handle_server_websocket_message(
             let Some(key) = value.get("key").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
+            if key.is_empty() || key.len() > SERVER_WEBSOCKET_MAX_KEY_BYTES {
+                return Err(CliError::InvalidArgs(
+                    "websocket key is empty or exceeds 64 bytes.".to_string(),
+                ));
+            }
             (
                 "session.send_key",
                 serde_json::to_value(SessionSendKeyParams {
@@ -8962,6 +9242,15 @@ fn handle_server_websocket_message(
                 .and_then(|value| value.as_u64())
                 .and_then(|value| u16::try_from(value).ok())
                 .unwrap_or(30);
+            if columns == 0
+                || rows == 0
+                || columns > SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION
+                || rows > SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION
+            {
+                return Err(CliError::InvalidArgs(
+                    "websocket terminal dimensions are outside the supported range.".to_string(),
+                ));
+            }
             (
                 "session.resize",
                 serde_json::to_value(SessionResizeParams {
@@ -8980,33 +9269,46 @@ fn handle_server_websocket_message(
             })
             .map_err(|error| CliError::Control(error.to_string()))?,
         ),
-        "pressure" => (
-            "session.report_output_pressure",
-            serde_json::to_value(SessionOutputPressureParams {
-                session_id: session_id.to_string(),
-                queued_bytes: value
-                    .get("queuedBytes")
-                    .or_else(|| value.get("queued_bytes"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                max_queued_bytes: value
-                    .get("maxQueuedBytes")
-                    .or_else(|| value.get("max_queued_bytes"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                backpressure_events: value
-                    .get("backpressureEvents")
-                    .or_else(|| value.get("backpressure_events"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                write_in_flight: value
-                    .get("writeInFlight")
-                    .or_else(|| value.get("write_in_flight"))
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false),
-            })
-            .map_err(|error| CliError::Control(error.to_string()))?,
-        ),
+        "pressure" => {
+            let queued_bytes = value
+                .get("queuedBytes")
+                .or_else(|| value.get("queued_bytes"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let max_queued_bytes = value
+                .get("maxQueuedBytes")
+                .or_else(|| value.get("max_queued_bytes"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let backpressure_events = value
+                .get("backpressureEvents")
+                .or_else(|| value.get("backpressure_events"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if queued_bytes > SERVER_WEBSOCKET_MAX_PRESSURE_BYTES
+                || max_queued_bytes > SERVER_WEBSOCKET_MAX_PRESSURE_BYTES
+                || backpressure_events > SERVER_WEBSOCKET_MAX_BACKPRESSURE_EVENTS
+            {
+                return Err(CliError::InvalidArgs(
+                    "websocket pressure report exceeds the supported range.".to_string(),
+                ));
+            }
+            (
+                "session.report_output_pressure",
+                serde_json::to_value(SessionOutputPressureParams {
+                    session_id: session_id.to_string(),
+                    queued_bytes,
+                    max_queued_bytes,
+                    backpressure_events,
+                    write_in_flight: value
+                        .get("writeInFlight")
+                        .or_else(|| value.get("write_in_flight"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                })
+                .map_err(|error| CliError::Control(error.to_string()))?,
+            )
+        }
         _ => return Ok(()),
     };
     let mut state = state
@@ -9132,7 +9434,7 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
         if !server_mutation_content_type_allowed(request) {
             return api_error_response(415, "Mutation requests require application/json.");
         }
-        if !server_mutation_origin_allowed(request) {
+        if !server_mutation_origin_allowed(request, &state.options) {
             return api_error_response(403, "Mutation origin is not allowed.");
         }
         if !state.allow_mutation(request.client_ip, Instant::now()) {
@@ -9144,6 +9446,7 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
         ("GET", "/api/state") => server_state_response(state),
         ("GET", "/api/sessions") => server_sessions_response(request, state),
         ("GET", "/api/wsl/distributions") => server_wsl_distributions_response(),
+        ("POST", "/api/ws-ticket") => server_websocket_ticket_response(request, state),
         ("POST", "/api/tmux/check") => server_tmux_check_response(request),
         ("POST", "/api/spawn") => server_spawn_response(request, state),
         ("POST", "/api/control") => server_control_response(request, state),
@@ -9336,16 +9639,50 @@ fn server_mutation_content_type_allowed(request: &HttpRequest) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
 }
 
-fn server_mutation_origin_allowed(request: &HttpRequest) -> bool {
+fn server_mutation_origin_allowed(request: &HttpRequest, options: &ServerOptions) -> bool {
     let Some(origin) = request.headers.get("origin") else {
         return true;
     };
-    let Some(host) = request.headers.get("host") else {
-        return false;
-    };
-    let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    normalized_allowed_server_origin(
+        Some(origin),
+        request.headers.get("host").map(String::as_str),
+        options,
+    )
+    .is_some()
+}
+
+fn normalized_allowed_server_origin(
+    origin: Option<&str>,
+    host: Option<&str>,
+    _options: &ServerOptions,
+) -> Option<String> {
+    let origin = origin?.trim().trim_end_matches('/').to_ascii_lowercase();
+    let host = host?.trim().to_ascii_lowercase();
+    if origin == format!("http://{host}") || origin == format!("https://{host}") {
+        return Some(origin);
+    }
+
+    // Tauri's WebView has a fixed application origin. It is only trusted when
+    // the actual HTTP target is loopback, so a remote AgentMux server cannot be
+    // mutated by a desktop WebView merely by presenting the Tauri origin.
+    if matches!(
+        origin.as_str(),
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) && server_host_header_is_loopback(&host)
+    {
+        return Some(origin);
+    }
+    None
+}
+
+fn server_host_header_is_loopback(host: &str) -> bool {
     let host = host.trim().to_ascii_lowercase();
-    origin == format!("http://{host}") || origin == format!("https://{host}")
+    let hostname = if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host).unwrap_or(rest)
+    } else {
+        host.split_once(':').map(|(host, _)| host).unwrap_or(&host)
+    };
+    matches!(hostname, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -9466,6 +9803,37 @@ fn server_wsl_distributions_response() -> HttpResponse {
             }),
         ),
         Err(diagnostic) => api_error_response(503, &diagnostic.message),
+    }
+}
+
+fn server_websocket_ticket_response(
+    request: &HttpRequest,
+    state: &mut ServerState,
+) -> HttpResponse {
+    let parsed = match parse_json_body::<ServerWebSocketTicketRequest>(&request.body) {
+        Ok(value) => value,
+        Err(error) => return api_error_response(400, &error.to_string()),
+    };
+    let session_id = parsed.session_id.trim();
+    if session_id.is_empty() || session_id.len() > 256 {
+        return api_error_response(400, "A valid terminal session ID is required.");
+    }
+    let Some(origin) = normalized_allowed_server_origin(
+        request.headers.get("origin").map(String::as_str),
+        request.headers.get("host").map(String::as_str),
+        &state.options,
+    ) else {
+        return api_error_response(403, "WebSocket ticket origin is not allowed.");
+    };
+    match state.issue_websocket_ticket(session_id, request.client_ip, &origin, Instant::now()) {
+        Ok(ticket) => api_json_response(
+            200,
+            serde_json::json!({
+                "ticket": ticket,
+                "expires_in_ms": SERVER_WEBSOCKET_TICKET_TTL.as_millis(),
+            }),
+        ),
+        Err(error) => api_error_response(503, &error.to_string()),
     }
 }
 
@@ -17952,7 +18320,7 @@ mod tests {
             ServerRequestAccess::Mutation
         ));
         assert!(server_mutation_content_type_allowed(&same_origin));
-        assert!(server_mutation_origin_allowed(&same_origin));
+        assert!(server_mutation_origin_allowed(&same_origin, &state.options));
     }
 
     #[test]
@@ -18036,6 +18404,225 @@ mod tests {
             Some(first),
             started + SERVER_MUTATION_RATE_WINDOW + Duration::from_millis(1)
         ));
+    }
+
+    fn issue_test_websocket_ticket(
+        state: &mut ServerState,
+        session_id: &str,
+        client_ip: IpAddr,
+        origin: &str,
+        now: Instant,
+    ) -> String {
+        state
+            .issue_websocket_ticket(session_id, Some(client_ip), origin, now)
+            .unwrap()
+    }
+
+    #[test]
+    fn server_websocket_rejects_reusable_query_token() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let rejection = authorize_server_websocket_target(
+            &format!("/api/session/sess_1/stream?token={token}"),
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            Instant::now(),
+        )
+        .unwrap_err();
+
+        assert_eq!(rejection.status, WsStatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn server_websocket_rejects_cross_origin_without_consuming_ticket() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let ticket = issue_test_websocket_ticket(
+            &mut state,
+            "sess_1",
+            client_ip,
+            "http://127.0.0.1:8765",
+            now,
+        );
+        let target = format!("/api/session/sess_1/stream?ticket={ticket}");
+        let rejection = authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("https://attacker.example"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(rejection.status, WsStatusCode::FORBIDDEN);
+
+        assert!(authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn server_websocket_ticket_is_session_bound_short_lived_and_single_use() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let ticket = issue_test_websocket_ticket(
+            &mut state,
+            "sess_1",
+            client_ip,
+            "http://127.0.0.1:8765",
+            now,
+        );
+        let target = format!("/api/session/sess_1/stream?ticket={ticket}");
+        let authorized = authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .unwrap();
+        assert_eq!(authorized.session_id, "sess_1");
+
+        let replay = authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(replay.status, WsStatusCode::UNAUTHORIZED);
+
+        let expired = issue_test_websocket_ticket(
+            &mut state,
+            "sess_2",
+            client_ip,
+            "http://127.0.0.1:8765",
+            now,
+        );
+        let expired_target = format!("/api/session/sess_2/stream?ticket={expired}");
+        assert!(authorize_server_websocket_target(
+            &expired_target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now + SERVER_WEBSOCKET_TICKET_TTL + Duration::from_millis(1),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn server_websocket_ticket_endpoint_and_tauri_loopback_origin_succeed() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/ws-ticket".to_string(),
+            query: None,
+            headers: HashMap::from([
+                ("authorization".to_string(), format!("Bearer {token}")),
+                ("content-type".to_string(), "application/json".to_string()),
+                ("host".to_string(), "127.0.0.1:8765".to_string()),
+                ("origin".to_string(), "http://tauri.localhost".to_string()),
+            ]),
+            body: serde_json::json!({ "session_id": "sess_1" }).to_string(),
+            client_ip: Some(client_ip),
+        };
+        let response = route_server_request(&request, &mut state);
+        assert_eq!(response.status_code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let ticket = payload["result"]["ticket"].as_str().unwrap();
+        assert!(ticket.starts_with("wst_"));
+        assert!(!ticket.contains(&state.options.auth_token));
+
+        let target = format!("/api/session/sess_1/stream?ticket={ticket}");
+        assert!(authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://tauri.localhost"),
+            Some(client_ip),
+            &mut state,
+            Instant::now(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn server_websocket_mutation_rate_is_bounded_per_connection_and_client() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut connection = ServerWebSocketRateWindow::new(now);
+
+        for _ in 0..SERVER_WEBSOCKET_RATE_FRAMES {
+            assert!(connection.allow(1, now));
+            assert!(state.allow_websocket_mutation(Some(client_ip), 1, now));
+        }
+        assert!(!connection.allow(1, now));
+        assert!(!state.allow_websocket_mutation(Some(client_ip), 1, now));
+
+        let reset_at = now + SERVER_WEBSOCKET_RATE_WINDOW + Duration::from_millis(1);
+        assert!(connection.allow(1, reset_at));
+        assert!(state.allow_websocket_mutation(Some(client_ip), 1, reset_at));
+
+        let mut byte_limited = ServerWebSocketRateWindow::new(now);
+        assert!(!byte_limited.allow(SERVER_WEBSOCKET_RATE_BYTES + 1, now));
+    }
+
+    #[test]
+    fn server_websocket_rejects_oversized_mutation_payloads_before_dispatch() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new(options)));
+        let oversized_input = serde_json::json!({
+            "type": "input",
+            "text": "x".repeat(SERVER_WEBSOCKET_MAX_INPUT_BYTES + 1),
+        })
+        .to_string();
+        let oversized_paste = serde_json::json!({
+            "type": "paste",
+            "text": "x".repeat(SERVER_WEBSOCKET_MAX_PASTE_BYTES + 1),
+        })
+        .to_string();
+        let oversized_key = serde_json::json!({
+            "type": "key",
+            "key": "x".repeat(SERVER_WEBSOCKET_MAX_KEY_BYTES + 1),
+        })
+        .to_string();
+        let oversized_resize = serde_json::json!({
+            "type": "resize",
+            "columns": u64::from(SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION) + 1,
+            "rows": 30,
+        })
+        .to_string();
+
+        for payload in [
+            oversized_input,
+            oversized_paste,
+            oversized_key,
+            oversized_resize,
+        ] {
+            assert!(handle_server_websocket_message("sess_1", &payload, &state).is_err());
+        }
     }
 
     #[test]

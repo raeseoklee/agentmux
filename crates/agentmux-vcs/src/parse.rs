@@ -46,6 +46,10 @@ impl PorcelainV2StreamParser {
         self.files.len()
     }
 
+    pub(crate) fn first_changes(&self, limit: usize) -> Vec<GitFileChange> {
+        self.files.iter().take(limit).cloned().collect()
+    }
+
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());

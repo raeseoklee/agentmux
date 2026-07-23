@@ -358,9 +358,12 @@ test("source control filters the complete change set and virtualizes a 15k file 
       __AGENTMUX_PREVIEW__?: { setGitStatusFileCount(count: number): void };
     }).__AGENTMUX_PREVIEW__?.setGitStatusFileCount(15_000);
   });
+  const openedAt = Date.now();
   await page.locator(".agentmux-status-git-button").click();
   const panel = page.getByTestId("source-control-panel");
   const changes = panel.locator(".agentmux-source-control__changes");
+  await expect(panel.locator(".agentmux-source-control__change").first()).toBeVisible();
+  expect(Date.now() - openedAt).toBeLessThan(900);
   await expect(changes).toHaveAttribute("data-filtered-count", "15000");
   expect(await panel.locator(".agentmux-source-control__virtual-row").count()).toBeLessThan(80);
   await expect(panel.locator(".agentmux-source-control__virtual-list")).toHaveCSS("height", /1\d{4}px/);

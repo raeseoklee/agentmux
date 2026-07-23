@@ -70,3 +70,20 @@ tests:
       - kind: contains
         path: $.structuredContent.error.message
         value: requires the 'standard' MCP profile
+  - id: read-profile-denies-review-comment-delete
+    description: Read profile cannot delete review comments
+    act:
+      method: tools/call
+      tool: git_review_comment_delete
+      args:
+        comment_id: comment-example
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'standard' MCP profile

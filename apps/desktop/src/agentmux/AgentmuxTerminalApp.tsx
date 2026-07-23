@@ -1511,6 +1511,7 @@ interface PaneViewProps {
   pane: PaneSummary;
   surface: SurfaceSummary | undefined;
   session: TerminalSession | undefined;
+  visible: boolean;
   active: boolean;
   isBrowser: boolean;
   agentState: AgentState | null;
@@ -1565,6 +1566,7 @@ const PaneView = memo(function PaneView({
   pane,
   surface,
   session,
+  visible,
   active,
   isBrowser,
   agentState,
@@ -1895,6 +1897,7 @@ const PaneView = memo(function PaneView({
               key={session.sessionId}
               client={client}
               sessionId={session.sessionId}
+              visible={visible}
               active={active}
               agentKind={terminalAgentKind(session, telemetry)}
               innerMargin={terminalInnerMargin}
@@ -7040,6 +7043,14 @@ export function AgentmuxTerminalApp() {
       ? sessionById.get(surface.sessionId)
       : undefined;
     const active = pane.paneId === activePaneId;
+    const zoomedPane = zoomedPaneId ? paneById.get(zoomedPaneId) : undefined;
+    const activeTabZoomedPaneId =
+      zoomedPane && rootPaneId && rootPaneForPane(zoomedPane).paneId === rootPaneId
+        ? zoomedPaneId
+        : null;
+    const visible =
+      rootPaneForPane(pane).paneId === rootPaneId &&
+      (!activeTabZoomedPaneId || pane.paneId === activeTabZoomedPaneId);
     const attentionState = session
       ? attentionBySession.get(session.sessionId)
       : undefined;
@@ -7070,6 +7081,7 @@ export function AgentmuxTerminalApp() {
         pane={pane}
         surface={surface}
         session={session}
+        visible={visible}
         active={active}
         isBrowser={isBrowser}
         agentState={agentState}
@@ -11158,6 +11170,7 @@ function DockPanel({
                   <LiveTerminal
                     client={client}
                     sessionId={session.sessionId}
+                    visible
                     active={activeSessionId === session.sessionId}
                     innerMargin={terminalInnerMargin}
                     terminalGpuAcceleration={terminalGpuAcceleration}

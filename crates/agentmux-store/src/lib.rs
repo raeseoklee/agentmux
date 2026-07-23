@@ -1,7 +1,9 @@
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Migration {
@@ -3034,23 +3036,36 @@ pub fn apply_migrations(connection: &Connection, migrations: &[Migration]) -> St
         return Err(StoreError::InvalidMigrationOrder);
     }
 
-    connection.execute_batch(SCHEMA_MIGRATIONS_SQL)?;
+    if migrations.is_empty() {
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_MIGRATIONS_SQL)?;
+        transaction.commit()?;
+        return Ok(());
+    }
+
     for migration in migrations {
-        let already_applied = connection.query_row(
+        // Keep the schema change and its ledger entry indivisible. SQLite DDL participates in an
+        // explicit transaction, so a failed rename/copy/drop migration rolls back to the schema
+        // that existed before this migration began. PRAGMAs are intentionally configured before
+        // this function opens a transaction in `initialize_connection`: SQLite does not allow
+        // changing `foreign_keys` from inside an active transaction.
+        let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA_MIGRATIONS_SQL)?;
+        let already_applied = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
             [migration.version],
             |row| row.get::<_, bool>(0),
         )?;
 
-        if already_applied {
-            continue;
+        if !already_applied {
+            transaction.execute_batch(migration.sql)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, name) VALUES (?1, ?2)",
+                params![migration.version, migration.name],
+            )?;
         }
 
-        connection.execute_batch(migration.sql)?;
-        connection.execute(
-            "INSERT INTO schema_migrations (version, name) VALUES (?1, ?2)",
-            params![migration.version, migration.name],
-        )?;
+        transaction.commit()?;
     }
 
     Ok(())
@@ -3835,6 +3850,124 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 3);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_and_ledger_together() {
+        let connection = Connection::open_in_memory().unwrap();
+        let invalid_migration = Migration {
+            version: 1,
+            name: "invalid_atomicity_probe",
+            sql: r#"
+CREATE TABLE migration_atomicity_probe (value TEXT NOT NULL);
+INSERT INTO migration_atomicity_probe (value) VALUES ('before failure');
+SELECT * FROM migration_atomicity_failure;
+"#,
+        };
+
+        assert!(apply_migrations(&connection, &[invalid_migration]).is_err());
+
+        let schema_ledger_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let probe_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migration_atomicity_probe')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!schema_ledger_exists);
+        assert!(!probe_exists);
+
+        let retry = Migration {
+            version: 1,
+            name: "atomicity_probe",
+            sql: "CREATE TABLE migration_atomicity_probe (value TEXT NOT NULL);",
+        };
+        apply_migrations(&connection, &[retry]).unwrap();
+        let recorded_name: String = connection
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_name, "atomicity_probe");
+    }
+
+    #[test]
+    fn destructive_worktree_migration_rolls_back_and_is_retryable() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&connection, &MIGRATIONS[..12]).unwrap();
+        let mut store = SqliteStore { connection };
+        store
+            .create_or_load_worktree_operation(&sample_worktree_operation(
+                "op_atomic_v12",
+                "key_atomic_v12",
+            ))
+            .unwrap();
+
+        let failing_sql = format!(
+            "{WORKTREE_REMOVED_STATE_SCHEMA}\nSELECT * FROM worktree_migration_fault_injection;"
+        );
+        let failed_v13 = Migration {
+            version: 13,
+            name: "worktree_removed_state_fault_injection",
+            sql: Box::leak(failing_sql.into_boxed_str()),
+        };
+        assert!(apply_migrations(&store.connection, &[failed_v13]).is_err());
+
+        let schema_version: i32 = store
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let backup_table_exists: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'worktree_operations_v12')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let worktree_schema: String = store
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worktree_operations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 12);
+        assert!(!backup_table_exists);
+        assert!(!worktree_schema.contains("'removed'"));
+        assert_eq!(
+            store
+                .load_worktree_operation("op_atomic_v12")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorktreeOperationState::Prepared
+        );
+
+        apply_migrations(&store.connection, MIGRATIONS).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 14);
+        assert_eq!(
+            store
+                .load_worktree_operation("op_atomic_v12")
+                .unwrap()
+                .unwrap()
+                .state,
+            WorktreeOperationState::Prepared
+        );
     }
 
     #[test]

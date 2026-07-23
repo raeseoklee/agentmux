@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub use command::{build_git_command_spec, CommandSpec};
@@ -76,6 +78,139 @@ pub struct StatusReadMetrics {
 pub struct StatusReadResult {
     pub snapshot: StatusSnapshot,
     pub metrics: StatusReadMetrics,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusFirstPage {
+    pub generation: u64,
+    pub changes: Vec<GitFileChange>,
+    pub first_change_after: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+pub enum StatusScanFirstPage {
+    Prefix(StatusFirstPage),
+    Complete(Arc<StatusReadResult>),
+}
+
+#[derive(Clone)]
+pub struct StatusScan {
+    generation: u64,
+    shared: Arc<StatusScanShared>,
+}
+
+struct StatusScanShared {
+    state: Mutex<StatusScanState>,
+    changed: Condvar,
+    cancelled: AtomicBool,
+    prefix_published: AtomicBool,
+}
+
+enum StatusScanState {
+    Running { prefix: Option<StatusFirstPage> },
+    Complete(Arc<StatusReadResult>),
+    Failed(GitError),
+    Cancelled,
+}
+
+impl StatusScan {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn wait_for_first_page(&self) -> Result<StatusScanFirstPage> {
+        let mut state = recover_lock(&self.shared.state);
+        loop {
+            match &*state {
+                StatusScanState::Running {
+                    prefix: Some(prefix),
+                } => return Ok(StatusScanFirstPage::Prefix(prefix.clone())),
+                StatusScanState::Running { prefix: None } => {
+                    state = self
+                        .shared
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                StatusScanState::Complete(result) => {
+                    return Ok(StatusScanFirstPage::Complete(result.clone()))
+                }
+                StatusScanState::Failed(error) => return Err(error.clone()),
+                StatusScanState::Cancelled => {
+                    return Err(GitError::StateUnavailable(
+                        "Git status scan was cancelled.".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn wait_for_completion(&self) -> Result<Arc<StatusReadResult>> {
+        let mut state = recover_lock(&self.shared.state);
+        loop {
+            match &*state {
+                StatusScanState::Running { .. } => {
+                    state = self
+                        .shared
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                StatusScanState::Complete(result) => return Ok(result.clone()),
+                StatusScanState::Failed(error) => return Err(error.clone()),
+                StatusScanState::Cancelled => {
+                    return Err(GitError::StateUnavailable(
+                        "Git status scan was cancelled.".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn try_completion(&self) -> Option<Result<Arc<StatusReadResult>>> {
+        let state = recover_lock(&self.shared.state);
+        match &*state {
+            StatusScanState::Running { .. } => None,
+            StatusScanState::Complete(result) => Some(Ok(result.clone())),
+            StatusScanState::Failed(error) => Some(Err(error.clone())),
+            StatusScanState::Cancelled => Some(Err(GitError::StateUnavailable(
+                "Git status scan was cancelled.".to_string(),
+            ))),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.shared.cancelled.store(true, Ordering::Release);
+        let mut state = recover_lock(&self.shared.state);
+        if matches!(*state, StatusScanState::Running { .. }) {
+            *state = StatusScanState::Cancelled;
+        }
+        self.shared.changed.notify_all();
+    }
+
+    fn publish_prefix(&self, prefix: StatusFirstPage) {
+        let mut state = recover_lock(&self.shared.state);
+        if let StatusScanState::Running {
+            prefix: current @ None,
+        } = &mut *state
+        {
+            *current = Some(prefix);
+            self.shared.changed.notify_all();
+        }
+    }
+
+    fn finish(&self, result: Result<StatusReadResult>) {
+        let mut state = recover_lock(&self.shared.state);
+        if self.shared.cancelled.load(Ordering::Acquire) {
+            *state = StatusScanState::Cancelled;
+        } else {
+            *state = match result {
+                Ok(result) => StatusScanState::Complete(Arc::new(result)),
+                Err(error) => StatusScanState::Failed(error),
+            };
+        }
+        self.shared.changed.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -143,6 +278,75 @@ impl GitClient {
     }
 
     pub fn read_status_with_metrics(&self, repository: &Repository) -> Result<StatusReadResult> {
+        let generation = self.generation(repository);
+        self.read_status_with_progress(repository, generation, |_, _| Ok(()))
+    }
+
+    pub fn start_status_scan(
+        &self,
+        repository: &Repository,
+        first_page_limit: usize,
+    ) -> Result<StatusScan> {
+        if first_page_limit == 0 || first_page_limit > MAX_STATUS_PAGE_SIZE {
+            return Err(GitError::InvalidStatusPage(format!(
+                "Git status first page size must be between 1 and {MAX_STATUS_PAGE_SIZE}."
+            )));
+        }
+        let generation = self.generation(repository);
+        let scan = StatusScan {
+            generation,
+            shared: Arc::new(StatusScanShared {
+                state: Mutex::new(StatusScanState::Running { prefix: None }),
+                changed: Condvar::new(),
+                cancelled: AtomicBool::new(false),
+                prefix_published: AtomicBool::new(false),
+            }),
+        };
+        let worker_scan = scan.clone();
+        let client = self.clone();
+        let repository = repository.clone();
+        thread::Builder::new()
+            .name("agentmux-git-status".to_string())
+            .spawn(move || {
+                let result =
+                    client.read_status_with_progress(&repository, generation, |parser, elapsed| {
+                        if worker_scan.shared.cancelled.load(Ordering::Acquire) {
+                            return Err(GitError::StateUnavailable(
+                                "Git status scan was cancelled.".to_string(),
+                            ));
+                        }
+                        if parser.file_count() > 0
+                            && !worker_scan
+                                .shared
+                                .prefix_published
+                                .swap(true, Ordering::AcqRel)
+                        {
+                            worker_scan.publish_prefix(StatusFirstPage {
+                                generation,
+                                changes: parser.first_changes(first_page_limit),
+                                first_change_after: Some(elapsed),
+                            });
+                        }
+                        Ok(())
+                    });
+                worker_scan.finish(result);
+            })
+            .map_err(|error| GitError::Io {
+                operation: "start repository status scan".to_string(),
+                message: error.to_string(),
+            })?;
+        Ok(scan)
+    }
+
+    fn read_status_with_progress<F>(
+        &self,
+        repository: &Repository,
+        generation: u64,
+        mut on_progress: F,
+    ) -> Result<StatusReadResult>
+    where
+        F: FnMut(&PorcelainV2StreamParser, Duration) -> Result<()>,
+    {
         let repository_lock = self.repository_lock(&repository.key());
         let _guard = recover_read(&repository_lock);
         let arguments = [
@@ -172,6 +376,7 @@ impl GitClient {
                 if first_change_after.is_none() && parser.file_count() > 0 {
                     first_change_after = Some(started_at.elapsed());
                 }
+                on_progress(&parser, started_at.elapsed())?;
                 Ok(())
             },
         )?;
@@ -187,7 +392,7 @@ impl GitClient {
             &command_output,
             "read repository status",
         )?;
-        let snapshot = parser.finish(repository.root.clone(), self.generation(repository))?;
+        let snapshot = parser.finish(repository.root.clone(), generation)?;
         Ok(StatusReadResult {
             snapshot,
             metrics: StatusReadMetrics {
@@ -1541,15 +1746,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "performance gate creates 5,000 files; run through tools/run-performance-gates.ps1"]
+    fn streams_5k_native_status_first_page_within_budget() {
+        assert_native_status_scan(5_000);
+    }
+
+    #[test]
+    #[ignore = "performance gate creates 10,000 files; run through tools/run-performance-gates.ps1"]
+    fn streams_10k_native_status_first_page_within_budget() {
+        assert_native_status_scan(10_000);
+    }
+
+    #[test]
     #[ignore = "performance gate creates 15,000 files; run through tools/run-performance-gates.ps1"]
     fn reads_15k_native_status_records_within_budget() {
+        assert_native_status_scan(15_000);
+    }
+
+    fn assert_native_status_scan(file_count: usize) {
         let directory = TempDir::new().expect("temporary repository should be created");
         let context = GitContext::native(directory.path().to_string_lossy());
         let client = GitClient::default();
         run_setup(&client, &context, &["init", "-q"]);
         let generated = directory.path().join("generated");
         fs::create_dir(&generated).expect("generated fixture directory should be created");
-        for index in 0..15_000 {
+        for index in 0..file_count {
             fs::write(generated.join(format!("file-{index:05}.txt")), b"x")
                 .expect("performance fixture should be written");
         }
@@ -1558,12 +1779,28 @@ mod tests {
         let repository = client
             .require_repository(&context)
             .expect("repository should resolve");
-        let result = client
-            .read_status_with_metrics(&repository)
-            .expect("status should load");
-        let elapsed = started_at.elapsed();
-        assert_eq!(result.snapshot.summary.file_count, 15_000);
-        assert_eq!(result.snapshot.summary.untracked_count, 15_000);
+        let scan = client
+            .start_status_scan(&repository, 250)
+            .expect("status scan should start");
+        let first_page = scan
+            .wait_for_first_page()
+            .expect("first status page should return");
+        let first_page_after = started_at.elapsed();
+        let first_page_count = match &first_page {
+            StatusScanFirstPage::Prefix(prefix) => prefix.changes.len(),
+            StatusScanFirstPage::Complete(result) => result.snapshot.files.len().min(250),
+        };
+        assert!(first_page_count > 0 && first_page_count <= 250);
+        assert!(
+            first_page_after < Duration::from_millis(900),
+            "native Git {file_count} request-to-first-page was {first_page_after:?}, budget was 900ms"
+        );
+        let result = scan
+            .wait_for_completion()
+            .expect("status snapshot should complete");
+        let completed_after = started_at.elapsed();
+        assert_eq!(result.snapshot.summary.file_count, file_count);
+        assert_eq!(result.snapshot.summary.untracked_count, file_count);
         assert!(result.metrics.stdout_bytes > 0);
         assert!(result.metrics.first_change_after.is_some());
         assert!(
@@ -1574,13 +1811,12 @@ mod tests {
                 <= result.metrics.completed_after
         );
         assert!(
-            elapsed < Duration::from_secs(10),
-            "read 15,000 native status records in {elapsed:?}, budget was 10s"
+            completed_after < Duration::from_secs(10),
+            "read {file_count} native status records in {completed_after:?}, budget was 10s"
         );
         eprintln!(
-            "native git status 15k: first_change={:?}, completed={:?}, bytes={}",
+            "native git status {file_count}: returned_first_page={first_page_after:?}, parser_first_change={:?}, completed={completed_after:?}, bytes={}",
             result.metrics.first_change_after,
-            result.metrics.completed_after,
             result.metrics.stdout_bytes,
         );
     }
