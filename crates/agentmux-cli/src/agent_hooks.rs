@@ -334,14 +334,24 @@ fn agentmux_hook_group(provider: Provider, event: &str, state: &str, adapter: &P
         "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\" --provider {} --event {} --state {}",
         adapter.display(), provider.source(), event, state
     );
-    json!({
-        "matcher": "",
-        "hooks": [{
+    let handler = match provider {
+        Provider::Claude => json!({
+            "type": "command",
+            "shell": "powershell",
+            "command": command_windows,
+            "timeout": 10,
+            "statusMessage": MANAGED_DESCRIPTION,
+        }),
+        Provider::Codex => json!({
             "type": "command",
             "commandWindows": command_windows,
             "timeout": 10,
             "statusMessage": MANAGED_DESCRIPTION,
-        }]
+        }),
+    };
+    json!({
+        "matcher": "",
+        "hooks": [handler]
     })
 }
 
@@ -463,6 +473,25 @@ mod tests {
             "user-tool"
         );
         assert!(value["hooks"]["SessionStart"].is_array());
+        let handler = &value["hooks"]["SessionStart"][0]["hooks"][0];
+        assert_eq!(handler["shell"], "powershell");
+        assert!(handler["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("agentmux-hook-adapter.ps1")));
+        assert!(handler.get("commandWindows").is_none());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_plan_uses_windows_command_field() {
+        let home = temp_home("codex-command");
+        let plan = plan_provider(Provider::Codex, &home, &adapter_path(&home)).unwrap();
+        let value: Value = serde_json::from_str(&plan.updated).unwrap();
+        let handler = &value["hooks"]["SessionStart"][0]["hooks"][0];
+        assert!(handler["commandWindows"]
+            .as_str()
+            .is_some_and(|command| command.contains("agentmux-hook-adapter.ps1")));
+        assert!(handler.get("command").is_none());
         let _ = fs::remove_dir_all(home);
     }
 
