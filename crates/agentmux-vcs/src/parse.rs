@@ -1,88 +1,206 @@
 use crate::{GitError, GitFileChange, Result, StatusSnapshot, StatusSummary, WorktreeInfo};
 
-pub fn parse_porcelain_v2(
-    output: &[u8],
-    repository_root: impl Into<String>,
-    generation: u64,
-) -> Result<StatusSnapshot> {
-    let mut records = output.split(|byte| *byte == 0);
-    let mut branch = None;
-    let mut head = None;
-    let mut upstream = None;
-    let mut ahead = 0;
-    let mut behind = 0;
-    let mut files = Vec::new();
-    while let Some(record) = records.next() {
-        let record = String::from_utf8_lossy(record);
-        if record.is_empty() {
-            continue;
+pub const MAX_STATUS_ENTRIES: usize = 100_000;
+const MAX_PORCELAIN_RECORD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct PendingRename {
+    xy: String,
+    path: String,
+}
+
+/// Incrementally parses the NUL-delimited output of `git status --porcelain=v2 -z`.
+///
+/// The status reader feeds this parser as child-process bytes arrive, avoiding a second
+/// full-size stdout allocation while retaining the complete bounded snapshot required by
+/// paging and repository-change reconciliation.
+#[derive(Debug)]
+pub(crate) struct PorcelainV2StreamParser {
+    pending: Vec<u8>,
+    branch: Option<String>,
+    head: Option<String>,
+    upstream: Option<String>,
+    ahead: u64,
+    behind: u64,
+    files: Vec<GitFileChange>,
+    pending_rename: Option<PendingRename>,
+    max_entries: usize,
+}
+
+impl PorcelainV2StreamParser {
+    pub(crate) fn new(max_entries: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            branch: None,
+            head: None,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            files: Vec::new(),
+            pending_rename: None,
+            max_entries,
         }
+    }
+
+    pub(crate) fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        // Move the buffered tail out of `self` so records can be borrowed directly while
+        // `consume_record` updates parser state. This avoids copying each status record.
+        let mut input = std::mem::take(&mut self.pending);
+        input.extend_from_slice(chunk);
+        let mut start = 0;
+        while let Some(relative_end) = input[start..].iter().position(|byte| *byte == 0) {
+            let end = start + relative_end;
+            self.consume_record(&input[start..end])?;
+            start = end + 1;
+        }
+        self.pending.extend_from_slice(&input[start..]);
+        if self.pending.len() > MAX_PORCELAIN_RECORD_BYTES {
+            return Err(GitError::InvalidOutput(format!(
+                "Git returned a porcelain-v2 record larger than {MAX_PORCELAIN_RECORD_BYTES} bytes."
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        repository_root: impl Into<String>,
+        generation: u64,
+    ) -> Result<StatusSnapshot> {
+        if !self.pending.is_empty() {
+            return Err(GitError::InvalidOutput(
+                "Git returned an unterminated porcelain-v2 status record.".to_string(),
+            ));
+        }
+        if self.pending_rename.take().is_some() {
+            return Err(invalid_record("rename source"));
+        }
+
+        let staged_count = self.files.iter().filter(|file| file.staged).count();
+        let unstaged_count = self.files.iter().filter(|file| file.unstaged).count();
+        let untracked_count = self.files.iter().filter(|file| file.untracked).count();
+        let conflict_count = self.files.iter().filter(|file| file.conflict).count();
+        Ok(StatusSnapshot {
+            summary: StatusSummary {
+                repository_root: repository_root.into(),
+                branch: self.branch,
+                head: self.head,
+                upstream: self.upstream,
+                ahead: self.ahead,
+                behind: self.behind,
+                file_count: self.files.len(),
+                staged_count,
+                unstaged_count,
+                untracked_count,
+                conflict_count,
+                generation,
+            },
+            files: self.files,
+        })
+    }
+
+    fn consume_record(&mut self, raw_record: &[u8]) -> Result<()> {
+        if let Some(rename) = self.pending_rename.take() {
+            if raw_record.is_empty() {
+                return Err(invalid_record("rename source"));
+            }
+            return self.push_change(rename.xy, rename.path, Some(lossy(raw_record)), false);
+        }
+
+        if raw_record.is_empty() {
+            return Ok(());
+        }
+        let record = String::from_utf8_lossy(raw_record);
         if let Some(value) = record.strip_prefix("# branch.oid ") {
             if value != "(initial)" {
-                head = Some(value.to_string());
+                self.head = Some(value.to_string());
             }
-            continue;
+            return Ok(());
         }
         if let Some(value) = record.strip_prefix("# branch.head ") {
-            branch = Some(if value == "(detached)" {
+            self.branch = Some(if value == "(detached)" {
                 "detached".to_string()
             } else {
                 value.to_string()
             });
-            continue;
+            return Ok(());
         }
         if let Some(value) = record.strip_prefix("# branch.upstream ") {
-            upstream = Some(value.to_string());
-            continue;
+            self.upstream = Some(value.to_string());
+            return Ok(());
         }
         if let Some(value) = record.strip_prefix("# branch.ab ") {
             for token in value.split_whitespace() {
                 if let Some(value) = token.strip_prefix('+') {
-                    ahead = value.parse().unwrap_or(0);
+                    self.ahead = value.parse().unwrap_or(0);
                 } else if let Some(value) = token.strip_prefix('-') {
-                    behind = value.parse().unwrap_or(0);
+                    self.behind = value.parse().unwrap_or(0);
                 }
             }
-            continue;
+            return Ok(());
         }
 
-        let (xy, path, original_path, conflict) = if record.starts_with("1 ") {
+        if record.starts_with("1 ") {
             let fields = record.splitn(9, ' ').collect::<Vec<_>>();
             if fields.len() != 9 {
                 return Err(invalid_record("ordinary"));
             }
-            (fields[1], fields[8].to_string(), None, false)
-        } else if record.starts_with("2 ") {
+            return self.push_change(fields[1].to_string(), fields[8].to_string(), None, false);
+        }
+        if record.starts_with("2 ") {
             let fields = record.splitn(10, ' ').collect::<Vec<_>>();
             if fields.len() != 10 {
                 return Err(invalid_record("rename"));
             }
-            let original_path = records
-                .next()
-                .map(|value| String::from_utf8_lossy(value).to_string())
-                .ok_or_else(|| invalid_record("rename source"))?;
-            (fields[1], fields[9].to_string(), Some(original_path), false)
-        } else if record.starts_with("u ") {
+            self.pending_rename = Some(PendingRename {
+                xy: fields[1].to_string(),
+                path: fields[9].to_string(),
+            });
+            return Ok(());
+        }
+        if record.starts_with("u ") {
             let fields = record.splitn(11, ' ').collect::<Vec<_>>();
             if fields.len() != 11 {
                 return Err(invalid_record("conflict"));
             }
-            (fields[1], fields[10].to_string(), None, true)
-        } else if let Some(path) = record.strip_prefix("? ") {
-            ("??", path.to_string(), None, false)
-        } else if record.starts_with("! ") {
-            continue;
-        } else {
-            return Err(GitError::InvalidOutput(
-                "Git returned an unknown porcelain-v2 status record.".to_string(),
-            ));
-        };
+            return self.push_change(fields[1].to_string(), fields[10].to_string(), None, true);
+        }
+        if let Some(path) = record.strip_prefix("? ") {
+            return self.push_change("??".to_string(), path.to_string(), None, false);
+        }
+        if record.starts_with("! ") {
+            return Ok(());
+        }
+        Err(GitError::InvalidOutput(
+            "Git returned an unknown porcelain-v2 status record.".to_string(),
+        ))
+    }
 
+    fn push_change(
+        &mut self,
+        xy: String,
+        path: String,
+        original_path: Option<String>,
+        conflict: bool,
+    ) -> Result<()> {
+        if self.files.len() >= self.max_entries {
+            return Err(GitError::StatusEntryLimit {
+                limit: self.max_entries,
+            });
+        }
         let mut statuses = xy.chars();
         let index_status = statuses.next().unwrap_or('.');
         let worktree_status = statuses.next().unwrap_or('.');
         let untracked = index_status == '?' && worktree_status == '?';
-        files.push(GitFileChange {
+        self.files.push(GitFileChange {
             path,
             original_path,
             index_status: index_status.to_string(),
@@ -92,30 +210,22 @@ pub fn parse_porcelain_v2(
             untracked,
             conflict,
         });
+        Ok(())
     }
+}
 
-    let staged_count = files.iter().filter(|file| file.staged).count();
-    let unstaged_count = files.iter().filter(|file| file.unstaged).count();
-    let untracked_count = files.iter().filter(|file| file.untracked).count();
-    let conflict_count = files.iter().filter(|file| file.conflict).count();
-    let repository_root = repository_root.into();
-    Ok(StatusSnapshot {
-        summary: StatusSummary {
-            repository_root,
-            branch,
-            head,
-            upstream,
-            ahead,
-            behind,
-            file_count: files.len(),
-            staged_count,
-            unstaged_count,
-            untracked_count,
-            conflict_count,
-            generation,
-        },
-        files,
-    })
+fn lossy(value: &[u8]) -> String {
+    String::from_utf8_lossy(value).to_string()
+}
+
+pub fn parse_porcelain_v2(
+    output: &[u8],
+    repository_root: impl Into<String>,
+    generation: u64,
+) -> Result<StatusSnapshot> {
+    let mut parser = PorcelainV2StreamParser::new(MAX_STATUS_ENTRIES);
+    parser.push(output)?;
+    parser.finish(repository_root, generation)
 }
 
 fn invalid_record(kind: &str) -> GitError {

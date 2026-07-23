@@ -54,3 +54,19 @@ tests:
       - kind: contains
         path: $.structuredContent.error.message
         value: requires the 'standard' MCP profile
+  - id: read-profile-denies-git-mutation
+    description: Read profile cannot dispatch caller-scoped Git mutations
+    act:
+      method: tools/call
+      tool: git_stage
+      args: {}
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'standard' MCP profile

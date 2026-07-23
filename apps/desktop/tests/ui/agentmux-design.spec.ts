@@ -268,6 +268,114 @@ test("source control panel follows the active terminal pane", async ({ page }) =
   }
 });
 
+test("source control discards a stale review completion after the active pane changes", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-pane-split-horizontal").click();
+  const panes = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(panes).toHaveCount(2);
+
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await panes.nth(0).click({ position: { x: 24, y: 24 } });
+  await panel.getByTestId("source-control-change-working").locator(".agentmux-source-control__change-main").click();
+  const selectableDiff = panel.locator(".agentmux-source-control__diff-line:not([disabled])").first();
+  await expect(selectableDiff).toBeVisible();
+  await selectableDiff.click();
+  await panel.getByPlaceholder("Write review feedback").fill("stale pane review must not leak");
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { holdGitReviewCreate(): void };
+    }).__AGENTMUX_PREVIEW__?.holdGitReviewCreate();
+  });
+  await panel.getByRole("button", { name: "Add comment" }).click();
+  await panes.nth(1).click({ position: { x: 24, y: 24 } });
+  await expect(panel.getByPlaceholder("Write review feedback")).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { releaseGitReviewCreate(): void };
+    }).__AGENTMUX_PREVIEW__?.releaseGitReviewCreate();
+  });
+  await page.waitForTimeout(100);
+  await expect(panel.getByText("stale pane review must not leak")).toHaveCount(0);
+});
+
+test("source control discards a stale review list after the active pane changes", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-pane-split-horizontal").click();
+  const panes = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(panes).toHaveCount(2);
+
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await panes.nth(0).click({ position: { x: 24, y: 24 } });
+  const working = panel.getByTestId("source-control-change-working").first();
+  await working.locator(".agentmux-source-control__change-main").click();
+  const selectableDiff = panel.locator(".agentmux-source-control__diff-line:not([disabled])").first();
+  await expect(selectableDiff).toBeVisible();
+  await selectableDiff.click();
+  await panel.getByPlaceholder("Write review feedback").fill("stale review list must not leak");
+  await panel.getByRole("button", { name: "Add comment" }).click();
+  await expect(panel.getByText("stale review list must not leak")).toBeVisible();
+
+  await panel.getByTestId("source-control-change-staged").first().locator(".agentmux-source-control__change-main").click();
+  await expect(panel.getByText("stale review list must not leak")).toHaveCount(0);
+
+  const reviewListRequests = await page.evaluate(() => {
+    return (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { gitReviewListRequests(): number };
+    }).__AGENTMUX_PREVIEW__?.gitReviewListRequests() ?? 0;
+  });
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { holdGitReviewList(): void };
+    }).__AGENTMUX_PREVIEW__?.holdGitReviewList();
+  });
+  await working.locator(".agentmux-source-control__change-main").click();
+  await expect.poll(() => page.evaluate(() => {
+    return (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { gitReviewListRequests(): number };
+    }).__AGENTMUX_PREVIEW__?.gitReviewListRequests() ?? 0;
+  })).toBeGreaterThan(reviewListRequests);
+  await panes.nth(1).click({ position: { x: 24, y: 24 } });
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { failGitReviewList(): void };
+    }).__AGENTMUX_PREVIEW__?.failGitReviewList();
+  });
+  await page.waitForTimeout(100);
+  await expect(panel.locator('[role="status"]')).toHaveCount(0);
+});
+
+test("source control filters the complete change set and virtualizes a 15k file repository", async ({ page }) => {
+  await bootPreview(page);
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { setGitStatusFileCount(count: number): void };
+    }).__AGENTMUX_PREVIEW__?.setGitStatusFileCount(15_000);
+  });
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  const changes = panel.locator(".agentmux-source-control__changes");
+  await expect(changes).toHaveAttribute("data-filtered-count", "15000");
+  expect(await panel.locator(".agentmux-source-control__virtual-row").count()).toBeLessThan(80);
+  await expect(panel.locator(".agentmux-source-control__virtual-list")).toHaveCSS("height", /1\d{4}px/);
+
+  await panel.getByLabel("Filter changed files").fill("file-14999");
+  await expect.poll(() => page.evaluate(() => {
+    const requests = (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { gitRequests(): Array<{ operation: string; query: string | null }> };
+    }).__AGENTMUX_PREVIEW__?.gitRequests() ?? [];
+    return requests.filter((request) => request.operation === "page").at(-1)?.query ?? null;
+  })).toBe("file-14999");
+  await expect(changes).toHaveAttribute("data-filtered-count", "1");
+  await expect(panel.locator(".agentmux-source-control__filename")).toContainText("file-14999.ts");
+});
+
 test("status bar exposes the current folder as an Explorer action", async ({ page }) => {
   await bootPreview(page);
 

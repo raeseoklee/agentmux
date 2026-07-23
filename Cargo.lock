@@ -156,6 +156,7 @@ dependencies = [
  "agentmux-backend-wsl",
  "agentmux-core",
  "agentmux-ipc",
+ "agentmux-vcs",
  "axum",
  "bytes",
  "getrandom 0.2.17",

@@ -2017,6 +2017,9 @@ pub struct GitStatusPageParams {
     pub repository_id: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    /// Case-insensitive repository-relative path query. The host binds cursors to this value.
+    #[serde(default)]
+    pub query: Option<String>,
     #[serde(default)]
     pub cursor: Option<String>,
     #[serde(default)]
@@ -2043,6 +2046,7 @@ impl GitStatusPageParams {
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional("state", self.state.as_deref(), 64)?;
+        validate_optional("query", self.query.as_deref(), 512)?;
         validate_optional("cursor", self.cursor.as_deref(), 1024)?;
         if let Some(limit) = self.limit {
             validate_range("limit", limit, 1, MAX_GIT_STATUS_PAGE_SIZE)?;

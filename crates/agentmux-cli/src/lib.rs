@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -69,6 +69,9 @@ mod agent_hooks;
 mod mcp;
 mod mcp_config;
 mod mcp_http;
+mod server_local_git;
+
+use server_local_git::ServerLocalGit;
 
 const AGENTMUX_CONFIG_SCHEMA_JSON: &str =
     include_str!("../../../docs/en/schemas/agentmux.config.schema.json");
@@ -1614,6 +1617,7 @@ fn parse_git_page_options(
     let mut pane_id = None;
     let mut repository_id = None;
     let mut state = None;
+    let mut query = None;
     let mut cursor = None;
     let mut limit = None;
     let mut generation = None;
@@ -1637,6 +1641,10 @@ fn parse_git_page_options(
             }
             "--state" => {
                 state = Some(option_value(args, index, "--state")?.to_string());
+                index += 2;
+            }
+            "--query" => {
+                query = Some(option_value(args, index, "--query")?.to_string());
                 index += 2;
             }
             "--cursor" => {
@@ -1679,6 +1687,7 @@ fn parse_git_page_options(
             pane_id,
             repository_id,
             state,
+            query,
             cursor,
             limit,
             generation,
@@ -8121,10 +8130,27 @@ where
 
 const SERVER_LOCAL_TOKEN: &str = "server-local-token";
 const SERVER_LOCAL_WORKSPACE_ID: &str = "ws_server";
+const SERVER_MUTATION_RATE_LIMIT: usize = 1_200;
+const SERVER_MUTATION_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerRequestAccess {
+    Public,
+    Read,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerRateWindow {
+    started_at: Instant,
+    request_count: usize,
+}
 
 struct ServerState {
     options: ServerOptions,
     local_control: Option<LocalServerControl>,
+    local_git: Option<ServerLocalGit>,
+    mutation_rate_limits: HashMap<IpAddr, ServerRateWindow>,
 }
 
 impl ServerState {
@@ -8133,9 +8159,23 @@ impl ServerState {
             ServerMode::Local => Some(LocalServerControl::new(&options)),
             ServerMode::DesktopBridge => None,
         };
+        let local_git = match options.mode {
+            ServerMode::Local => ServerLocalGit::probe(
+                options
+                    .workspace_id
+                    .as_deref()
+                    .unwrap_or(SERVER_LOCAL_WORKSPACE_ID),
+                options.backend.as_deref(),
+                options.backend_profile.as_deref(),
+                options.cwd.as_deref(),
+            ),
+            ServerMode::DesktopBridge => None,
+        };
         Self {
             options,
             local_control,
+            local_git,
+            mutation_rate_limits: HashMap::new(),
         }
     }
 
@@ -8161,12 +8201,60 @@ impl ServerState {
                     &params_json,
                     SERVER_LOCAL_TOKEN,
                 );
+                if ServerLocalGit::supports_method(method) {
+                    let git = self.local_git.as_mut().ok_or_else(|| {
+                        CliError::Control(
+                            "Git is not available for the configured local server directory."
+                                .to_string(),
+                        )
+                    })?;
+                    return Ok(git.handle_request(request));
+                }
                 let control = self.local_control.as_mut().ok_or_else(|| {
                     CliError::Control("local server runtime is not initialized.".to_string())
                 })?;
                 Ok(control.handle_request(request))
             }
         }
+    }
+
+    fn source_control_available(&self) -> bool {
+        self.options.mode == ServerMode::DesktopBridge || self.local_git.is_some()
+    }
+
+    fn control_methods(&self) -> Vec<&'static str> {
+        match self.options.mode {
+            ServerMode::DesktopBridge => server_desktop_control_methods().to_vec(),
+            ServerMode::Local if self.local_git.is_some() => ServerLocalGit::methods().to_vec(),
+            ServerMode::Local => Vec::new(),
+        }
+    }
+
+    fn allow_mutation(&mut self, client_ip: Option<IpAddr>, now: Instant) -> bool {
+        let Some(client_ip) = client_ip else {
+            return true;
+        };
+        self.mutation_rate_limits.retain(|_, window| {
+            now.saturating_duration_since(window.started_at) < SERVER_MUTATION_RATE_WINDOW
+        });
+        let window = self
+            .mutation_rate_limits
+            .entry(client_ip)
+            .or_insert(ServerRateWindow {
+                started_at: now,
+                request_count: 0,
+            });
+        if now.saturating_duration_since(window.started_at) >= SERVER_MUTATION_RATE_WINDOW {
+            *window = ServerRateWindow {
+                started_at: now,
+                request_count: 0,
+            };
+        }
+        if window.request_count >= SERVER_MUTATION_RATE_LIMIT {
+            return false;
+        }
+        window.request_count += 1;
+        true
     }
 }
 
@@ -8587,6 +8675,10 @@ fn server_startup_payload(
         "backend": state.options.backend.clone(),
         "backend_profile": state.options.backend_profile.clone(),
         "allow_remote": state.options.allow_remote,
+        "capabilities": {
+            "source_control": state.source_control_available(),
+            "control_methods": state.control_methods(),
+        },
         "auth": {
             "token_source": "generated_ephemeral",
             "token_disclosure": "pass --show-auth-token to include auth_token",
@@ -8622,18 +8714,21 @@ fn handle_server_stream(
     mut stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
 ) -> Result<(), CliError> {
+    let client_ip = stream.peer_addr().ok().map(|address| address.ip());
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     if is_websocket_upgrade(&stream)? {
         return handle_server_websocket(stream, state);
     }
 
-    let request = match read_http_request(&mut stream).and_then(|raw| parse_http_request(&raw)) {
+    let mut request = match read_http_request(&mut stream).and_then(|raw| parse_http_request(&raw))
+    {
         Ok(request) => request,
         Err(error) => {
             let response = api_error_response(400, &format!("Bad request: {error}"));
             return write_http_response(&mut stream, &response);
         }
     };
+    request.client_ip = client_ip;
     let response = match state.lock() {
         Ok(mut state) => route_server_request(&request, &mut state),
         Err(_) => api_error_response(503, "Server state is unavailable."),
@@ -8929,6 +9024,7 @@ struct HttpRequest {
     query: Option<String>,
     headers: HashMap<String, String>,
     body: String,
+    client_ip: Option<IpAddr>,
 }
 
 #[derive(Debug)]
@@ -9023,15 +9119,28 @@ fn parse_http_request(raw: &str) -> Result<HttpRequest, CliError> {
         query,
         headers,
         body: body.to_string(),
+        client_ip: None,
     })
 }
 
 fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpResponse {
-    if server_request_requires_auth(request) && !server_request_authorized(request, state) {
+    let access = server_request_access(request, state.options.mode);
+    if access != ServerRequestAccess::Public && !server_request_authorized(request, state, access) {
         return api_error_response(401, "Unauthorized.");
     }
+    if access == ServerRequestAccess::Mutation {
+        if !server_mutation_content_type_allowed(request) {
+            return api_error_response(415, "Mutation requests require application/json.");
+        }
+        if !server_mutation_origin_allowed(request) {
+            return api_error_response(403, "Mutation origin is not allowed.");
+        }
+        if !state.allow_mutation(request.client_ip, Instant::now()) {
+            return api_error_response(429, "Mutation rate limit exceeded.");
+        }
+    }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => server_desktop_index_response(&state.options),
+        ("GET", "/") | ("GET", "/index.html") => server_desktop_index_response(state),
         ("GET", "/api/state") => server_state_response(state),
         ("GET", "/api/sessions") => server_sessions_response(request, state),
         ("GET", "/api/wsl/distributions") => server_wsl_distributions_response(),
@@ -9099,7 +9208,11 @@ fn server_control_response(request: &HttpRequest, state: &mut ServerState) -> Ht
         Err(error) => return api_error_response(400, &error.to_string()),
     };
     let method = parsed.method.trim();
-    if method.len() > 128 || !server_control_method_allowed(method, state.options.mode) {
+    let capability_available = state.options.mode != ServerMode::Local || state.local_git.is_some();
+    if method.len() > 128
+        || !capability_available
+        || !server_control_method_allowed(method, state.options.mode)
+    {
         return api_error_response(403, "Control method is not available through server mode.");
     }
     match state
@@ -9112,53 +9225,127 @@ fn server_control_response(request: &HttpRequest, state: &mut ServerState) -> Ht
 }
 
 fn server_control_method_allowed(method: &str, mode: ServerMode) -> bool {
-    if mode != ServerMode::DesktopBridge {
-        return false;
+    match mode {
+        ServerMode::DesktopBridge => server_desktop_control_methods().contains(&method),
+        ServerMode::Local => ServerLocalGit::supports_method(method),
     }
-    matches!(
-        method,
-        "git.status"
-            | "git.status_summary"
-            | "git.status_page"
-            | "git.diff"
-            | "git.stage"
-            | "git.unstage"
-            | "git.stage_all"
-            | "git.unstage_all"
-            | "git.discard"
-            | "git.commit"
-            | "agent.worktree.create"
-            | "agent.worktree.list"
-            | "agent.worktree.recover"
-            | "agent.worktree.remove"
-            | "git.review_thread.create"
-            | "git.review_thread.list"
-            | "git.review_thread.update"
-            | "git.review_thread.delete"
-            | "git.review_thread.mark_stale"
-            | "git.review_thread.deliver"
-            | "git.review_comment.list"
-            | "git.review_comment.create"
-            | "git.review_comment.update"
-            | "git.review_comment.delete"
-            | "agent.hook_state"
-            | "dev_server.candidate.list"
-            | "dev_server.candidate.dismiss"
-            | "dev_server.candidate.open_in_split"
-    )
+}
+
+fn server_desktop_control_methods() -> &'static [&'static str] {
+    &[
+        "git.status",
+        "git.status_summary",
+        "git.status_page",
+        "git.diff",
+        "git.stage",
+        "git.unstage",
+        "git.stage_all",
+        "git.unstage_all",
+        "git.discard",
+        "git.commit",
+        "agent.worktree.create",
+        "agent.worktree.list",
+        "agent.worktree.recover",
+        "agent.worktree.remove",
+        "git.review_thread.create",
+        "git.review_thread.list",
+        "git.review_thread.update",
+        "git.review_thread.delete",
+        "git.review_thread.mark_stale",
+        "git.review_thread.deliver",
+        "git.review_comment.list",
+        "git.review_comment.create",
+        "git.review_comment.update",
+        "git.review_comment.delete",
+        "agent.hook_state",
+        "dev_server.candidate.list",
+        "dev_server.candidate.dismiss",
+        "dev_server.candidate.open_in_split",
+    ]
 }
 
 fn server_request_requires_auth(request: &HttpRequest) -> bool {
     request.path.starts_with("/api/")
 }
 
-fn server_request_authorized(request: &HttpRequest, state: &ServerState) -> bool {
-    request
+fn server_request_access(request: &HttpRequest, mode: ServerMode) -> ServerRequestAccess {
+    if !server_request_requires_auth(request) || request.method == "OPTIONS" {
+        return ServerRequestAccess::Public;
+    }
+    if request.method == "GET" {
+        return ServerRequestAccess::Read;
+    }
+    if request.method == "POST" && request.path == "/api/control" {
+        let method = serde_json::from_str::<ServerControlRequest>(&request.body)
+            .ok()
+            .map(|request| request.method);
+        if method
+            .as_deref()
+            .is_some_and(|method| server_control_method_is_read(method, mode))
+        {
+            return ServerRequestAccess::Read;
+        }
+    }
+    ServerRequestAccess::Mutation
+}
+
+fn server_control_method_is_read(method: &str, mode: ServerMode) -> bool {
+    match mode {
+        ServerMode::Local => ServerLocalGit::is_read_method(method),
+        ServerMode::DesktopBridge => matches!(
+            method,
+            "git.status"
+                | "git.status_summary"
+                | "git.status_page"
+                | "git.diff"
+                | "agent.worktree.list"
+                | "git.review_thread.list"
+                | "git.review_comment.list"
+                | "dev_server.candidate.list"
+        ),
+    }
+}
+
+fn server_request_authorized(
+    request: &HttpRequest,
+    state: &ServerState,
+    access: ServerRequestAccess,
+) -> bool {
+    let header_authorized = request
         .headers
         .get("x-agentmux-server-token")
         .is_some_and(|token| constant_time_eq(token, &state.options.auth_token))
-        || query_param(request.query.as_deref(), "token")
-            .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token))
+        || request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, token)| token)
+            .is_some_and(|token| constant_time_eq(token.trim(), &state.options.auth_token));
+    header_authorized
+        || (access == ServerRequestAccess::Read
+            && query_param(request.query.as_deref(), "token")
+                .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token)))
+}
+
+fn server_mutation_content_type_allowed(request: &HttpRequest) -> bool {
+    request
+        .headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn server_mutation_origin_allowed(request: &HttpRequest) -> bool {
+    let Some(origin) = request.headers.get("origin") else {
+        return true;
+    };
+    let Some(host) = request.headers.get("host") else {
+        return false;
+    };
+    let origin = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    let host = host.trim().to_ascii_lowercase();
+    origin == format!("http://{host}") || origin == format!("https://{host}")
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -9233,6 +9420,10 @@ fn load_server_state(state: &mut ServerState) -> Result<serde_json::Value, CliEr
 
     Ok(serde_json::json!({
         "mode": state.options.mode.as_str(),
+        "capabilities": {
+            "source_control": state.source_control_available(),
+            "control_methods": state.control_methods(),
+        },
         "control_pipe": if state.options.mode == ServerMode::DesktopBridge {
             Some(state.options.invoke.pipe_name.clone())
         } else {
@@ -9763,12 +9954,12 @@ fn bytes_response(status_code: u16, content_type: &'static str, body: Vec<u8>) -
     }
 }
 
-fn server_desktop_index_response(options: &ServerOptions) -> HttpResponse {
+fn server_desktop_index_response(state: &ServerState) -> HttpResponse {
     let Some(index_path) = desktop_ui_file_path("index.html") else {
         return html_response(503, missing_desktop_ui_html());
     };
     match fs::read_to_string(&index_path) {
-        Ok(html) => html_response(200, inject_server_bootstrap(html, options)),
+        Ok(html) => html_response(200, inject_server_bootstrap(html, state)),
         Err(error) => html_response(
             503,
             format!(
@@ -9851,11 +10042,16 @@ fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn inject_server_bootstrap(mut html: String, options: &ServerOptions) -> String {
+fn inject_server_bootstrap(mut html: String, state: &ServerState) -> String {
+    let options = &state.options;
     let bootstrap = serde_json::to_string(&serde_json::json!({
         "baseUrl": "",
         "mode": options.mode.as_str(),
         "token": options.auth_token.clone(),
+        "capabilities": {
+            "source_control": state.source_control_available(),
+            "control_methods": state.control_methods(),
+        },
         "defaults": server_defaults_json(options),
     }))
     .unwrap_or_else(|_| "{}".to_string());
@@ -9908,7 +10104,10 @@ fn http_reason(status_code: u16) -> &'static str {
         304 => "Not Modified",
         401 => "Unauthorized",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "OK",
     }
@@ -17623,9 +17822,14 @@ mod tests {
             query: None,
             headers: HashMap::new(),
             body: String::new(),
+            client_ip: None,
         };
         assert!(server_request_requires_auth(&unauthenticated));
-        assert!(!server_request_authorized(&unauthenticated, &state));
+        assert!(!server_request_authorized(
+            &unauthenticated,
+            &state,
+            ServerRequestAccess::Read
+        ));
 
         let mut headers = HashMap::new();
         headers.insert(
@@ -17636,7 +17840,11 @@ mod tests {
             headers,
             ..unauthenticated
         };
-        assert!(server_request_authorized(&header_authenticated, &state));
+        assert!(server_request_authorized(
+            &header_authenticated,
+            &state,
+            ServerRequestAccess::Read
+        ));
 
         let query_authenticated = HttpRequest {
             method: "GET".to_string(),
@@ -17644,9 +17852,19 @@ mod tests {
             query: Some(format!("token={}", state.options.auth_token)),
             headers: HashMap::new(),
             body: String::new(),
+            client_ip: None,
         };
         assert!(server_request_requires_auth(&query_authenticated));
-        assert!(server_request_authorized(&query_authenticated, &state));
+        assert!(server_request_authorized(
+            &query_authenticated,
+            &state,
+            ServerRequestAccess::Read
+        ));
+        assert!(!server_request_authorized(
+            &query_authenticated,
+            &state,
+            ServerRequestAccess::Mutation
+        ));
 
         let public_asset = HttpRequest {
             method: "GET".to_string(),
@@ -17654,8 +17872,170 @@ mod tests {
             query: None,
             headers: HashMap::new(),
             body: String::new(),
+            client_ip: None,
         };
         assert!(!server_request_requires_auth(&public_asset));
+    }
+
+    #[test]
+    fn server_mutations_require_header_auth_json_and_same_origin() {
+        let options = parse_server_options(&[
+            "--desktop-control".to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let body = serde_json::json!({
+            "method": "git.stage",
+            "params": { "workspace_id": "ws_1", "paths": ["src/lib.rs"] }
+        })
+        .to_string();
+
+        let query_only = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: Some(format!("token={token}")),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: body.clone(),
+            client_ip: None,
+        };
+        assert_eq!(
+            route_server_request(&query_only, &mut state).status_code,
+            401
+        );
+
+        let header = HashMap::from([("authorization".to_string(), format!("Bearer {token}"))]);
+        let missing_content_type = HttpRequest {
+            headers: header.clone(),
+            query: None,
+            ..query_only
+        };
+        assert_eq!(
+            route_server_request(&missing_content_type, &mut state).status_code,
+            415
+        );
+
+        let mut wrong_origin_headers = header.clone();
+        wrong_origin_headers.insert("content-type".to_string(), "application/json".to_string());
+        wrong_origin_headers.insert("host".to_string(), "127.0.0.1:8765".to_string());
+        wrong_origin_headers.insert("origin".to_string(), "https://attacker.example".to_string());
+        let wrong_origin = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: None,
+            headers: wrong_origin_headers,
+            body: body.clone(),
+            client_ip: None,
+        };
+        assert_eq!(
+            route_server_request(&wrong_origin, &mut state).status_code,
+            403
+        );
+
+        let mut same_origin_headers = header;
+        same_origin_headers.insert("content-type".to_string(), "application/json".to_string());
+        same_origin_headers.insert("host".to_string(), "127.0.0.1:8765".to_string());
+        same_origin_headers.insert("origin".to_string(), "http://127.0.0.1:8765".to_string());
+        let same_origin = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: None,
+            headers: same_origin_headers,
+            body,
+            client_ip: None,
+        };
+        assert!(server_request_authorized(
+            &same_origin,
+            &state,
+            ServerRequestAccess::Mutation
+        ));
+        assert!(server_mutation_content_type_allowed(&same_origin));
+        assert!(server_mutation_origin_allowed(&same_origin));
+    }
+
+    #[test]
+    fn server_read_control_keeps_query_token_compatibility() {
+        let options = parse_server_options(&[
+            "--desktop-control".to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: Some(format!("token={token}")),
+            headers: HashMap::new(),
+            body: serde_json::json!({
+                "method": "git.status_page",
+                "params": { "workspace_id": "ws_1", "limit": 25 }
+            })
+            .to_string(),
+            client_ip: None,
+        };
+        assert_eq!(
+            server_request_access(&request, ServerMode::DesktopBridge),
+            ServerRequestAccess::Read
+        );
+        assert_ne!(route_server_request(&request, &mut state).status_code, 401);
+    }
+
+    #[test]
+    fn server_control_access_classification_is_exact() {
+        let desktop_reads = [
+            "git.status",
+            "git.status_summary",
+            "git.status_page",
+            "git.diff",
+            "agent.worktree.list",
+            "git.review_thread.list",
+            "git.review_comment.list",
+            "dev_server.candidate.list",
+        ];
+        for method in server_desktop_control_methods() {
+            assert_eq!(
+                server_control_method_is_read(method, ServerMode::DesktopBridge),
+                desktop_reads.contains(method),
+                "desktop method {method} was classified incorrectly"
+            );
+        }
+        for method in ServerLocalGit::methods() {
+            assert_eq!(
+                server_control_method_is_read(method, ServerMode::Local),
+                ServerLocalGit::is_read_method(method),
+                "local method {method} was classified incorrectly"
+            );
+        }
+        assert!(!server_control_method_is_read(
+            "workspace.close",
+            ServerMode::DesktopBridge
+        ));
+        assert!(!server_control_method_is_read(
+            "workspace.close",
+            ServerMode::Local
+        ));
+    }
+
+    #[test]
+    fn server_mutation_rate_limit_is_per_client_and_resets() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let first: IpAddr = "127.0.0.1".parse().unwrap();
+        let second: IpAddr = "127.0.0.2".parse().unwrap();
+        let started = Instant::now();
+        for _ in 0..SERVER_MUTATION_RATE_LIMIT {
+            assert!(state.allow_mutation(Some(first), started));
+        }
+        assert!(!state.allow_mutation(Some(first), started));
+        assert!(state.allow_mutation(Some(second), started));
+        assert!(state.allow_mutation(
+            Some(first),
+            started + SERVER_MUTATION_RATE_WINDOW + Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -17672,7 +18052,11 @@ mod tests {
             "session.send_text",
             ServerMode::DesktopBridge
         ));
-        assert!(!server_control_method_allowed(
+        assert!(server_control_method_allowed(
+            "git.status_page",
+            ServerMode::Local
+        ));
+        assert!(server_control_method_allowed(
             "git.status",
             ServerMode::Local
         ));
@@ -17683,6 +18067,7 @@ mod tests {
             "x-agentmux-server-token".to_string(),
             options.auth_token.clone(),
         );
+        headers.insert("content-type".to_string(), "application/json".to_string());
         let mut state = ServerState::new(options);
         let response = route_server_request(
             &HttpRequest {
@@ -17691,10 +18076,11 @@ mod tests {
                 query: None,
                 headers,
                 body: serde_json::json!({
-                    "method": "git.status",
-                    "params": { "workspace_id": "ws_1" }
+                    "method": "session.send_text",
+                    "params": { "session_id": "sess_1", "text": "blocked" }
                 })
                 .to_string(),
+                client_ip: None,
             },
             &mut state,
         );
@@ -17720,14 +18106,39 @@ mod tests {
     #[test]
     fn server_desktop_bootstrap_embeds_auth_token() {
         let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = ServerState::new(options);
         let html = inject_server_bootstrap(
             "<!doctype html><html><head></head><body></body></html>".to_string(),
-            &options,
+            &state,
         );
 
         assert!(html.contains("window.__AGENTMUX_SERVER__"));
         assert!(html.contains("\"token\""));
-        assert!(html.contains(&options.auth_token));
+        assert!(html.contains(&state.options.auth_token));
+    }
+
+    #[test]
+    fn local_server_source_control_capability_requires_a_successful_probe() {
+        let cwd = std::env::temp_dir().join(format!(
+            "agentmux-server-non-repository-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd).unwrap();
+        let options = parse_server_options(&[
+            "--port".to_string(),
+            "0".to_string(),
+            "--cwd".to_string(),
+            cwd.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        let state = ServerState::new(options);
+        assert!(!state.source_control_available());
+        assert!(state.control_methods().is_empty());
+        fs::remove_dir_all(cwd).unwrap();
     }
 
     #[test]

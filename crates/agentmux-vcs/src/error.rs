@@ -34,6 +34,9 @@ pub enum GitError {
     InvalidWorktreeDestination(String),
     InvalidWorktreeRequest(String),
     InvalidStatusPage(String),
+    StatusEntryLimit {
+        limit: usize,
+    },
     InvalidOutput(String),
     StateUnavailable(String),
 }
@@ -81,6 +84,10 @@ impl fmt::Display for GitError {
             | Self::InvalidStatusPage(message)
             | Self::InvalidOutput(message)
             | Self::StateUnavailable(message) => formatter.write_str(message),
+            Self::StatusEntryLimit { limit } => write!(
+                formatter,
+                "Git status contains more than the configured {limit} change entries"
+            ),
         }
     }
 }

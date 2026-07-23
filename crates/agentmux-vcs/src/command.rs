@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,14 @@ pub(crate) struct ExecutionOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamingExecutionOutput {
+    pub status: ExitStatus,
+    pub stderr: Vec<u8>,
+    pub stdout_bytes: usize,
+    pub first_stdout_after: Option<Duration>,
 }
 
 pub fn build_git_command_spec(
@@ -224,6 +232,149 @@ pub(crate) fn execute(
     })
 }
 
+/// Runs a command while forwarding bounded stdout chunks to a parser callback.
+///
+/// Unlike `execute`, this path never assembles stdout into one large `Vec`. The bounded
+/// synchronous channel applies backpressure to the child reader while preserving the existing
+/// timeout, process termination, and stderr capture guarantees.
+pub(crate) fn execute_streaming_stdout<F>(
+    spec: &CommandSpec,
+    operation: &str,
+    limits: CaptureLimits,
+    mut on_stdout: F,
+) -> Result<StreamingExecutionOutput>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .envs(&spec.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console_window(&mut command);
+
+    let mut child = command.spawn().map_err(|error| GitError::Io {
+        operation: operation.to_string(),
+        message: error.to_string(),
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        GitError::StateUnavailable("Git stdout pipe was unavailable.".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        GitError::StateUnavailable("Git stderr pipe was unavailable.".to_string())
+    })?;
+    let (overflow_tx, overflow_rx) = mpsc::channel();
+    let stderr_reader = spawn_reader(
+        stderr,
+        limits.stderr_bytes,
+        OverflowPolicy::Fail,
+        OutputStream::Stderr,
+        overflow_tx,
+    );
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(4);
+    let stdout_reader = spawn_stream_reader(stdout, stdout_tx);
+    let started_at = Instant::now();
+    let mut stdout_closed = false;
+    let mut status = None;
+    let mut stdout_bytes = 0usize;
+    let mut first_stdout_after = None;
+
+    while !stdout_closed || status.is_none() {
+        if let Ok((stream, limit)) = overflow_rx.try_recv() {
+            terminate(&mut child);
+            let _ = join_stream_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(GitError::OutputLimit {
+                operation: operation.to_string(),
+                stream,
+                limit,
+            });
+        }
+
+        match stdout_rx.recv_timeout(PROCESS_POLL_INTERVAL) {
+            Ok(Ok(bytes)) => {
+                let next = stdout_bytes.saturating_add(bytes.len());
+                if next > limits.stdout_bytes {
+                    terminate(&mut child);
+                    let _ = join_stream_reader(stdout_reader);
+                    let _ = join_reader(stderr_reader);
+                    return Err(GitError::OutputLimit {
+                        operation: operation.to_string(),
+                        stream: OutputStream::Stdout,
+                        limit: limits.stdout_bytes,
+                    });
+                }
+                if first_stdout_after.is_none() {
+                    first_stdout_after = Some(started_at.elapsed());
+                }
+                stdout_bytes = next;
+                if let Err(error) = on_stdout(&bytes) {
+                    terminate(&mut child);
+                    let _ = join_stream_reader(stdout_reader);
+                    let _ = join_reader(stderr_reader);
+                    return Err(error);
+                }
+            }
+            Ok(Err(error)) => {
+                terminate(&mut child);
+                let _ = join_stream_reader(stdout_reader);
+                let _ = join_reader(stderr_reader);
+                return Err(GitError::Io {
+                    operation: operation.to_string(),
+                    message: error.to_string(),
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => stdout_closed = true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+
+        match child.try_wait() {
+            Ok(next) => {
+                if next.is_some() {
+                    status = next;
+                }
+            }
+            Err(error) => {
+                terminate(&mut child);
+                let _ = join_stream_reader(stdout_reader);
+                let _ = join_reader(stderr_reader);
+                return Err(GitError::Io {
+                    operation: operation.to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
+        if status.is_none() && started_at.elapsed() >= limits.timeout {
+            terminate(&mut child);
+            let _ = join_stream_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(GitError::Timeout {
+                operation: operation.to_string(),
+                timeout_ms: limits.timeout.as_millis(),
+            });
+        }
+    }
+
+    let status = status.expect("child status is present when the streaming loop exits");
+    join_stream_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
+    if stderr.truncated {
+        return Err(GitError::OutputLimit {
+            operation: operation.to_string(),
+            stream: OutputStream::Stderr,
+            limit: limits.stderr_bytes,
+        });
+    }
+    Ok(StreamingExecutionOutput {
+        status,
+        stderr: stderr.bytes,
+        stdout_bytes,
+        first_stdout_after,
+    })
+}
+
 fn terminate(child: &mut std::process::Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -279,6 +430,38 @@ fn read_bounded<R: Read>(
 }
 
 fn join_reader(reader: thread::JoinHandle<io::Result<ReaderOutput>>) -> Result<ReaderOutput> {
+    reader
+        .join()
+        .map_err(|_| GitError::StateUnavailable("Git output reader panicked.".to_string()))?
+        .map_err(|error| GitError::Io {
+            operation: "read Git output".to_string(),
+            message: error.to_string(),
+        })
+}
+
+fn spawn_stream_reader<R>(
+    mut reader: R,
+    sender: SyncSender<io::Result<Vec<u8>>>,
+) -> thread::JoinHandle<io::Result<()>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            if sender.send(Ok(buffer[..count].to_vec())).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn join_stream_reader(reader: thread::JoinHandle<io::Result<()>>) -> Result<()> {
     reader
         .join()
         .map_err(|_| GitError::StateUnavailable("Git output reader panicked.".to_string()))?

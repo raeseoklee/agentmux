@@ -15,18 +15,21 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub use command::{build_git_command_spec, CommandSpec};
-use command::{build_wsl_utility_spec, execute, CaptureLimits, ExecutionOutput, OverflowPolicy};
+use command::{
+    build_wsl_utility_spec, execute, execute_streaming_stdout, CaptureLimits, ExecutionOutput,
+    OverflowPolicy,
+};
 pub use error::{GitError, OutputStream, Result};
 pub use model::{
     CommitResult, CreateWorktreeResult, DiffRequest, DiffResult, GitContext, GitFileChange,
     GitHost, Repository, StatusPage, StatusSnapshot, StatusSummary, VerifiedWorktreeDestination,
     WorktreeInfo, MAX_STATUS_PAGE_SIZE,
 };
-pub use parse::parse_porcelain_v2;
-use parse::parse_worktree_porcelain;
+pub use parse::{parse_porcelain_v2, MAX_STATUS_ENTRIES};
+use parse::{parse_worktree_porcelain, PorcelainV2StreamParser};
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_BRANCH_BYTES: usize = 1024;
@@ -37,6 +40,7 @@ pub struct GitConfig {
     pub command_timeout: Duration,
     pub resolve_output_bytes: usize,
     pub status_output_bytes: usize,
+    pub status_entry_limit: usize,
     pub diff_output_bytes: usize,
     pub worktree_output_bytes: usize,
     pub mutation_output_bytes: usize,
@@ -49,12 +53,29 @@ impl Default for GitConfig {
             command_timeout: Duration::from_secs(15),
             resolve_output_bytes: 64 * 1024,
             status_output_bytes: 16 * 1024 * 1024,
+            status_entry_limit: MAX_STATUS_ENTRIES,
             diff_output_bytes: 2 * 1024 * 1024,
             worktree_output_bytes: 2 * 1024 * 1024,
             mutation_output_bytes: 2 * 1024 * 1024,
             stderr_output_bytes: 1024 * 1024,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusReadMetrics {
+    /// Total porcelain bytes consumed from the child stdout pipe.
+    pub stdout_bytes: usize,
+    /// Time from process launch until the first file record is available to paging.
+    pub first_change_after: Option<Duration>,
+    /// Time from process launch until the complete snapshot is ready for the host cache.
+    pub completed_after: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusReadResult {
+    pub snapshot: StatusSnapshot,
+    pub metrics: StatusReadMetrics,
 }
 
 #[derive(Default)]
@@ -118,30 +139,63 @@ impl GitClient {
     }
 
     pub fn read_status(&self, repository: &Repository) -> Result<StatusSnapshot> {
+        Ok(self.read_status_with_metrics(repository)?.snapshot)
+    }
+
+    pub fn read_status_with_metrics(&self, repository: &Repository) -> Result<StatusReadResult> {
         let repository_lock = self.repository_lock(&repository.key());
         let _guard = recover_read(&repository_lock);
-        let output = self.run(
-            &repository.context(),
-            &[
-                "-c".to_string(),
-                "core.quotePath=false".to_string(),
-                "status".to_string(),
-                "--porcelain=v2".to_string(),
-                "--branch".to_string(),
-                "-z".to_string(),
-                "--untracked-files=all".to_string(),
-            ],
-            true,
+        let arguments = [
+            "-c".to_string(),
+            "core.quotePath=false".to_string(),
+            "status".to_string(),
+            "--porcelain=v2".to_string(),
+            "--branch".to_string(),
+            "-z".to_string(),
+            "--untracked-files=all".to_string(),
+        ];
+        let spec = build_git_command_spec(&repository.context(), &arguments, true);
+        let mut parser = PorcelainV2StreamParser::new(self.config.status_entry_limit);
+        let started_at = Instant::now();
+        let mut first_change_after = None;
+        let output = execute_streaming_stdout(
+            &spec,
             "read repository status",
-            self.config.status_output_bytes,
-            OverflowPolicy::Fail,
+            CaptureLimits {
+                timeout: self.config.command_timeout,
+                stdout_bytes: self.config.status_output_bytes,
+                stderr_bytes: self.config.stderr_output_bytes,
+                stdout_overflow: OverflowPolicy::Fail,
+            },
+            |chunk| {
+                parser.push(chunk)?;
+                if first_change_after.is_none() && parser.file_count() > 0 {
+                    first_change_after = Some(started_at.elapsed());
+                }
+                Ok(())
+            },
         )?;
-        ensure_success(output.status.success(), &output, "read repository status")?;
-        parse_porcelain_v2(
-            &output.stdout,
-            repository.root.clone(),
-            self.generation(repository),
-        )
+        let completed_after = started_at.elapsed();
+        let command_output = ExecutionOutput {
+            status: output.status,
+            stdout: Vec::new(),
+            stderr: output.stderr,
+            stdout_truncated: false,
+        };
+        ensure_success(
+            command_output.status.success(),
+            &command_output,
+            "read repository status",
+        )?;
+        let snapshot = parser.finish(repository.root.clone(), self.generation(repository))?;
+        Ok(StatusReadResult {
+            snapshot,
+            metrics: StatusReadMetrics {
+                stdout_bytes: output.stdout_bytes,
+                first_change_after: first_change_after.or(output.first_stdout_after),
+                completed_after,
+            },
+        })
     }
 
     pub fn status_summary(&self, repository: &Repository) -> Result<StatusSummary> {
@@ -346,6 +400,51 @@ impl GitClient {
         } else {
             Err(GitError::InvalidBranch(branch.to_string()))
         }
+    }
+
+    pub fn local_branch_head(
+        &self,
+        repository: &Repository,
+        branch: &str,
+    ) -> Result<Option<String>> {
+        self.validate_branch_name(&repository.context(), branch)?;
+        let repository_lock = self.repository_lock(&repository.key());
+        let _guard = recover_read(&repository_lock);
+        let reference = format!("refs/heads/{}", branch.trim());
+        let exists = self.run(
+            &repository.context(),
+            &[
+                "show-ref".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                reference.clone(),
+            ],
+            true,
+            "verify the local branch",
+            self.config.resolve_output_bytes,
+            OverflowPolicy::Fail,
+        )?;
+        if exists.status.code() == Some(1) {
+            return Ok(None);
+        }
+        ensure_success(exists.status.success(), &exists, "verify the local branch")?;
+        let output = self.run(
+            &repository.context(),
+            &[
+                "rev-parse".to_string(),
+                "--verify".to_string(),
+                "--quiet".to_string(),
+                "--end-of-options".to_string(),
+                format!("{reference}^{{commit}}"),
+            ],
+            true,
+            "read the local branch",
+            self.config.resolve_output_bytes,
+            OverflowPolicy::Fail,
+        )?;
+        ensure_success(output.status.success(), &output, "read the local branch")?;
+        let head = output_text(&output.stdout).trim().to_string();
+        Ok((!head.is_empty()).then_some(head))
     }
 
     pub fn validate_revision(&self, repository: &Repository, revision: &str) -> Result<String> {
@@ -667,6 +766,34 @@ impl GitClient {
             allowed_root: canonical_root,
             path: canonical_destination,
         })
+    }
+
+    pub fn delete_local_branch(
+        &self,
+        repository: &Repository,
+        branch: &str,
+        force: bool,
+    ) -> Result<u64> {
+        self.validate_branch_name(&repository.context(), branch)?;
+        let branch = branch.trim().to_string();
+        self.with_mutation(repository, || {
+            let arguments = vec![
+                "branch".to_string(),
+                if force { "-D" } else { "-d" }.to_string(),
+                "--".to_string(),
+                branch,
+            ];
+            let output = self.run(
+                &repository.context(),
+                &arguments,
+                false,
+                "delete the local branch",
+                self.config.mutation_output_bytes,
+                OverflowPolicy::Fail,
+            )?;
+            ensure_success(output.status.success(), &output, "delete the local branch")
+        })
+        .map(|(_, generation)| generation)
     }
 
     fn wsl_canonicalize(&self, host: &GitHost, path: &str) -> Result<String> {
@@ -1323,12 +1450,48 @@ mod tests {
     }
 
     #[test]
+    fn streaming_porcelain_parser_handles_record_boundaries_and_renames() {
+        let output = concat!(
+            "# branch.head feature/streaming\0",
+            "2 R. N... 100644 100644 100644 3333333 4444444 R100 docs/new name.md\0",
+            "docs/old name.md\0",
+            "? generated/untracked.rs\0",
+        );
+        let mut parser = PorcelainV2StreamParser::new(MAX_STATUS_ENTRIES);
+        for chunk in output.as_bytes().chunks(7) {
+            parser.push(chunk).expect("chunk should parse");
+        }
+        let snapshot = parser
+            .finish(r"D:\repo", 4)
+            .expect("streaming porcelain should finish");
+        assert_eq!(
+            snapshot.summary.branch.as_deref(),
+            Some("feature/streaming")
+        );
+        assert_eq!(snapshot.summary.file_count, 2);
+        assert_eq!(
+            snapshot.files[0].original_path.as_deref(),
+            Some("docs/old name.md")
+        );
+        assert!(snapshot.files[1].untracked);
+    }
+
+    #[test]
+    fn streaming_porcelain_parser_enforces_entry_limit() {
+        let mut parser = PorcelainV2StreamParser::new(2);
+        let error = parser
+            .push(&synthetic_mixed_status(3))
+            .expect_err("third change must exceed the configured entry cap");
+        assert!(matches!(error, GitError::StatusEntryLimit { limit: 2 }));
+    }
+
+    #[test]
     fn status_pages_are_bounded_and_stable() {
-        let output = synthetic_status(25);
+        let output = synthetic_mixed_status(25);
         let snapshot = parse_porcelain_v2(&output, r"D:\repo", 3).expect("status should parse");
         let page = snapshot.page(10, 10).expect("page should be valid");
         assert_eq!(page.files.len(), 10);
-        assert_eq!(page.files[0].path, "src/generated/file-00010.rs");
+        assert_eq!(page.files[0].path, "src/working/file-00010.rs");
         assert_eq!(page.next_offset, Some(20));
         assert!(snapshot.page(0, MAX_STATUS_PAGE_SIZE + 1).is_err());
         assert!(snapshot.page(26, 10).is_err());
@@ -1363,13 +1526,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_5k_porcelain_records_within_generous_budget() {
-        assert_large_status_parses(5_000, Duration::from_secs(5));
+    fn parses_5k_mixed_porcelain_records_within_budget() {
+        assert_large_status_parses(5_000, Duration::from_secs(1));
     }
 
     #[test]
-    fn parses_10k_porcelain_records_within_generous_budget() {
-        assert_large_status_parses(10_000, Duration::from_secs(10));
+    fn parses_10k_mixed_porcelain_records_within_budget() {
+        assert_large_status_parses(10_000, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn parses_15k_mixed_porcelain_records_within_budget() {
+        assert_large_status_parses(15_000, Duration::from_secs(2));
     }
 
     #[test]
@@ -1390,14 +1558,96 @@ mod tests {
         let repository = client
             .require_repository(&context)
             .expect("repository should resolve");
-        let snapshot = client.read_status(&repository).expect("status should load");
+        let result = client
+            .read_status_with_metrics(&repository)
+            .expect("status should load");
         let elapsed = started_at.elapsed();
-        assert_eq!(snapshot.summary.file_count, 15_000);
-        assert_eq!(snapshot.summary.untracked_count, 15_000);
+        assert_eq!(result.snapshot.summary.file_count, 15_000);
+        assert_eq!(result.snapshot.summary.untracked_count, 15_000);
+        assert!(result.metrics.stdout_bytes > 0);
+        assert!(result.metrics.first_change_after.is_some());
         assert!(
-            elapsed < Duration::from_secs(20),
-            "read 15,000 native status records in {elapsed:?}, budget was 20s"
+            result
+                .metrics
+                .first_change_after
+                .expect("first status record should be observable")
+                <= result.metrics.completed_after
         );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "read 15,000 native status records in {elapsed:?}, budget was 10s"
+        );
+        eprintln!(
+            "native git status 15k: first_change={:?}, completed={:?}, bytes={}",
+            result.metrics.first_change_after,
+            result.metrics.completed_after,
+            result.metrics.stdout_bytes,
+        );
+    }
+
+    #[test]
+    fn native_status_reports_first_record_latency() {
+        let directory = TempDir::new().expect("temporary repository should be created");
+        let context = GitContext::native(directory.path().to_string_lossy());
+        let client = GitClient::default();
+        run_setup(&client, &context, &["init", "-q"]);
+        fs::write(directory.path().join("first-visible.txt"), "x")
+            .expect("fixture should be written");
+        let repository = client
+            .require_repository(&context)
+            .expect("repository should resolve");
+        let result = client
+            .read_status_with_metrics(&repository)
+            .expect("status should stream");
+
+        assert_eq!(result.snapshot.summary.file_count, 1);
+        assert!(result.metrics.stdout_bytes > 0);
+        let first = result
+            .metrics
+            .first_change_after
+            .expect("first visible status record should be measured");
+        assert!(first <= result.metrics.completed_after);
+        assert!(
+            first < Duration::from_secs(1),
+            "first visible status record arrived too late: {first:?}"
+        );
+    }
+
+    #[test]
+    fn native_status_stream_enforces_output_and_entry_bounds() {
+        let directory = TempDir::new().expect("temporary repository should be created");
+        let context = GitContext::native(directory.path().to_string_lossy());
+        let setup_client = GitClient::default();
+        run_setup(&setup_client, &context, &["init", "-q"]);
+        for index in 0..3 {
+            fs::write(directory.path().join(format!("bounded-{index}.txt")), "x")
+                .expect("fixture should be written");
+        }
+        let repository = setup_client
+            .require_repository(&context)
+            .expect("repository should resolve");
+
+        let entry_limited = GitClient::new(GitConfig {
+            status_entry_limit: 2,
+            ..GitConfig::default()
+        });
+        assert!(matches!(
+            entry_limited.read_status(&repository),
+            Err(GitError::StatusEntryLimit { limit: 2 })
+        ));
+
+        let output_limited = GitClient::new(GitConfig {
+            status_output_bytes: 16,
+            ..GitConfig::default()
+        });
+        assert!(matches!(
+            output_limited.read_status(&repository),
+            Err(GitError::OutputLimit {
+                stream: OutputStream::Stdout,
+                limit: 16,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1560,6 +1810,20 @@ mod tests {
             .validate_revision(&repository, "refs/heads/feature/worktree-one")
             .is_ok());
         assert!(client
+            .local_branch_head(&repository, "feature/worktree-one")
+            .expect("owned branch should resolve")
+            .is_some());
+        assert_eq!(
+            client
+                .delete_local_branch(&repository, "feature/worktree-one", true)
+                .expect("owned branch should be deleted"),
+            3
+        );
+        assert!(client
+            .local_branch_head(&repository, "feature/worktree-one")
+            .expect("deleted branch lookup should succeed")
+            .is_none());
+        assert!(client
             .remove_worktree(&repository, repository.root(), true)
             .is_err());
     }
@@ -1587,32 +1851,49 @@ mod tests {
         .expect("Git setup should succeed");
     }
 
-    fn synthetic_status(count: usize) -> Vec<u8> {
-        let mut output = Vec::with_capacity(count * 120);
+    fn synthetic_mixed_status(count: usize) -> Vec<u8> {
+        let mut output = Vec::with_capacity(count * 150);
         output.extend_from_slice(b"# branch.oid 0123456789abcdef\0");
         output.extend_from_slice(b"# branch.head perf/status\0");
         for index in 0..count {
-            output.extend_from_slice(
-                format!(
-                    "1 .M N... 100644 100644 100644 1111111 2222222 src/generated/file-{index:05}.rs\0"
-                )
-                .as_bytes(),
-            );
+            let record = match index % 5 {
+                0 => format!("1 .M N... 100644 100644 100644 1111111 2222222 src/working/file-{index:05}.rs\0"),
+                1 => format!("1 M. N... 100644 100644 100644 1111111 2222222 src/staged/file-{index:05}.rs\0"),
+                2 => format!("? src/untracked/file-{index:05}.rs\0"),
+                3 => format!("2 R. N... 100644 100644 100644 3333333 4444444 R100 src/renamed/file-{index:05}.rs\0src/previous/file-{index:05}.rs\0"),
+                _ => format!("u UU N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc src/conflicted/file-{index:05}.rs\0"),
+            };
+            output.extend_from_slice(record.as_bytes());
         }
         output
     }
 
     fn assert_large_status_parses(count: usize, budget: Duration) {
-        let output = synthetic_status(count);
+        let output = synthetic_mixed_status(count);
         let started_at = Instant::now();
-        let snapshot =
-            parse_porcelain_v2(&output, r"D:\repo", 0).expect("synthetic porcelain should parse");
+        let mut parser = PorcelainV2StreamParser::new(MAX_STATUS_ENTRIES);
+        let mut first_change_after = None;
+        for chunk in output.chunks(1537) {
+            parser.push(chunk).expect("synthetic chunk should parse");
+            if first_change_after.is_none() && parser.file_count() > 0 {
+                first_change_after = Some(started_at.elapsed());
+            }
+        }
+        let snapshot = parser
+            .finish(r"D:\repo", 0)
+            .expect("synthetic porcelain should parse");
         let elapsed = started_at.elapsed();
         assert_eq!(snapshot.summary.file_count, count);
         assert_eq!(snapshot.files.len(), count);
+        assert!(first_change_after.is_some());
+        assert!(first_change_after.expect("first record should arrive") <= elapsed);
         assert!(
             elapsed < budget,
             "parsed {count} records in {elapsed:?}, budget was {budget:?}"
+        );
+        eprintln!(
+            "streaming porcelain {count}: first_change={:?}, completed={elapsed:?}",
+            first_change_after,
         );
     }
 }

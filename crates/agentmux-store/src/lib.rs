@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Migration {
@@ -405,6 +405,48 @@ CREATE INDEX idx_worktree_operations_workspace
   ON worktree_operations (workspace_id, updated_at, operation_id);
 "#;
 
+pub const FIVE_TRACK_RECOVERY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS git_review_delivery_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK(state IN (
+    'prepared',
+    'sending',
+    'confirmed',
+    'uncertain',
+    'failed'
+  )),
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  UNIQUE(thread_id, payload_hash, target_kind, target_id, attempt_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_review_delivery_attempt_lookup
+  ON git_review_delivery_attempts (
+    thread_id, payload_hash, target_kind, target_id, attempt_number DESC
+  );
+
+CREATE TABLE IF NOT EXISTS verified_agent_hooks (
+  session_id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  reason TEXT,
+  telemetry_json TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verified_agent_hooks_workspace
+  ON verified_agent_hooks (workspace_id, updated_at, session_id);
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -470,6 +512,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 13,
         name: "worktree_removed_state",
         sql: WORKTREE_REMOVED_STATE_SCHEMA,
+    },
+    Migration {
+        version: 14,
+        name: "five_track_recovery_state",
+        sql: FIVE_TRACK_RECOVERY_SCHEMA,
     },
 ];
 
@@ -870,6 +917,33 @@ pub struct GitReviewDeliveryUpdate {
     pub delivery_state: String,
     pub delivery_error: Option<String>,
     pub delivered_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedGitReviewDeliveryAttempt {
+    pub attempt_id: String,
+    pub thread_id: String,
+    pub payload_hash: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub attempt_number: i64,
+    pub state: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedVerifiedAgentHook {
+    pub session_id: String,
+    pub workspace_id: String,
+    pub source: String,
+    pub sequence: u64,
+    pub state: String,
+    pub reason: Option<String>,
+    pub telemetry_json: Option<String>,
     pub updated_at: String,
 }
 
@@ -1782,6 +1856,69 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn load_team_message(&self, message_id: &str) -> StoreResult<Option<PersistedTeamMessage>> {
+        self.connection
+            .query_row(
+                "SELECT message_id, workspace_id, thread_id, from_session_id, to_session_id,
+                        body, kind, created_at, read_at
+                 FROM team_messages
+                 WHERE message_id = ?1",
+                [message_id],
+                team_message_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Persists a deterministic mailbox delivery and its notification in one
+    /// transaction. Replaying the same IDs is idempotent and cannot create a
+    /// second mailbox entry after a host restart.
+    pub fn upsert_team_message_and_notification(
+        &mut self,
+        message: &PersistedTeamMessage,
+        notification: &PersistedNotification,
+    ) -> StoreResult<()> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO team_messages (
+                message_id, workspace_id, thread_id, from_session_id, to_session_id,
+                body, kind, created_at, read_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(message_id) DO NOTHING",
+            params![
+                message.message_id,
+                message.workspace_id,
+                message.thread_id,
+                message.from_session_id,
+                message.to_session_id,
+                message.body,
+                message.kind,
+                message.created_at,
+                message.read_at
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO notifications (
+                notification_id, notification_type, severity, workspace_id,
+                session_id, title, message, created_at, dismissed
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(notification_id) DO NOTHING",
+            params![
+                notification.notification_id,
+                notification.notification_type,
+                notification.severity,
+                notification.workspace_id,
+                notification.session_id,
+                notification.title,
+                notification.message,
+                notification.created_at,
+                i64::from(notification.dismissed)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn list_team_messages(
         &self,
         workspace_id: Option<&str>,
@@ -2341,6 +2478,189 @@ impl SqliteStore {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub fn load_latest_git_review_delivery_attempt(
+        &self,
+        thread_id: &str,
+        payload_hash: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> StoreResult<Option<PersistedGitReviewDeliveryAttempt>> {
+        self.connection
+            .query_row(
+                "SELECT attempt_id, thread_id, payload_hash, target_kind, target_id,
+                        attempt_number, state, error_message, created_at, updated_at, completed_at
+                 FROM git_review_delivery_attempts
+                 WHERE thread_id = ?1 AND payload_hash = ?2
+                   AND target_kind = ?3 AND target_id = ?4
+                 ORDER BY attempt_number DESC
+                 LIMIT 1",
+                params![thread_id, payload_hash, target_kind, target_id],
+                git_review_delivery_attempt_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn load_latest_git_review_delivery_attempt_for_target(
+        &self,
+        thread_id: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> StoreResult<Option<PersistedGitReviewDeliveryAttempt>> {
+        self.connection
+            .query_row(
+                "SELECT attempt_id, thread_id, payload_hash, target_kind, target_id,
+                        attempt_number, state, error_message, created_at, updated_at, completed_at
+                 FROM git_review_delivery_attempts
+                 WHERE thread_id = ?1 AND target_kind = ?2 AND target_id = ?3
+                 ORDER BY attempt_number DESC, created_at DESC
+                 LIMIT 1",
+                params![thread_id, target_kind, target_id],
+                git_review_delivery_attempt_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn begin_git_review_delivery_attempt(
+        &mut self,
+        attempt: &PersistedGitReviewDeliveryAttempt,
+        delivery: &GitReviewDeliveryUpdate,
+    ) -> StoreResult<bool> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO git_review_delivery_attempts (
+                attempt_id, thread_id, payload_hash, target_kind, target_id,
+                attempt_number, state, error_message, created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                attempt.attempt_id,
+                attempt.thread_id,
+                attempt.payload_hash,
+                attempt.target_kind,
+                attempt.target_id,
+                attempt.attempt_number,
+                attempt.state,
+                attempt.error_message,
+                attempt.created_at,
+                attempt.updated_at,
+                attempt.completed_at
+            ],
+        )?;
+        if !update_git_review_delivery_batch_in_transaction(&tx, &attempt.thread_id, delivery)? {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn update_git_review_delivery_attempt(
+        &mut self,
+        attempt_id: &str,
+        expected_state: &str,
+        next_state: &str,
+        error_message: Option<&str>,
+        completed_at: Option<&str>,
+        delivery: &GitReviewDeliveryUpdate,
+    ) -> StoreResult<bool> {
+        let tx = self.connection.transaction()?;
+        let updated = tx.execute(
+            "UPDATE git_review_delivery_attempts
+             SET state = ?3,
+                 error_message = ?4,
+                 updated_at = ?5,
+                 completed_at = ?6
+             WHERE attempt_id = ?1 AND state = ?2",
+            params![
+                attempt_id,
+                expected_state,
+                next_state,
+                error_message,
+                delivery.updated_at,
+                completed_at
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        let thread_id: String = tx.query_row(
+            "SELECT thread_id FROM git_review_delivery_attempts WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| row.get(0),
+        )?;
+        if !update_git_review_delivery_batch_in_transaction(&tx, &thread_id, delivery)? {
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn upsert_verified_agent_hook(
+        &mut self,
+        hook: &PersistedVerifiedAgentHook,
+    ) -> StoreResult<()> {
+        self.connection.execute(
+            "INSERT INTO verified_agent_hooks (
+                session_id, workspace_id, source, sequence, state, reason,
+                telemetry_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(session_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                source = excluded.source,
+                sequence = excluded.sequence,
+                state = excluded.state,
+                reason = excluded.reason,
+                telemetry_json = excluded.telemetry_json,
+                updated_at = excluded.updated_at",
+            params![
+                hook.session_id,
+                hook.workspace_id,
+                hook.source,
+                i64::try_from(hook.sequence).unwrap_or(i64::MAX),
+                hook.state,
+                hook.reason,
+                hook.telemetry_json,
+                hook.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_verified_agent_hook(
+        &self,
+        session_id: &str,
+    ) -> StoreResult<Option<PersistedVerifiedAgentHook>> {
+        self.connection
+            .query_row(
+                "SELECT session_id, workspace_id, source, sequence, state, reason,
+                        telemetry_json, updated_at
+                 FROM verified_agent_hooks
+                 WHERE session_id = ?1",
+                [session_id],
+                verified_agent_hook_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_verified_agent_hooks(&self) -> StoreResult<Vec<PersistedVerifiedAgentHook>> {
+        let mut statement = self.connection.prepare(
+            "SELECT session_id, workspace_id, source, sequence, state, reason,
+                    telemetry_json, updated_at
+             FROM verified_agent_hooks
+             ORDER BY updated_at ASC, session_id ASC",
+        )?;
+        let rows = statement.query_map([], verified_agent_hook_from_row)?;
+        collect_rows(rows)
+    }
+
+    pub fn delete_verified_agent_hook(&mut self, session_id: &str) -> StoreResult<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM verified_agent_hooks WHERE session_id = ?1",
+            [session_id],
+        )? > 0)
     }
 
     pub fn upsert_git_review_comment(
@@ -3277,6 +3597,53 @@ fn team_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedT
     })
 }
 
+fn update_git_review_delivery_batch_in_transaction(
+    tx: &Transaction<'_>,
+    thread_id: &str,
+    delivery: &GitReviewDeliveryUpdate,
+) -> rusqlite::Result<bool> {
+    let updated = tx.execute(
+        "UPDATE git_review_threads
+         SET target_kind = ?2,
+             target_id = ?3,
+             delivery_state = ?4,
+             delivery_error = ?5,
+             updated_at = ?6
+         WHERE thread_id = ?1",
+        params![
+            thread_id,
+            delivery.target_kind,
+            delivery.target_id,
+            delivery.delivery_state,
+            delivery.delivery_error,
+            delivery.updated_at
+        ],
+    )?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE git_review_comments
+         SET target_kind = ?2,
+             target_id = ?3,
+             delivery_state = ?4,
+             delivery_error = ?5,
+             delivered_at = ?6,
+             updated_at = ?7
+         WHERE thread_id = ?1",
+        params![
+            thread_id,
+            delivery.target_kind,
+            delivery.target_id,
+            delivery.delivery_state,
+            delivery.delivery_error,
+            delivery.delivered_at,
+            delivery.updated_at
+        ],
+    )?;
+    Ok(true)
+}
+
 fn worktree_operation_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<PersistedWorktreeOperation> {
@@ -3360,6 +3727,40 @@ fn git_review_comment_from_row(
     })
 }
 
+fn git_review_delivery_attempt_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedGitReviewDeliveryAttempt> {
+    Ok(PersistedGitReviewDeliveryAttempt {
+        attempt_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        payload_hash: row.get(2)?,
+        target_kind: row.get(3)?,
+        target_id: row.get(4)?,
+        attempt_number: row.get(5)?,
+        state: row.get(6)?,
+        error_message: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        completed_at: row.get(10)?,
+    })
+}
+
+fn verified_agent_hook_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedVerifiedAgentHook> {
+    let sequence: i64 = row.get(3)?;
+    Ok(PersistedVerifiedAgentHook {
+        session_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        source: row.get(2)?,
+        sequence: u64::try_from(sequence).unwrap_or_default(),
+        state: row.get(4)?,
+        reason: row.get(5)?,
+        telemetry_json: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3381,7 +3782,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 13);
+        assert_eq!(store.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -3397,7 +3798,7 @@ mod tests {
         assert!(migration
             .sql
             .contains("CREATE TABLE IF NOT EXISTS git_review_comments"));
-        let removed = MIGRATIONS.last().unwrap();
+        let removed = &MIGRATIONS[12];
         assert_eq!(removed.version, 13);
         assert!(removed.sql.contains("'removed'"));
     }
@@ -3423,7 +3824,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 13);
+        assert_eq!(after, 14);
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -3449,7 +3850,7 @@ mod tests {
             .mark_worktree_operation_removed("op_v12", r#"{"owned":false}"#, "removed")
             .unwrap();
         assert_eq!(removed.state, WorktreeOperationState::Removed);
-        assert_eq!(store.schema_version().unwrap(), 13);
+        assert_eq!(store.schema_version().unwrap(), 14);
     }
 
     #[test]
@@ -3800,6 +4201,243 @@ mod tests {
             .unwrap();
         assert_eq!(thread.delivery_state, "pending");
         assert_eq!(comment.delivery_state, "pending");
+    }
+
+    #[test]
+    fn review_attempt_begin_rolls_back_at_the_comment_side_effect_boundary() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .upsert_git_review_thread(&sample_git_review_thread("thread_attempt", "diff"))
+            .unwrap();
+        store
+            .upsert_git_review_comment(&PersistedGitReviewComment {
+                comment_id: "comment_attempt".to_string(),
+                thread_id: "thread_attempt".to_string(),
+                author_id: "reviewer".to_string(),
+                body: "Atomic attempt".to_string(),
+                target_kind: None,
+                target_id: None,
+                delivery_state: "pending".to_string(),
+                delivery_error: None,
+                delivered_at: None,
+                created_at: "created".to_string(),
+                updated_at: "created".to_string(),
+            })
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_attempt_comment_delivery
+                 BEFORE UPDATE ON git_review_comments
+                 BEGIN SELECT RAISE(FAIL, 'injected attempt boundary failure'); END;",
+            )
+            .unwrap();
+        let attempt = sample_git_review_delivery_attempt("attempt_atomic", "thread_attempt");
+        let update = GitReviewDeliveryUpdate {
+            target_kind: Some("mailbox".to_string()),
+            target_id: Some("session_worker".to_string()),
+            delivery_state: "delivering".to_string(),
+            delivery_error: None,
+            delivered_at: None,
+            updated_at: "updated".to_string(),
+        };
+        assert!(store
+            .begin_git_review_delivery_attempt(&attempt, &update)
+            .is_err());
+        assert!(store
+            .load_latest_git_review_delivery_attempt(
+                "thread_attempt",
+                "payload",
+                "mailbox",
+                "session_worker"
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .load_git_review_thread("thread_attempt")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn review_attempt_confirmation_rolls_back_at_the_comment_side_effect_boundary() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .upsert_git_review_thread(&sample_git_review_thread("thread_confirm", "diff"))
+            .unwrap();
+        store
+            .upsert_git_review_comment(&PersistedGitReviewComment {
+                comment_id: "comment_confirm".to_string(),
+                thread_id: "thread_confirm".to_string(),
+                author_id: "reviewer".to_string(),
+                body: "Atomic confirmation".to_string(),
+                target_kind: None,
+                target_id: None,
+                delivery_state: "pending".to_string(),
+                delivery_error: None,
+                delivered_at: None,
+                created_at: "created".to_string(),
+                updated_at: "created".to_string(),
+            })
+            .unwrap();
+        let attempt = sample_git_review_delivery_attempt("attempt_confirm", "thread_confirm");
+        let delivering = GitReviewDeliveryUpdate {
+            target_kind: Some("mailbox".to_string()),
+            target_id: Some("session_worker".to_string()),
+            delivery_state: "delivering".to_string(),
+            delivery_error: None,
+            delivered_at: None,
+            updated_at: "sending".to_string(),
+        };
+        assert!(store
+            .begin_git_review_delivery_attempt(&attempt, &delivering)
+            .unwrap());
+        assert!(store
+            .update_git_review_delivery_attempt(
+                &attempt.attempt_id,
+                "prepared",
+                "sending",
+                None,
+                None,
+                &delivering,
+            )
+            .unwrap());
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_confirmation_comment_delivery
+                 BEFORE UPDATE ON git_review_comments
+                 BEGIN SELECT RAISE(FAIL, 'injected confirmation boundary failure'); END;",
+            )
+            .unwrap();
+        let confirmed = GitReviewDeliveryUpdate {
+            target_kind: Some("mailbox".to_string()),
+            target_id: Some("session_worker".to_string()),
+            delivery_state: "delivered".to_string(),
+            delivery_error: None,
+            delivered_at: Some("confirmed".to_string()),
+            updated_at: "confirmed".to_string(),
+        };
+        assert!(store
+            .update_git_review_delivery_attempt(
+                &attempt.attempt_id,
+                "sending",
+                "confirmed",
+                None,
+                Some("confirmed"),
+                &confirmed,
+            )
+            .is_err());
+        let persisted = store
+            .load_latest_git_review_delivery_attempt(
+                "thread_confirm",
+                "payload",
+                "mailbox",
+                "session_worker",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, "sending");
+        assert_eq!(
+            store
+                .load_git_review_thread("thread_confirm")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            "delivering"
+        );
+        assert_eq!(
+            store
+                .load_git_review_comment("comment_confirm")
+                .unwrap()
+                .unwrap()
+                .delivery_state,
+            "delivering"
+        );
+    }
+
+    #[test]
+    fn deterministic_mailbox_delivery_rolls_back_when_notification_insert_fails() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_review_notification
+                 BEFORE INSERT ON notifications
+                 BEGIN SELECT RAISE(FAIL, 'injected notification failure'); END;",
+            )
+            .unwrap();
+        let message = PersistedTeamMessage {
+            message_id: "msg_attempt".to_string(),
+            workspace_id: "ws".to_string(),
+            thread_id: Some("thread".to_string()),
+            from_session_id: None,
+            to_session_id: Some("session".to_string()),
+            body: "review".to_string(),
+            kind: "git_review".to_string(),
+            created_at: "created".to_string(),
+            read_at: None,
+        };
+        let notification = PersistedNotification {
+            notification_id: "not_attempt".to_string(),
+            notification_type: "team.message".to_string(),
+            severity: "info".to_string(),
+            workspace_id: Some("ws".to_string()),
+            session_id: Some("session".to_string()),
+            title: "Agent message".to_string(),
+            message: "review".to_string(),
+            created_at: "created".to_string(),
+            dismissed: false,
+        };
+        assert!(store
+            .upsert_team_message_and_notification(&message, &notification)
+            .is_err());
+        assert!(store.load_team_message("msg_attempt").unwrap().is_none());
+    }
+
+    #[test]
+    fn verified_hook_sequence_survives_store_reopen() {
+        let path = unique_temp_db_path("verified_hook_sequence_survives_store_reopen");
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store
+                .upsert_verified_agent_hook(&PersistedVerifiedAgentHook {
+                    session_id: "session_hook".to_string(),
+                    workspace_id: "workspace_hook".to_string(),
+                    source: "claude_hook".to_string(),
+                    sequence: 42,
+                    state: "running".to_string(),
+                    reason: Some("PreToolUse".to_string()),
+                    telemetry_json: Some(r#"{"model":"claude"}"#.to_string()),
+                    updated_at: "updated".to_string(),
+                })
+                .unwrap();
+        }
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        let hook = reopened
+            .load_verified_agent_hook("session_hook")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hook.sequence, 42);
+        assert_eq!(hook.state, "running");
+        assert!(reopened.delete_verified_agent_hook("session_hook").unwrap());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn five_track_recovery_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[13].version, 14);
+        assert!(MIGRATIONS[13]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS git_review_delivery_attempts"));
+        assert!(MIGRATIONS[13]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS verified_agent_hooks"));
     }
 
     #[test]
@@ -4434,6 +5072,25 @@ mod tests {
             delivery_error: None,
             created_at: "2026-07-23T00:00:00Z".to_string(),
             updated_at: "2026-07-23T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_git_review_delivery_attempt(
+        attempt_id: &str,
+        thread_id: &str,
+    ) -> PersistedGitReviewDeliveryAttempt {
+        PersistedGitReviewDeliveryAttempt {
+            attempt_id: attempt_id.to_string(),
+            thread_id: thread_id.to_string(),
+            payload_hash: "payload".to_string(),
+            target_kind: "mailbox".to_string(),
+            target_id: "session_worker".to_string(),
+            attempt_number: 1,
+            state: "prepared".to_string(),
+            error_message: None,
+            created_at: "created".to_string(),
+            updated_at: "created".to_string(),
+            completed_at: None,
         }
     }
 

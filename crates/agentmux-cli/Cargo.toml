@@ -13,6 +13,7 @@ agentmux-backend-conpty = { path = "../agentmux-backend-conpty" }
 agentmux-backend-wsl = { path = "../agentmux-backend-wsl" }
 agentmux-core = { path = "../agentmux-core" }
 agentmux-ipc = { path = "../agentmux-ipc" }
+agentmux-vcs = { path = "../agentmux-vcs" }
 serde = "1"
 serde_json = "1"
 tungstenite = "0.24"

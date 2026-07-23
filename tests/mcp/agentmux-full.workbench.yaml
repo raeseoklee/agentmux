@@ -58,6 +58,12 @@ tests:
         value: git_commit
       - kind: contains
         path: $.tools[*].name
+        value: git_stage_all
+      - kind: contains
+        path: $.tools[*].name
+        value: git_discard
+      - kind: contains
+        path: $.tools[*].name
         value: agent_worktree_remove
       - kind: contains
         path: $.tools[*].name

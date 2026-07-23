@@ -1095,6 +1095,7 @@ export interface ControlClient {
     options?: {
       repositoryId?: string | null;
       state?: "staged" | "unstaged" | "untracked" | "conflicted" | string | null;
+      query?: string | null;
       cursor?: string | null;
       limit?: number;
       generation?: number | null;
@@ -1250,6 +1251,7 @@ interface AgentmuxServerBootstrap {
   baseUrl?: string;
   mode?: string;
   token?: string | null;
+  capabilities?: ServerCapabilitiesWire;
   defaults?: {
     workspace_id?: string | null;
     backend?: string | null;
@@ -2717,6 +2719,7 @@ class TauriControlClient implements ControlClient {
     options: {
       repositoryId?: string | null;
       state?: string | null;
+      query?: string | null;
       cursor?: string | null;
       limit?: number;
       generation?: number | null;
@@ -2727,6 +2730,7 @@ class TauriControlClient implements ControlClient {
       workspace_id: workspaceId,
       repository_id: options.repositoryId ?? null,
       state: options.state ?? null,
+      query: options.query ?? null,
       cursor: options.cursor ?? null,
       limit: options.limit ?? null,
       generation: options.generation ?? null,
@@ -2916,6 +2920,13 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly sidebarStates = new Map<string, SidebarState>();
   private readonly gitStatuses = new Map<string, GitStatus>();
   private readonly gitReviewThreads = new Map<string, GitReviewThread>();
+  private heldGitReviewCreate: { wait: Promise<void>; release: () => void } | null = null;
+  private heldGitReviewList: {
+    wait: Promise<void>;
+    release: () => void;
+    reject: (reason: Error) => void;
+  } | null = null;
+  private gitReviewListRequestCount = 0;
   private readonly agentWorktrees = new Map<string, AgentWorktreeOperation>();
   private gitReviewCounter = 0;
   private gitReviewCommentCounter = 0;
@@ -2927,7 +2938,7 @@ class BrowserPreviewControlClient implements ControlClient {
     string,
     Array<{ columns: number; rows: number }>
   >();
-  private readonly gitRequestLog: Array<{ operation: string; paneId: string | null }> = [];
+  private readonly gitRequestLog: Array<{ operation: string; paneId: string | null; query: string | null }> = [];
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
   private readonly browserActionLog: string[] = [];
@@ -3000,6 +3011,13 @@ class BrowserPreviewControlClient implements ControlClient {
         return id ? [...(this.terminalResizeLog.get(id) ?? [])] : [];
       },
       gitRequests: () => [...this.gitRequestLog],
+      setGitStatusFileCount: (count) => this.setPreviewGitStatusFileCount(count),
+      holdGitReviewCreate: () => this.holdGitReviewCreate(),
+      releaseGitReviewCreate: () => this.releaseGitReviewCreate(),
+      holdGitReviewList: () => this.holdGitReviewList(),
+      releaseGitReviewList: () => this.releaseGitReviewList(),
+      failGitReviewList: () => this.failGitReviewList(),
+      gitReviewListRequests: () => this.gitReviewListRequestCount,
     };
     window.__AGENTMUX_PREVIEW__ = previewApi;
     if (window.__AGENTMUX_PREVIEW_SEED_WORKSPACE__ === true) {
@@ -4363,7 +4381,7 @@ class BrowserPreviewControlClient implements ControlClient {
     _repositoryId?: string | null,
     _paneId?: string | null,
   ): Promise<GitStatusSummary> {
-    this.gitRequestLog.push({ operation: "summary", paneId: _paneId ?? null });
+    this.gitRequestLog.push({ operation: "summary", paneId: _paneId ?? null, query: null });
     const status = await this.getGitStatus(workspaceId);
     const files = status.files;
     return {
@@ -4389,13 +4407,14 @@ class BrowserPreviewControlClient implements ControlClient {
     options: {
       repositoryId?: string | null;
       state?: string | null;
+      query?: string | null;
       cursor?: string | null;
       limit?: number;
       generation?: number | null;
       paneId?: string | null;
     } = {},
   ): Promise<GitStatusPage> {
-    this.gitRequestLog.push({ operation: "page", paneId: options.paneId ?? null });
+    this.gitRequestLog.push({ operation: "page", paneId: options.paneId ?? null, query: options.query?.trim() || null });
     const [status, summary] = await Promise.all([
       this.getGitStatus(workspaceId),
       this.getGitStatusSummary(workspaceId, options.repositoryId, options.paneId),
@@ -4409,9 +4428,13 @@ class BrowserPreviewControlClient implements ControlClient {
         default: return true;
       }
     });
+    const query = options.query?.trim().toLocaleLowerCase() ?? "";
+    const queried = query
+      ? filtered.filter((change) => `${change.path} ${change.originalPath ?? ""}`.toLocaleLowerCase().includes(query))
+      : filtered;
     const offset = Math.max(0, Number.parseInt(options.cursor ?? "0", 10) || 0);
     const limit = Math.max(1, Math.min(500, options.limit ?? 200));
-    const page = filtered.slice(offset, offset + limit);
+    const page = queried.slice(offset, offset + limit);
     const nextOffset = offset + page.length;
     return {
       workspaceId,
@@ -4430,8 +4453,8 @@ class BrowserPreviewControlClient implements ControlClient {
         additions: null,
         deletions: null,
       })),
-      nextCursor: nextOffset < filtered.length ? String(nextOffset) : null,
-      totalCount: filtered.length,
+      nextCursor: nextOffset < queried.length ? String(nextOffset) : null,
+      totalCount: queried.length,
     };
   }
 
@@ -4819,6 +4842,63 @@ class BrowserPreviewControlClient implements ControlClient {
     }
   }
 
+  private setPreviewGitStatusFileCount(count: number): void {
+    const workspaceId = this.workspaces[0]?.workspaceId;
+    if (!workspaceId) return;
+    const status = this.gitStatuses.get(workspaceId);
+    if (!status) return;
+    const normalized = Math.max(0, Math.min(20_000, Math.floor(count)));
+    status.files = Array.from({ length: normalized }, (_, index) => {
+      const remainder = index % 5;
+      return {
+        path: `generated/${remainder === 1 ? "staged" : remainder === 2 ? "untracked" : "working"}/file-${index.toString().padStart(5, "0")}.ts`,
+        originalPath: remainder === 4 ? `generated/renamed/from-${index.toString().padStart(5, "0")}.ts` : null,
+        indexStatus: remainder === 1 || remainder === 4 ? "M" : remainder === 2 ? "?" : ".",
+        worktreeStatus: remainder === 0 || remainder === 3 ? "M" : remainder === 2 ? "?" : ".",
+        staged: remainder === 1 || remainder === 4,
+        unstaged: remainder === 0 || remainder === 2 || remainder === 3,
+        untracked: remainder === 2,
+        conflict: false,
+      };
+    });
+  }
+
+  private holdGitReviewCreate(): void {
+    if (this.heldGitReviewCreate) return;
+    let release: () => void = () => {};
+    const wait = new Promise<void>((resolve) => { release = () => resolve(); });
+    this.heldGitReviewCreate = { wait, release };
+  }
+
+  private releaseGitReviewCreate(): void {
+    const held = this.heldGitReviewCreate;
+    this.heldGitReviewCreate = null;
+    held?.release();
+  }
+
+  private holdGitReviewList(): void {
+    if (this.heldGitReviewList) return;
+    let release: () => void = () => {};
+    let reject: (reason: Error) => void = () => {};
+    const wait = new Promise<void>((resolve, rejectWait) => {
+      release = () => resolve();
+      reject = rejectWait;
+    });
+    this.heldGitReviewList = { wait, release, reject };
+  }
+
+  private releaseGitReviewList(): void {
+    const held = this.heldGitReviewList;
+    this.heldGitReviewList = null;
+    held?.release();
+  }
+
+  private failGitReviewList(): void {
+    const held = this.heldGitReviewList;
+    this.heldGitReviewList = null;
+    held?.reject(new ControlClientError("Synthetic stale review-list failure.", "backend_degraded"));
+  }
+
   async getGitStatus(workspaceId: string): Promise<GitStatus> {
     const workspace = this.findWorkspace(workspaceId);
     return cloneGitStatus(
@@ -4961,9 +5041,20 @@ class BrowserPreviewControlClient implements ControlClient {
   async unstageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.unstageGitFiles(workspaceId, [], options); }
 
   async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
+    this.gitReviewListRequestCount += 1;
+    const held = this.heldGitReviewList;
+    if (held) {
+      this.heldGitReviewList = null;
+      await held.wait;
+    }
     return [...this.gitReviewThreads.values()].filter((thread) => thread.workspaceId === workspaceId).filter((thread) => !options.repositoryId || thread.repositoryId === options.repositoryId).filter((thread) => !options.path || thread.anchor.path === options.path).filter((thread) => options.includeResolved || !thread.resolved).filter((thread) => options.includeStale || !thread.stale).slice(0, options.limit ?? 500).map(cloneGitReviewThread);
   }
   async createGitReviewThread(input: { workspaceId: string; repositoryId?: string | null; anchor: GitReviewLineAnchor; body: string; authorSessionId?: string | null }): Promise<GitReviewThread> {
+    const held = this.heldGitReviewCreate;
+    if (held) {
+      this.heldGitReviewCreate = null;
+      await held.wait;
+    }
     const now = new Date().toISOString(); const threadId = `review_preview_${++this.gitReviewCounter}`;
     const comment: GitReviewComment = { commentId: `review_comment_preview_${++this.gitReviewCommentCounter}`, threadId, body: input.body.trim(), authorSessionId: input.authorSessionId ?? null, createdAt: now, updatedAt: now };
     const thread: GitReviewThread = { threadId, workspaceId: input.workspaceId, repositoryId: input.repositoryId ?? `preview_repo_${input.workspaceId}`, anchor: { ...input.anchor }, resolved: false, stale: false, staleReason: null, createdAt: now, updatedAt: now, comments: [comment] };
@@ -5790,8 +5881,14 @@ interface ServerApiEnvelope<T> {
   error?: string;
 }
 
+interface ServerCapabilitiesWire {
+  source_control?: boolean;
+  control_methods?: string[];
+}
+
 interface ServerStateResult {
   mode: string;
+  capabilities?: ServerCapabilitiesWire;
   control_pipe?: string | null;
   default_workspace_id?: string | null;
   workspaces: WorkspaceSummaryWire[];
@@ -5800,7 +5897,7 @@ interface ServerStateResult {
 }
 
 class ServerControlClient extends BrowserPreviewControlClient {
-  override readonly supportsSourceControl: boolean;
+  override supportsSourceControl: boolean;
   private readonly serverBaseUrl: string;
   private readonly serverToken: string | null;
   private readonly serverDefaults: NonNullable<AgentmuxServerBootstrap["defaults"]>;
@@ -5817,7 +5914,10 @@ class ServerControlClient extends BrowserPreviewControlClient {
     this.serverBaseUrl = (bootstrap.baseUrl ?? "").replace(/\/+$/, "");
     this.serverToken = bootstrap.token?.trim() || null;
     this.serverDefaults = bootstrap.defaults ?? {};
-    this.supportsSourceControl = bootstrap.mode === "desktop-bridge";
+    this.supportsSourceControl = serverSupportsSourceControl(
+      bootstrap.capabilities,
+      bootstrap.mode,
+    );
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -6458,8 +6558,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return mapGitStatusSummary(await this.serverControl<GitStatusSummaryWire>("git.status_summary", { workspace_id: workspaceId, repository_id: repositoryId ?? null, pane_id: paneId ?? null }));
   }
 
-  async getGitStatusPage(workspaceId: string, options: { repositoryId?: string | null; state?: string | null; cursor?: string | null; limit?: number; generation?: number | null; paneId?: string | null } = {}): Promise<GitStatusPage> {
-    return mapGitStatusPage(await this.serverControl<GitStatusPageWire>("git.status_page", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, state: options.state ?? null, cursor: options.cursor ?? null, limit: options.limit ?? null, generation: options.generation ?? null, pane_id: options.paneId ?? null }));
+  async getGitStatusPage(workspaceId: string, options: { repositoryId?: string | null; state?: string | null; query?: string | null; cursor?: string | null; limit?: number; generation?: number | null; paneId?: string | null } = {}): Promise<GitStatusPage> {
+    return mapGitStatusPage(await this.serverControl<GitStatusPageWire>("git.status_page", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, state: options.state ?? null, query: options.query ?? null, cursor: options.cursor ?? null, limit: options.limit ?? null, generation: options.generation ?? null, pane_id: options.paneId ?? null }));
   }
 
   async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null; paneId?: string | null } = {}): Promise<GitPagedDiff> {
@@ -6471,6 +6571,16 @@ class ServerControlClient extends BrowserPreviewControlClient {
   async discardGitFiles(workspaceId: string, paths: string[], options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.discard", { workspace_id: workspaceId, paths, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
   async stageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.stage_all", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
   async unstageAllGitFiles(workspaceId: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<void> { await this.serverControl("git.unstage_all", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, pane_id: options.paneId ?? null }); }
+
+  async commitGitChanges(workspaceId: string, message: string, options: { repositoryId?: string | null; paneId?: string | null } = {}): Promise<GitCommitResult> {
+    const result = await this.serverControl<GitCommitResultWire | GitMutationResultWire>("git.commit", {
+      workspace_id: workspaceId,
+      repository_id: options.repositoryId ?? null,
+      pane_id: options.paneId ?? null,
+      message,
+    });
+    return mapServerGitCommitResult(result, message);
+  }
 
   async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
     const result = await this.serverControl<GitReviewThreadListWire>("git.review_thread.list", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path: options.path ?? null, include_resolved: options.includeResolved ?? false, include_stale: options.includeStale ?? false, limit: options.limit ?? null });
@@ -6512,6 +6622,10 @@ class ServerControlClient extends BrowserPreviewControlClient {
 
   private async hydrateServerState(): Promise<ServerStateResult> {
     const state = await this.serverApi<ServerStateResult>("/api/state");
+    this.supportsSourceControl = serverSupportsSourceControl(
+      state.capabilities,
+      state.mode,
+    );
     for (const wire of state.workspaces ?? []) {
       this.ensureServerWorkspace(mapWorkspace(wire));
     }
@@ -6869,7 +6983,41 @@ interface BrowserPreviewApi {
   browserDialog(detail?: SyntheticBrowserDialogDetail): string | null;
   terminalOutput(sessionId?: string): string | null;
   terminalResizes(sessionId?: string): Array<{ columns: number; rows: number }>;
-  gitRequests(): Array<{ operation: string; paneId: string | null }>;
+  gitRequests(): Array<{ operation: string; paneId: string | null; query: string | null }>;
+  setGitStatusFileCount(count: number): void;
+  holdGitReviewCreate(): void;
+  releaseGitReviewCreate(): void;
+  holdGitReviewList(): void;
+  releaseGitReviewList(): void;
+  failGitReviewList(): void;
+  gitReviewListRequests(): number;
+}
+
+export function serverSupportsSourceControl(
+  capabilities: ServerCapabilitiesWire | undefined,
+  mode?: string,
+): boolean {
+  if (typeof capabilities?.source_control === "boolean") {
+    return capabilities.source_control;
+  }
+  return mode === "desktop-bridge";
+}
+
+export function mapServerGitCommitResult(
+  result: GitCommitResultWire | GitMutationResultWire,
+  message: string,
+): GitCommitResult {
+  const commit = "commit" in result ? result.commit : result.commit_oid;
+  if (!commit) {
+    throw new ControlClientError(
+      "The server did not return the created commit.",
+      "backend_degraded",
+    );
+  }
+  return {
+    commit,
+    summary: "summary" in result ? result.summary : message.trim(),
+  };
 }
 
 interface WorkspaceSummaryWire {
@@ -7088,6 +7236,10 @@ interface GitDiffWire {
 interface GitCommitResultWire {
   commit: string;
   summary: string;
+}
+
+interface GitMutationResultWire {
+  commit_oid?: string | null;
 }
 
 interface GitChangeSummaryWire {

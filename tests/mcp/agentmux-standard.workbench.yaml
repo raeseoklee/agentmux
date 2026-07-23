@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 50
+        equals: 54
       - kind: contains
         path: $.tools[*].name
         value: terminal_open
@@ -44,6 +44,18 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: git_review_thread_create
+      - kind: contains
+        path: $.tools[*].name
+        value: git_stage
+      - kind: contains
+        path: $.tools[*].name
+        value: git_unstage
+      - kind: contains
+        path: $.tools[*].name
+        value: git_commit
+      - kind: contains
+        path: $.tools[*].name
+        value: git_review_thread_deliver
       - kind: contains
         path: $.tools[*].name
         value: development_server_candidate_open_in_split
@@ -80,11 +92,11 @@ tests:
       - kind: contains
         path: $.structuredContent.error.message
         value: requires the 'full' MCP profile
-  - id: standard-profile-denies-git-commit
-    description: Committing repository changes is intentionally reserved for the full profile
+  - id: standard-profile-denies-broad-git-mutation
+    description: Broad repository mutations remain reserved for the full profile
     act:
       method: tools/call
-      tool: git_commit
+      tool: git_stage_all
       args: {}
     assert:
       - kind: status

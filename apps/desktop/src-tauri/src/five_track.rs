@@ -1,6 +1,6 @@
 use super::*;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
@@ -29,7 +29,7 @@ use agentmux_ipc::{
     GitReviewThreadDeliverParams, GitReviewThreadIdParams, GitReviewThreadListParams,
     GitReviewThreadListResult, GitReviewThreadMarkStaleParams, GitReviewThreadResult,
     GitReviewThreadUpdateParams, GitStatusPageParams, GitStatusPageResult, GitStatusSummaryResult,
-    TeamMessageSendParams, EVENT_AGENT_HOOK_STATE_CHANGED, EVENT_DEV_SERVER_CANDIDATE_DETECTED,
+    EVENT_AGENT_HOOK_STATE_CHANGED, EVENT_DEV_SERVER_CANDIDATE_DETECTED,
     EVENT_GIT_REPOSITORY_CHANGED, METHOD_AGENT_HOOK_STATE, METHOD_AGENT_WORKTREE_CREATE,
     METHOD_AGENT_WORKTREE_LIST, METHOD_AGENT_WORKTREE_RECOVER, METHOD_AGENT_WORKTREE_REMOVE,
     METHOD_DEV_SERVER_CANDIDATE_DETECTED, METHOD_DEV_SERVER_CANDIDATE_DISMISS,
@@ -43,8 +43,9 @@ use agentmux_ipc::{
     METHOD_GIT_STATUS_PAGE, METHOD_GIT_STATUS_SUMMARY, METHOD_GIT_UNSTAGE, METHOD_GIT_UNSTAGE_ALL,
 };
 use agentmux_store::{
-    GitReviewDeliveryUpdate, PersistedGitReviewComment, PersistedGitReviewThread,
-    PersistedNotification, PersistedWorktreeOperation, WorktreeOperationState,
+    GitReviewDeliveryUpdate, PersistedGitReviewComment, PersistedGitReviewDeliveryAttempt,
+    PersistedGitReviewThread, PersistedNotification, PersistedTeamMessage,
+    PersistedVerifiedAgentHook, PersistedWorktreeOperation, WorktreeOperationState,
 };
 use agentmux_vcs::{
     DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost as VcsGitHost, Repository,
@@ -61,6 +62,7 @@ const MAX_OBSERVED_REPOSITORIES: usize = 64;
 const MAX_MUTATION_IDEMPOTENCY_RESULTS: usize = 512;
 const MAX_DEV_SERVER_CANDIDATES: usize = 500;
 const MAX_DEV_SERVER_CANDIDATES_PER_SESSION: usize = 32;
+const MAX_STATUS_QUERY_INDEXES: usize = 16;
 
 pub(super) struct FiveTrackState {
     shared: Arc<FiveTrackShared>,
@@ -73,6 +75,7 @@ struct FiveTrackShared {
     mutation_results: Mutex<MutationResultCache>,
     monitor_started: AtomicBool,
     worktree_saga_guard: Mutex<()>,
+    review_delivery_guard: Mutex<()>,
     hook_normalizer: Mutex<AgentHookNormalizer>,
     verified_hooks: Mutex<HashMap<String, VerifiedHookRecord>>,
     url_detectors: Mutex<HashMap<String, PtyUrlDetector>>,
@@ -87,51 +90,110 @@ struct CachedStatusSnapshot {
     captured_at: Instant,
 }
 
+type GitStatusQueryCache = Arc<Mutex<VecDeque<(GitStatusPageFilter, Arc<Vec<usize>>)>>>;
+
 #[derive(Clone, Debug)]
 struct GitStatusPageIndexes {
-    all: Vec<usize>,
-    staged: Vec<usize>,
-    unstaged: Vec<usize>,
-    untracked: Vec<usize>,
-    conflicted: Vec<usize>,
+    all: Arc<Vec<usize>>,
+    staged: Arc<Vec<usize>>,
+    unstaged: Arc<Vec<usize>>,
+    untracked: Arc<Vec<usize>>,
+    conflicted: Arc<Vec<usize>>,
+    query_cache: GitStatusQueryCache,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GitStatusPageFilter {
+    state: String,
+    query: String,
+}
+
+impl GitStatusPageFilter {
+    fn from_request(state: Option<&str>, query: Option<&str>) -> Self {
+        Self {
+            state: state
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("all")
+                .to_ascii_lowercase(),
+            query: query
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_lowercase)
+                .unwrap_or_default(),
+        }
+    }
 }
 
 impl GitStatusPageIndexes {
     fn from_snapshot(snapshot: &StatusSnapshot) -> Self {
-        let mut indexes = Self {
-            all: Vec::with_capacity(snapshot.files.len()),
-            staged: Vec::with_capacity(snapshot.summary.staged_count),
-            unstaged: Vec::with_capacity(snapshot.summary.unstaged_count),
-            untracked: Vec::with_capacity(snapshot.summary.untracked_count),
-            conflicted: Vec::with_capacity(snapshot.summary.conflict_count),
-        };
+        let mut all = Vec::with_capacity(snapshot.files.len());
+        let mut staged = Vec::with_capacity(snapshot.summary.staged_count);
+        let mut unstaged = Vec::with_capacity(snapshot.summary.unstaged_count);
+        let mut untracked = Vec::with_capacity(snapshot.summary.untracked_count);
+        let mut conflicted = Vec::with_capacity(snapshot.summary.conflict_count);
         for (index, change) in snapshot.files.iter().enumerate() {
-            indexes.all.push(index);
+            all.push(index);
             if change.staged {
-                indexes.staged.push(index);
+                staged.push(index);
             }
             if change.unstaged {
-                indexes.unstaged.push(index);
+                unstaged.push(index);
             }
             if change.untracked {
-                indexes.untracked.push(index);
+                untracked.push(index);
             }
             if change.conflict {
-                indexes.conflicted.push(index);
+                conflicted.push(index);
             }
         }
-        indexes
+        Self {
+            all: Arc::new(all),
+            staged: Arc::new(staged),
+            unstaged: Arc::new(unstaged),
+            untracked: Arc::new(untracked),
+            conflicted: Arc::new(conflicted),
+            query_cache: Arc::new(Mutex::new(VecDeque::new())),
+        }
     }
 
-    fn for_state(&self, state: Option<&str>) -> &[usize] {
-        match state.map(str::trim).filter(|state| !state.is_empty()) {
-            None | Some("all") => &self.all,
-            Some("staged") => &self.staged,
-            Some("unstaged") => &self.unstaged,
-            Some("untracked") => &self.untracked,
-            Some("conflicted" | "conflict") => &self.conflicted,
-            Some(_) => &[],
+    fn for_filter(
+        &self,
+        snapshot: &StatusSnapshot,
+        filter: &GitStatusPageFilter,
+    ) -> Arc<Vec<usize>> {
+        let base = match filter.state.as_str() {
+            "all" => self.all.clone(),
+            "staged" => self.staged.clone(),
+            "unstaged" => self.unstaged.clone(),
+            "untracked" => self.untracked.clone(),
+            "conflicted" | "conflict" => self.conflicted.clone(),
+            _ => Arc::new(Vec::new()),
+        };
+        if filter.query.is_empty() {
+            return base;
         }
+        if let Ok(cache) = self.query_cache.lock() {
+            if let Some((_, indexes)) = cache.iter().find(|(key, _)| key == filter) {
+                return indexes.clone();
+            }
+        }
+        let indexes: Arc<Vec<usize>> = Arc::new(
+            base.iter()
+                .copied()
+                .filter(|index| status_change_matches_query(&snapshot.files[*index], &filter.query))
+                .collect(),
+        );
+        if let Ok(mut cache) = self.query_cache.lock() {
+            if let Some((_, cached)) = cache.iter().find(|(key, _)| key == filter) {
+                return cached.clone();
+            }
+            if cache.len() >= MAX_STATUS_QUERY_INDEXES {
+                cache.pop_front();
+            }
+            cache.push_back((filter.clone(), indexes.clone()));
+        }
+        indexes
     }
 }
 
@@ -209,7 +271,9 @@ struct MutationResultCache {
 
 #[derive(Clone)]
 struct VerifiedHookRecord {
+    workspace_id: String,
     session_id: String,
+    source: String,
     sequence: u64,
     state: String,
     reason: Option<String>,
@@ -226,6 +290,7 @@ impl FiveTrackState {
                 mutation_results: Mutex::new(MutationResultCache::default()),
                 monitor_started: AtomicBool::new(false),
                 worktree_saga_guard: Mutex::new(()),
+                review_delivery_guard: Mutex::new(()),
                 hook_normalizer: Mutex::new(AgentHookNormalizer::new(
                     AgentHookNormalizerConfig::default(),
                 )),
@@ -379,6 +444,7 @@ fn vcs_error(error: GitError) -> DesktopHostError {
         | GitError::InvalidWorktreeDestination(_)
         | GitError::InvalidWorktreeRequest(_)
         | GitError::InvalidStatusPage(_)
+        | GitError::StatusEntryLimit { .. }
         | GitError::NotRepository => ErrorCode::InvalidRequest,
         GitError::Timeout { .. }
         | GitError::OutputLimit { .. }
@@ -615,8 +681,14 @@ impl DesktopControlState {
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
         validate_generation(params.generation, cached.snapshot.summary.generation)?;
 
-        let filtered = cached.page_indexes.for_state(params.state.as_deref());
-        let offset = parse_git_cursor(params.cursor.as_deref())?;
+        let filter =
+            GitStatusPageFilter::from_request(params.state.as_deref(), params.query.as_deref());
+        let filtered = cached.page_indexes.for_filter(&cached.snapshot, &filter);
+        let offset = parse_git_cursor(
+            params.cursor.as_deref(),
+            cached.snapshot.summary.generation,
+            &filter,
+        )?;
         if offset > filtered.len() {
             return Err(control_invalid_request(format!(
                 "Git status cursor {offset} exceeds {} changes.",
@@ -652,7 +724,8 @@ impl DesktopControlState {
                     refreshed_at: timestamp(),
                 }),
                 changes,
-                next_cursor: (end < filtered.len()).then(|| end.to_string()),
+                next_cursor: (end < filtered.len())
+                    .then(|| format_git_cursor(cached.snapshot.summary.generation, &filter, end)),
                 total_count: Some(filtered.len()),
             },
         ))
@@ -1115,17 +1188,54 @@ fn validate_generation(requested: Option<u64>, actual: u64) -> Result<(), Deskto
     Ok(())
 }
 
-fn parse_git_cursor(cursor: Option<&str>) -> Result<usize, DesktopHostError> {
-    cursor
-        .map(str::trim)
-        .filter(|cursor| !cursor.is_empty())
-        .map(|cursor| {
-            cursor
-                .parse::<usize>()
-                .map_err(|_| control_invalid_request("Git status cursor is invalid."))
-        })
-        .transpose()
-        .map(|cursor| cursor.unwrap_or(0))
+fn status_change_matches_query(change: &GitFileChange, query: &str) -> bool {
+    change.path.to_lowercase().contains(query)
+        || change
+            .original_path
+            .as_deref()
+            .is_some_and(|path| path.to_lowercase().contains(query))
+}
+
+fn git_cursor_fingerprint(generation: u64, filter: &GitStatusPageFilter) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    generation.hash(&mut hasher);
+    filter.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn format_git_cursor(generation: u64, filter: &GitStatusPageFilter, offset: usize) -> String {
+    format!(
+        "v1:{generation}:{:016x}:{offset}",
+        git_cursor_fingerprint(generation, filter)
+    )
+}
+
+fn parse_git_cursor(
+    cursor: Option<&str>,
+    generation: u64,
+    filter: &GitStatusPageFilter,
+) -> Result<usize, DesktopHostError> {
+    let Some(cursor) = cursor.map(str::trim).filter(|cursor| !cursor.is_empty()) else {
+        return Ok(0);
+    };
+    let mut fields = cursor.split(':');
+    let version = fields.next();
+    let cursor_generation = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let fingerprint = fields
+        .next()
+        .and_then(|value| u64::from_str_radix(value, 16).ok());
+    let offset = fields.next().and_then(|value| value.parse::<usize>().ok());
+    if version != Some("v1")
+        || fields.next().is_some()
+        || cursor_generation != Some(generation)
+        || fingerprint != Some(git_cursor_fingerprint(generation, filter))
+    {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::Conflict,
+            "Git status cursor belongs to a different generation, state, or query; refresh and retry.",
+        )));
+    }
+    offset.ok_or_else(|| control_invalid_request("Git status cursor is invalid."))
 }
 
 fn git_change_result(change: &GitFileChange) -> GitChangeSummaryResult {
@@ -1594,6 +1704,8 @@ fn start_repository_native_watchers(
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 struct WorktreeOwnership {
+    #[serde(default)]
+    journal_version: u8,
     source_workspace_id: String,
     repository_host: String,
     #[serde(default)]
@@ -1601,11 +1713,60 @@ struct WorktreeOwnership {
     #[serde(default)]
     worktree_owned: bool,
     #[serde(default)]
+    worktree_preexisting: Option<bool>,
+    #[serde(default)]
+    worktree_create_started: bool,
+    #[serde(default)]
+    worktree_create_succeeded: bool,
+    #[serde(default)]
+    ownership_uncertain: bool,
+    #[serde(default)]
+    branch_preexisting: Option<bool>,
+    #[serde(default)]
+    branch_owned: bool,
+    #[serde(default)]
+    created_branch_head: Option<String>,
+    #[serde(default)]
     workspace_owned: bool,
     #[serde(default)]
     session_owned: bool,
     #[serde(default)]
     pane_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedWorktreeRecovery {
+    Create,
+    ContinueOwned,
+    RejectPreexisting,
+    RejectUncertain,
+}
+
+fn prepared_worktree_recovery(
+    ownership: &WorktreeOwnership,
+    destination_registered: bool,
+) -> PreparedWorktreeRecovery {
+    if !destination_registered {
+        return if ownership.worktree_create_succeeded || ownership.worktree_owned {
+            PreparedWorktreeRecovery::RejectUncertain
+        } else {
+            PreparedWorktreeRecovery::Create
+        };
+    }
+    if ownership.journal_version >= 2
+        && ownership.worktree_create_succeeded
+        && ownership.worktree_owned
+        && !ownership.ownership_uncertain
+    {
+        return PreparedWorktreeRecovery::ContinueOwned;
+    }
+    if ownership.journal_version >= 2
+        && !ownership.worktree_create_started
+        && ownership.worktree_preexisting != Some(false)
+    {
+        return PreparedWorktreeRecovery::RejectPreexisting;
+    }
+    PreparedWorktreeRecovery::RejectUncertain
 }
 
 impl DesktopControlState {
@@ -1637,6 +1798,13 @@ impl DesktopControlState {
             let existing = if existing.state == WorktreeOperationState::Removed {
                 let mut ownership = worktree_ownership(&existing)?;
                 ownership.worktree_owned = false;
+                ownership.worktree_preexisting = None;
+                ownership.worktree_create_started = false;
+                ownership.worktree_create_succeeded = false;
+                ownership.ownership_uncertain = false;
+                ownership.branch_preexisting = None;
+                ownership.branch_owned = false;
+                ownership.created_branch_head = None;
                 ownership.workspace_owned = false;
                 ownership.session_owned = false;
                 ownership.pane_id = None;
@@ -1687,6 +1855,7 @@ impl DesktopControlState {
             .verify_worktree_destination(&repository, &allowed_root, &params.destination)
             .map_err(vcs_error)?;
         let ownership = WorktreeOwnership {
+            journal_version: 2,
             source_workspace_id: params.workspace_id.clone(),
             repository_host: match repository.host() {
                 VcsGitHost::Native => "native".to_string(),
@@ -1845,6 +2014,13 @@ impl DesktopControlState {
         self.rollback_worktree_resources(&operation, params.force, false)?;
         let mut ownership = worktree_ownership(&operation)?;
         ownership.worktree_owned = false;
+        ownership.worktree_preexisting = None;
+        ownership.worktree_create_started = false;
+        ownership.worktree_create_succeeded = false;
+        ownership.ownership_uncertain = false;
+        ownership.branch_preexisting = None;
+        ownership.branch_owned = false;
+        ownership.created_branch_head = None;
         ownership.workspace_owned = false;
         ownership.session_owned = false;
         ownership.pane_id = None;
@@ -1917,33 +2093,89 @@ impl DesktopControlState {
                             &operation.worktree_path,
                         )
                     });
-                operation = self.update_worktree_ownership(&operation, |ownership| {
-                    ownership.worktree_owned = true;
-                })?;
-                if existing.is_none() {
-                    let allowed_root = worktree_allowed_root(repository.root())?;
-                    let destination = self
-                        .five_track
-                        .shared
-                        .git
-                        .verify_worktree_destination(
-                            &repository,
-                            &allowed_root,
-                            &operation.worktree_path,
-                        )
-                        .map_err(vcs_error)?;
-                    self.five_track
-                        .shared
-                        .git
-                        .create_worktree(
-                            &repository,
-                            &destination,
-                            &params.branch,
-                            params.base_revision.as_deref(),
-                            params.create_branch,
-                        )
-                        .map_err(vcs_error)?;
-                } else if existing
+                let ownership = worktree_ownership(&operation)?;
+                match prepared_worktree_recovery(&ownership, existing.is_some()) {
+                    PreparedWorktreeRecovery::ContinueOwned => {}
+                    PreparedWorktreeRecovery::Create => {
+                        let branch_head = self
+                            .five_track
+                            .shared
+                            .git
+                            .local_branch_head(&repository, &params.branch)
+                            .map_err(vcs_error)?;
+                        operation = self.update_worktree_ownership(&operation, |ownership| {
+                            ownership.journal_version = 2;
+                            ownership.worktree_preexisting = Some(false);
+                            ownership.worktree_create_started = true;
+                            ownership.worktree_create_succeeded = false;
+                            ownership.worktree_owned = false;
+                            ownership.ownership_uncertain = false;
+                            ownership.branch_preexisting = Some(branch_head.is_some());
+                            ownership.branch_owned = false;
+                            ownership.created_branch_head = None;
+                        })?;
+                        if params.create_branch && branch_head.is_some() {
+                            return Err(DesktopHostError::Control(ControlError::new(
+                                ErrorCode::Conflict,
+                                "The requested branch existed before AgentMux began the worktree operation.",
+                            )));
+                        }
+                        let allowed_root = worktree_allowed_root(repository.root())?;
+                        let destination = self
+                            .five_track
+                            .shared
+                            .git
+                            .verify_worktree_destination(
+                                &repository,
+                                &allowed_root,
+                                &operation.worktree_path,
+                            )
+                            .map_err(vcs_error)?;
+                        let created = self
+                            .five_track
+                            .shared
+                            .git
+                            .create_worktree(
+                                &repository,
+                                &destination,
+                                &params.branch,
+                                params.base_revision.as_deref(),
+                                params.create_branch,
+                            )
+                            .map_err(vcs_error)?;
+                        let created_head = created.worktree.head().map(str::to_string);
+                        operation = self.update_worktree_ownership(&operation, |ownership| {
+                            ownership.worktree_create_succeeded = true;
+                            ownership.worktree_owned = true;
+                            ownership.branch_owned =
+                                params.create_branch && ownership.branch_preexisting == Some(false);
+                            ownership.created_branch_head = created_head;
+                        })?;
+                    }
+                    PreparedWorktreeRecovery::RejectPreexisting => {
+                        self.update_worktree_ownership(&operation, |ownership| {
+                            ownership.worktree_preexisting = Some(true);
+                            ownership.worktree_owned = false;
+                            ownership.branch_owned = false;
+                        })?;
+                        return Err(DesktopHostError::Control(ControlError::new(
+                            ErrorCode::Conflict,
+                            "The worktree destination existed before AgentMux began this operation.",
+                        )));
+                    }
+                    PreparedWorktreeRecovery::RejectUncertain => {
+                        self.update_worktree_ownership(&operation, |ownership| {
+                            ownership.ownership_uncertain = true;
+                            ownership.worktree_owned = false;
+                            ownership.branch_owned = false;
+                        })?;
+                        return Err(DesktopHostError::Control(ControlError::new(
+                            ErrorCode::Conflict,
+                            "Worktree creation outcome is uncertain after recovery; AgentMux will not adopt or delete the destination.",
+                        )));
+                    }
+                }
+                if existing
                     .as_ref()
                     .and_then(|worktree| worktree.branch())
                     .is_some_and(|branch| {
@@ -2321,8 +2553,18 @@ impl DesktopControlState {
                 }
             }
         }
+        let mut worktree_removed = true;
         if ownership.worktree_owned {
             match self.remove_owned_worktree(operation, force) {
+                Ok(()) => {}
+                Err(error) => {
+                    worktree_removed = false;
+                    errors.push(error.to_string());
+                }
+            }
+        }
+        if ownership.branch_owned && worktree_removed {
+            match self.remove_owned_branch(operation, force) {
                 Ok(()) => {}
                 Err(error) => errors.push(error.to_string()),
             }
@@ -2378,16 +2620,72 @@ impl DesktopControlState {
             .list_worktrees(&repository)
             .map_err(vcs_error)?
             .into_iter()
-            .any(|worktree| {
+            .find(|worktree| {
                 worktree_paths_equal(repository.host(), worktree.path(), &operation.worktree_path)
             });
-        if registered {
+        if let Some(registered) = registered {
+            let expected_branch = operation
+                .branch_name
+                .as_deref()
+                .ok_or_else(|| control_invalid_request("Owned worktree branch is missing."))?;
+            if registered.branch().is_none_or(|branch| {
+                branch != expected_branch && branch != format!("refs/heads/{expected_branch}")
+            }) {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::Conflict,
+                    "Managed worktree ownership drifted to another branch; automatic deletion was refused.",
+                )));
+            }
             self.five_track
                 .shared
                 .git
                 .remove_worktree(&repository, &operation.worktree_path, force)
                 .map_err(vcs_error)?;
         }
+        Ok(())
+    }
+
+    fn remove_owned_branch(
+        &self,
+        operation: &PersistedWorktreeOperation,
+        force: bool,
+    ) -> Result<(), DesktopHostError> {
+        let ownership = worktree_ownership(operation)?;
+        if !ownership.branch_owned {
+            return Ok(());
+        }
+        let branch = operation
+            .branch_name
+            .as_deref()
+            .ok_or_else(|| control_invalid_request("Owned worktree branch is missing."))?;
+        let context = worktree_operation_git_context(operation)?;
+        let repository = self
+            .five_track
+            .shared
+            .git
+            .require_repository(&context)
+            .map_err(vcs_error)?;
+        let Some(current_head) = self
+            .five_track
+            .shared
+            .git
+            .local_branch_head(&repository, branch)
+            .map_err(vcs_error)?
+        else {
+            return Ok(());
+        };
+        if !owned_branch_head_is_unchanged(ownership.created_branch_head.as_deref(), &current_head)
+        {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Managed branch advanced after AgentMux created it; automatic deletion was refused.",
+            )));
+        }
+        self.five_track
+            .shared
+            .git
+            .delete_local_branch(&repository, branch, force)
+            .map_err(vcs_error)?;
         Ok(())
     }
 }
@@ -2427,6 +2725,10 @@ fn worktree_ownership(
     operation: &PersistedWorktreeOperation,
 ) -> Result<WorktreeOwnership, DesktopHostError> {
     serde_json::from_str(&operation.ownership_json).map_err(DesktopHostError::from)
+}
+
+fn owned_branch_head_is_unchanged(created_head: Option<&str>, current_head: &str) -> bool {
+    created_head.is_some_and(|created_head| created_head == current_head)
 }
 
 fn worktree_result(
@@ -2864,6 +3166,16 @@ impl DesktopControlState {
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: GitReviewThreadDeliverParams = request.parse_params()?;
         params.validate()?;
+        let _delivery_guard = self
+            .five_track
+            .shared
+            .review_delivery_guard
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable(
+                    "review delivery state is unavailable".to_string(),
+                )
+            })?;
         if !matches!(params.target.as_str(), "terminal" | "mailbox") {
             return Err(control_invalid_request(
                 "Review target must be 'terminal' or 'mailbox'.",
@@ -2925,60 +3237,94 @@ impl DesktopControlState {
                 },
             ));
         }
-        if same_target && thread.delivery_state == "delivering" {
-            return Err(DesktopHostError::Control(ControlError::new(
-                ErrorCode::Conflict,
-                "Review delivery is already in progress; retry after its state is reconciled.",
-            )));
-        }
         let body = format_review_delivery(&thread, &comments, params.include_context)?;
-        let started_at = timestamp();
-        let delivering = GitReviewDeliveryUpdate {
-            target_kind: Some(params.target.clone()),
-            target_id: Some(target_session_id.to_string()),
-            delivery_state: "delivering".to_string(),
-            delivery_error: None,
-            delivered_at: None,
-            updated_at: started_at,
-        };
-        if !self
-            .store
-            .lock()
-            .map_err(|_| {
-                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
-            })?
-            .update_git_review_delivery_batch(&thread.thread_id, &delivering)?
-        {
-            return Err(control_invalid_request("Git review thread not found."));
+        let payload_hash = review_delivery_payload_hash(
+            &thread.thread_id,
+            &params.target,
+            target_session_id,
+            &body,
+        );
+        let (attempt, already_sending) = self.prepare_review_delivery_attempt(
+            &thread,
+            &params.target,
+            target_session_id,
+            &payload_hash,
+        )?;
+
+        if attempt.state == "confirmed" {
+            let delivered_at = attempt
+                .completed_at
+                .clone()
+                .unwrap_or_else(|| attempt.updated_at.clone());
+            return Ok(ResponseEnvelope::ok_typed(
+                request.id.clone(),
+                &GitReviewDeliveryResult {
+                    thread_id: thread.thread_id,
+                    target: params.target,
+                    target_session_id: Some(target_session_id.to_string()),
+                    delivered_at,
+                },
+            ));
         }
 
-        let delivery_result = (|| match params.target.as_str() {
-            "terminal" => self.send_paste_direct(target_session_id, format!("{body}\r"), true),
-            "mailbox" => {
-                let workspace_id = thread
-                    .workspace_id
-                    .clone()
-                    .ok_or_else(|| control_invalid_request("Review thread has no workspace."))?;
-                let envelope = RequestEnvelope::new(
-                    format!("{}_mailbox", request.id),
-                    "team.message.send",
-                    serde_json::to_string(&TeamMessageSendParams {
-                        workspace_id,
-                        thread_id: Some(thread.thread_id.clone()),
-                        from_session_id: None,
-                        to_session_id: Some(target_session_id.to_string()),
-                        body: body.clone(),
-                        kind: Some("git_review".to_string()),
-                    })?,
-                    self.control_token.clone(),
-                );
-                let response = self.handle_team_message_send(&envelope)?;
-                let _: TeamMessageResult = response_result_json(&response)?;
-                Ok(())
+        if already_sending {
+            let mailbox_recorded = if params.target == "mailbox" {
+                let message_id = review_mailbox_message_id(&attempt.attempt_id);
+                self.store
+                    .lock()
+                    .map_err(|_| {
+                        DesktopHostError::StateUnavailable(
+                            "desktop store state is unavailable".to_string(),
+                        )
+                    })?
+                    .load_team_message(&message_id)?
+                    .is_some()
+            } else {
+                false
+            };
+            match interrupted_review_delivery_action(&params.target, mailbox_recorded) {
+                InterruptedReviewDeliveryAction::Confirm => {
+                    let delivered_at = timestamp();
+                    self.confirm_review_delivery_attempt(&attempt, &delivered_at)?;
+                    return Ok(ResponseEnvelope::ok_typed(
+                        request.id.clone(),
+                        &GitReviewDeliveryResult {
+                            thread_id: thread.thread_id,
+                            target: params.target,
+                            target_session_id: Some(target_session_id.to_string()),
+                            delivered_at,
+                        },
+                    ));
+                }
+                InterruptedReviewDeliveryAction::MarkUncertain => {
+                    self.mark_review_delivery_uncertain(
+                        &attempt,
+                        "AgentMux restarted while terminal delivery was in flight; automatic resend is disabled to avoid duplicate input.",
+                    )?;
+                    return Err(review_delivery_uncertain_error());
+                }
+                InterruptedReviewDeliveryAction::Dispatch => {}
             }
+        }
+
+        if !already_sending {
+            self.mark_review_delivery_sending(&attempt)?;
+        }
+        let delivery_result = match params.target.as_str() {
+            "terminal" => self.send_paste_direct(target_session_id, format!("{body}\r"), true),
+            "mailbox" => self.deliver_review_mailbox(&attempt, &thread, target_session_id, &body),
             _ => unreachable!(),
-        })();
+        };
         if let Err(error) = delivery_result {
+            if review_delivery_failure_disposition(&params.target)
+                == ReviewDeliveryFailureDisposition::MarkUncertain
+            {
+                let reason = format!(
+                    "Terminal delivery returned an error after dispatch began; partial delivery cannot be excluded: {error}"
+                );
+                self.mark_review_delivery_uncertain(&attempt, &reason)?;
+                return Err(review_delivery_uncertain_error());
+            }
             let failed_at = timestamp();
             let failed = GitReviewDeliveryUpdate {
                 target_kind: Some(params.target.clone()),
@@ -2986,29 +3332,23 @@ impl DesktopControlState {
                 delivery_state: "failed".to_string(),
                 delivery_error: Some(error.to_string()),
                 delivered_at: None,
-                updated_at: failed_at,
+                updated_at: failed_at.clone(),
             };
             if let Ok(mut store) = self.store.lock() {
-                let _ = store.update_git_review_delivery_batch(&thread.thread_id, &failed);
+                let _ = store.update_git_review_delivery_attempt(
+                    &attempt.attempt_id,
+                    "sending",
+                    "failed",
+                    Some(&error.to_string()),
+                    Some(&failed_at),
+                    &failed,
+                );
             }
             return Err(error);
         }
 
         let delivered_at = timestamp();
-        let update = GitReviewDeliveryUpdate {
-            target_kind: Some(params.target.clone()),
-            target_id: Some(target_session_id.to_string()),
-            delivery_state: "delivered".to_string(),
-            delivery_error: None,
-            delivered_at: Some(delivered_at.clone()),
-            updated_at: delivered_at.clone(),
-        };
-        let mut store = self.store.lock().map_err(|_| {
-            DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
-        })?;
-        if !store.update_git_review_delivery_batch(&thread.thread_id, &update)? {
-            return Err(control_invalid_request("Git review thread not found."));
-        }
+        self.confirm_review_delivery_attempt(&attempt, &delivered_at)?;
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &GitReviewDeliveryResult {
@@ -3018,6 +3358,278 @@ impl DesktopControlState {
                 delivered_at,
             },
         ))
+    }
+
+    fn prepare_review_delivery_attempt(
+        &self,
+        thread: &PersistedGitReviewThread,
+        target: &str,
+        target_session_id: &str,
+        payload_hash: &str,
+    ) -> Result<(PersistedGitReviewDeliveryAttempt, bool), DesktopHostError> {
+        let mut store = self.store.lock().map_err(|_| {
+            DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+        })?;
+        let latest = store.load_latest_git_review_delivery_attempt(
+            &thread.thread_id,
+            payload_hash,
+            target,
+            target_session_id,
+        )?;
+        let latest_for_target = store.load_latest_git_review_delivery_attempt_for_target(
+            &thread.thread_id,
+            target,
+            target_session_id,
+        )?;
+        if let Some(attempt) = latest.as_ref() {
+            match attempt.state.as_str() {
+                "confirmed" => return Ok((attempt.clone(), true)),
+                "prepared" => return Ok((attempt.clone(), false)),
+                "sending" => return Ok((attempt.clone(), true)),
+                "uncertain" => return Err(review_delivery_uncertain_error()),
+                "failed" => {}
+                _ => {
+                    return Err(DesktopHostError::StateUnavailable(
+                        "review delivery journal contains an invalid state".to_string(),
+                    ));
+                }
+            }
+        } else if matches!(thread.delivery_state.as_str(), "delivering" | "uncertain")
+            && thread.target_kind.as_deref() == Some(target)
+            && thread.target_id.as_deref() == Some(target_session_id)
+            && latest_for_target.is_none()
+        {
+            let now = timestamp();
+            let reason =
+                "Legacy delivery was interrupted before a payload attempt journal was recorded.";
+            let attempt = PersistedGitReviewDeliveryAttempt {
+                attempt_id: format!("review_delivery_{}", unique_time_id()),
+                thread_id: thread.thread_id.clone(),
+                payload_hash: payload_hash.to_string(),
+                target_kind: target.to_string(),
+                target_id: target_session_id.to_string(),
+                attempt_number: 1,
+                state: "uncertain".to_string(),
+                error_message: Some(reason.to_string()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                completed_at: Some(now.clone()),
+            };
+            let delivery = GitReviewDeliveryUpdate {
+                target_kind: Some(target.to_string()),
+                target_id: Some(target_session_id.to_string()),
+                delivery_state: "uncertain".to_string(),
+                delivery_error: Some(reason.to_string()),
+                delivered_at: None,
+                updated_at: now,
+            };
+            if !store.begin_git_review_delivery_attempt(&attempt, &delivery)? {
+                return Err(control_invalid_request("Git review thread not found."));
+            }
+            return Err(review_delivery_uncertain_error());
+        }
+
+        let now = timestamp();
+        let attempt_number = latest
+            .as_ref()
+            .map(|attempt| attempt.attempt_number + 1)
+            .unwrap_or(1);
+        let attempt = PersistedGitReviewDeliveryAttempt {
+            attempt_id: format!("review_delivery_{}", unique_time_id()),
+            thread_id: thread.thread_id.clone(),
+            payload_hash: payload_hash.to_string(),
+            target_kind: target.to_string(),
+            target_id: target_session_id.to_string(),
+            attempt_number,
+            state: "prepared".to_string(),
+            error_message: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            completed_at: None,
+        };
+        let delivery = GitReviewDeliveryUpdate {
+            target_kind: Some(target.to_string()),
+            target_id: Some(target_session_id.to_string()),
+            delivery_state: "delivering".to_string(),
+            delivery_error: None,
+            delivered_at: None,
+            updated_at: now,
+        };
+        if !store.begin_git_review_delivery_attempt(&attempt, &delivery)? {
+            return Err(control_invalid_request("Git review thread not found."));
+        }
+        Ok((attempt, false))
+    }
+
+    fn mark_review_delivery_sending(
+        &self,
+        attempt: &PersistedGitReviewDeliveryAttempt,
+    ) -> Result<(), DesktopHostError> {
+        let now = timestamp();
+        let delivery = GitReviewDeliveryUpdate {
+            target_kind: Some(attempt.target_kind.clone()),
+            target_id: Some(attempt.target_id.clone()),
+            delivery_state: "delivering".to_string(),
+            delivery_error: None,
+            delivered_at: None,
+            updated_at: now,
+        };
+        let updated = self
+            .store
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+            })?
+            .update_git_review_delivery_attempt(
+                &attempt.attempt_id,
+                "prepared",
+                "sending",
+                None,
+                None,
+                &delivery,
+            )?;
+        if !updated {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Review delivery state changed before dispatch.",
+            )));
+        }
+        Ok(())
+    }
+
+    fn mark_review_delivery_uncertain(
+        &self,
+        attempt: &PersistedGitReviewDeliveryAttempt,
+        reason: &str,
+    ) -> Result<(), DesktopHostError> {
+        let now = timestamp();
+        let delivery = GitReviewDeliveryUpdate {
+            target_kind: Some(attempt.target_kind.clone()),
+            target_id: Some(attempt.target_id.clone()),
+            delivery_state: "uncertain".to_string(),
+            delivery_error: Some(reason.to_string()),
+            delivered_at: None,
+            updated_at: now.clone(),
+        };
+        let updated = self
+            .store
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+            })?
+            .update_git_review_delivery_attempt(
+                &attempt.attempt_id,
+                "sending",
+                "uncertain",
+                Some(reason),
+                Some(&now),
+                &delivery,
+            )?;
+        if !updated {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Review delivery state changed before interrupted delivery reconciliation.",
+            )));
+        }
+        Ok(())
+    }
+
+    fn confirm_review_delivery_attempt(
+        &self,
+        attempt: &PersistedGitReviewDeliveryAttempt,
+        delivered_at: &str,
+    ) -> Result<(), DesktopHostError> {
+        let update = GitReviewDeliveryUpdate {
+            target_kind: Some(attempt.target_kind.clone()),
+            target_id: Some(attempt.target_id.clone()),
+            delivery_state: "delivered".to_string(),
+            delivery_error: None,
+            delivered_at: Some(delivered_at.to_string()),
+            updated_at: delivered_at.to_string(),
+        };
+        let updated = self
+            .store
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+            })?
+            .update_git_review_delivery_attempt(
+                &attempt.attempt_id,
+                "sending",
+                "confirmed",
+                None,
+                Some(delivered_at),
+                &update,
+            )?;
+        if !updated {
+            let current = self
+                .store
+                .lock()
+                .map_err(|_| {
+                    DesktopHostError::StateUnavailable(
+                        "desktop store state is unavailable".to_string(),
+                    )
+                })?
+                .load_latest_git_review_delivery_attempt(
+                    &attempt.thread_id,
+                    &attempt.payload_hash,
+                    &attempt.target_kind,
+                    &attempt.target_id,
+                )?;
+            if current
+                .as_ref()
+                .is_none_or(|current| current.state != "confirmed")
+            {
+                return Err(DesktopHostError::StateUnavailable(
+                    "review delivery confirmation could not be persisted".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver_review_mailbox(
+        &self,
+        attempt: &PersistedGitReviewDeliveryAttempt,
+        thread: &PersistedGitReviewThread,
+        target_session_id: &str,
+        body: &str,
+    ) -> Result<(), DesktopHostError> {
+        let workspace_id = thread
+            .workspace_id
+            .clone()
+            .ok_or_else(|| control_invalid_request("Review thread has no workspace."))?;
+        let now = timestamp();
+        let message = PersistedTeamMessage {
+            message_id: review_mailbox_message_id(&attempt.attempt_id),
+            workspace_id: workspace_id.clone(),
+            thread_id: Some(thread.thread_id.clone()),
+            from_session_id: None,
+            to_session_id: Some(target_session_id.to_string()),
+            body: body.to_string(),
+            kind: "git_review".to_string(),
+            created_at: now.clone(),
+            read_at: None,
+        };
+        let notification = PersistedNotification {
+            notification_id: review_mailbox_notification_id(&attempt.attempt_id),
+            notification_type: "team.message".to_string(),
+            severity: "info".to_string(),
+            workspace_id: Some(workspace_id),
+            session_id: Some(target_session_id.to_string()),
+            title: "Agent message".to_string(),
+            message: body.to_string(),
+            created_at: now,
+            dismissed: false,
+        };
+        self.store
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+            })?
+            .upsert_team_message_and_notification(&message, &notification)?;
+        self.dispatch_desktop_notification(&notification_result_from_persisted(&notification));
+        Ok(())
     }
 }
 
@@ -3103,6 +3715,79 @@ fn format_review_delivery(
         body.push_str(comment.body.trim());
     }
     Ok(body)
+}
+
+fn review_delivery_payload_hash(
+    thread_id: &str,
+    target: &str,
+    target_session_id: &str,
+    body: &str,
+) -> String {
+    let body_hash = stable_hash_bytes(body.as_bytes());
+    let component = |domain: u8| {
+        stable_hash(&(
+            domain,
+            thread_id,
+            target,
+            target_session_id,
+            body_hash,
+            body.len(),
+        ))
+    };
+    format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        component(0),
+        component(1),
+        component(2),
+        component(3)
+    )
+}
+
+fn review_mailbox_message_id(attempt_id: &str) -> String {
+    format!("msg_{attempt_id}")
+}
+
+fn review_mailbox_notification_id(attempt_id: &str) -> String {
+    format!("not_{attempt_id}")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptedReviewDeliveryAction {
+    Dispatch,
+    Confirm,
+    MarkUncertain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewDeliveryFailureDisposition {
+    RetryableFailure,
+    MarkUncertain,
+}
+
+fn interrupted_review_delivery_action(
+    target: &str,
+    mailbox_recorded: bool,
+) -> InterruptedReviewDeliveryAction {
+    match (target, mailbox_recorded) {
+        ("mailbox", true) => InterruptedReviewDeliveryAction::Confirm,
+        ("mailbox", false) => InterruptedReviewDeliveryAction::Dispatch,
+        _ => InterruptedReviewDeliveryAction::MarkUncertain,
+    }
+}
+
+fn review_delivery_failure_disposition(target: &str) -> ReviewDeliveryFailureDisposition {
+    if target == "mailbox" {
+        ReviewDeliveryFailureDisposition::RetryableFailure
+    } else {
+        ReviewDeliveryFailureDisposition::MarkUncertain
+    }
+}
+
+fn review_delivery_uncertain_error() -> DesktopHostError {
+    DesktopHostError::Control(ControlError::new(
+        ErrorCode::Conflict,
+        "A previous terminal delivery may already have been sent. Automatic resend is disabled; edit the review payload before retrying.",
+    ))
 }
 
 impl DesktopControlState {
@@ -3210,11 +3895,20 @@ impl DesktopControlState {
             ));
         };
         let state = normalized_hook_state(normalized.state);
+        let record = VerifiedHookRecord {
+            workspace_id: params.workspace_id.clone(),
+            session_id: params.session_id.clone(),
+            source: params.source.clone(),
+            sequence: params.sequence,
+            state: state.clone(),
+            reason: params.reason.clone(),
+            telemetry: params.telemetry.clone(),
+        };
         {
-            let mut hooks = self.five_track.shared.verified_hooks.lock().map_err(|_| {
-                DesktopHostError::StateUnavailable("verified hook state is unavailable".to_string())
+            let mut store = self.store.lock().map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
             })?;
-            if let Some(previous) = hooks.get(&params.session_id) {
+            if let Some(previous) = store.load_verified_agent_hook(&params.session_id)? {
                 if params.sequence < previous.sequence {
                     return Err(DesktopHostError::Control(ControlError::new(
                         ErrorCode::Conflict,
@@ -3241,27 +3935,17 @@ impl DesktopControlState {
                     )));
                 }
             }
-            hooks.insert(
-                params.session_id.clone(),
-                VerifiedHookRecord {
-                    session_id: params.session_id.clone(),
-                    sequence: params.sequence,
-                    state: state.clone(),
-                    reason: params.reason.clone(),
-                    telemetry: params.telemetry.clone(),
-                },
-            );
+            store.upsert_verified_agent_hook(&persisted_verified_hook(&record)?)?;
         }
-        self.apply_verified_hook_record(
-            &VerifiedHookRecord {
-                session_id: params.session_id.clone(),
-                sequence: params.sequence,
-                state: state.clone(),
-                reason: params.reason,
-                telemetry: params.telemetry,
-            },
-            &request.id,
-        )?;
+        self.five_track
+            .shared
+            .verified_hooks
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("verified hook state is unavailable".to_string())
+            })?
+            .insert(params.session_id.clone(), record.clone());
+        self.apply_verified_hook_record(&record, &request.id)?;
         if let Some(handle) = self.app_handle.get() {
             let _ = handle.emit(
                 EVENT_AGENT_HOOK_STATE_CHANGED,
@@ -3312,15 +3996,37 @@ impl DesktopControlState {
     }
 
     pub(super) fn reassert_verified_hook_states(&self) {
-        let hooks = self
-            .five_track
-            .shared
-            .verified_hooks
-            .lock()
-            .map(|hooks| hooks.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let hooks = if let Ok(mut store) = self.store.lock() {
+            let persisted = store.list_verified_agent_hooks().unwrap_or_default();
+            let mut active = Vec::new();
+            for hook in persisted {
+                let session_active = store
+                    .load_session(&hook.session_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|session| !is_terminal_state(&session.state));
+                if session_active {
+                    if let Ok(record) = verified_hook_from_persisted(&hook) {
+                        active.push(record);
+                    }
+                } else {
+                    let _ = store.delete_verified_agent_hook(&hook.session_id);
+                }
+            }
+            active
+        } else {
+            Vec::new()
+        };
         if hooks.is_empty() {
             return;
+        }
+        if let Ok(mut memory) = self.five_track.shared.verified_hooks.lock() {
+            memory.extend(
+                hooks
+                    .iter()
+                    .cloned()
+                    .map(|hook| (hook.session_id.clone(), hook)),
+            );
         }
         let current = self
             .control
@@ -3354,6 +4060,11 @@ impl DesktopControlState {
         if !terminal_sessions.is_empty() {
             if let Ok(mut hooks) = self.five_track.shared.verified_hooks.lock() {
                 hooks.retain(|session_id, _| !terminal_sessions.contains(session_id));
+            }
+            if let Ok(mut store) = self.store.lock() {
+                for session_id in &terminal_sessions {
+                    let _ = store.delete_verified_agent_hook(session_id);
+                }
             }
         }
 
@@ -3413,7 +4124,7 @@ impl DesktopControlState {
                 workspace_id,
                 session_id: candidate.session_id,
                 url: candidate.origin,
-                source: "pty".to_string(),
+                source: pty_dev_server_source(candidate.process_id).to_string(),
                 detected_at: timestamp(),
                 process_id: candidate.process_id,
             };
@@ -3754,11 +4465,59 @@ fn normalized_hook_state(state: AgentHookState) -> String {
     .to_string()
 }
 
+fn persisted_verified_hook(
+    record: &VerifiedHookRecord,
+) -> Result<PersistedVerifiedAgentHook, DesktopHostError> {
+    Ok(PersistedVerifiedAgentHook {
+        session_id: record.session_id.clone(),
+        workspace_id: record.workspace_id.clone(),
+        source: record.source.clone(),
+        sequence: record.sequence,
+        state: record.state.clone(),
+        reason: record.reason.clone(),
+        telemetry_json: record
+            .telemetry
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?,
+        updated_at: timestamp(),
+    })
+}
+
+fn verified_hook_from_persisted(
+    hook: &PersistedVerifiedAgentHook,
+) -> Result<VerifiedHookRecord, DesktopHostError> {
+    Ok(VerifiedHookRecord {
+        workspace_id: hook.workspace_id.clone(),
+        session_id: hook.session_id.clone(),
+        source: hook.source.clone(),
+        sequence: hook.sequence,
+        state: hook.state.clone(),
+        reason: hook.reason.clone(),
+        telemetry: hook
+            .telemetry_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
+    })
+}
+
 fn unix_time_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or_default()
+}
+
+fn pty_dev_server_source(process_id: Option<u32>) -> &'static str {
+    if process_id.is_some() {
+        "pty_process_attributed"
+    } else {
+        // ConPTY and WSL output deltas currently identify the owning session,
+        // not the child process that printed a URL. Keep the PID empty rather
+        // than incorrectly attributing it to the shell/transport process.
+        "pty_output_unattributed"
+    }
 }
 
 fn is_safe_development_server_url(url: &str) -> bool {
@@ -3997,7 +4756,7 @@ mod tests {
         fs::remove_dir_all(repository_path).unwrap();
     }
 
-    fn assert_large_git_page_pipeline(file_count: usize) {
+    fn assert_large_git_page_pipeline(file_count: usize, budget: Duration) {
         let files = (0..file_count)
             .map(|index| GitFileChange {
                 path: format!("src/generated/file-{index:05}.rs"),
@@ -4039,25 +4798,29 @@ mod tests {
         }
         assert!(serialized > file_count * 32);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{file_count} file index/page/serialization pipeline exceeded 3 seconds: {:?}",
+            started.elapsed() < budget,
+            "{file_count} file index/page/serialization pipeline exceeded {budget:?}: {:?}",
             started.elapsed()
+        );
+        eprintln!(
+            "git page pipeline {file_count}: completed={:?}, serialized_bytes={serialized}",
+            started.elapsed(),
         );
     }
 
     #[test]
     fn git_page_pipeline_handles_5k_files_within_budget() {
-        assert_large_git_page_pipeline(5_000);
+        assert_large_git_page_pipeline(5_000, Duration::from_millis(500));
     }
 
     #[test]
     fn git_page_pipeline_handles_10k_files_within_budget() {
-        assert_large_git_page_pipeline(10_000);
+        assert_large_git_page_pipeline(10_000, Duration::from_millis(750));
     }
 
     #[test]
     fn git_page_pipeline_handles_15k_files_within_budget() {
-        assert_large_git_page_pipeline(15_000);
+        assert_large_git_page_pipeline(15_000, Duration::from_secs(1));
     }
 
     #[test]
@@ -4099,6 +4862,7 @@ mod tests {
                 repository_id: Some(summary.repository_id.clone()),
                 generation: Some(summary.generation),
                 state: None,
+                query: None,
                 cursor: None,
                 limit: Some(5),
             },
@@ -4113,6 +4877,54 @@ mod tests {
             Some(summary.repository_id.as_str())
         );
 
+        let filtered: GitStatusPageResult = decode_ok(host.handle_request(test_request(
+            "git_page_query",
+            METHOD_GIT_STATUS_PAGE,
+            &GitStatusPageParams {
+                workspace_id: "ws_git".to_string(),
+                pane_id: None,
+                repository_id: Some(summary.repository_id.clone()),
+                generation: Some(summary.generation),
+                state: None,
+                query: Some("new-10".to_string()),
+                cursor: None,
+                limit: Some(5),
+            },
+        )));
+        assert_eq!(filtered.total_count, Some(1));
+        assert_eq!(filtered.changes[0].path, "new-10.txt");
+
+        let query_page: GitStatusPageResult = decode_ok(host.handle_request(test_request(
+            "git_page_query_cursor",
+            METHOD_GIT_STATUS_PAGE,
+            &GitStatusPageParams {
+                workspace_id: "ws_git".to_string(),
+                pane_id: None,
+                repository_id: Some(summary.repository_id.clone()),
+                generation: Some(summary.generation),
+                state: Some("untracked".to_string()),
+                query: Some("new-".to_string()),
+                cursor: None,
+                limit: Some(2),
+            },
+        )));
+        assert_eq!(query_page.total_count, Some(11));
+        let mismatched_query_cursor = host.handle_request(test_request(
+            "git_page_query_mismatch",
+            METHOD_GIT_STATUS_PAGE,
+            &GitStatusPageParams {
+                workspace_id: "ws_git".to_string(),
+                pane_id: None,
+                repository_id: Some(summary.repository_id.clone()),
+                generation: Some(summary.generation),
+                state: Some("untracked".to_string()),
+                query: Some("new-1".to_string()),
+                cursor: query_page.next_cursor.clone(),
+                limit: Some(2),
+            },
+        ));
+        assert_eq!(error_code(mismatched_query_cursor), ErrorCode::Conflict);
+
         fs::write(repository.join("late.txt"), "late\n").expect("late fixture");
         let second: GitStatusPageResult = decode_ok(host.handle_request(test_request(
             "git_page_2",
@@ -4123,6 +4935,7 @@ mod tests {
                 repository_id: Some(summary.repository_id.clone()),
                 generation: Some(summary.generation),
                 state: None,
+                query: None,
                 cursor: first.next_cursor.clone(),
                 limit: Some(5),
             },
@@ -4192,6 +5005,7 @@ mod tests {
                 repository_id: Some(parent_summary.repository_id),
                 generation: None,
                 state: None,
+                query: None,
                 cursor: None,
                 limit: Some(25),
             },
@@ -4271,6 +5085,264 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn worktree_fault_injection_never_adopts_an_ambiguous_destination() {
+        let fresh = WorktreeOwnership {
+            journal_version: 2,
+            source_workspace_id: "ws_source".to_string(),
+            repository_host: "native".to_string(),
+            ..WorktreeOwnership::default()
+        };
+        assert_eq!(
+            prepared_worktree_recovery(&fresh, false),
+            PreparedWorktreeRecovery::Create
+        );
+        assert_eq!(
+            prepared_worktree_recovery(&fresh, true),
+            PreparedWorktreeRecovery::RejectPreexisting
+        );
+
+        let create_started = WorktreeOwnership {
+            journal_version: 2,
+            worktree_preexisting: Some(false),
+            worktree_create_started: true,
+            ..fresh.clone()
+        };
+        assert_eq!(
+            prepared_worktree_recovery(&create_started, false),
+            PreparedWorktreeRecovery::Create,
+            "a crash before the Git side effect is safe to retry"
+        );
+        assert_eq!(
+            prepared_worktree_recovery(&create_started, true),
+            PreparedWorktreeRecovery::RejectUncertain,
+            "a crash after Git may have created the worktree must not claim ownership"
+        );
+
+        let created = WorktreeOwnership {
+            worktree_create_succeeded: true,
+            worktree_owned: true,
+            branch_owned: true,
+            ..create_started
+        };
+        assert_eq!(
+            prepared_worktree_recovery(&created, true),
+            PreparedWorktreeRecovery::ContinueOwned
+        );
+        assert_eq!(
+            prepared_worktree_recovery(&created, false),
+            PreparedWorktreeRecovery::RejectUncertain,
+            "a missing owned worktree is not silently recreated"
+        );
+
+        let legacy_prepared = WorktreeOwnership {
+            worktree_owned: true,
+            ..WorktreeOwnership::default()
+        };
+        assert_eq!(
+            prepared_worktree_recovery(&legacy_prepared, true),
+            PreparedWorktreeRecovery::RejectUncertain,
+            "legacy Prepared journals wrote ownership before the create result"
+        );
+    }
+
+    #[test]
+    fn prepared_recovery_fault_injection_preserves_ambiguous_registered_worktree() {
+        let repository = create_git_repository("ambiguous-worktree");
+        let destination = repository
+            .parent()
+            .unwrap()
+            .join(format!("ambiguous-destination-{}", unique_time_id()));
+        let destination_text = destination.to_string_lossy().to_string();
+        run_git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agentmux/ambiguous-recovery",
+                &destination_text,
+            ],
+        );
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository_root = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(repository.to_string_lossy()))
+            .expect("repository should resolve")
+            .root()
+            .to_string();
+        let params = AgentWorktreeCreateParams {
+            workspace_id: "workspace_source".to_string(),
+            branch: "agentmux/ambiguous-recovery".to_string(),
+            destination: destination_text.clone(),
+            base_revision: Some("HEAD".to_string()),
+            create_branch: true,
+            backend: None,
+            backend_profile: None,
+            command: Vec::new(),
+            cwd: None,
+            idempotency_key: "ambiguous-recovery-key".to_string(),
+        };
+        let ownership = WorktreeOwnership {
+            journal_version: 2,
+            source_workspace_id: params.workspace_id.clone(),
+            repository_host: "native".to_string(),
+            worktree_preexisting: Some(false),
+            worktree_create_started: true,
+            branch_preexisting: Some(false),
+            ..WorktreeOwnership::default()
+        };
+        let operation = PersistedWorktreeOperation {
+            operation_id: "operation_ambiguous_recovery".to_string(),
+            idempotency_key: params.idempotency_key.clone(),
+            repository_root,
+            worktree_path: destination_text.clone(),
+            branch_name: Some(params.branch.clone()),
+            revision: params.base_revision.clone(),
+            workspace_id: None,
+            surface_id: None,
+            session_id: None,
+            owner_kind: "agentmux.desktop".to_string(),
+            owner_id: Some(params.workspace_id.clone()),
+            ownership_json: serde_json::to_string(&ownership).unwrap(),
+            request_json: serde_json::to_string(&params).unwrap(),
+            state: WorktreeOperationState::Prepared,
+            error_code: None,
+            error_message: None,
+            recovery_json: "{}".to_string(),
+            recovery_attempts: 0,
+            last_recovery_at: None,
+            created_at: "created".to_string(),
+            updated_at: "created".to_string(),
+            completed_at: None,
+            rolled_back_at: None,
+        };
+        let operation = host
+            .store
+            .lock()
+            .unwrap()
+            .create_or_load_worktree_operation(&operation)
+            .unwrap();
+
+        assert!(host.resume_worktree_operation(operation).is_err());
+        assert!(destination.is_dir(), "ambiguous worktree must be preserved");
+        let recovered = host
+            .store
+            .lock()
+            .unwrap()
+            .load_worktree_operation("operation_ambiguous_recovery")
+            .unwrap()
+            .unwrap();
+        let recovered_ownership = worktree_ownership(&recovered).unwrap();
+        assert!(recovered_ownership.ownership_uncertain);
+        assert!(!recovered_ownership.worktree_owned);
+        assert!(!recovered_ownership.branch_owned);
+
+        run_git(
+            &repository,
+            &["worktree", "remove", "--force", &destination_text],
+        );
+        run_git(
+            &repository,
+            &["branch", "-D", "agentmux/ambiguous-recovery"],
+        );
+        fs::remove_dir_all(repository).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn owned_branch_rollback_refuses_missing_or_advanced_journal_heads() {
+        assert!(owned_branch_head_is_unchanged(Some("abc123"), "abc123"));
+        assert!(!owned_branch_head_is_unchanged(None, "abc123"));
+        assert!(!owned_branch_head_is_unchanged(Some("abc123"), "def456"));
+    }
+
+    #[test]
+    fn interrupted_review_delivery_prefers_duplicate_prevention() {
+        assert_eq!(
+            interrupted_review_delivery_action("mailbox", true),
+            InterruptedReviewDeliveryAction::Confirm,
+            "a durable mailbox record proves that the deterministic attempt was dispatched"
+        );
+        assert_eq!(
+            interrupted_review_delivery_action("mailbox", false),
+            InterruptedReviewDeliveryAction::Dispatch,
+            "an absent deterministic mailbox record is safe to insert after restart"
+        );
+        assert_eq!(
+            interrupted_review_delivery_action("terminal", false),
+            InterruptedReviewDeliveryAction::MarkUncertain,
+            "terminal input has no acknowledgement and must not be sent twice"
+        );
+        assert_eq!(
+            review_delivery_failure_disposition("terminal"),
+            ReviewDeliveryFailureDisposition::MarkUncertain,
+            "a terminal write error may follow a partial write"
+        );
+        assert_eq!(
+            review_delivery_failure_disposition("mailbox"),
+            ReviewDeliveryFailureDisposition::RetryableFailure,
+            "a failed SQLite mailbox transaction cannot partially commit"
+        );
+    }
+
+    #[test]
+    fn legacy_uncertain_review_blocks_same_payload_but_allows_edited_payload() {
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let thread = PersistedGitReviewThread {
+            thread_id: "thread_legacy_uncertain".to_string(),
+            repository_root: r"D:\repo".to_string(),
+            workspace_id: Some("workspace_review".to_string()),
+            diff_identity: "repo:diff".to_string(),
+            path: "src/lib.rs".to_string(),
+            hunk_id: None,
+            side: "right".to_string(),
+            line_number: Some(1),
+            line_anchor: "{}".to_string(),
+            stale: false,
+            stale_reason: None,
+            resolved_at: None,
+            author_id: "reviewer".to_string(),
+            target_kind: Some("terminal".to_string()),
+            target_id: Some("session_worker".to_string()),
+            delivery_state: "uncertain".to_string(),
+            delivery_error: Some("legacy crash".to_string()),
+            created_at: "created".to_string(),
+            updated_at: "created".to_string(),
+        };
+        host.store
+            .lock()
+            .unwrap()
+            .upsert_git_review_thread(&thread)
+            .unwrap();
+
+        assert!(host
+            .prepare_review_delivery_attempt(&thread, "terminal", "session_worker", "payload-a",)
+            .is_err());
+        let persisted = host
+            .store
+            .lock()
+            .unwrap()
+            .load_git_review_thread(&thread.thread_id)
+            .unwrap()
+            .unwrap();
+        let same_payload = host.prepare_review_delivery_attempt(
+            &persisted,
+            "terminal",
+            "session_worker",
+            "payload-a",
+        );
+        assert!(same_payload.is_err());
+
+        let (edited_attempt, already_sending) = host
+            .prepare_review_delivery_attempt(&persisted, "terminal", "session_worker", "payload-b")
+            .expect("edited payload should start a new durable attempt");
+        assert_eq!(edited_attempt.state, "prepared");
+        assert!(!already_sending);
     }
 
     #[test]
@@ -4576,6 +5648,8 @@ mod tests {
 
     #[test]
     fn raw_output_detects_url_and_opens_browser_in_the_same_workspace() {
+        assert_eq!(pty_dev_server_source(None), "pty_output_unattributed");
+        assert_eq!(pty_dev_server_source(Some(42)), "pty_process_attributed");
         let host = DesktopControlState::new_in_memory().expect("desktop state");
         save_bundle(
             &host,
@@ -4605,6 +5679,8 @@ mod tests {
                 },
             )));
         assert_eq!(listed.candidates.len(), 1);
+        assert_eq!(listed.candidates[0].source, "pty_output_unattributed");
+        assert_eq!(listed.candidates[0].process_id, None);
         let opened: DevelopmentServerCandidateOpenInSplitResult =
             decode_ok(host.handle_request(test_request(
                 "url_open",
