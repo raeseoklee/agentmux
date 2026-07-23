@@ -8,8 +8,6 @@ export interface TerminalWarmRetainTab {
   lastActive: boolean;
   lastActiveAt: number | null;
   hiddenSince: number | null;
-  /** Tabs that cannot safely be reconstructed from a terminal framebuffer. */
-  protectedFromParking: boolean;
 }
 
 export interface TerminalWarmRetainDecision {
@@ -28,19 +26,16 @@ function recency(tab: TerminalWarmRetainTab): number {
 }
 
 /**
- * Choose the tab trees that retain live xterm instances. Active, last-active,
- * and structurally unsafe tabs are hard exceptions; all other tabs share a
- * bounded LRU budget. A newly hidden tab receives a 30 second grace window
- * before it enters that budget, and otherwise remains warm for at most ten
- * minutes. Explicit safety exceptions may temporarily exceed the normal cap.
+ * Choose the tab trees that retain live xterm instances. The active tab is a
+ * hard exception; every hidden tab shares the remaining global budget. The
+ * last-active tab and tabs hidden during the 30 second grace window are ranked
+ * ahead of other hidden tabs, but never bypass the cap.
  */
 export function decideTerminalWarmRetain(
   tabs: readonly TerminalWarmRetainTab[],
   now: number,
 ): TerminalWarmRetainDecision {
   const warmTabIds = new Set<string>();
-  const protectedTabs: TerminalWarmRetainTab[] = [];
-  const graceTabs: TerminalWarmRetainTab[] = [];
   const candidates: TerminalWarmRetainTab[] = [];
   let nextTransitionAt: number | null = null;
 
@@ -53,41 +48,36 @@ export function decideTerminalWarmRetain(
   };
 
   for (const tab of tabs) {
-    if (tab.active || tab.lastActive || tab.protectedFromParking) {
-      protectedTabs.push(tab);
+    if (tab.active) {
       warmTabIds.add(tab.tabId);
       continue;
     }
 
     const lastActiveAt = recency(tab);
-    if (now - lastActiveAt >= TERMINAL_WARM_RETAIN_TTL_MS) {
-      continue;
-    }
-    if (
-      isFiniteTimestamp(tab.hiddenSince) &&
-      now - tab.hiddenSince < TERMINAL_WARM_RETAIN_HIDDEN_DELAY_MS
-    ) {
-      graceTabs.push(tab);
-      warmTabIds.add(tab.tabId);
-      scheduleAt(tab.hiddenSince + TERMINAL_WARM_RETAIN_HIDDEN_DELAY_MS);
+    if (!tab.lastActive && now - lastActiveAt >= TERMINAL_WARM_RETAIN_TTL_MS) {
       continue;
     }
     candidates.push(tab);
   }
 
-  candidates.sort((left, right) => recency(right) - recency(left));
-  const candidateBudget = Math.max(
-    0,
-    TERMINAL_WARM_RETAIN_MAX_TABS - protectedTabs.length - graceTabs.length,
-  );
+  const isWithinGrace = (tab: TerminalWarmRetainTab) =>
+    isFiniteTimestamp(tab.hiddenSince) &&
+    now - tab.hiddenSince < TERMINAL_WARM_RETAIN_HIDDEN_DELAY_MS;
+  candidates.sort((left, right) => {
+    const priority = (tab: TerminalWarmRetainTab) =>
+      (tab.lastActive ? 2 : 0) + (isWithinGrace(tab) ? 1 : 0);
+    return priority(right) - priority(left) || recency(right) - recency(left);
+  });
+  const candidateBudget = Math.max(0, TERMINAL_WARM_RETAIN_MAX_TABS - warmTabIds.size);
 
   for (const [index, tab] of candidates.entries()) {
-    if (index >= candidateBudget) {
-      continue;
+    if (index < candidateBudget) {
+      warmTabIds.add(tab.tabId);
     }
-    warmTabIds.add(tab.tabId);
-    scheduleAt(recency(tab) + TERMINAL_WARM_RETAIN_TTL_MS);
-    if (isFiniteTimestamp(tab.hiddenSince)) {
+    if (!tab.lastActive) {
+      scheduleAt(recency(tab) + TERMINAL_WARM_RETAIN_TTL_MS);
+    }
+    if (isWithinGrace(tab) && isFiniteTimestamp(tab.hiddenSince)) {
       scheduleAt(tab.hiddenSince + TERMINAL_WARM_RETAIN_HIDDEN_DELAY_MS);
     }
   }

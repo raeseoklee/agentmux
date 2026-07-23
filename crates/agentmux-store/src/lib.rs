@@ -341,6 +341,70 @@ CREATE INDEX IF NOT EXISTS idx_git_review_comments_thread
   ON git_review_comments (thread_id, created_at, comment_id);
 "#;
 
+pub const WORKTREE_REMOVED_STATE_SCHEMA: &str = r#"
+DROP INDEX IF EXISTS idx_worktree_operations_recovery;
+DROP INDEX IF EXISTS idx_worktree_operations_workspace;
+ALTER TABLE worktree_operations RENAME TO worktree_operations_v12;
+
+CREATE TABLE worktree_operations (
+  operation_id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  repository_root TEXT NOT NULL,
+  worktree_path TEXT NOT NULL,
+  branch_name TEXT,
+  revision TEXT,
+  workspace_id TEXT,
+  surface_id TEXT,
+  session_id TEXT,
+  owner_kind TEXT NOT NULL,
+  owner_id TEXT,
+  ownership_json TEXT NOT NULL DEFAULT '{}',
+  request_json TEXT NOT NULL DEFAULT '{}',
+  state TEXT NOT NULL CHECK(state IN (
+    'prepared',
+    'worktree_created',
+    'workspace_created',
+    'session_created',
+    'completed',
+    'failed',
+    'rolling_back',
+    'rolled_back',
+    'removed'
+  )),
+  error_code TEXT,
+  error_message TEXT,
+  recovery_json TEXT NOT NULL DEFAULT '{}',
+  recovery_attempts INTEGER NOT NULL DEFAULT 0,
+  last_recovery_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  rolled_back_at TEXT
+);
+
+INSERT INTO worktree_operations (
+  operation_id, idempotency_key, repository_root, worktree_path,
+  branch_name, revision, workspace_id, surface_id, session_id,
+  owner_kind, owner_id, ownership_json, request_json, state,
+  error_code, error_message, recovery_json, recovery_attempts,
+  last_recovery_at, created_at, updated_at, completed_at, rolled_back_at
+)
+SELECT
+  operation_id, idempotency_key, repository_root, worktree_path,
+  branch_name, revision, workspace_id, surface_id, session_id,
+  owner_kind, owner_id, ownership_json, request_json, state,
+  error_code, error_message, recovery_json, recovery_attempts,
+  last_recovery_at, created_at, updated_at, completed_at, rolled_back_at
+FROM worktree_operations_v12;
+
+DROP TABLE worktree_operations_v12;
+
+CREATE INDEX idx_worktree_operations_recovery
+  ON worktree_operations (state, updated_at, operation_id);
+CREATE INDEX idx_worktree_operations_workspace
+  ON worktree_operations (workspace_id, updated_at, operation_id);
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -401,6 +465,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "worktree_operations_and_git_review",
         sql: WORKTREE_OPERATIONS_AND_GIT_REVIEW_SCHEMA,
+    },
+    Migration {
+        version: 13,
+        name: "worktree_removed_state",
+        sql: WORKTREE_REMOVED_STATE_SCHEMA,
     },
 ];
 
@@ -665,6 +734,7 @@ pub enum WorktreeOperationState {
     Failed,
     RollingBack,
     RolledBack,
+    Removed,
 }
 
 impl WorktreeOperationState {
@@ -678,6 +748,7 @@ impl WorktreeOperationState {
             Self::Failed => "failed",
             Self::RollingBack => "rolling_back",
             Self::RolledBack => "rolled_back",
+            Self::Removed => "removed",
         }
     }
 
@@ -691,6 +762,7 @@ impl WorktreeOperationState {
             "failed" => Some(Self::Failed),
             "rolling_back" => Some(Self::RollingBack),
             "rolled_back" => Some(Self::RolledBack),
+            "removed" => Some(Self::Removed),
             _ => None,
         }
     }
@@ -698,6 +770,9 @@ impl WorktreeOperationState {
     pub const fn can_transition_to(self, next: Self) -> bool {
         if self as u8 == next as u8 {
             return true;
+        }
+        if next as u8 == Self::Removed as u8 {
+            return self as u8 != Self::Removed as u8;
         }
 
         match self {
@@ -718,7 +793,7 @@ impl WorktreeOperationState {
             }
             Self::Failed => matches!(next, Self::RollingBack),
             Self::RollingBack => matches!(next, Self::Failed | Self::RolledBack),
-            Self::Completed | Self::RolledBack => false,
+            Self::Completed | Self::RolledBack | Self::Removed => false,
         }
     }
 }
@@ -1931,6 +2006,79 @@ impl SqliteStore {
             .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))
     }
 
+    pub fn mark_worktree_operation_removed(
+        &mut self,
+        operation_id: &str,
+        ownership_json: &str,
+        updated_at: &str,
+    ) -> StoreResult<PersistedWorktreeOperation> {
+        let current = self
+            .load_worktree_operation(operation_id)?
+            .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))?;
+        if !current
+            .state
+            .can_transition_to(WorktreeOperationState::Removed)
+        {
+            return Err(StoreError::InvalidWorktreeOperationTransition {
+                from: current.state.as_str().to_string(),
+                to: WorktreeOperationState::Removed.as_str().to_string(),
+            });
+        }
+        self.connection.execute(
+            "UPDATE worktree_operations
+             SET state = 'removed',
+                 workspace_id = NULL,
+                 surface_id = NULL,
+                 session_id = NULL,
+                 ownership_json = ?2,
+                 error_code = NULL,
+                 error_message = NULL,
+                 updated_at = ?3
+             WHERE operation_id = ?1",
+            params![operation_id, ownership_json, updated_at],
+        )?;
+        self.load_worktree_operation(operation_id)?
+            .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))
+    }
+
+    pub fn restart_removed_worktree_operation(
+        &mut self,
+        operation_id: &str,
+        ownership_json: &str,
+        restarted_at: &str,
+    ) -> StoreResult<PersistedWorktreeOperation> {
+        let current = self
+            .load_worktree_operation(operation_id)?
+            .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))?;
+        if current.state != WorktreeOperationState::Removed {
+            return Err(StoreError::InvalidWorktreeOperationTransition {
+                from: current.state.as_str().to_string(),
+                to: WorktreeOperationState::Prepared.as_str().to_string(),
+            });
+        }
+        self.connection.execute(
+            "UPDATE worktree_operations
+             SET state = 'prepared',
+                 workspace_id = NULL,
+                 surface_id = NULL,
+                 session_id = NULL,
+                 ownership_json = ?2,
+                 error_code = NULL,
+                 error_message = NULL,
+                 recovery_json = '{}',
+                 recovery_attempts = 0,
+                 last_recovery_at = NULL,
+                 created_at = ?3,
+                 updated_at = ?3,
+                 completed_at = NULL,
+                 rolled_back_at = NULL
+             WHERE operation_id = ?1",
+            params![operation_id, ownership_json, restarted_at],
+        )?;
+        self.load_worktree_operation(operation_id)?
+            .ok_or_else(|| StoreError::WorktreeOperationNotFound(operation_id.to_string()))
+    }
+
     pub fn record_worktree_operation_recovery(
         &mut self,
         operation_id: &str,
@@ -1969,7 +2117,7 @@ impl SqliteStore {
                     error_code, error_message, recovery_json, recovery_attempts,
                     last_recovery_at, created_at, updated_at, completed_at, rolled_back_at
              FROM worktree_operations
-             WHERE state NOT IN ('completed', 'rolled_back')
+             WHERE state NOT IN ('completed', 'rolled_back', 'removed')
              ORDER BY updated_at ASC, operation_id ASC",
         )?;
         let rows = statement.query_map([], worktree_operation_from_row)?;
@@ -2144,6 +2292,55 @@ impl SqliteStore {
             ],
         )?;
         Ok(updated > 0)
+    }
+
+    pub fn update_git_review_delivery_batch(
+        &mut self,
+        thread_id: &str,
+        delivery: &GitReviewDeliveryUpdate,
+    ) -> StoreResult<bool> {
+        let tx = self.connection.transaction()?;
+        let updated = tx.execute(
+            "UPDATE git_review_threads
+             SET target_kind = ?2,
+                 target_id = ?3,
+                 delivery_state = ?4,
+                 delivery_error = ?5,
+                 updated_at = ?6
+             WHERE thread_id = ?1",
+            params![
+                thread_id,
+                delivery.target_kind,
+                delivery.target_id,
+                delivery.delivery_state,
+                delivery.delivery_error,
+                delivery.updated_at
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE git_review_comments
+             SET target_kind = ?2,
+                 target_id = ?3,
+                 delivery_state = ?4,
+                 delivery_error = ?5,
+                 delivered_at = ?6,
+                 updated_at = ?7
+             WHERE thread_id = ?1",
+            params![
+                thread_id,
+                delivery.target_kind,
+                delivery.target_id,
+                delivery.delivery_state,
+                delivery.delivery_error,
+                delivery.delivered_at,
+                delivery.updated_at
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn upsert_git_review_comment(
@@ -3184,12 +3381,12 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 12);
+        assert_eq!(store.schema_version().unwrap(), 13);
     }
 
     #[test]
     fn worktree_operations_and_git_review_schema_are_versioned() {
-        let migration = MIGRATIONS.last().unwrap();
+        let migration = &MIGRATIONS[11];
         assert_eq!(migration.version, 12);
         assert!(migration
             .sql
@@ -3200,6 +3397,9 @@ mod tests {
         assert!(migration
             .sql
             .contains("CREATE TABLE IF NOT EXISTS git_review_comments"));
+        let removed = MIGRATIONS.last().unwrap();
+        assert_eq!(removed.version, 13);
+        assert!(removed.sql.contains("'removed'"));
     }
 
     #[test]
@@ -3223,7 +3423,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 12);
+        assert_eq!(after, 13);
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -3234,6 +3434,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 3);
+    }
+
+    #[test]
+    fn removed_state_migration_preserves_v12_operations() {
+        let connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&connection, &MIGRATIONS[..12]).unwrap();
+        let mut store = SqliteStore { connection };
+        store
+            .create_or_load_worktree_operation(&sample_worktree_operation("op_v12", "key_v12"))
+            .unwrap();
+        apply_migrations(&store.connection, MIGRATIONS).unwrap();
+        let removed = store
+            .mark_worktree_operation_removed("op_v12", r#"{"owned":false}"#, "removed")
+            .unwrap();
+        assert_eq!(removed.state, WorktreeOperationState::Removed);
+        assert_eq!(store.schema_version().unwrap(), 13);
     }
 
     #[test]
@@ -3404,6 +3620,48 @@ mod tests {
     }
 
     #[test]
+    fn removed_worktree_operations_clear_resources_and_can_restart() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .create_or_load_worktree_operation(&sample_worktree_operation("op_removed", "key"))
+            .unwrap();
+        for state in [
+            WorktreeOperationState::WorktreeCreated,
+            WorktreeOperationState::WorkspaceCreated,
+            WorktreeOperationState::SessionCreated,
+            WorktreeOperationState::Completed,
+        ] {
+            store
+                .transition_worktree_operation("op_removed", state, None, None, "completed")
+                .unwrap();
+        }
+        store
+            .update_worktree_operation_resources(
+                "op_removed",
+                Some("ws_old"),
+                Some("surface_old"),
+                Some("session_old"),
+                None,
+                "owned",
+            )
+            .unwrap();
+        let removed = store
+            .mark_worktree_operation_removed("op_removed", r#"{"owned":false}"#, "removed")
+            .unwrap();
+        assert_eq!(removed.state, WorktreeOperationState::Removed);
+        assert_eq!(removed.workspace_id, None);
+        assert_eq!(removed.surface_id, None);
+        assert_eq!(removed.session_id, None);
+
+        let restarted = store
+            .restart_removed_worktree_operation("op_removed", r#"{"owned":false}"#, "restarted")
+            .unwrap();
+        assert_eq!(restarted.state, WorktreeOperationState::Prepared);
+        assert_eq!(restarted.recovery_attempts, 0);
+        assert_eq!(restarted.completed_at, None);
+    }
+
+    #[test]
     fn git_review_threads_and_comments_support_crud_delivery_and_stale_marking() {
         let mut store = SqliteStore::in_memory().unwrap();
         store
@@ -3435,6 +3693,9 @@ mod tests {
             delivered_at: Some("2026-07-23T00:00:02Z".to_string()),
             updated_at: "2026-07-23T00:00:02Z".to_string(),
         };
+        assert!(store
+            .update_git_review_delivery_batch("thread_old", &delivery)
+            .unwrap());
         assert!(store
             .update_git_review_comment_delivery("comment_1", &delivery)
             .unwrap());
@@ -3487,6 +3748,58 @@ mod tests {
             .load_git_review_thread("thread_old")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn git_review_delivery_batch_rolls_back_on_comment_update_failure() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .upsert_git_review_thread(&sample_git_review_thread("thread_atomic", "diff"))
+            .unwrap();
+        store
+            .upsert_git_review_comment(&PersistedGitReviewComment {
+                comment_id: "comment_atomic".to_string(),
+                thread_id: "thread_atomic".to_string(),
+                author_id: "reviewer".to_string(),
+                body: "Atomic delivery".to_string(),
+                target_kind: None,
+                target_id: None,
+                delivery_state: "pending".to_string(),
+                delivery_error: None,
+                delivered_at: None,
+                created_at: "created".to_string(),
+                updated_at: "created".to_string(),
+            })
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_review_comment_delivery
+                 BEFORE UPDATE ON git_review_comments
+                 BEGIN SELECT RAISE(FAIL, 'injected comment update failure'); END;",
+            )
+            .unwrap();
+        let update = GitReviewDeliveryUpdate {
+            target_kind: Some("mailbox".to_string()),
+            target_id: Some("session_worker".to_string()),
+            delivery_state: "delivering".to_string(),
+            delivery_error: None,
+            delivered_at: None,
+            updated_at: "updated".to_string(),
+        };
+        assert!(store
+            .update_git_review_delivery_batch("thread_atomic", &update)
+            .is_err());
+        let thread = store
+            .load_git_review_thread("thread_atomic")
+            .unwrap()
+            .unwrap();
+        let comment = store
+            .load_git_review_comment("comment_atomic")
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.delivery_state, "pending");
+        assert_eq!(comment.delivery_state, "pending");
     }
 
     #[test]

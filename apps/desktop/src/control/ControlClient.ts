@@ -345,6 +345,7 @@ export interface GitPagedDiff extends GitDiff {
   generation: number;
   originalPath?: string | null;
   isBinary: boolean;
+  diffHash: string;
 }
 
 export interface GitReviewLineAnchor {
@@ -4923,7 +4924,7 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {}): Promise<GitPagedDiff> {
     const [diff, summary] = await Promise.all([this.getGitDiff(workspaceId, path, { staged: options.stage === "staged" }), this.getGitStatusSummary(workspaceId, options.repositoryId)]);
-    return { ...diff, workspaceId, repositoryId: summary.repositoryId, generation: summary.generation, originalPath: null, isBinary: false };
+    return { ...diff, workspaceId, repositoryId: summary.repositoryId, generation: summary.generation, originalPath: null, isBinary: false, diffHash: `${summary.generation}:${diff.patch.length}` };
   }
 
   async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> {
@@ -7110,6 +7111,7 @@ interface GitPagedDiffWire {
   diff?: string;
   is_binary?: boolean;
   truncated?: boolean;
+  diff_hash?: string;
 }
 
 interface GitReviewLineAnchorWire {
@@ -7759,6 +7761,7 @@ function mapGitPagedDiff(value: GitPagedDiffWire): GitPagedDiff {
     patch: value.diff ?? "",
     isBinary: value.is_binary ?? false,
     truncated: value.truncated ?? false,
+    diffHash: value.diff_hash ?? "",
   };
 }
 

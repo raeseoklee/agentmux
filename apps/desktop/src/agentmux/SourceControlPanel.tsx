@@ -24,7 +24,7 @@ import {
 } from "../control/GitWorktreeForm";
 import { useAppDialogs } from "./dialogs";
 import { IconBranch, IconClose, IconPlus, IconReset, IconSearch } from "./icons";
-import type { Translator } from "./i18n";
+import type { I18nKey, Translator } from "./i18n";
 import "./SourceControlPanel.css";
 
 interface Props {
@@ -47,6 +47,17 @@ const PAGE_SIZE = 250;
 const MIN_CHANGE_HEIGHT = 120;
 const MIN_DIFF_HEIGHT = 180;
 const SPLIT_RATIO_STORAGE_KEY = "agentmux.sourceControl.changeListRatio.v1";
+const WORKTREE_STATE_KEYS: Record<string, I18nKey> = {
+  prepared: "sourceControl.worktreeStatePrepared",
+  worktree_created: "sourceControl.worktreeStateWorktreeCreated",
+  workspace_created: "sourceControl.worktreeStateWorkspaceCreated",
+  session_created: "sourceControl.worktreeStateSessionCreated",
+  completed: "sourceControl.worktreeStateCompleted",
+  failed: "sourceControl.worktreeStateFailed",
+  rolling_back: "sourceControl.worktreeStateRollingBack",
+  rolled_back: "sourceControl.worktreeStateRolledBack",
+  removed: "sourceControl.worktreeStateRemoved",
+};
 
 function readSplitRatio(): number {
   try {
@@ -72,6 +83,19 @@ function splitPath(path: string): { name: string; directory: string } {
   return { name: segments.pop() ?? path, directory: segments.join("/") };
 }
 
+function worktreeStateLabel(t: Translator, state: string): string {
+  return t(WORKTREE_STATE_KEYS[state] ?? "sourceControl.worktreeStateUnknown");
+}
+
+function reviewAnchorSideLabel(t: Translator, side: GitReviewLineAnchor["side"]): string {
+  switch (side) {
+    case "left": return t("sourceControl.reviewSideLeft");
+    case "right": return t("sourceControl.reviewSideRight");
+    case "context": return t("sourceControl.reviewSideContext");
+    default: return t("sourceControl.reviewSideUnknown");
+  }
+}
+
 function diffLineAnchors(diff: GitPagedDiff | null, path: string): Array<{ text: string; kind: string; anchor: GitReviewLineAnchor | null }> {
   let left = 0;
   let right = 0;
@@ -85,17 +109,17 @@ function diffLineAnchors(diff: GitPagedDiff | null, path: string): Array<{ text:
       return { text, kind: "hunk", anchor: null };
     }
     if (text.startsWith("+") && !text.startsWith("+++")) {
-      const anchor = right ? { path, side: "right", line: right, hunkHeader } : null;
+      const anchor = right ? { path, side: "right", line: right, hunkHeader, diffHash: diff?.diffHash || null } : null;
       right += 1;
       return { text, kind: "add", anchor };
     }
     if (text.startsWith("-") && !text.startsWith("---")) {
-      const anchor = left ? { path, side: "left", line: left, hunkHeader } : null;
+      const anchor = left ? { path, side: "left", line: left, hunkHeader, diffHash: diff?.diffHash || null } : null;
       left += 1;
       return { text, kind: "remove", anchor };
     }
     if (text.startsWith(" ")) {
-      const anchor = right ? { path, side: "right", line: right, hunkHeader } : null;
+      const anchor = right ? { path, side: "right", line: right, hunkHeader, diffHash: diff?.diffHash || null } : null;
       left += 1;
       right += 1;
       return { text, kind: "context", anchor };
@@ -145,7 +169,7 @@ export function SourceControlPanel({ client, workspace, onClose, onRepositoryCha
     if (!repositoryId) return;
     try {
       setThreads(await client.listGitReviewThreads(workspace.workspaceId, {
-        repositoryId, path: path ?? null, includeResolved: true, includeStale: true, limit: 250,
+        repositoryId, path: path ?? null, includeResolved: true, includeStale: true,
       }));
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
   }, [client, workspace.workspaceId]);
@@ -323,7 +347,7 @@ export function SourceControlPanel({ client, workspace, onClose, onRepositoryCha
       const destination = String(values.destination).trim();
       const result = await client.createAgentWorktree({ workspaceId: workspace.workspaceId, branch, destination, baseRevision: String(values.base).trim() || null, createBranch: true, command: parseAgentWorktreeCommand(String(values.command)), cwd: destination, idempotencyKey: createAgentWorktreeIdempotencyKey(workspace.workspaceId, branch, destination) });
       await loadWorktrees();
-      dialogs.toast({ title: t("sourceControl.worktreeStarted"), description: `${result.branch} · ${result.state}`, tone: "success" });
+      dialogs.toast({ title: t("sourceControl.worktreeStarted"), description: `${result.branch} · ${worktreeStateLabel(t, result.state)}`, tone: "success" });
     });
   }, [client, dialogs, loadWorktrees, mutate, t, workspace.workspaceId]);
 
@@ -340,11 +364,11 @@ export function SourceControlPanel({ client, workspace, onClose, onRepositoryCha
     <header className="agentmux-source-control__header"><div className="agentmux-source-control__title"><IconBranch size={14} /><span>{t("sourceControl.title")}</span></div><div className="agentmux-source-control__header-actions"><button type="button" title={t("sourceControl.worktreeCreateTitle")} aria-label={t("sourceControl.worktreeCreateTitle")} onClick={() => void createWorktree()}><IconPlus size={13} /></button><button type="button" title={t("common.refresh")} aria-label={t("common.refresh")} disabled={loading || busy} onClick={() => void refresh(true)}><IconReset size={13} /></button><button type="button" title={t("common.close")} aria-label={t("common.close")} onClick={onClose}><IconClose size={12} /></button></div></header>
     <div className="agentmux-source-control__repository"><strong>{summary?.branch ?? t("sourceControl.noBranch")}</strong>{summary?.upstream ? <span>{summary.upstream}</span> : null}{summary && (summary.ahead || summary.behind) ? <span>{t("sourceControl.syncState", { ahead: summary.ahead, behind: summary.behind })}</span> : null}<small title={path}>{path}</small></div>
     {error ? <div className="agentmux-source-control__error" role="status">{error}</div> : null}
-    {worktrees.length ? <div className="agentmux-source-control__worktrees"><span>{t("sourceControl.worktreeList")}</span>{worktrees.slice(0, 3).map((operation) => <div className="agentmux-source-control__worktree" key={operation.worktreeId}><button type="button" title={t("sourceControl.worktreeRecover")} onClick={() => void runPanelAction(async () => { await client.recoverAgentWorktree({ operationId: operation.operationId }); await loadWorktrees(); })}>{operation.branch}</button><small>{operation.state}</small><button type="button" onClick={() => void dialogs.confirm({ title: t("sourceControl.worktreeRemoveTitle"), description: operation.path, detail: t("sourceControl.worktreeRemoveDescription"), confirmLabel: t("sourceControl.worktreeRemove"), tone: "danger" }).then((confirmed) => { if (confirmed) void runPanelAction(async () => { await client.removeAgentWorktree({ worktreeId: operation.worktreeId }); await loadWorktrees(); }); })}>{t("sourceControl.worktreeRemove")}</button></div>)}</div> : null}
+    {worktrees.length ? <div className="agentmux-source-control__worktrees"><span>{t("sourceControl.worktreeList")}</span>{worktrees.map((operation) => <div className="agentmux-source-control__worktree" key={operation.worktreeId}><button type="button" title={t("sourceControl.worktreeRecover")} onClick={() => void runPanelAction(async () => { await client.recoverAgentWorktree({ operationId: operation.operationId }); await loadWorktrees(); })}>{operation.branch}</button><small>{worktreeStateLabel(t, operation.state)}</small><button type="button" onClick={() => void dialogs.confirm({ title: t("sourceControl.worktreeRemoveTitle"), description: operation.path, detail: t("sourceControl.worktreeRemoveDescription"), confirmLabel: t("sourceControl.worktreeRemove"), tone: "danger" }).then((confirmed) => { if (confirmed) void runPanelAction(async () => { await client.removeAgentWorktree({ worktreeId: operation.worktreeId }); await loadWorktrees(); }); })}>{t("sourceControl.worktreeRemove")}</button></div>)}</div> : null}
     {loading && !summary ? <div className="agentmux-source-control__loading">{t("sourceControl.loading")}</div> : <div ref={splitRef} className="agentmux-source-control__content">
       <section className="agentmux-source-control__changes" style={{ flexBasis: `${ratio * 100}%` }}><label className="agentmux-source-control__filter"><IconSearch size={13} /><input type="search" value={filter} onChange={(event) => setFilter(event.currentTarget.value)} placeholder={t("sourceControl.filterPlaceholder")} aria-label={t("sourceControl.filterPlaceholder")} /></label><div ref={scrollRef} className="agentmux-source-control__virtual-scroll agentmux-scroll" onScroll={(event) => { const target = event.currentTarget; if (nextCursor && target.scrollTop + target.clientHeight > target.scrollHeight - 180) void loadMore(); }}><div className="agentmux-source-control__virtual-list" style={{ height: `${virtualizer.getTotalSize()}px` }}>{virtualizer.getVirtualItems().map((item) => { const row = rows[item.index]; if (!row) return null; let content: ReactNode; if (row.kind === "header") content = <div className="agentmux-source-control__section-header"><span>{row.title}</span><span className="agentmux-source-control__count">{row.count}</span>{row.action ? <button type="button" className="agentmux-source-control__section-action" onClick={() => void mutate(() => row.action === "stage" ? client.stageAllGitFiles(workspace.workspaceId) : client.unstageAllGitFiles(workspace.workspaceId))}>{row.action === "stage" ? t("sourceControl.stageAll") : t("sourceControl.unstageAll")}</button> : null}</div>; else if (row.kind === "more") content = <button type="button" className="agentmux-source-control__load-more" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? t("common.loading") : t("sourceControl.loadMore", { count: PAGE_SIZE })}</button>; else if (row.kind === "empty") content = <div className="agentmux-source-control__clean">{row.text}</div>; else { const next = { path: row.change.path, stage: stageFor(row.change) }; const selected = selection?.path === next.path && selection.stage === next.stage; const label = splitPath(row.change.path); content = <div className="agentmux-source-control__change" data-testid={`source-control-change-${row.change.staged ? "staged" : "working"}`} data-selected={selected || undefined}><button type="button" className="agentmux-source-control__change-main" onClick={() => setSelection(next)}><span className="agentmux-source-control__badge" data-status={statusBadge(row.change)}>{statusBadge(row.change)}</span><span className="agentmux-source-control__change-label"><span className="agentmux-source-control__filename">{label.name}</span>{label.directory ? <span className="agentmux-source-control__directory">{label.directory}</span> : null}</span></button><button type="button" className="agentmux-source-control__row-action" onClick={() => void mutate(() => row.change.staged ? client.unstageGitFiles(workspace.workspaceId, [row.change.path]) : client.stageGitFiles(workspace.workspaceId, [row.change.path]))}>{row.change.staged ? <IconClose size={10} /> : <IconPlus size={11} />}</button></div>; } return <div key={row.key} className="agentmux-source-control__virtual-row" data-index={item.index} ref={virtualizer.measureElement} style={{ transform: `translateY(${item.start}px)` }}>{content}</div>; })}</div></div></section>
       <div className="agentmux-source-control__splitter" role="separator" aria-orientation="horizontal" aria-label={t("sourceControl.resizeFileList")} aria-valuemin={20} aria-valuemax={80} aria-valuenow={Math.round(ratio * 100)} data-resizing={resizing || undefined} tabIndex={0} onPointerDown={(event) => { if (event.button !== 0) return; event.currentTarget.setPointerCapture(event.pointerId); setResizing(true); updateRatio(event.clientY); }} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updateRatio(event.clientY); }} onPointerUp={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); setResizing(false); }} onPointerCancel={() => setResizing(false)} onKeyDown={(event) => { if (event.key === "ArrowUp") { setRatio((current) => Math.max(.2, current - .05)); event.preventDefault(); } if (event.key === "ArrowDown") { setRatio((current) => Math.min(.8, current + .05)); event.preventDefault(); } }} />
-      <section className="agentmux-source-control__diff"><div className="agentmux-source-control__diff-header"><span title={selection?.path}>{selection?.path ?? t("sourceControl.diff")}</span>{diff?.truncated ? <em>{t("sourceControl.truncated")}</em> : null}</div><div className="agentmux-source-control__diff-lines agentmux-scroll">{diff ? diffLines.map((line, index) => { const marked = line.anchor ? markers.get(`${line.anchor.side}:${line.anchor.line}`) : null; const selectedLine = reviewAnchor?.line === line.anchor?.line && reviewAnchor?.side === line.anchor?.side; return <button key={`${index}:${line.text}`} type="button" className="agentmux-source-control__diff-line" data-kind={line.kind} data-selected={selectedLine || undefined} disabled={!line.anchor} onClick={() => setReviewAnchor(line.anchor)}><span className="agentmux-source-control__diff-line-number">{line.anchor?.line ?? ""}</span><code>{line.text || " "}</code>{marked ? <span className="agentmux-source-control__thread-marker">1</span> : null}</button>; }) : <div className="agentmux-source-control__diff-empty">{selection ? t("common.loading") : t("sourceControl.selectFile")}</div>}</div>{reviewAnchor ? <div className="agentmux-source-control__review-composer"><small>{t("sourceControl.reviewCommentOn", { side: reviewAnchor.side, line: reviewAnchor.line })}</small><textarea value={reviewBody} onChange={(event) => setReviewBody(event.currentTarget.value)} placeholder={t("sourceControl.reviewPlaceholder")} /><div><select value={delivery} onChange={(event) => setDelivery(event.currentTarget.value as "mailbox" | "terminal")}><option value="mailbox">{t("sourceControl.reviewMailbox")}</option><option value="terminal">{t("sourceControl.reviewTerminal")}</option></select><select value={deliverySession} onChange={(event) => setDeliverySession(event.currentTarget.value)}><option value="">{t("sourceControl.reviewDoNotDeliver")}</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.backendKind} · {session.sessionId.slice(-8)}</option>)}</select><button type="button" disabled={!reviewBody.trim() || busy} onClick={() => void createReview()}>{t("sourceControl.reviewAdd")}</button></div></div> : null}{threads.length ? <div className="agentmux-source-control__threads">{threads.slice(0, 4).map((thread) => <div key={thread.threadId}><span>{thread.anchor.side} {thread.anchor.line}</span><p>{thread.comments.at(-1)?.body}</p><button type="button" onClick={() => void runPanelAction(async () => { await client.updateGitReviewThread(thread.threadId, { resolved: !thread.resolved }); await loadThreads(selection?.path, summary?.repositoryId); })}>{thread.resolved ? t("sourceControl.reviewReopen") : t("sourceControl.reviewResolve")}</button><button type="button" onClick={() => void dialogs.confirm({ title: t("sourceControl.reviewDeleteTitle"), description: t("sourceControl.reviewDeleteDescription"), confirmLabel: t("sourceControl.reviewDelete"), tone: "danger" }).then((confirmed) => { if (confirmed) void runPanelAction(async () => { await client.deleteGitReviewThread(thread.threadId); await loadThreads(selection?.path, summary?.repositoryId); }); })}>{t("sourceControl.reviewDelete")}</button></div>)}</div> : null}</section>
+      <section className="agentmux-source-control__diff"><div className="agentmux-source-control__diff-header"><span title={selection?.path}>{selection?.path ?? t("sourceControl.diff")}</span>{diff?.truncated ? <em>{t("sourceControl.truncated")}</em> : null}</div><div className="agentmux-source-control__diff-lines agentmux-scroll">{diff ? diffLines.map((line, index) => { const marked = line.anchor ? markers.get(`${line.anchor.side}:${line.anchor.line}`) : null; const selectedLine = reviewAnchor?.line === line.anchor?.line && reviewAnchor?.side === line.anchor?.side; return <button key={`${index}:${line.text}`} type="button" className="agentmux-source-control__diff-line" data-kind={line.kind} data-selected={selectedLine || undefined} disabled={!line.anchor} onClick={() => setReviewAnchor(line.anchor)}><span className="agentmux-source-control__diff-line-number">{line.anchor?.line ?? ""}</span><code>{line.text || " "}</code>{marked ? <span className="agentmux-source-control__thread-marker">1</span> : null}</button>; }) : <div className="agentmux-source-control__diff-empty">{selection ? t("common.loading") : t("sourceControl.selectFile")}</div>}</div>{reviewAnchor ? <div className="agentmux-source-control__review-composer"><small>{t("sourceControl.reviewCommentOn", { side: reviewAnchorSideLabel(t, reviewAnchor.side), line: reviewAnchor.line })}</small><textarea value={reviewBody} onChange={(event) => setReviewBody(event.currentTarget.value)} placeholder={t("sourceControl.reviewPlaceholder")} /><div><select value={delivery} onChange={(event) => setDelivery(event.currentTarget.value as "mailbox" | "terminal")}><option value="mailbox">{t("sourceControl.reviewMailbox")}</option><option value="terminal">{t("sourceControl.reviewTerminal")}</option></select><select value={deliverySession} onChange={(event) => setDeliverySession(event.currentTarget.value)}><option value="">{t("sourceControl.reviewDoNotDeliver")}</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.backendKind} · {session.sessionId.slice(-8)}</option>)}</select><button type="button" disabled={!reviewBody.trim() || busy} onClick={() => void createReview()}>{t("sourceControl.reviewAdd")}</button></div></div> : null}{threads.length ? <div className="agentmux-source-control__threads">{threads.map((thread) => <div key={thread.threadId}><span>{reviewAnchorSideLabel(t, thread.anchor.side)} {thread.anchor.line}</span><p>{thread.comments.at(-1)?.body}</p><button type="button" onClick={() => void runPanelAction(async () => { await client.updateGitReviewThread(thread.threadId, { resolved: !thread.resolved }); await loadThreads(selection?.path, summary?.repositoryId); })}>{thread.resolved ? t("sourceControl.reviewReopen") : t("sourceControl.reviewResolve")}</button><button type="button" onClick={() => void dialogs.confirm({ title: t("sourceControl.reviewDeleteTitle"), description: t("sourceControl.reviewDeleteDescription"), confirmLabel: t("sourceControl.reviewDelete"), tone: "danger" }).then((confirmed) => { if (confirmed) void runPanelAction(async () => { await client.deleteGitReviewThread(thread.threadId); await loadThreads(selection?.path, summary?.repositoryId); }); })}>{t("sourceControl.reviewDelete")}</button></div>)}</div> : null}</section>
     </div>}
     <div className="agentmux-source-control__commit">
       <textarea value={commitMessage} disabled={busy} onChange={(event) => setCommitMessage(event.currentTarget.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void commit(); } }} rows={2} placeholder={t("sourceControl.commitPlaceholder")} aria-label={t("sourceControl.commitPlaceholder")} />

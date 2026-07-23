@@ -2165,6 +2165,8 @@ pub struct GitDiffResult {
     pub is_binary: bool,
     #[serde(default)]
     pub truncated: bool,
+    #[serde(default)]
+    pub diff_hash: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

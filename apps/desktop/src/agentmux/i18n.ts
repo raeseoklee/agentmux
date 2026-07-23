@@ -182,6 +182,16 @@ export type I18nKey =
   | "sourceControl.worktreeRemoveDescription"
   | "sourceControl.worktreeRemoveTitle"
   | "sourceControl.worktreeStarted"
+  | "sourceControl.worktreeStateCompleted"
+  | "sourceControl.worktreeStateFailed"
+  | "sourceControl.worktreeStatePrepared"
+  | "sourceControl.worktreeStateRemoved"
+  | "sourceControl.worktreeStateRolledBack"
+  | "sourceControl.worktreeStateRollingBack"
+  | "sourceControl.worktreeStateSessionCreated"
+  | "sourceControl.worktreeStateUnknown"
+  | "sourceControl.worktreeStateWorkspaceCreated"
+  | "sourceControl.worktreeStateWorktreeCreated"
   | "sourceControl.reviewAdd"
   | "sourceControl.reviewCommentOn"
   | "sourceControl.reviewDelete"
@@ -192,6 +202,10 @@ export type I18nKey =
   | "sourceControl.reviewPlaceholder"
   | "sourceControl.reviewReopen"
   | "sourceControl.reviewResolve"
+  | "sourceControl.reviewSideContext"
+  | "sourceControl.reviewSideLeft"
+  | "sourceControl.reviewSideRight"
+  | "sourceControl.reviewSideUnknown"
   | "sourceControl.reviewTerminal"
   | "devServer.detectedTitle"
   | "devServer.detectedDescription"
@@ -475,6 +489,16 @@ const en: Record<I18nKey, string> = {
   "sourceControl.worktreeRemoveDescription": "Only AgentMux-owned worktree resources will be removed.",
   "sourceControl.worktreeRemoveTitle": "Remove isolated worktree?",
   "sourceControl.worktreeStarted": "Worktree operation started",
+  "sourceControl.worktreeStateCompleted": "Completed",
+  "sourceControl.worktreeStateFailed": "Failed",
+  "sourceControl.worktreeStatePrepared": "Preparing",
+  "sourceControl.worktreeStateRemoved": "Removed",
+  "sourceControl.worktreeStateRolledBack": "Rolled back",
+  "sourceControl.worktreeStateRollingBack": "Rolling back",
+  "sourceControl.worktreeStateSessionCreated": "Session created",
+  "sourceControl.worktreeStateUnknown": "Unknown status",
+  "sourceControl.worktreeStateWorkspaceCreated": "Workspace created",
+  "sourceControl.worktreeStateWorktreeCreated": "Worktree created",
   "sourceControl.reviewAdd": "Add comment",
   "sourceControl.reviewCommentOn": "Comment on {side} line {line}",
   "sourceControl.reviewDelete": "Delete",
@@ -485,6 +509,10 @@ const en: Record<I18nKey, string> = {
   "sourceControl.reviewPlaceholder": "Write review feedback",
   "sourceControl.reviewReopen": "Reopen",
   "sourceControl.reviewResolve": "Resolve",
+  "sourceControl.reviewSideContext": "context",
+  "sourceControl.reviewSideLeft": "left",
+  "sourceControl.reviewSideRight": "right",
+  "sourceControl.reviewSideUnknown": "unknown side",
   "sourceControl.reviewTerminal": "Terminal",
   "devServer.detectedTitle": "Development server detected",
   "devServer.detectedDescription": "{url} is ready to open beside the terminal.",
@@ -847,6 +875,16 @@ const ko: Record<I18nKey, string> = {
   "sourceControl.worktreeRemoveDescription": "AgentMux가 소유한 worktree 리소스만 제거됩니다.",
   "sourceControl.worktreeRemoveTitle": "격리된 worktree를 제거할까요?",
   "sourceControl.worktreeStarted": "worktree 작업 시작됨",
+  "sourceControl.worktreeStateCompleted": "완료됨",
+  "sourceControl.worktreeStateFailed": "실패함",
+  "sourceControl.worktreeStatePrepared": "준비 중",
+  "sourceControl.worktreeStateRemoved": "제거됨",
+  "sourceControl.worktreeStateRolledBack": "되돌림 완료",
+  "sourceControl.worktreeStateRollingBack": "되돌리는 중",
+  "sourceControl.worktreeStateSessionCreated": "세션 생성됨",
+  "sourceControl.worktreeStateUnknown": "알 수 없는 상태",
+  "sourceControl.worktreeStateWorkspaceCreated": "워크스페이스 생성됨",
+  "sourceControl.worktreeStateWorktreeCreated": "worktree 생성됨",
   "sourceControl.reviewAdd": "코멘트 추가",
   "sourceControl.reviewCommentOn": "{side} {line}번 줄에 코멘트",
   "sourceControl.reviewDelete": "삭제",
@@ -857,6 +895,10 @@ const ko: Record<I18nKey, string> = {
   "sourceControl.reviewPlaceholder": "리뷰 피드백 작성",
   "sourceControl.reviewReopen": "다시 열기",
   "sourceControl.reviewResolve": "해결",
+  "sourceControl.reviewSideContext": "문맥",
+  "sourceControl.reviewSideLeft": "왼쪽",
+  "sourceControl.reviewSideRight": "오른쪽",
+  "sourceControl.reviewSideUnknown": "알 수 없는 쪽",
   "sourceControl.reviewTerminal": "터미널",
   "devServer.detectedTitle": "개발 서버 감지됨",
   "devServer.detectedDescription": "{url}을(를) 터미널 옆에서 열 수 있습니다.",

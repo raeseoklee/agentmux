@@ -4,7 +4,7 @@
 //! host validates the caller/session token, then passes a single JSON payload
 //! here before applying the resulting event to its control plane.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde_json::Value;
@@ -117,7 +117,7 @@ impl std::error::Error for AgentHookValidationError {}
 pub struct AgentHookNormalizer {
     config: AgentHookNormalizerConfig,
     latest_sequences: HashMap<(AgentHookProvider, String), u64>,
-    recent_events: HashMap<String, u64>,
+    recent_events: HashMap<(AgentHookProvider, String, String), u64>,
 }
 
 impl AgentHookNormalizer {
@@ -137,6 +137,7 @@ impl AgentHookNormalizer {
         expected_process_id: Option<u32>,
         now_ms: u64,
     ) -> Result<Option<NormalizedAgentHookEvent>, AgentHookValidationError> {
+        self.prune_expired(now_ms);
         if payload.len() > self.config.max_payload_bytes {
             return Err(AgentHookValidationError::PayloadTooLarge);
         }
@@ -190,16 +191,16 @@ impl AgentHookNormalizer {
                 &["cwd", "working_directory", "workingDirectory"],
             )?,
         };
-        self.prune_expired(now_ms);
         let fingerprint = fingerprint(&event);
-        if self.recent_events.contains_key(&fingerprint) {
+        let recent_event_key = (provider, event.session_id.clone(), fingerprint);
+        if self.recent_events.contains_key(&recent_event_key) {
             return Ok(None);
         }
         if let Some(sequence) = sequence {
             self.latest_sequences.insert(sequence_key, sequence);
         }
         self.recent_events.insert(
-            fingerprint,
+            recent_event_key,
             now_ms.saturating_add(self.config.dedupe_ttl_ms),
         );
         Ok(Some(event))
@@ -207,6 +208,13 @@ impl AgentHookNormalizer {
 
     fn prune_expired(&mut self, now_ms: u64) {
         self.recent_events.retain(|_, expiry| *expiry > now_ms);
+        let retained_sessions: HashSet<_> = self
+            .recent_events
+            .keys()
+            .map(|(provider, session_id, _)| (*provider, session_id.clone()))
+            .collect();
+        self.latest_sequences
+            .retain(|session, _| retained_sessions.contains(session));
     }
 }
 
@@ -422,6 +430,94 @@ mod tests {
             .is_none());
         assert!(normalizer
             .normalize(AgentHookProvider::Codex, payload, None, None, 111)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn prunes_expired_sequence_tracking_for_claude_and_codex_sessions() {
+        let mut normalizer = AgentHookNormalizer::new(AgentHookNormalizerConfig {
+            max_payload_bytes: 1024,
+            dedupe_ttl_ms: 10,
+        });
+        for (provider, session_id, payload) in [
+            (
+                AgentHookProvider::Claude,
+                "claude-sequence",
+                br#"{"hook_event_name":"PreToolUse","session_id":"claude-sequence","sequence":7}"#
+                    as &[u8],
+            ),
+            (
+                AgentHookProvider::Codex,
+                "codex-sequence",
+                br#"{"event":"agent.running","session_id":"codex-sequence","seq":7}"#,
+            ),
+        ] {
+            assert!(normalizer
+                .normalize(provider, payload, Some(session_id), None, 100)
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(normalizer.latest_sequences.len(), 2);
+
+        assert!(normalizer
+            .normalize(
+                AgentHookProvider::Codex,
+                br#"{"event":"agent.running","session_id":"cleanup"}"#,
+                None,
+                None,
+                111,
+            )
+            .unwrap()
+            .is_some());
+        assert!(normalizer.latest_sequences.is_empty());
+    }
+
+    #[test]
+    fn retained_unsequenced_event_preserves_sequence_ordering() {
+        let mut normalizer = AgentHookNormalizer::new(AgentHookNormalizerConfig {
+            max_payload_bytes: 1024,
+            dedupe_ttl_ms: 10,
+        });
+        assert!(normalizer
+            .normalize(
+                AgentHookProvider::Claude,
+                br#"{"hook_event_name":"PreToolUse","session_id":"claude-1","sequence":5}"#,
+                None,
+                None,
+                100,
+            )
+            .unwrap()
+            .is_some());
+        assert!(normalizer
+            .normalize(
+                AgentHookProvider::Claude,
+                br#"{"hook_event_name":"PostToolUse","session_id":"claude-1"}"#,
+                None,
+                None,
+                105,
+            )
+            .unwrap()
+            .is_some());
+
+        assert_eq!(
+            normalizer.normalize(
+                AgentHookProvider::Claude,
+                br#"{"hook_event_name":"Stop","session_id":"claude-1","sequence":4}"#,
+                None,
+                None,
+                111,
+            ),
+            Err(AgentHookValidationError::StaleSequence)
+        );
+        assert!(normalizer
+            .normalize(
+                AgentHookProvider::Claude,
+                br#"{"hook_event_name":"Stop","session_id":"claude-1","sequence":4}"#,
+                None,
+                None,
+                116,
+            )
             .unwrap()
             .is_some());
     }

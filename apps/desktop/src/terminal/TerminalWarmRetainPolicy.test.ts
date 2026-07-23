@@ -19,7 +19,6 @@ function tab(
     lastActive: false,
     lastActiveAt: NOW - 1_000,
     hiddenSince: NOW - 1_000,
-    protectedFromParking: false,
     ...overrides,
   };
 }
@@ -39,16 +38,21 @@ describe("decideTerminalWarmRetain", () => {
     expect([...decision.parkedTabIds]).toEqual(["expired"]);
   });
 
-  it("keeps structurally unsafe tabs mounted outside the normal cap", () => {
+  it("keeps the active tab while hidden split tabs stay within the global cap", () => {
     const decision = decideTerminalWarmRetain(
-      Array.from({ length: TERMINAL_WARM_RETAIN_MAX_TABS + 2 }, (_, index) =>
-        tab(`protected-${index}`, { protectedFromParking: true }),
-      ),
+      [
+        tab("active", { active: true, hiddenSince: null }),
+        ...Array.from({ length: TERMINAL_WARM_RETAIN_MAX_TABS + 2 }, (_, index) =>
+          tab(`hidden-split-${index}`, { hiddenSince: NOW - 1_000 - index }),
+        ),
+      ],
       NOW,
     );
 
-    expect(decision.warmTabIds.size).toBe(TERMINAL_WARM_RETAIN_MAX_TABS + 2);
-    expect(decision.parkedTabIds.size).toBe(0);
+    expect(decision.warmTabIds.size).toBe(TERMINAL_WARM_RETAIN_MAX_TABS);
+    expect(decision.warmTabIds.has("active")).toBe(true);
+    expect(decision.warmTabIds.has("hidden-split-0")).toBe(true);
+    expect(decision.parkedTabIds.has("hidden-split-7")).toBe(true);
   });
 
   it("uses recency to enforce the capped normal warm set", () => {
@@ -94,18 +98,26 @@ describe("decideTerminalWarmRetain", () => {
     );
   });
 
-  it("gives a newly hidden tab a grace window before normal cap eviction", () => {
+  it("prioritizes newly hidden tabs without letting grace exceed the cap", () => {
     const decision = decideTerminalWarmRetain(
-      Array.from({ length: TERMINAL_WARM_RETAIN_MAX_TABS + 3 }, (_, index) =>
-        tab(`tab-${index}`, {
-          lastActiveAt: NOW - index * 1_000,
+      [
+        ...Array.from({ length: TERMINAL_WARM_RETAIN_MAX_TABS }, (_, index) =>
+          tab(`older-${index}`, {
+            lastActiveAt: NOW - 40_000 - index * 1_000,
+            hiddenSince: NOW - 40_000 - index * 1_000,
+          }),
+        ),
+        tab("newly-hidden", {
+          lastActiveAt: NOW - 1_000,
           hiddenSince: NOW - 1_000,
         }),
-      ),
+      ],
       NOW,
     );
 
-    expect(decision.warmTabIds.size).toBe(TERMINAL_WARM_RETAIN_MAX_TABS + 3);
+    expect(decision.warmTabIds.size).toBe(TERMINAL_WARM_RETAIN_MAX_TABS);
+    expect(decision.warmTabIds.has("newly-hidden")).toBe(true);
+    expect(decision.parkedTabIds.has(`older-${TERMINAL_WARM_RETAIN_MAX_TABS - 1}`)).toBe(true);
     expect(decision.nextTransitionAt).toBe(
       NOW - 1_000 + TERMINAL_WARM_RETAIN_HIDDEN_DELAY_MS,
     );

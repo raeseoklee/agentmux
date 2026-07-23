@@ -3,7 +3,7 @@ use super::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,8 +82,57 @@ struct FiveTrackShared {
 #[derive(Clone)]
 struct CachedStatusSnapshot {
     repository: Repository,
-    snapshot: StatusSnapshot,
+    snapshot: Arc<StatusSnapshot>,
+    page_indexes: Arc<GitStatusPageIndexes>,
     captured_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct GitStatusPageIndexes {
+    all: Vec<usize>,
+    staged: Vec<usize>,
+    unstaged: Vec<usize>,
+    untracked: Vec<usize>,
+    conflicted: Vec<usize>,
+}
+
+impl GitStatusPageIndexes {
+    fn from_snapshot(snapshot: &StatusSnapshot) -> Self {
+        let mut indexes = Self {
+            all: Vec::with_capacity(snapshot.files.len()),
+            staged: Vec::with_capacity(snapshot.summary.staged_count),
+            unstaged: Vec::with_capacity(snapshot.summary.unstaged_count),
+            untracked: Vec::with_capacity(snapshot.summary.untracked_count),
+            conflicted: Vec::with_capacity(snapshot.summary.conflict_count),
+        };
+        for (index, change) in snapshot.files.iter().enumerate() {
+            indexes.all.push(index);
+            if change.staged {
+                indexes.staged.push(index);
+            }
+            if change.unstaged {
+                indexes.unstaged.push(index);
+            }
+            if change.untracked {
+                indexes.untracked.push(index);
+            }
+            if change.conflict {
+                indexes.conflicted.push(index);
+            }
+        }
+        indexes
+    }
+
+    fn for_state(&self, state: Option<&str>) -> &[usize] {
+        match state.map(str::trim).filter(|state| !state.is_empty()) {
+            None | Some("all") => &self.all,
+            Some("staged") => &self.staged,
+            Some("unstaged") => &self.unstaged,
+            Some("untracked") => &self.untracked,
+            Some("conflicted" | "conflict") => &self.conflicted,
+            Some(_) => &[],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +146,7 @@ struct ObservedRepository {
     fallback_status_hash: Option<u64>,
     next_fallback_status_at: Instant,
     last_event_at: Option<Instant>,
+    last_observed_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -373,7 +423,7 @@ impl DesktopControlState {
         &self,
         workspace_id: &str,
         repository: &Repository,
-    ) -> Result<(String, StatusSnapshot), DesktopHostError> {
+    ) -> Result<(String, CachedStatusSnapshot), DesktopHostError> {
         let repository_id = repository_id(repository);
         let generation = self.five_track.shared.git.generation(repository);
         if let Ok(cache) = self.five_track.shared.git_status_cache.lock() {
@@ -382,7 +432,7 @@ impl DesktopControlState {
                     && entry.snapshot.summary.generation == generation
                 {
                     self.observe_repository(workspace_id, &repository_id, &entry.repository);
-                    return Ok((repository_id, entry.snapshot.clone()));
+                    return Ok((repository_id, entry.clone()));
                 }
             }
         }
@@ -393,18 +443,17 @@ impl DesktopControlState {
             .git
             .read_status(repository)
             .map_err(vcs_error)?;
+        let cached = CachedStatusSnapshot {
+            repository: repository.clone(),
+            page_indexes: Arc::new(GitStatusPageIndexes::from_snapshot(&snapshot)),
+            snapshot: Arc::new(snapshot),
+            captured_at: Instant::now(),
+        };
         if let Ok(mut cache) = self.five_track.shared.git_status_cache.lock() {
-            cache.insert(
-                repository_id.clone(),
-                CachedStatusSnapshot {
-                    repository: repository.clone(),
-                    snapshot: snapshot.clone(),
-                    captured_at: Instant::now(),
-                },
-            );
+            cache.insert(repository_id.clone(), cached.clone());
         }
         self.observe_repository(workspace_id, &repository_id, repository);
-        Ok((repository_id, snapshot))
+        Ok((repository_id, cached))
     }
 
     fn observe_repository(&self, workspace_id: &str, repository_id: &str, repository: &Repository) {
@@ -413,13 +462,24 @@ impl DesktopControlState {
             return;
         };
         if observed.len() >= MAX_OBSERVED_REPOSITORIES && !observed.contains_key(&key) {
-            return;
+            if let Some(oldest_key) = observed
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_observed_at)
+                .map(|(key, _)| key.clone())
+            {
+                if let Some(mut evicted) = observed.remove(&oldest_key) {
+                    if let Some(cancel) = evicted.watch_cancel.take() {
+                        cancel.request();
+                    }
+                }
+            }
         }
         observed
             .entry(key)
             .and_modify(|entry| {
                 entry.workspace_id = workspace_id.to_string();
                 entry.repository = repository.clone();
+                entry.last_observed_at = Instant::now();
                 let scan_root = repository_scan_root(repository);
                 if entry.scan_root != scan_root {
                     if let Some(cancel) = entry.watch_cancel.take() {
@@ -441,6 +501,7 @@ impl DesktopControlState {
                 fallback_status_hash: None,
                 next_fallback_status_at: Instant::now(),
                 last_event_at: None,
+                last_observed_at: Instant::now(),
             });
     }
 
@@ -471,10 +532,10 @@ impl DesktopControlState {
                 },
             ));
         };
-        let (_, snapshot) = self.status_snapshot(&params.workspace_id, &repository)?;
+        let (_, cached) = self.status_snapshot(&params.workspace_id, &repository)?;
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &legacy_git_status_result(&snapshot),
+            &legacy_git_status_result(&cached.snapshot),
         ))
     }
 
@@ -485,9 +546,9 @@ impl DesktopControlState {
         let params: GitRepositoryParams = request.parse_params()?;
         validate_workspace_id(&params.workspace_id)?;
         let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
-        let (repository_id, snapshot) = self.status_snapshot(&params.workspace_id, &repository)?;
+        let (repository_id, cached) = self.status_snapshot(&params.workspace_id, &repository)?;
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
-        let summary = &snapshot.summary;
+        let summary = &cached.snapshot.summary;
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &GitStatusSummaryResult {
@@ -516,15 +577,11 @@ impl DesktopControlState {
         let params: GitStatusPageParams = request.parse_params()?;
         params.validate()?;
         let (_, repository) = self.resolve_vcs_repository(&params.workspace_id)?;
-        let (repository_id, snapshot) = self.status_snapshot(&params.workspace_id, &repository)?;
+        let (repository_id, cached) = self.status_snapshot(&params.workspace_id, &repository)?;
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
-        validate_generation(params.generation, snapshot.summary.generation)?;
+        validate_generation(params.generation, cached.snapshot.summary.generation)?;
 
-        let filtered = snapshot
-            .files
-            .iter()
-            .filter(|change| git_change_matches_state(change, params.state.as_deref()))
-            .collect::<Vec<_>>();
+        let filtered = cached.page_indexes.for_state(params.state.as_deref());
         let offset = parse_git_cursor(params.cursor.as_deref())?;
         if offset > filtered.len() {
             return Err(control_invalid_request(format!(
@@ -536,14 +593,14 @@ impl DesktopControlState {
         let end = offset.saturating_add(limit).min(filtered.len());
         let changes = filtered[offset..end]
             .iter()
-            .map(|change| git_change_result(change))
+            .map(|index| git_change_result(&cached.snapshot.files[*index]))
             .collect();
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &GitStatusPageResult {
                 workspace_id: params.workspace_id,
                 repository_id,
-                generation: snapshot.summary.generation,
+                generation: cached.snapshot.summary.generation,
                 changes,
                 next_cursor: (end < filtered.len()).then(|| end.to_string()),
                 total_count: Some(filtered.len()),
@@ -617,6 +674,29 @@ impl DesktopControlState {
                 },
             )
             .map_err(vcs_error)?;
+        let diff_hash = format!("{:016x}", stable_hash_bytes(result.patch.as_bytes()));
+        if let Ok(mut store) = self.store.lock() {
+            if let Ok(threads) =
+                store.list_git_review_threads(repository.root(), Some(&params.workspace_id), true)
+            {
+                for mut thread in threads
+                    .into_iter()
+                    .filter(|thread| thread.path == result.path && !thread.stale)
+                {
+                    let anchor = serde_json::from_str::<GitReviewLineAnchor>(&thread.line_anchor);
+                    let still_current = anchor
+                        .ok()
+                        .and_then(|anchor| anchor.diff_hash)
+                        .is_some_and(|identity| identity == diff_hash);
+                    if !still_current {
+                        thread.stale = true;
+                        thread.stale_reason = Some("diff content changed".to_string());
+                        thread.updated_at = timestamp();
+                        let _ = store.upsert_git_review_thread(&thread);
+                    }
+                }
+            }
+        }
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &IpcGitDiffResult {
@@ -628,6 +708,7 @@ impl DesktopControlState {
                 is_binary: diff_is_binary(&result.patch),
                 diff: result.patch,
                 truncated: result.truncated,
+                diff_hash,
             },
         ))
     }
@@ -979,17 +1060,6 @@ fn parse_git_cursor(cursor: Option<&str>) -> Result<usize, DesktopHostError> {
         })
         .transpose()
         .map(|cursor| cursor.unwrap_or(0))
-}
-
-fn git_change_matches_state(change: &GitFileChange, state: Option<&str>) -> bool {
-    match state.map(str::trim).filter(|state| !state.is_empty()) {
-        None | Some("all") => true,
-        Some("staged") => change.staged,
-        Some("unstaged") => change.unstaged,
-        Some("untracked") => change.untracked,
-        Some("conflicted" | "conflict") => change.conflict,
-        Some(_) => false,
-    }
 }
 
 fn git_change_result(change: &GitFileChange) -> GitChangeSummaryResult {
@@ -1481,6 +1551,27 @@ impl DesktopControlState {
             .load_worktree_operation_by_idempotency_key(&params.idempotency_key)?
         {
             ensure_same_worktree_request(&existing, &request_json)?;
+            let existing = if existing.state == WorktreeOperationState::Removed {
+                let mut ownership = worktree_ownership(&existing)?;
+                ownership.worktree_owned = false;
+                ownership.workspace_owned = false;
+                ownership.session_owned = false;
+                ownership.pane_id = None;
+                self.store
+                    .lock()
+                    .map_err(|_| {
+                        DesktopHostError::StateUnavailable(
+                            "desktop store state is unavailable".to_string(),
+                        )
+                    })?
+                    .restart_removed_worktree_operation(
+                        &existing.operation_id,
+                        &serde_json::to_string(&ownership)?,
+                        &timestamp(),
+                    )?
+            } else {
+                existing
+            };
             let mut result = self.resume_worktree_operation(existing)?;
             result.reused = true;
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
@@ -1662,9 +1753,30 @@ impl DesktopControlState {
             .load_worktree_operation(&params.worktree_id)?
             .ok_or_else(|| control_invalid_request("Managed worktree not found."))?;
         ensure_agentmux_owned_operation(&operation)?;
+        if operation.state == WorktreeOperationState::Removed {
+            return Ok(ResponseEnvelope::ok_typed(
+                request.id.clone(),
+                &worktree_result(&operation, true, false)?,
+            ));
+        }
         self.rollback_worktree_resources(&operation, params.force, false)?;
-        let mut result = worktree_result(&operation, true, true)?;
-        result.state = "removed".to_string();
+        let mut ownership = worktree_ownership(&operation)?;
+        ownership.worktree_owned = false;
+        ownership.workspace_owned = false;
+        ownership.session_owned = false;
+        ownership.pane_id = None;
+        let removed = self
+            .store
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+            })?
+            .mark_worktree_operation_removed(
+                &operation.operation_id,
+                &serde_json::to_string(&ownership)?,
+                &timestamp(),
+            )?;
+        let result = worktree_result(&removed, false, false)?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -1703,6 +1815,9 @@ impl DesktopControlState {
             if operation.state == WorktreeOperationState::RolledBack {
                 return Ok(operation.clone());
             }
+            if operation.state == WorktreeOperationState::Removed {
+                return Ok(operation.clone());
+            }
 
             if operation.state == WorktreeOperationState::Prepared {
                 let existing = self
@@ -1719,6 +1834,9 @@ impl DesktopControlState {
                             &operation.worktree_path,
                         )
                     });
+                operation = self.update_worktree_ownership(&operation, |ownership| {
+                    ownership.worktree_owned = true;
+                })?;
                 if existing.is_none() {
                     let allowed_root = worktree_allowed_root(repository.root())?;
                     let destination = self
@@ -1753,9 +1871,6 @@ impl DesktopControlState {
                         "The journal path is registered to a different Git branch.",
                     ));
                 }
-                operation = self.update_worktree_ownership(&operation, |ownership| {
-                    ownership.worktree_owned = true;
-                })?;
                 operation = self.transition_worktree(
                     &operation,
                     WorktreeOperationState::WorktreeCreated,
@@ -1764,16 +1879,35 @@ impl DesktopControlState {
             }
 
             if operation.state == WorktreeOperationState::WorktreeCreated {
-                let workspace_id = self
-                    .find_managed_worktree_workspace(&operation)?
-                    .unwrap_or(self.create_managed_worktree_workspace(&operation, &params)?);
-                operation = self.update_worktree_resources(
-                    &operation,
-                    Some(&workspace_id),
-                    None,
-                    None,
-                    |ownership| ownership.workspace_owned = true,
-                )?;
+                let workspace_id =
+                    if let Some(existing) = self.find_managed_worktree_workspace(&operation)? {
+                        operation = self.update_worktree_resources(
+                            &operation,
+                            Some(&existing),
+                            None,
+                            None,
+                            |ownership| ownership.workspace_owned = true,
+                        )?;
+                        existing
+                    } else {
+                        let reserved = operation
+                            .workspace_id
+                            .clone()
+                            .unwrap_or_else(|| WorkspaceId::new().to_string());
+                        operation = self.update_worktree_resources(
+                            &operation,
+                            Some(&reserved),
+                            None,
+                            None,
+                            |ownership| ownership.workspace_owned = true,
+                        )?;
+                        self.create_managed_worktree_workspace(&operation, &params, &reserved)?;
+                        reserved
+                    };
+                debug_assert_eq!(
+                    operation.workspace_id.as_deref(),
+                    Some(workspace_id.as_str())
+                );
                 operation = self.transition_worktree(
                     &operation,
                     WorktreeOperationState::WorkspaceCreated,
@@ -1788,7 +1922,7 @@ impl DesktopControlState {
                     } else {
                         self.spawn_managed_worktree_terminal(&operation, &params)?
                     };
-                operation = self.update_worktree_resources(
+                operation = match self.update_worktree_resources(
                     &operation,
                     operation.workspace_id.as_deref(),
                     placement.surface_id.as_deref(),
@@ -1797,7 +1931,15 @@ impl DesktopControlState {
                         ownership.session_owned = placement.session_id.is_some();
                         ownership.pane_id = Some(placement.pane_id.clone());
                     },
-                )?;
+                ) {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        if let Some(session_id) = placement.session_id.as_deref() {
+                            self.terminate_runtime_session(session_id, TerminationMode::Kill);
+                        }
+                        return Err(error);
+                    }
+                };
                 operation = self.transition_worktree(
                     &operation,
                     WorktreeOperationState::SessionCreated,
@@ -1816,9 +1958,12 @@ impl DesktopControlState {
             Ok(operation) => worktree_result(&operation, false, false),
             Err(error) => {
                 let message = error.to_string();
-                let failed = self
-                    .mark_worktree_failed(&operation, &message)
+                let latest = self
+                    .load_worktree_operation_required(&operation.operation_id)
                     .unwrap_or(operation);
+                let failed = self
+                    .mark_worktree_failed(&latest, &message)
+                    .unwrap_or(latest);
                 let _ = self.rollback_worktree_resources(&failed, true, true);
                 Err(error)
             }
@@ -1930,14 +2075,14 @@ impl DesktopControlState {
         &self,
         operation: &PersistedWorktreeOperation,
         params: &AgentWorktreeCreateParams,
+        workspace_id: &str,
     ) -> Result<String, DesktopHostError> {
         let now = timestamp();
-        let workspace_id = WorkspaceId::new().to_string();
         let pane_id = PaneId::new().to_string();
         let source = self.load_workspace_or_not_found(&params.workspace_id)?;
         let bundle = WorkspaceBundle {
             workspace: PersistedWorkspace {
-                workspace_id: workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 name: format!("{} [{}]", source.workspace.name, params.branch),
                 root_pane_id: pane_id.clone(),
                 active_pane_id: pane_id.clone(),
@@ -1957,7 +2102,7 @@ impl DesktopControlState {
             },
             panes: vec![PersistedPane {
                 pane_id,
-                workspace_id: workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 parent_pane_id: None,
                 kind: "leaf".to_string(),
                 split_axis: None,
@@ -1976,7 +2121,7 @@ impl DesktopControlState {
                 DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
             })?
             .save_workspace_bundle(&bundle)?;
-        Ok(workspace_id)
+        Ok(workspace_id.to_string())
     }
 
     fn find_managed_worktree_session(
@@ -2263,20 +2408,49 @@ fn validated_worktree_cwd(
         return Ok(worktree_path.to_string());
     };
     if worktree_path.starts_with('/') {
-        let root = worktree_path.trim_end_matches('/');
-        if requested == root || requested.starts_with(&format!("{root}/")) {
-            return Ok(requested.to_string());
+        let root = normalized_posix_path_segments(worktree_path);
+        let requested_segments = normalized_posix_path_segments(requested);
+        if let (Some(root), Some(requested_segments)) = (root, requested_segments) {
+            if requested_segments.starts_with(&root) {
+                return Ok(requested.to_string());
+            }
         }
     } else {
         let root = PathBuf::from(worktree_path);
         let requested_path = PathBuf::from(requested);
-        if requested_path.starts_with(&root) {
+        let contains_parent = requested_path
+            .components()
+            .any(|component| component == Component::ParentDir);
+        let canonical_root = fs::canonicalize(&root);
+        let canonical_requested = fs::canonicalize(&requested_path);
+        if !contains_parent
+            && canonical_root
+                .as_ref()
+                .ok()
+                .zip(canonical_requested.as_ref().ok())
+                .is_some_and(|(root, requested)| requested.starts_with(root))
+        {
             return Ok(requested.to_string());
         }
     }
     Err(control_invalid_request(
         "Worktree terminal cwd must stay inside the managed worktree.",
     ))
+}
+
+fn normalized_posix_path_segments(path: &str) -> Option<Vec<&str>> {
+    if !path.starts_with('/') || path.contains('\\') {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            value => segments.push(value),
+        }
+    }
+    Some(segments)
 }
 
 fn worktree_paths_equal(host: &VcsGitHost, left: &str, right: &str) -> bool {
@@ -2616,13 +2790,79 @@ impl DesktopControlState {
                 .load_git_review_thread(&params.thread_id)?
                 .ok_or_else(|| control_invalid_request("Git review thread not found."))?;
             let comments = store.list_git_review_comments(&params.thread_id)?;
+            let workspace_id = thread
+                .workspace_id
+                .as_deref()
+                .ok_or_else(|| control_invalid_request("Review thread has no workspace."))?;
+            let owns_session = store
+                .load_workspace_bundle(workspace_id)?
+                .is_some_and(|bundle| {
+                    bundle
+                        .sessions
+                        .iter()
+                        .any(|session| session.session_id == target_session_id)
+                });
+            if !owns_session {
+                return Err(control_invalid_request(
+                    "Review workspace does not own the target session.",
+                ));
+            }
             (thread, comments)
         };
+        let same_target = thread.target_kind.as_deref() == Some(params.target.as_str())
+            && thread.target_id.as_deref() == Some(target_session_id);
+        let all_comments_delivered = !comments.is_empty()
+            && comments.iter().all(|comment| {
+                comment.delivery_state == "delivered"
+                    && comment.target_kind.as_deref() == Some(params.target.as_str())
+                    && comment.target_id.as_deref() == Some(target_session_id)
+            });
+        if same_target && thread.delivery_state == "delivered" && all_comments_delivered {
+            let delivered_at = comments
+                .iter()
+                .filter_map(|comment| comment.delivered_at.as_deref())
+                .max()
+                .unwrap_or(thread.updated_at.as_str())
+                .to_string();
+            return Ok(ResponseEnvelope::ok_typed(
+                request.id.clone(),
+                &GitReviewDeliveryResult {
+                    thread_id: thread.thread_id,
+                    target: params.target,
+                    target_session_id: Some(target_session_id.to_string()),
+                    delivered_at,
+                },
+            ));
+        }
+        if same_target && thread.delivery_state == "delivering" {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Review delivery is already in progress; retry after its state is reconciled.",
+            )));
+        }
         let body = format_review_delivery(&thread, &comments, params.include_context)?;
-        match params.target.as_str() {
-            "terminal" => {
-                self.send_paste_direct(target_session_id, format!("{body}\r"), true)?;
-            }
+        let started_at = timestamp();
+        let delivering = GitReviewDeliveryUpdate {
+            target_kind: Some(params.target.clone()),
+            target_id: Some(target_session_id.to_string()),
+            delivery_state: "delivering".to_string(),
+            delivery_error: None,
+            delivered_at: None,
+            updated_at: started_at,
+        };
+        if !self
+            .store
+            .lock()
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+            })?
+            .update_git_review_delivery_batch(&thread.thread_id, &delivering)?
+        {
+            return Err(control_invalid_request("Git review thread not found."));
+        }
+
+        let delivery_result = (|| match params.target.as_str() {
+            "terminal" => self.send_paste_direct(target_session_id, format!("{body}\r"), true),
             "mailbox" => {
                 let workspace_id = thread
                     .workspace_id
@@ -2643,8 +2883,24 @@ impl DesktopControlState {
                 );
                 let response = self.handle_team_message_send(&envelope)?;
                 let _: TeamMessageResult = response_result_json(&response)?;
+                Ok(())
             }
             _ => unreachable!(),
+        })();
+        if let Err(error) = delivery_result {
+            let failed_at = timestamp();
+            let failed = GitReviewDeliveryUpdate {
+                target_kind: Some(params.target.clone()),
+                target_id: Some(target_session_id.to_string()),
+                delivery_state: "failed".to_string(),
+                delivery_error: Some(error.to_string()),
+                delivered_at: None,
+                updated_at: failed_at,
+            };
+            if let Ok(mut store) = self.store.lock() {
+                let _ = store.update_git_review_delivery_batch(&thread.thread_id, &failed);
+            }
+            return Err(error);
         }
 
         let delivered_at = timestamp();
@@ -2659,9 +2915,8 @@ impl DesktopControlState {
         let mut store = self.store.lock().map_err(|_| {
             DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
         })?;
-        store.update_git_review_thread_delivery(&thread.thread_id, &update)?;
-        for comment in &comments {
-            store.update_git_review_comment_delivery(&comment.comment_id, &update)?;
+        if !store.update_git_review_delivery_batch(&thread.thread_id, &update)? {
+            return Err(control_invalid_request("Git review thread not found."));
         }
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
@@ -3343,22 +3598,36 @@ impl DesktopControlState {
                 return Err(error);
             }
         };
-        let mut candidates = self
-            .five_track
-            .shared
-            .dev_server_candidates
-            .lock()
-            .map_err(|_| {
-                DesktopHostError::StateUnavailable(
-                    "development server candidates are unavailable".to_string(),
-                )
-            })?;
-        let current = candidates
-            .iter_mut()
-            .find(|entry| entry.candidate_id == candidate.candidate_id)
-            .ok_or_else(|| control_invalid_request("Development server candidate disappeared."))?;
-        current.opened_surface_id = Some(surface.surface_id.clone());
-        let result = current.clone();
+        let bookkeeping = (|| {
+            let mut candidates = self
+                .five_track
+                .shared
+                .dev_server_candidates
+                .lock()
+                .map_err(|_| {
+                    DesktopHostError::StateUnavailable(
+                        "development server candidates are unavailable".to_string(),
+                    )
+                })?;
+            let current = candidates
+                .iter_mut()
+                .find(|entry| entry.candidate_id == candidate.candidate_id)
+                .ok_or_else(|| {
+                    control_invalid_request("Development server candidate disappeared.")
+                })?;
+            current.opened_surface_id = Some(surface.surface_id.clone());
+            Ok::<_, DesktopHostError>(current.clone())
+        })();
+        let result = match bookkeeping {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.close_browser_surface_if_present(&surface.surface_id);
+                if let Ok(mut store) = self.store.lock() {
+                    let _ = store.save_workspace_bundle(&original);
+                }
+                return Err(error);
+            }
+        };
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &DevelopmentServerCandidateOpenInSplitResult {
@@ -3598,6 +3867,104 @@ mod tests {
     }
 
     #[test]
+    fn repository_monitor_evicts_least_recent_entry_at_capacity() {
+        let repository_path = create_git_repository("watcher-capacity");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .unwrap();
+        let repository_id = repository_id(&repository);
+        for index in 0..MAX_OBSERVED_REPOSITORIES {
+            host.observe_repository(&format!("ws_{index:03}"), &repository_id, &repository);
+        }
+        host.five_track
+            .shared
+            .observed_repositories
+            .lock()
+            .unwrap()
+            .get_mut(&format!("ws_000|{repository_id}"))
+            .unwrap()
+            .last_observed_at = Instant::now() - Duration::from_secs(60);
+        host.observe_repository(
+            &format!("ws_{:03}", MAX_OBSERVED_REPOSITORIES),
+            &repository_id,
+            &repository,
+        );
+        let observed = host.five_track.shared.observed_repositories.lock().unwrap();
+        assert_eq!(observed.len(), MAX_OBSERVED_REPOSITORIES);
+        assert!(!observed.contains_key(&format!("ws_000|{repository_id}")));
+        assert!(observed.contains_key(&format!(
+            "ws_{:03}|{repository_id}",
+            MAX_OBSERVED_REPOSITORIES
+        )));
+        drop(observed);
+        fs::remove_dir_all(repository_path).unwrap();
+    }
+
+    fn assert_large_git_page_pipeline(file_count: usize) {
+        let files = (0..file_count)
+            .map(|index| GitFileChange {
+                path: format!("src/generated/file-{index:05}.rs"),
+                original_path: None,
+                index_status: if index % 3 == 0 { "M" } else { "." }.to_string(),
+                worktree_status: if index % 3 == 0 { "." } else { "M" }.to_string(),
+                staged: index % 3 == 0,
+                unstaged: index % 3 != 0,
+                untracked: false,
+                conflict: false,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = StatusSnapshot {
+            summary: agentmux_vcs::StatusSummary {
+                repository_root: r"D:\repo".to_string(),
+                branch: Some("main".to_string()),
+                head: Some("0123456789abcdef".to_string()),
+                upstream: Some("origin/main".to_string()),
+                ahead: 0,
+                behind: 0,
+                file_count,
+                staged_count: files.iter().filter(|change| change.staged).count(),
+                unstaged_count: files.iter().filter(|change| change.unstaged).count(),
+                untracked_count: 0,
+                conflict_count: 0,
+                generation: 1,
+            },
+            files,
+        };
+        let started = Instant::now();
+        let indexes = GitStatusPageIndexes::from_snapshot(&snapshot);
+        let mut serialized = 0usize;
+        for page in indexes.all.chunks(250) {
+            let values = page
+                .iter()
+                .map(|index| git_change_result(&snapshot.files[*index]))
+                .collect::<Vec<_>>();
+            serialized += serde_json::to_vec(&values).unwrap().len();
+        }
+        assert!(serialized > file_count * 32);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{file_count} file index/page/serialization pipeline exceeded 3 seconds: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn git_page_pipeline_handles_5k_files_within_budget() {
+        assert_large_git_page_pipeline(5_000);
+    }
+
+    #[test]
+    fn git_page_pipeline_handles_10k_files_within_budget() {
+        assert_large_git_page_pipeline(10_000);
+    }
+
+    #[test]
     fn git_status_pages_share_one_snapshot_until_change_signal() {
         let repository = create_git_repository("paging");
         fs::write(repository.join("tracked.txt"), "changed\n").expect("modified fixture");
@@ -3735,6 +4102,37 @@ mod tests {
     }
 
     #[test]
+    fn worktree_cwd_rejects_parent_and_link_escape_paths() {
+        assert!(validated_worktree_cwd(
+            "/mnt/d/worktrees/agent",
+            Some("/mnt/d/worktrees/agent/../primary")
+        )
+        .is_err());
+        assert_eq!(
+            validated_worktree_cwd("/mnt/d/worktrees/agent", Some("/mnt/d/worktrees/agent/src"))
+                .unwrap(),
+            "/mnt/d/worktrees/agent/src"
+        );
+
+        let root = std::env::temp_dir().join(format!("agentmux-cwd-{}", unique_time_id()));
+        let inside = root.join("src");
+        let outside = root.parent().unwrap().join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let root_text = root.to_string_lossy().to_string();
+        let escaped_text = root
+            .join("..")
+            .join("outside")
+            .to_string_lossy()
+            .to_string();
+        let inside_text = inside.to_string_lossy().to_string();
+        assert!(validated_worktree_cwd(&root_text, Some(&escaped_text)).is_err());
+        assert!(validated_worktree_cwd(&root_text, Some(&inside_text)).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
     fn review_threads_deliver_to_the_existing_team_mailbox() {
         let repository = create_git_repository("review");
         let host = DesktopControlState::new_in_memory().expect("desktop state");
@@ -3788,6 +4186,119 @@ mod tests {
         assert_eq!(messages[0].to_session_id.as_deref(), Some("ses_worker"));
         assert!(messages[0].body.contains("Please keep the stable API."));
 
+        let duplicate: GitReviewDeliveryResult = decode_ok(host.handle_request(test_request(
+            "review_deliver_retry",
+            METHOD_GIT_REVIEW_THREAD_DELIVER,
+            &GitReviewThreadDeliverParams {
+                thread_id: delivered.thread_id.clone(),
+                target: "mailbox".to_string(),
+                target_session_id: Some("ses_worker".to_string()),
+                include_context: true,
+            },
+        )));
+        assert_eq!(duplicate.delivered_at, delivered.delivered_at);
+        assert_eq!(
+            host.store
+                .lock()
+                .unwrap()
+                .list_team_messages(Some("ws_review"), true)
+                .unwrap()
+                .len(),
+            1,
+            "an idempotent retry must not duplicate the mailbox message"
+        );
+
+        save_bundle(
+            &host,
+            &workspace_bundle(
+                "ws_other",
+                None,
+                &[("pane_other", "surface_other", "ses_other")],
+            ),
+        );
+        let cross_workspace = host.handle_request(test_request(
+            "review_deliver_cross_workspace",
+            METHOD_GIT_REVIEW_THREAD_DELIVER,
+            &GitReviewThreadDeliverParams {
+                thread_id: delivered.thread_id,
+                target: "terminal".to_string(),
+                target_session_id: Some("ses_other".to_string()),
+                include_context: true,
+            },
+        ));
+        assert_eq!(error_code(cross_workspace), ErrorCode::InvalidRequest);
+
+        fs::remove_dir_all(repository).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn review_threads_are_marked_stale_when_diff_content_changes() {
+        let repository = create_git_repository("review-stale");
+        fs::write(repository.join("tracked.txt"), "reviewed\n").unwrap();
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        save_bundle(
+            &host,
+            &workspace_bundle(
+                "ws_review_stale",
+                Some(repository.to_string_lossy().to_string()),
+                &[("pane_worker", "surface_worker", "ses_worker")],
+            ),
+        );
+        let first: IpcGitDiffResult = decode_ok(host.handle_request(test_request(
+            "review_diff_first",
+            METHOD_GIT_DIFF,
+            &IpcGitDiffParams {
+                workspace_id: "ws_review_stale".to_string(),
+                repository_id: None,
+                path: "tracked.txt".to_string(),
+                stage: Some("worktree".to_string()),
+                context_lines: Some(3),
+                generation: None,
+            },
+        )));
+        assert!(!first.diff_hash.is_empty());
+        let created: GitReviewThreadResult = decode_ok(host.handle_request(test_request(
+            "review_stale_create",
+            METHOD_GIT_REVIEW_THREAD_CREATE,
+            &GitReviewThreadCreateParams {
+                workspace_id: "ws_review_stale".to_string(),
+                repository_id: Some(first.repository_id),
+                anchor: GitReviewLineAnchor {
+                    path: "tracked.txt".to_string(),
+                    side: "right".to_string(),
+                    line: 1,
+                    start_line: None,
+                    base_revision: None,
+                    head_revision: None,
+                    hunk_header: Some("@@ -1 +1 @@".to_string()),
+                    diff_hash: Some(first.diff_hash),
+                },
+                body: "Keep this line.".to_string(),
+                author_session_id: None,
+            },
+        )));
+        fs::write(repository.join("tracked.txt"), "changed again\n").unwrap();
+        let _: IpcGitDiffResult = decode_ok(host.handle_request(test_request(
+            "review_diff_second",
+            METHOD_GIT_DIFF,
+            &IpcGitDiffParams {
+                workspace_id: "ws_review_stale".to_string(),
+                repository_id: None,
+                path: "tracked.txt".to_string(),
+                stage: Some("worktree".to_string()),
+                context_lines: Some(3),
+                generation: None,
+            },
+        )));
+        let thread = host
+            .store
+            .lock()
+            .unwrap()
+            .load_git_review_thread(&created.thread_id)
+            .unwrap()
+            .unwrap();
+        assert!(thread.stale);
+        assert_eq!(thread.stale_reason.as_deref(), Some("diff content changed"));
         fs::remove_dir_all(repository).expect("temporary repository cleanup");
     }
 
@@ -3952,6 +4463,41 @@ mod tests {
         closed: Arc<Mutex<Vec<String>>>,
     }
 
+    struct CandidateRemovingBrowser {
+        inner: InMemoryBrowserAutomation,
+        shared: Arc<FiveTrackShared>,
+        closed: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl BrowserAutomation for CandidateRemovingBrowser {
+        fn create_surface(
+            &mut self,
+            surface_id: String,
+            workspace_id: String,
+            profile: Option<String>,
+        ) -> BrowserAutomationResult<BrowserSurface> {
+            self.inner.create_surface(surface_id, workspace_id, profile)
+        }
+
+        fn surface(&self, surface_id: &str) -> BrowserAutomationResult<BrowserSurface> {
+            self.inner.surface(surface_id)
+        }
+
+        fn close_surface(&mut self, surface_id: &str) -> BrowserAutomationResult<BrowserSurface> {
+            self.closed.lock().unwrap().push(surface_id.to_string());
+            self.inner.close_surface(surface_id)
+        }
+
+        fn execute(
+            &mut self,
+            command: BrowserCommand,
+        ) -> BrowserAutomationResult<BrowserCommandResult> {
+            let result = self.inner.execute(command)?;
+            self.shared.dev_server_candidates.lock().unwrap().clear();
+            Ok(result)
+        }
+    }
+
     impl BrowserAutomation for NavigateFailingBrowser {
         fn create_surface(
             &mut self,
@@ -4031,6 +4577,54 @@ mod tests {
         let closed = closed.lock().unwrap();
         assert_eq!(closed.len(), 1, "new browser surface must be closed");
         assert!(!closed[0].is_empty());
+    }
+
+    #[test]
+    fn browser_split_bookkeeping_failure_closes_surface_and_restores_topology() {
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let original = workspace_bundle(
+            "ws_bookkeeping_rollback",
+            None,
+            &[("pane_terminal", "surface_terminal", "ses_rollback")],
+        );
+        save_bundle(&host, &original);
+        let candidate = host
+            .record_dev_server_candidate(DevelopmentServerCandidateParams {
+                workspace_id: "ws_bookkeeping_rollback".to_string(),
+                session_id: "ses_rollback".to_string(),
+                url: "http://127.0.0.1:3000".to_string(),
+                source: "test".to_string(),
+                detected_at: "2026-07-23T00:00:00Z".to_string(),
+                process_id: None,
+            })
+            .expect("candidate");
+        let closed = Arc::new(Mutex::new(Vec::new()));
+        *host.browser.lock().unwrap() = Box::new(CandidateRemovingBrowser {
+            inner: InMemoryBrowserAutomation::new(),
+            shared: Arc::clone(&host.five_track.shared),
+            closed: Arc::clone(&closed),
+        });
+
+        let response = host.handle_request(test_request(
+            "bookkeeping_rollback_open",
+            METHOD_DEV_SERVER_CANDIDATE_OPEN_IN_SPLIT,
+            &DevelopmentServerCandidateOpenInSplitParams {
+                candidate_id: candidate.candidate_id,
+                pane_id: Some("pane_terminal".to_string()),
+                axis: Some("vertical".to_string()),
+                ratio: Some(0.5),
+            },
+        ));
+        assert_eq!(error_code(response), ErrorCode::InvalidRequest);
+        let restored = host
+            .store
+            .lock()
+            .unwrap()
+            .load_workspace_bundle("ws_bookkeeping_rollback")
+            .unwrap()
+            .expect("restored workspace");
+        assert_eq!(restored, original);
+        assert_eq!(closed.lock().unwrap().len(), 1);
     }
 
     #[test]
