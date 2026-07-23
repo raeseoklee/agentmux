@@ -393,7 +393,7 @@ $ErrorActionPreference = 'Stop'
 $raw = [Console]::In.ReadToEnd()
 $payload = if ([string]::IsNullOrWhiteSpace($raw)) { $null } else { $raw | ConvertFrom-Json }
 $workspace = $env:AGENTMUX_WORKSPACE_ID
-$session = if ($payload -and $payload.session_id) { [string]$payload.session_id } elseif ($env:AGENTMUX_SESSION_ID) { $env:AGENTMUX_SESSION_ID } else { '' }
+$session = $env:AGENTMUX_SESSION_ID
 if ([string]::IsNullOrWhiteSpace($workspace) -or [string]::IsNullOrWhiteSpace($session)) { exit 0 }
 $sequence = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $observed = [DateTime]::UtcNow.ToString('o')
@@ -512,6 +512,8 @@ mod tests {
         let script = hook_adapter_script();
         assert!(script.contains("$argv = @("));
         assert!(script.contains("& agentmux @argv"));
+        assert!(script.contains("$session = $env:AGENTMUX_SESSION_ID"));
+        assert!(!script.contains("$payload.session_id"));
         assert!(!script.contains("Invoke-Expression"));
     }
 }
