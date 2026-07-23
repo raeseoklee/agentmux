@@ -130,6 +130,27 @@ export interface AgentTelemetry {
   cache?: string | null;
   rate?: string | null;
   ctx?: string | null;
+  teamId?: string | null;
+  teamRole?: string | null;
+  workerName?: string | null;
+  parentSessionId?: string | null;
+  layoutRootPaneId?: string | null;
+  mainRatio?: string | null;
+  maxWorkers?: number | null;
+  workerIndex?: number | null;
+  defaultWorkerKind?: string | null;
+  distribution?: string | null;
+  teamCwd?: string | null;
+  durability?: string | null;
+  teamMode?: string | null;
+  teamStatus?: string | null;
+  teamLayout?: string | null;
+  teamGeneration?: number | null;
+  teamMutationId?: string | null;
+  teamMutationOwnerId?: string | null;
+  teamAutoAdopt?: boolean | null;
+  teamIdempotencyKey?: string | null;
+  teamMemberIdempotencyKey?: string | null;
 }
 
 export interface AgentState {
@@ -6162,7 +6183,38 @@ interface AgentStateWire {
   attention: boolean;
   reason?: string | null;
   updated_at?: string | null;
-  telemetry?: AgentTelemetry | null;
+  telemetry?: AgentTelemetryWire | null;
+}
+
+interface AgentTelemetryWire {
+  activity?: string | null;
+  session?: string | null;
+  cost?: string | null;
+  tokens?: string | null;
+  cache?: string | null;
+  rate?: string | null;
+  ctx?: string | null;
+  team_id?: string | null;
+  team_role?: string | null;
+  worker_name?: string | null;
+  parent_session_id?: string | null;
+  layout_root_pane_id?: string | null;
+  main_ratio?: string | null;
+  max_workers?: number | null;
+  worker_index?: number | null;
+  default_worker_kind?: string | null;
+  distribution?: string | null;
+  team_cwd?: string | null;
+  durability?: string | null;
+  team_mode?: string | null;
+  team_status?: string | null;
+  team_layout?: string | null;
+  team_generation?: number | null;
+  team_mutation_id?: string | null;
+  team_mutation_owner_id?: string | null;
+  team_auto_adopt?: boolean | null;
+  team_idempotency_key?: string | null;
+  team_member_idempotency_key?: string | null;
 }
 
 interface NotificationSummaryWire {
@@ -6574,7 +6626,43 @@ function mapAgentState(value: AgentStateWire): AgentState {
     attention: value.attention,
     reason: value.reason,
     updatedAt: value.updated_at,
-    telemetry: value.telemetry ?? null,
+    telemetry: mapAgentTelemetry(value.telemetry),
+  };
+}
+
+function mapAgentTelemetry(value?: AgentTelemetryWire | null): AgentTelemetry | null {
+  if (!value) {
+    return null;
+  }
+  return {
+    activity: value.activity,
+    session: value.session,
+    cost: value.cost,
+    tokens: value.tokens,
+    cache: value.cache,
+    rate: value.rate,
+    ctx: value.ctx,
+    teamId: value.team_id,
+    teamRole: value.team_role,
+    workerName: value.worker_name,
+    parentSessionId: value.parent_session_id,
+    layoutRootPaneId: value.layout_root_pane_id,
+    mainRatio: value.main_ratio,
+    maxWorkers: value.max_workers,
+    workerIndex: value.worker_index,
+    defaultWorkerKind: value.default_worker_kind,
+    distribution: value.distribution,
+    teamCwd: value.team_cwd,
+    durability: value.durability,
+    teamMode: value.team_mode,
+    teamStatus: value.team_status,
+    teamLayout: value.team_layout,
+    teamGeneration: value.team_generation,
+    teamMutationId: value.team_mutation_id,
+    teamMutationOwnerId: value.team_mutation_owner_id,
+    teamAutoAdopt: value.team_auto_adopt,
+    teamIdempotencyKey: value.team_idempotency_key,
+    teamMemberIdempotencyKey: value.team_member_idempotency_key,
   };
 }
 

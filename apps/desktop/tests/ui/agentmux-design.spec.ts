@@ -1143,27 +1143,36 @@ test("new WSL terminal adds a separate top tab without changing the split layout
   page,
 }) => {
   await bootPreview(page);
+  const activePaneTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(1);
 
   await page.locator(".agentmux-new-terminal-tab").click();
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(1);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
 
   await page.locator(".agentmux-surface-tab-close").last().click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(1);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
 });
 
 test("split panes stay scoped to their top tab", async ({ page }) => {
@@ -1178,43 +1187,56 @@ test("split panes stay scoped to their top tab", async ({ page }) => {
     );
   });
   await bootPreview(page);
+  const activePaneTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
 
   await page.getByRole("button", { name: "Open terminal" }).last().click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
 
   await page.locator(".agentmux-top-split-vertical").click();
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(2);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(1);
 
   await page.getByRole("button", { name: "Open terminal" }).last().click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(2);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(2);
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(1);
 
   await page.locator(".agentmux-surface-tab").first().click();
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(2);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(2);
 
   await page.locator(".agentmux-surface-tab").last().click();
   await page.locator(".agentmux-surface-tab-close").last().click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(2);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(2);
 });
 
@@ -1262,6 +1284,9 @@ test("terminal profile picker can launch native shells in split panes", async ({
 
 test("browser surface opens as a separate top tab", async ({ page }) => {
   await bootPreview(page);
+  const activePaneTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
@@ -1275,7 +1300,7 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
   await page.keyboard.press("Enter");
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
   await expect(page.getByPlaceholder("URL")).toBeVisible();
 });
 
@@ -1283,6 +1308,9 @@ test("agent tmux session opens as a separate top tab without splitting the curre
   page,
 }) => {
   await bootPreview(page);
+  const activePaneTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.getByText("wsl-direct").first()).toBeVisible({
@@ -1302,9 +1330,11 @@ test("agent tmux session opens as a separate top tab without splitting the curre
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+    activePaneTree.locator(
+      '[data-agentmux-pane][data-agentmux-mounted="true"]',
+    ),
   ).toHaveCount(1);
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
   await expect(page.getByText("wsl-tmux-control").first()).toBeVisible({
     timeout: 5000,
   });
@@ -1401,9 +1431,12 @@ test("tab switch focuses the remembered pane within the tab, not the root pane",
 
   // Switch to Tab B — the single pane in Tab B should become active.
   await page.locator(".agentmux-surface-tab").last().click();
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(1);
+  const activeTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
+  await expect(activeTree.locator("[data-agentmux-pane]")).toHaveCount(1);
   await expect(
-    page.locator('[data-agentmux-pane][data-agentmux-active="true"]'),
+    activeTree.locator('[data-agentmux-pane][data-agentmux-active="true"]'),
   ).toHaveCount(1);
 
   // Inject a distinct sidebar state for Tab B to confirm the footer reflects
@@ -1421,12 +1454,54 @@ test("tab switch focuses the remembered pane within the tab, not the root pane",
   // Switch back to Tab A — the second pane (the one last focused) should be
   // restored as active, not the first pane.
   await page.locator(".agentmux-surface-tab").first().click();
-  await expect(page.locator("[data-agentmux-pane]")).toHaveCount(2);
-  const panesAfterReturn = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(activeTree.locator("[data-agentmux-pane]")).toHaveCount(2);
+  const panesAfterReturn = activeTree.locator(
+    '[data-agentmux-pane][data-agentmux-mounted="true"]',
+  );
   await expect(panesAfterReturn).toHaveCount(2);
   // The second pane should be active again (remembered from before Tab B).
   await expect(panesAfterReturn.nth(1)).toHaveAttribute("data-agentmux-active", "true");
   await expect(panesAfterReturn.nth(0)).toHaveAttribute("data-agentmux-active", "false");
+});
+
+test("tab switch keeps the terminal renderer DOM mounted", async ({ page }) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const tabs = page.locator(".agentmux-surface-tab");
+  await expect(tabs).toHaveCount(2);
+
+  await tabs.nth(0).click();
+  const activeTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
+  const firstRootId = await activeTree.getAttribute(
+    "data-agentmux-tab-pane-tree",
+  );
+  expect(firstRootId).toBeTruthy();
+  const firstTerminal = activeTree
+    .locator("[data-agentmux-terminal-session]")
+    .first();
+  await expect(firstTerminal).toBeVisible();
+  await firstTerminal.evaluate((element) => {
+    (element as HTMLElement).dataset.agentmuxKeepaliveProbe = "preserved";
+  });
+
+  await tabs.nth(1).click();
+  const firstTree = page.locator(
+    `[data-agentmux-tab-pane-tree="${firstRootId}"]`,
+  );
+  await expect(firstTree).toHaveAttribute("data-agentmux-tab-active", "false");
+  await expect(
+    firstTree.locator('[data-agentmux-keepalive-probe="preserved"]'),
+  ).toHaveCount(1);
+
+  await tabs.nth(0).click();
+  await expect(firstTree).toHaveAttribute("data-agentmux-tab-active", "true");
+  await expect(
+    firstTree.locator('[data-agentmux-keepalive-probe="preserved"]'),
+  ).toBeVisible();
 });
 
 test("Ctrl+Tab and Ctrl+Shift+Tab cycle through surface tabs with wrap-around", async ({
@@ -1946,6 +2021,30 @@ test("UI chrome prioritizes Windows-native hinted fonts", async ({ page }) => {
     "font-family",
     /Segoe UI Variable Text/,
   );
+});
+
+test("dark settings selects expose a readable native popup palette", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-settings-open").click();
+
+  const selector = page.locator(".agentmux-terminal-start-directory");
+  await expect(selector).toBeVisible();
+  const palette = await selector.evaluate((element) => {
+    const selectStyle = window.getComputedStyle(element);
+    const option = element.querySelector("option");
+    const optionStyle = option ? window.getComputedStyle(option) : null;
+    return {
+      colorScheme: selectStyle.colorScheme,
+      optionColor: optionStyle?.color ?? "",
+      optionBackground: optionStyle?.backgroundColor ?? "",
+    };
+  });
+
+  expect(palette.colorScheme).toContain("dark");
+  expect(palette.optionColor).not.toBe(palette.optionBackground);
+  expect(palette.optionBackground).not.toBe("rgba(0, 0, 0, 0)");
 });
 
 test("appearance settings persist through reload", async ({ page }) => {

@@ -28,7 +28,7 @@ Always start with the narrowest profile that can complete the workflow.
 | --- | --- | --- |
 | `read` | Lists workspaces, sessions, agent attention, pane workers, integration readiness, team messages and tasks; reads terminal output, browser snapshots, events, context, and diagnostics. | Monitoring, status collection, and first-time client setup. |
 | `standard` | Includes `read`, then adds pane focus, terminal open/split/input, pane-worker start/send, browser open/navigation/click/fill, team messaging/task updates, and agent-state updates. This is a trusted write and command-execution profile: terminal tools can run arbitrary commands and browser tools can mutate external systems. | Trusted interactive agent workflows that require command execution or writes. |
-| `full` | Includes `standard`, then adds pane-worker stop, integration shim setup, workspace/pane/surface close, session termination, config updates, browser JavaScript evaluation, action execution, and notification clearing. | Trusted operator automation that genuinely needs destructive or high-impact actions. |
+| `full` | Includes `standard`, then adds adaptive-team worker release, pane-worker stop, integration shim setup, workspace/pane/surface close, session termination, config updates, browser JavaScript evaluation, action execution, and notification clearing. | Trusted operator automation that genuinely needs destructive or high-impact actions. |
 
 `standard` is not a safe or non-destructive profile. Grant it only to a client
 that may execute commands and change terminal, browser, and shared coordination
@@ -54,39 +54,157 @@ AgentMux exposes typed MCP tools for agent-oriented panes:
 | --- | --- | --- |
 | `agent_worker_list` | `read` | List AgentMux-managed tmux integration workers and independent Codex pane workers. |
 | `agent_integration_status` | `read` | Diagnose Claude Teams, OMO, OMX, or OMC wrapper and WSL readiness, using the selected workspace's default WSL distribution when available. |
+| `agent_team_list` | `read` | Reconstruct adaptive teams and their live membership from persisted agent telemetry. |
 | `agent_worker_start` | `standard` | Split the active pane or create a tab, then start `claude-teams`, `omo`, `omx`, `omc`, or `codex-pane`. |
+| `agent_team_start` | `standard` | Create an adaptive team manifest around the current terminal. Seed workers are optional. |
+| `agent_team_spawn` | `standard` | Add one top-level worker with generation and idempotency protection, then reflow the managed layout. |
+| `agent_team_release` | `full` | Terminate and release one worker owned by the selected team, then reflow the remaining workers. |
+| `agent_team_reflow` | `standard` | Recompute managed pane ratios, or preview them with `dry_run`, without moving foreign panes. |
 | `agent_worker_send` | `standard` | Send literal instructions to a worker and optionally submit Enter. |
 | `agent_worker_stop` | `full` | Terminate a worker session. |
 | `agent_integration_setup` | `full` | Install shared tmux-compatible wrappers and optionally add their directory to the Windows user PATH. |
 
-Use `kind: "claude-teams"` for Claude Code Agent Teams. The lead process gets
-the AgentMux tmux shim, and descendants created by `tmux split-window` inherit
-the integration environment while receiving pane-specific `TMUX` and
-`TMUX_PANE` identities from the desktop host.
+### Run an adaptive visible team
 
-Use `kind: "codex-pane"` for an independent Codex CLI process in another
-AgentMux pane. This is not a Codex built-in subagent: Codex owns its internal
-`/agent` threads, and AgentMux cannot move or terminate those threads as panes.
-The explicit name prevents an MCP client from presenting an independent CLI
-process as a native Codex subagent.
+The normal workflow does not pre-register a fixed number of agents. Start an
+empty adaptive team around the lead terminal, then let the lead agent add and
+release workers as the task graph changes. AgentMux provides lifecycle,
+visibility, capacity, and conflict controls; the lead model decides whether a
+new worker is useful for the current project.
 
-`agent_worker_send` and `agent_worker_stop` reject ordinary terminal sessions.
-If worker metadata registration fails after a launch, AgentMux stops the new
-session and closes its pane instead of leaving an untracked worker behind.
+```json
+{
+  "workspace_id": "workspace-id",
+  "pane_id": "main-pane-id",
+  "mode": "adaptive",
+  "layout": "main-left-workers-right",
+  "main_ratio": 0.55,
+  "max_workers": 6,
+  "default_worker_kind": "codex-pane",
+  "distribution": "Ubuntu",
+  "idempotency_key": "release-0.2.0-analysis",
+  "workers": []
+}
+```
 
-Start with `agent_integration_status`, use `agent_integration_setup` only from
-an approved `full` client, and then use `agent_worker_start`. `team_message_send`
-operates AgentMux's shared mailbox; steering an arbitrary terminal TUI is done
-with `agent_worker_send` or the lower-level terminal input tools.
+`workers` may be omitted. `max_workers` is a safety ceiling, not a requested
+worker count, and includes every managed non-main member, including descendants
+adopted from tmux. The response contains a durable `team_id` and `generation`.
+Persist the `team_id` in the agent's working context and read the latest team
+with `agent_team_list` before making a lifecycle change.
+
+The desktop host claims the main session and generation under one control-plane
+lock. Concurrent starts cannot replace an existing team owner. A concurrent
+retry with the same non-empty `idempotency_key` reuses the in-progress claim;
+it never starts the same seed workers twice.
+
+Each MCP server serializes its own team mutations, while the desktop host stores
+the reservation owner and applies generation plus mutation-ID compare-and-set
+checks. A repeated live reservation reports `provisioning` without repeating a
+split, resize, or termination. If the owning MCP process exits, a later client
+may recover the abandoned reservation as `layout_dirty`, inspect the visible
+panes, and continue. A live owner cannot be taken over.
+
+When another independent workstream appears, add exactly one worker:
+
+```json
+{
+  "team_id": "team-id",
+  "expected_generation": 1,
+  "idempotency_key": "release-0.2.0-docs",
+  "name": "docs",
+  "args": ["Review the release documentation and report gaps."]
+}
+```
+
+AgentMux atomically reserves the next generation before it changes topology.
+A stale `expected_generation` returns `generation_conflict` without opening a
+pane. Repeating the same `idempotency_key` returns the existing worker instead
+of creating a duplicate. A successful spawn keeps the main terminal on the
+left, places workers in an equal-height stack on the right, and returns the new
+generation plus the worker's `pane_id`, `surface_id`, and `session_id`.
+
+Release a completed worker from a client running the `full` profile:
+
+```json
+{
+  "team_id": "team-id",
+  "expected_generation": 2,
+  "name": "docs",
+  "mode": "soft"
+}
+```
+
+`agent_team_release` only accepts a member owned by the selected team, but it
+still terminates a process and closes a pane, so it requires the `full` profile.
+Membership is cleared only after session termination succeeds. If termination
+fails, the pane remains visible and the worker remains a team member so it can
+be retried safely. Settlement is compare-and-set protected; a stale completion
+cannot overwrite a newer team generation.
+
+### Layout and tmux auto-adoption
+
+Each worker pane keeps its own live terminal output subscription. Non-focused
+workers therefore continue to render and report attention while the lead is
+active. Use `agent_team_list` for membership, `agent_worker_list` for process
+state, `agent_attention_list` for workers waiting for input, and
+`team_task_list` for shared progress.
+
+With `auto_adopt_tmux` enabled, managed `split-window` descendants created
+through the AgentMux tmux shim inherit the team identity and main-session
+anchor. Team environment is sufficient for adoption, so a separate integration
+marker is not required. The first descendant is placed to the right of the main
+pane; later descendants are added to the worker stack and reflowed
+automatically. New tabs and new sessions are not silently added to the managed
+layout. This supports Claude Code Agent Teams and the OMO/OMX/OMC integrations
+without knowing their eventual worker count.
+
+If a tmux shim process exits after reserving a generation but before registering
+its pane, the next managed split verifies that the recorded owner process is no
+longer alive, recovers the abandoned reservation as `layout_dirty`, reloads the
+canonical topology, and continues the split in the same invocation. A live
+owner still produces a conflict, so recovery cannot duplicate an in-flight
+worker.
+
+AgentMux only resizes the managed subtree. If a user-created pane appears under
+that subtree, or the split axes no longer match the managed layout, reflow
+returns `layout_conflict`, performs no resize, and marks the layout dirty for an
+explicit operator decision. Preview repairs with:
+
+```json
+{
+  "team_id": "team-id",
+  "expected_generation": 3,
+  "dry_run": true
+}
+```
+
+A non-dry-run reflow reserves the next generation before applying ratios. This
+serializes it with MCP spawn/release and tmux auto-adoption. A dry run performs
+no reservation and never changes topology.
+
+### Fixed seed teams and compensation
+
+For a fully known batch, set `mode` to `fixed` and pass one to eight named seed
+workers. Adaptive teams may also include seed workers and then grow later.
+Worker names are unique and contain 1-64 characters.
+
+Multi-step starts and spawns use compensation rather than pretending several
+control-plane calls are one database transaction. A failed MCP-created worker
+is terminated and its pane is closed; initial seed workers are rolled back in
+reverse order. A tmux-created descendant is retained if only automatic reflow
+fails, because terminating a child owned by the agent framework would be more
+surprising than reporting a dirty layout.
+
+`codex-pane` starts an independent Codex CLI process and is not a Codex built-in
+`/agent` thread. `claude-teams`, `omo`, `omx`, and `omc` launch tmux-compatible
+lead processes whose descendants can be auto-adopted. `agent_worker_send` and
+generic `agent_worker_stop` reject ordinary terminal sessions.
 
 The shim captures the WSL-side `PATH` separately when it crosses into
 `agentmux.exe`; it never copies the Windows process `PATH` into a Linux child.
-The desktop restores the captured WSL path inside each integration child so
-recursive `tmux split-window` calls continue to resolve the AgentMux shim.
-On restart, persisted integration launch settings are reused and disconnected
-tmux-owned child workers are respawned into their original panes. Their saved
-command and working directory are restored independently so a lead crash or a
-desktop restart does not leave a permanently empty worker pane.
+The desktop restores the captured WSL path and persisted team telemetry after a
+restart so recursive splits remain attributable to the same team.
 
 ## Run a Local stdio Server
 

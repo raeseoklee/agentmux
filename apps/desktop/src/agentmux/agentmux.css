@@ -201,6 +201,50 @@ body {
   outline-offset: 1px;
 }
 
+/* Keep every tab's pane tree mounted so xterm, its scrollback, and browser
+   surfaces survive tab changes. The trees share identical geometry; only the
+   active layer participates in painting and pointer input. */
+.agentmux-tab-pane-stack {
+  position: relative;
+  display: flex;
+  overflow: hidden;
+}
+
+.agentmux-tab-pane-tree {
+  position: absolute;
+  inset: 9px;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.agentmux-tab-pane-tree[data-agentmux-tab-active="true"] {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+/* WebView2 may otherwise open a light native option popup while preserving the
+   dark select's light text color. Explicit option colors cover both engines
+   that honor color-scheme and older native popup implementations. */
+[data-agentmux-root][data-agentmux-theme="dark"] select {
+  color-scheme: dark;
+}
+
+[data-agentmux-root][data-agentmux-theme="light"] select {
+  color-scheme: light;
+}
+
+[data-agentmux-root] select option {
+  color: var(--fg1);
+  background-color: var(--surface);
+}
+
+[data-agentmux-root] select option:disabled {
+  color: var(--fg4);
+}
+
 /* TS-13: pane zoom — CSS-only, no remount.
    When data-agentmux-zoomed-pane is set on the pane-tree wrapper, all leaf
    panes become invisible (keeping sessions running and the fit observer idle)

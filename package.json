@@ -1,7 +1,7 @@
 {
   "name": "agentmux-workspace",
   "private": true,
-  "version": "0.1.18",
+  "version": "0.1.19",
   "description": "Windows desktop terminal multiplexer for AI-agent workflows.",
   "license": "MIT",
   "repository": {

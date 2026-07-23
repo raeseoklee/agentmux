@@ -2324,6 +2324,11 @@ export function AgentmuxTerminalApp() {
   }, [language]);
   const accent = ACCENTS.find((a) => a.key === accentKey) ?? ACCENTS[0];
   const isDark = theme === "dark";
+  useEffect(() => {
+    // Native select popups are rendered by WebView2 outside the element box.
+    // Propagate the app theme so their palette matches the surrounding UI.
+    document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+  }, [isDark]);
   const closeOverlay = useCallback(() => setOverlay(null), []);
   const stop = useCallback(
     (event: { stopPropagation: () => void }) => event.stopPropagation(),
@@ -3260,6 +3265,27 @@ export function AgentmuxTerminalApp() {
     surfaces,
     surfaceTabOrderByWorkspace,
   ]);
+  const tabRootPaneIds = useMemo(() => {
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    for (const surface of tabSurfaces) {
+      const host = panes.find(
+        (pane) => pane.mountedSurfaceId === surface.surfaceId,
+      );
+      if (!host) continue;
+      const root = rootPaneForPane(host);
+      if (!seen.has(root.paneId)) {
+        seen.add(root.paneId);
+        ordered.push(root.paneId);
+      }
+    }
+    // Empty/restoring tabs may temporarily have no representative surface.
+    // Keep the active root renderable while its surface is being attached.
+    if (rootPaneId && !seen.has(rootPaneId)) {
+      ordered.push(rootPaneId);
+    }
+    return ordered;
+  }, [panes, rootPaneForPane, rootPaneId, tabSurfaces]);
 
   const activeWorkspace = workspaces.find(
     (ws) => ws.workspaceId === activeWorkspaceId,
@@ -5499,7 +5525,9 @@ export function AgentmuxTerminalApp() {
   const focusPaneInDirection = useCallback((direction: "left" | "right" | "up" | "down") => {
     if (!activePaneId) return;
     const allPanes = Array.from(
-      document.querySelectorAll<HTMLElement>('[data-agentmux-pane][data-agentmux-mounted="true"]'),
+      document.querySelectorAll<HTMLElement>(
+        '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"] [data-agentmux-pane][data-agentmux-mounted="true"]',
+      ),
     );
     if (allPanes.length < 2) return;
     const activeEl = allPanes.find((el) => el.getAttribute("data-agentmux-pane") === activePaneId);
@@ -5710,6 +5738,7 @@ export function AgentmuxTerminalApp() {
   const rootStyle = useMemo<CSSProperties>(
     () => ({
       ...buildRootVars(T, accent, fontSize),
+      colorScheme: isDark ? "dark" : "light",
       height: "100vh",
       width: "100vw",
       boxSizing: "border-box",
@@ -5720,7 +5749,7 @@ export function AgentmuxTerminalApp() {
       fontFamily: `${FONT_SANS},Pretendard,-apple-system,'Segoe UI',sans-serif`,
       color: T.fg1,
     }),
-    [T, accent, fontSize],
+    [T, accent, fontSize, isDark],
   );
   // PR-3: alias the hoisted module-level style constants so the JSX below keeps
   // its existing names while the references stay stable across renders.
@@ -6911,7 +6940,7 @@ export function AgentmuxTerminalApp() {
   };
 
   return (
-    <div data-agentmux-root style={rootStyle}>
+    <div data-agentmux-root data-agentmux-theme={theme} style={rootStyle}>
       {/* ============ APP SHELL (fills the OS window) ============ */}
       <div
         style={{
@@ -8876,7 +8905,10 @@ export function AgentmuxTerminalApp() {
               </div>
             ) : null}
 
-            <div style={{ flex: 1, minHeight: 0, padding: 9, display: "flex" }}>
+            <div
+              className="agentmux-tab-pane-stack"
+              style={{ flex: 1, minHeight: 0, padding: 9 }}
+            >
               {!ready ? (
                 <div
                   style={{
@@ -8891,13 +8923,26 @@ export function AgentmuxTerminalApp() {
                   제어 플레인에 연결 중…
                 </div>
               ) : rootPaneId ? (
-                <div
-                  style={{ display: "contents" }}
-                  data-agentmux-pane-tree={rootPaneId}
-                  data-agentmux-zoomed-pane={zoomedPaneId && paneById.get(zoomedPaneId) ? zoomedPaneId : undefined}
-                >
-                  {renderPane(rootPaneId)}
-                </div>
+                tabRootPaneIds.map((tabRootPaneId) => {
+                  const tabActive = tabRootPaneId === rootPaneId;
+                  return (
+                    <div
+                      key={tabRootPaneId}
+                      className="agentmux-tab-pane-tree"
+                      data-agentmux-pane-tree={tabRootPaneId}
+                      data-agentmux-tab-pane-tree={tabRootPaneId}
+                      data-agentmux-tab-active={tabActive ? "true" : "false"}
+                      data-agentmux-zoomed-pane={
+                        tabActive && zoomedPaneId && paneById.get(zoomedPaneId)
+                          ? zoomedPaneId
+                          : undefined
+                      }
+                      aria-hidden={tabActive ? undefined : true}
+                    >
+                      {renderPane(tabRootPaneId)}
+                    </div>
+                  );
+                })
               ) : (
                 <div
                   style={{

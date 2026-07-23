@@ -323,7 +323,7 @@ pub enum CoreEvent {
         state: AgentState,
         reason: Option<String>,
         source: String,
-        telemetry: Option<AgentTelemetry>,
+        telemetry: Box<Option<AgentTelemetry>>,
     },
     NotificationCreated {
         notification: NotificationRecord,
@@ -1704,7 +1704,7 @@ where
                 state,
                 reason: record.reason.clone(),
                 source: source.to_string(),
-                telemetry: record.telemetry.clone(),
+                telemetry: Box::new(record.telemetry.clone()),
             });
             if let Some(notification) = self.notification_for_agent_state(&record) {
                 self.push_notification(notification);

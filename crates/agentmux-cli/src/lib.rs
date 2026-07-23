@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -19,15 +19,16 @@ use agentmux_core::{RuntimeControlPlane, TerminalRuntime};
 use agentmux_ipc::{
     default_control_token_path, read_control_token, AckResult, ActionListParams, ActionListResult,
     ActionRunParams, ActionRunResult, AgentAttentionListResult, AgentListAttentionParams,
-    AgentSetStateParams, AgentStateResult, AgentTelemetry, AppConfigDiagnosticsParams,
-    AppConfigDiagnosticsResult, AppConfigGetParams, AppConfigMigrateProjectParams,
-    AppConfigMigrateProjectResult, AppConfigResult, BrowserActionResult, BrowserCheckParams,
-    BrowserClickParams, BrowserConsoleParams, BrowserConsoleResult, BrowserCookiesResult,
-    BrowserDiagnosticsParams, BrowserDiagnosticsResult, BrowserDialogsParams, BrowserDialogsResult,
-    BrowserDomSnapshotParams, BrowserDomSnapshotResult, BrowserDownloadsParams,
-    BrowserDownloadsResult, BrowserErrorsParams, BrowserErrorsResult, BrowserEvaluateParams,
-    BrowserEvaluateResult, BrowserFillParams, BrowserFindParams, BrowserFindResult,
-    BrowserFocusParams, BrowserFramesResult, BrowserGetParams, BrowserGetResult,
+    AgentSetStateParams, AgentStateResult, AgentTeamRecoverParams, AgentTeamRecoverResult,
+    AgentTeamReserveParams, AgentTeamReserveResult, AgentTeamSettleParams, AgentTelemetry,
+    AppConfigDiagnosticsParams, AppConfigDiagnosticsResult, AppConfigGetParams,
+    AppConfigMigrateProjectParams, AppConfigMigrateProjectResult, AppConfigResult,
+    BrowserActionResult, BrowserCheckParams, BrowserClickParams, BrowserConsoleParams,
+    BrowserConsoleResult, BrowserCookiesResult, BrowserDiagnosticsParams, BrowserDiagnosticsResult,
+    BrowserDialogsParams, BrowserDialogsResult, BrowserDomSnapshotParams, BrowserDomSnapshotResult,
+    BrowserDownloadsParams, BrowserDownloadsResult, BrowserErrorsParams, BrowserErrorsResult,
+    BrowserEvaluateParams, BrowserEvaluateResult, BrowserFillParams, BrowserFindParams,
+    BrowserFindResult, BrowserFocusParams, BrowserFramesResult, BrowserGetParams, BrowserGetResult,
     BrowserHighlightParams, BrowserHistoryResult, BrowserHoverParams, BrowserNavigateParams,
     BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams, BrowserScreenshotResult,
     BrowserScrollParams, BrowserSelectParams, BrowserStorageResult, BrowserSurfaceParams,
@@ -37,17 +38,18 @@ use agentmux_ipc::{
     EventSubscribeResult, NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
     NotificationCreateParams, NotificationDismissParams, NotificationListParams,
     NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
-    PaneSplitParams, PaneSummaryResult, ProfileListResult, ProfileSummaryResult,
-    RecoveryDiagnosticsResult, RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionIdParams,
-    SessionListParams, SessionListResult, SessionOutputPressureParams, SessionReadRecentParams,
-    SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams, SessionSendPasteParams,
-    SessionSendTextParams, SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams,
-    SessionSpawnResult, SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams,
-    SidebarLogListParams, SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult,
-    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusSetParams,
-    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams, SurfaceSummaryResult,
-    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams,
-    WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
+    PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, ProfileListResult,
+    ProfileSummaryResult, RecoveryDiagnosticsResult, RequestEnvelope, ResponseEnvelope,
+    ResponseOutcome, SessionIdParams, SessionListParams, SessionListResult,
+    SessionOutputPressureParams, SessionReadRecentParams, SessionReadRecentResult,
+    SessionResizeParams, SessionSendKeyParams, SessionSendPasteParams, SessionSendTextParams,
+    SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult,
+    SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams, SidebarLogListParams,
+    SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams,
+    SidebarStatusListResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
+    SurfaceCreateBrowserParams, SurfaceSummaryResult, SystemCapabilitiesResult,
+    SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams, WorkspaceCloseResult,
+    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
     WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
     WorkspaceGroupMemberParams, WorkspaceGroupResult, WorkspaceGroupUpdateParams,
     WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
@@ -10121,11 +10123,15 @@ where
         .unwrap_or_else(|| detail.workspace.active_pane_id.clone());
     register_tmux_agent_team_metadata(
         &invoke,
-        &workspace_id,
-        &result.session_id,
-        None,
-        "new-window",
-        Some(&pane_id),
+        TmuxAgentTeamMetadataContext {
+            workspace_id: &workspace_id,
+            session_id: &result.session_id,
+            parent_session_id: None,
+            parent_pane_id: None,
+            action: "new-window",
+            pane_id: Some(&pane_id),
+            mutation: None,
+        },
     )?;
     if invoke.json {
         return write_json_response(&response, output);
@@ -10215,11 +10221,15 @@ where
         session_id = Some(spawn_result.session_id.clone());
         register_tmux_agent_team_metadata(
             &invoke,
-            &workspace.workspace_id,
-            &spawn_result.session_id,
-            None,
-            "new-session",
-            Some(&workspace.active_pane_id),
+            TmuxAgentTeamMetadataContext {
+                workspace_id: &workspace.workspace_id,
+                session_id: &spawn_result.session_id,
+                parent_session_id: None,
+                parent_pane_id: None,
+                action: "new-session",
+                pane_id: Some(&workspace.active_pane_id),
+                mutation: None,
+            },
         )?;
         let detail = load_workspace_detail(&invoke, &workspace.workspace_id)?;
         surface_id = detail
@@ -10273,10 +10283,15 @@ where
 {
     let context = identify_context(&invoke, workspace_id.clone())?;
     let workspace_id = require_context_field(context.workspace_id.clone(), "workspace")?;
-    let pane_id = target_pane_id
+    let requested_pane_id = target_pane_id
         .or_else(pane_from_env)
         .or(context.pane_id.clone())
         .ok_or_else(|| CliError::Control("No active tmux-compatible pane context.".to_string()))?;
+    let split_plan =
+        resolve_tmux_agent_team_split_plan(&invoke, &workspace_id, &requested_pane_id, &axis)?;
+    let pane_id = split_plan.target_pane_id;
+    let axis = split_plan.axis;
+    let team_mutation = split_plan.team_mutation;
     let split = invoke_control(
         "pane.split",
         &PaneSplitParams {
@@ -10286,7 +10301,21 @@ where
             ratio: None,
         },
         &invoke,
-    )?;
+    );
+    let split = match split {
+        Ok(split) => split,
+        Err(error) => {
+            if let Some(mutation) = team_mutation.as_ref() {
+                mark_tmux_agent_team_layout_dirty(
+                    &invoke,
+                    &workspace_id,
+                    mutation,
+                    &format!("reserved split failed: {error}"),
+                );
+            }
+            return Err(error);
+        }
+    };
     let detail: WorkspaceDetailResult = response_result(&split)?;
     let new_pane_id = split_child_pane_id(&detail, &pane_id).ok_or_else(|| {
         CliError::Control("Could not resolve the newly split AgentMux pane.".to_string())
@@ -10319,7 +10348,7 @@ where
         let (spawn_response, result) = match spawn {
             Ok(result) => result,
             Err(error) => {
-                return Err(rollback_tmux_pane_after_spawn_failure(
+                let error = rollback_tmux_pane_after_spawn_failure(
                     &workspace_id,
                     &new_pane_id,
                     error,
@@ -10327,16 +10356,29 @@ where
                         let response = invoke_control(method, params, &invoke)?;
                         response_result::<serde_json::Value>(&response).map(|_| ())
                     },
-                ))
+                );
+                if let Some(mutation) = team_mutation.as_ref() {
+                    mark_tmux_agent_team_layout_dirty(
+                        &invoke,
+                        &workspace_id,
+                        mutation,
+                        &format!("reserved worker spawn failed: {error}"),
+                    );
+                }
+                return Err(error);
             }
         };
         register_tmux_agent_team_metadata(
             &invoke,
-            &workspace_id,
-            &result.session_id,
-            Some(&pane_id),
-            "split-window",
-            Some(&new_pane_id),
+            TmuxAgentTeamMetadataContext {
+                workspace_id: &workspace_id,
+                session_id: &result.session_id,
+                parent_session_id: context.session_id.as_deref(),
+                parent_pane_id: Some(&pane_id),
+                action: "split-window",
+                pane_id: Some(&new_pane_id),
+                mutation: team_mutation.as_ref(),
+            },
         )?;
         if invoke.json {
             return write_json_response(&spawn_response, output);
@@ -10476,45 +10518,58 @@ fn posix_default_shell_command() -> Vec<String> {
         .unwrap_or_else(|| vec!["sh".to_string()])
 }
 
+struct TmuxAgentTeamMetadataContext<'a> {
+    workspace_id: &'a str,
+    session_id: &'a str,
+    parent_session_id: Option<&'a str>,
+    parent_pane_id: Option<&'a str>,
+    action: &'a str,
+    pane_id: Option<&'a str>,
+    mutation: Option<&'a TmuxAgentTeamMutation>,
+}
+
 fn register_tmux_agent_team_metadata(
     invoke: &ControlInvokeOptions,
-    workspace_id: &str,
-    session_id: &str,
-    parent_pane_id: Option<&str>,
-    action: &str,
-    pane_id: Option<&str>,
+    context: TmuxAgentTeamMetadataContext<'_>,
 ) -> Result<(), CliError> {
-    let Some(integration) = agent_integration_from_env() else {
+    let team = context
+        .mutation
+        .map(|mutation| mutation.team.clone())
+        .unwrap_or_else(tmux_agent_team_environment);
+    let Some(integration) = agent_integration_from_env()
+        .or_else(|| team.team_id.as_ref().map(|_| "agentmux-team".to_string()))
+    else {
         return Ok(());
     };
-    let metadata = build_tmux_agent_team_metadata(
-        &integration,
-        workspace_id,
-        session_id,
-        parent_pane_id,
-        action,
-        pane_id,
-    );
+    let metadata = build_tmux_agent_team_metadata(&integration, &context);
     let registration = invoke_control("agent.set_state", &metadata.agent_state, invoke)
         .and_then(|response| response_result::<AgentStateResult>(&response));
     if let Err(error) = registration {
         let _ = invoke_control(
             "session.terminate",
             &SessionTerminateParams {
-                session_id: session_id.to_string(),
+                session_id: context.session_id.to_string(),
                 mode: "kill".to_string(),
             },
             invoke,
         );
-        if let Some(pane_id) = pane_id {
+        if let Some(pane_id) = context.pane_id {
             let _ = invoke_control(
                 "pane.close",
                 &PaneCloseParams {
-                    workspace_id: workspace_id.to_string(),
+                    workspace_id: context.workspace_id.to_string(),
                     pane_id: pane_id.to_string(),
                     surface_policy: "close_surface".to_string(),
                 },
                 invoke,
+            );
+        }
+        if let Some(mutation) = context.mutation {
+            mark_tmux_agent_team_layout_dirty(
+                invoke,
+                context.workspace_id,
+                mutation,
+                &format!("reserved worker metadata registration failed: {error}"),
             );
         }
         return Err(CliError::Control(format!(
@@ -10523,7 +10578,609 @@ fn register_tmux_agent_team_metadata(
     }
     let _ = invoke_control("sidebar.set_status", &metadata.sidebar_status, invoke);
     let _ = invoke_control("sidebar.log", &metadata.sidebar_log, invoke);
+    if context.action == "split-window" && team.team_id.is_some() {
+        if let Err(error) = reflow_tmux_agent_team(invoke, context.workspace_id, &team) {
+            if let Some(mutation) = context.mutation {
+                mark_tmux_agent_team_layout_dirty(
+                    invoke,
+                    context.workspace_id,
+                    mutation,
+                    &error.to_string(),
+                );
+            }
+        } else if let Some(mutation) = context.mutation {
+            complete_tmux_agent_team_mutation(invoke, mutation)?;
+        }
+    }
     Ok(())
+}
+
+struct TmuxAgentTeamSplitPlan {
+    target_pane_id: String,
+    axis: String,
+    team_mutation: Option<TmuxAgentTeamMutation>,
+}
+
+#[derive(Clone)]
+struct TmuxAgentTeamMutation {
+    team: TmuxAgentTeamEnvironment,
+    generation: u64,
+    mutation_id: String,
+}
+
+fn resolve_tmux_agent_team_split_plan(
+    invoke: &ControlInvokeOptions,
+    workspace_id: &str,
+    fallback_pane_id: &str,
+    fallback_axis: &str,
+) -> Result<TmuxAgentTeamSplitPlan, CliError> {
+    let mut team = tmux_agent_team_environment();
+    let Some(team_id) = team.team_id.clone() else {
+        return Ok(TmuxAgentTeamSplitPlan {
+            target_pane_id: fallback_pane_id.to_string(),
+            axis: fallback_axis.to_string(),
+            team_mutation: None,
+        });
+    };
+    let Some(main_session_id) = team.main_session_id.clone() else {
+        return Ok(TmuxAgentTeamSplitPlan {
+            target_pane_id: fallback_pane_id.to_string(),
+            axis: fallback_axis.to_string(),
+            team_mutation: None,
+        });
+    };
+
+    let mut attempted_recovery = false;
+    let (detail, agents, main_telemetry) = loop {
+        let detail = load_workspace_detail(invoke, workspace_id)?;
+        let agents = load_workspace_agent_states(invoke, workspace_id)?;
+        let main_state = agents
+            .sessions
+            .iter()
+            .find(|state| state.session_id == main_session_id)
+            .ok_or_else(|| {
+                CliError::Control(format!(
+                    "agent team '{team_id}' main session '{main_session_id}' has no registered state"
+                ))
+            })?;
+        let main_telemetry = main_state.telemetry.clone().ok_or_else(|| {
+            CliError::Control(format!(
+                "agent team '{team_id}' main session has no team telemetry"
+            ))
+        })?;
+        if main_telemetry.team_id.as_deref() != Some(team_id.as_str())
+            || main_telemetry.team_role.as_deref() != Some("main")
+        {
+            return Err(CliError::Control(format!(
+                "session '{main_session_id}' is not the main session for agent team '{team_id}'"
+            )));
+        }
+        if main_telemetry.team_auto_adopt == Some(false) {
+            return Err(CliError::Control(format!(
+                "agent team '{team_id}' does not allow automatic tmux worker adoption"
+            )));
+        }
+        if main_telemetry.team_status.as_deref() != Some("provisioning") {
+            break (detail, agents, main_telemetry);
+        }
+        if attempted_recovery {
+            return Err(CliError::Control(format!(
+                "agent team '{team_id}' remained provisioning after recovery"
+            )));
+        }
+        recover_abandoned_tmux_agent_team_mutation(
+            invoke,
+            &team_id,
+            &main_session_id,
+            &main_telemetry,
+        )?;
+        attempted_recovery = true;
+    };
+    team.layout_root_pane_id = main_telemetry.layout_root_pane_id.clone();
+    team.main_ratio = main_telemetry.main_ratio.clone();
+    team.max_workers = main_telemetry.max_workers.or(team.max_workers);
+    let worker_sessions = agents
+        .sessions
+        .iter()
+        .filter(|state| {
+            state
+                .telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.team_id.as_deref())
+                == Some(team_id.as_str())
+                && state
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.team_role.as_deref())
+                    != Some("main")
+        })
+        .map(|state| state.session_id.as_str())
+        .collect::<HashSet<_>>();
+    if worker_sessions.len() >= usize::from(team.max_workers.unwrap_or(8)) {
+        return Err(CliError::Control(format!(
+            "agent team '{team_id}' already has the maximum number of workers ({})",
+            team.max_workers.unwrap_or(8)
+        )));
+    }
+
+    let (target_pane_id, split_axis) = if worker_sessions.is_empty() {
+        let main_pane_id = pane_id_for_session(&detail, &main_session_id).ok_or_else(|| {
+            CliError::Control(format!(
+                "could not resolve agent team main session '{main_session_id}' to a pane"
+            ))
+        })?;
+        (main_pane_id, "vertical".to_string())
+    } else {
+        let target_pane_id = detail
+            .panes
+            .iter()
+            .filter(|pane| pane.kind == "leaf")
+            .filter_map(|pane| {
+                session_id_for_pane(&detail, &pane.pane_id)
+                    .filter(|session_id| worker_sessions.contains(session_id.as_str()))
+                    .map(|_| pane.pane_id.clone())
+            })
+            .next_back()
+            .ok_or_else(|| {
+                CliError::Control(format!(
+                    "agent team '{team_id}' has registered workers but no managed worker pane"
+                ))
+            })?;
+        (target_pane_id, "horizontal".to_string())
+    };
+    let generation = main_telemetry.team_generation.unwrap_or(1);
+    let mutation_id = tmux_agent_team_mutation_id(&team_id);
+    let reservation = invoke_control(
+        "agent.team.reserve",
+        &AgentTeamReserveParams {
+            team_id: team_id.clone(),
+            main_session_id: main_session_id.clone(),
+            expected_generation: generation,
+            next_generation: generation.saturating_add(1),
+            mutation_id: Some(mutation_id.clone()),
+            claim: false,
+            claim_telemetry: None,
+        },
+        invoke,
+    )?;
+    let reservation: AgentTeamReserveResult = response_result(&reservation)?;
+    if !reservation.acquired {
+        return Err(CliError::Control(format!(
+            "agent team '{team_id}' already has this tmux mutation in progress"
+        )));
+    }
+    Ok(TmuxAgentTeamSplitPlan {
+        target_pane_id,
+        axis: split_axis,
+        team_mutation: Some(TmuxAgentTeamMutation {
+            team,
+            generation: reservation.generation,
+            mutation_id: reservation.mutation_id.unwrap_or(mutation_id),
+        }),
+    })
+}
+
+fn tmux_agent_team_mutation_id(team_id: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("tmux:{team_id}:{}:{nanos:x}", std::process::id())
+}
+
+fn recover_abandoned_tmux_agent_team_mutation(
+    invoke: &ControlInvokeOptions,
+    team_id: &str,
+    main_session_id: &str,
+    telemetry: &AgentTelemetry,
+) -> Result<(), CliError> {
+    let generation = telemetry.team_generation.ok_or_else(|| {
+        CliError::Control(format!(
+            "agent team '{team_id}' provisioning state has no generation"
+        ))
+    })?;
+    let mutation_id = telemetry.team_mutation_id.clone().ok_or_else(|| {
+        CliError::Control(format!(
+            "agent team '{team_id}' provisioning state has no mutation id"
+        ))
+    })?;
+    let recovery_owner_id = tmux_agent_team_mutation_id(team_id);
+    let response = invoke_control_with_caller(
+        "agent.team.recover",
+        &AgentTeamRecoverParams {
+            team_id: team_id.to_string(),
+            main_session_id: main_session_id.to_string(),
+            generation,
+            mutation_id,
+        },
+        invoke,
+        Some(ControlCaller {
+            source: "tmux".to_string(),
+            profile: Some("standard".to_string()),
+            client_session_id: Some(recovery_owner_id),
+        }),
+    )?;
+    let recovered: AgentTeamRecoverResult = response_result(&response)?;
+    if !recovered.recovered {
+        return Err(CliError::Control(format!(
+            "agent team '{team_id}' abandoned mutation was not recovered"
+        )));
+    }
+    Ok(())
+}
+
+fn load_workspace_agent_states(
+    invoke: &ControlInvokeOptions,
+    workspace_id: &str,
+) -> Result<AgentAttentionListResult, CliError> {
+    let response = invoke_control(
+        "agent.list",
+        &AgentListAttentionParams {
+            workspace_id: Some(workspace_id.to_string()),
+        },
+        invoke,
+    )?;
+    response_result(&response)
+}
+
+fn reflow_tmux_agent_team(
+    invoke: &ControlInvokeOptions,
+    workspace_id: &str,
+    team: &TmuxAgentTeamEnvironment,
+) -> Result<(), CliError> {
+    let team_id = team
+        .team_id
+        .as_deref()
+        .ok_or_else(|| CliError::Control("missing agent team id".to_string()))?;
+    let main_session_id = team
+        .main_session_id
+        .as_deref()
+        .ok_or_else(|| CliError::Control("missing agent team main session id".to_string()))?;
+    let detail = load_workspace_detail(invoke, workspace_id)?;
+    let agents = load_workspace_agent_states(invoke, workspace_id)?;
+    let main_pane_id = pane_id_for_session(&detail, main_session_id).ok_or_else(|| {
+        CliError::Control(format!(
+            "could not resolve agent team main session '{main_session_id}' to a pane"
+        ))
+    })?;
+    let root_id = match team.layout_root_pane_id.as_deref() {
+        Some(pane_id) if detail.panes.iter().any(|pane| pane.pane_id == pane_id) => pane_id,
+        Some(pane_id) => {
+            return Err(CliError::Control(format!(
+                "team layout root '{pane_id}' no longer exists"
+            )))
+        }
+        None => main_pane_id.as_str(),
+    };
+    let root = detail
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == root_id)
+        .ok_or_else(|| CliError::Control(format!("team layout root '{root_id}' does not exist")))?;
+    if root.kind == "leaf" {
+        let has_registered_workers = agents.sessions.iter().any(|state| {
+            state
+                .telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.team_id.as_deref())
+                == Some(team_id)
+                && state
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.team_role.as_deref())
+                    != Some("main")
+        });
+        if has_registered_workers {
+            return Err(CliError::Control(format!(
+                "team layout root '{root_id}' is a leaf while managed workers still exist"
+            )));
+        }
+        return Ok(());
+    }
+    if root.split_axis.as_deref() != Some("vertical") {
+        return Err(CliError::Control(format!(
+            "team layout root '{root_id}' is not a vertical split"
+        )));
+    }
+    let children = tmux_team_children(&detail, root_id);
+    if children.len() != 2 {
+        return Err(CliError::Control(format!(
+            "team layout root '{root_id}' does not have exactly two children"
+        )));
+    }
+    let main_child_index = children
+        .iter()
+        .position(|child| tmux_team_subtree_contains(&detail, &child.pane_id, &main_pane_id))
+        .ok_or_else(|| {
+            CliError::Control("main pane is outside the managed layout root".to_string())
+        })?;
+    let worker_root = children[1 - main_child_index];
+    if tmux_team_split_nodes(&detail, &worker_root.pane_id)
+        .iter()
+        .any(|pane| pane.split_axis.as_deref() != Some("horizontal"))
+    {
+        return Err(CliError::Control(
+            "managed worker subtree contains a non-horizontal split".to_string(),
+        ));
+    }
+
+    let managed_leaf_ids = agents
+        .sessions
+        .iter()
+        .filter(|state| {
+            state
+                .telemetry
+                .as_ref()
+                .and_then(|telemetry| telemetry.team_id.as_deref())
+                == Some(team_id)
+                && state
+                    .telemetry
+                    .as_ref()
+                    .and_then(|telemetry| telemetry.team_role.as_deref())
+                    != Some("main")
+        })
+        .filter_map(|state| pane_id_for_session(&detail, &state.session_id))
+        .collect::<HashSet<_>>();
+    let worker_leaf_ids = tmux_team_leaf_ids(&detail, &worker_root.pane_id);
+    let foreign = worker_leaf_ids
+        .iter()
+        .filter(|pane_id| !managed_leaf_ids.contains(*pane_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !foreign.is_empty() {
+        return Err(CliError::Control(format!(
+            "foreign panes found under managed worker subtree: {}",
+            foreign.join(", ")
+        )));
+    }
+    let missing = managed_leaf_ids
+        .iter()
+        .filter(|pane_id| !worker_leaf_ids.contains(*pane_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(CliError::Control(format!(
+            "team worker panes are outside the managed subtree: {}",
+            missing.join(", ")
+        )));
+    }
+
+    let main_ratio = team
+        .main_ratio
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.1, 0.9);
+    let root_ratio = if main_child_index == 0 {
+        main_ratio
+    } else {
+        1.0 - main_ratio
+    };
+    let mut updates = vec![(
+        root_id.to_string(),
+        root_ratio,
+        root.split_ratio.unwrap_or(0.5),
+    )];
+    tmux_team_collect_reflow_updates(&detail, &worker_root.pane_id, &mut updates);
+    let mut applied: Vec<(String, f64)> = Vec::with_capacity(updates.len());
+    for (pane_id, ratio, previous_ratio) in &updates {
+        let resize = invoke_control(
+            "pane.resize_layout",
+            &PaneResizeLayoutParams {
+                workspace_id: workspace_id.to_string(),
+                pane_id: pane_id.clone(),
+                ratio: *ratio,
+            },
+            invoke,
+        )
+        .and_then(|response| response_result::<serde_json::Value>(&response));
+        if let Err(error) = resize {
+            let mut restored = true;
+            for (applied_pane_id, applied_previous_ratio) in applied.iter().rev() {
+                restored &= invoke_control(
+                    "pane.resize_layout",
+                    &PaneResizeLayoutParams {
+                        workspace_id: workspace_id.to_string(),
+                        pane_id: applied_pane_id.clone(),
+                        ratio: *applied_previous_ratio,
+                    },
+                    invoke,
+                )
+                .and_then(|response| response_result::<serde_json::Value>(&response))
+                .is_ok();
+            }
+            return Err(CliError::Control(format!(
+                "layout resize failed at pane '{pane_id}': {error}; previous ratios restored={restored}"
+            )));
+        }
+        applied.push((pane_id.clone(), *previous_ratio));
+    }
+    Ok(())
+}
+
+fn mark_tmux_agent_team_layout_dirty(
+    invoke: &ControlInvokeOptions,
+    workspace_id: &str,
+    mutation: &TmuxAgentTeamMutation,
+    reason: &str,
+) {
+    if let (Some(team_id), Some(main_session_id)) = (
+        mutation.team.team_id.as_deref(),
+        mutation.team.main_session_id.as_deref(),
+    ) {
+        let state = invoke_control(
+            "agent.get_state",
+            &SessionIdParams {
+                session_id: main_session_id.to_string(),
+            },
+            invoke,
+        )
+        .and_then(|response| response_result::<AgentStateResult>(&response));
+        if let Ok(state) = state {
+            if let Some(mut telemetry) = state.telemetry {
+                telemetry.team_status = Some("layout_dirty".to_string());
+                telemetry.team_mutation_id = None;
+                telemetry.team_mutation_owner_id = None;
+                let _ = invoke_control(
+                    "agent.team.settle",
+                    &AgentTeamSettleParams {
+                        team_id: team_id.to_string(),
+                        main_session_id: main_session_id.to_string(),
+                        generation: mutation.generation,
+                        mutation_id: mutation.mutation_id.clone(),
+                        telemetry,
+                    },
+                    invoke,
+                );
+            }
+        }
+    }
+    let _ = invoke_control(
+        "sidebar.log",
+        &SidebarLogAddParams {
+            workspace_id: Some(workspace_id.to_string()),
+            level: Some("warning".to_string()),
+            source: Some("agent-team".to_string()),
+            message: format!("Automatic worker layout reflow was skipped: {reason}"),
+        },
+        invoke,
+    );
+}
+
+fn complete_tmux_agent_team_mutation(
+    invoke: &ControlInvokeOptions,
+    mutation: &TmuxAgentTeamMutation,
+) -> Result<(), CliError> {
+    let Some(main_session_id) = mutation.team.main_session_id.as_deref() else {
+        return Err(CliError::Control(
+            "tmux team mutation has no main session".to_string(),
+        ));
+    };
+    let Some(team_id) = mutation.team.team_id.as_deref() else {
+        return Err(CliError::Control(
+            "tmux team mutation has no team id".to_string(),
+        ));
+    };
+    let state = invoke_control(
+        "agent.get_state",
+        &SessionIdParams {
+            session_id: main_session_id.to_string(),
+        },
+        invoke,
+    )
+    .and_then(|response| response_result::<AgentStateResult>(&response));
+    let state = state?;
+    let Some(mut telemetry) = state.telemetry else {
+        return Err(CliError::Control(
+            "tmux team main session has no telemetry".to_string(),
+        ));
+    };
+    if telemetry.team_id != mutation.team.team_id
+        || telemetry.team_role.as_deref() != Some("main")
+        || telemetry.team_generation != Some(mutation.generation)
+        || telemetry.team_mutation_id.as_deref() != Some(mutation.mutation_id.as_str())
+    {
+        return Err(CliError::Control(
+            "tmux team reservation changed before completion".to_string(),
+        ));
+    }
+    telemetry.team_status = Some("ready".to_string());
+    telemetry.team_mutation_id = None;
+    telemetry.team_mutation_owner_id = None;
+    let response = invoke_control(
+        "agent.team.settle",
+        &AgentTeamSettleParams {
+            team_id: team_id.to_string(),
+            main_session_id: main_session_id.to_string(),
+            generation: mutation.generation,
+            mutation_id: mutation.mutation_id.clone(),
+            telemetry,
+        },
+        invoke,
+    )?;
+    response_result::<serde_json::Value>(&response).map(|_| ())
+}
+
+fn tmux_team_children<'a>(
+    detail: &'a WorkspaceDetailResult,
+    pane_id: &str,
+) -> Vec<&'a PaneSummaryResult> {
+    detail
+        .panes
+        .iter()
+        .filter(|pane| pane.parent_pane_id.as_deref() == Some(pane_id))
+        .collect()
+}
+
+fn tmux_team_subtree_contains(
+    detail: &WorkspaceDetailResult,
+    root_id: &str,
+    pane_id: &str,
+) -> bool {
+    root_id == pane_id
+        || tmux_team_children(detail, root_id)
+            .iter()
+            .any(|child| tmux_team_subtree_contains(detail, &child.pane_id, pane_id))
+}
+
+fn tmux_team_leaf_ids(detail: &WorkspaceDetailResult, root_id: &str) -> Vec<String> {
+    let Some(root) = detail.panes.iter().find(|pane| pane.pane_id == root_id) else {
+        return Vec::new();
+    };
+    if root.kind == "leaf" {
+        return vec![root.pane_id.clone()];
+    }
+    tmux_team_children(detail, root_id)
+        .iter()
+        .flat_map(|child| tmux_team_leaf_ids(detail, &child.pane_id))
+        .collect()
+}
+
+fn tmux_team_split_nodes<'a>(
+    detail: &'a WorkspaceDetailResult,
+    root_id: &str,
+) -> Vec<&'a PaneSummaryResult> {
+    let Some(root) = detail.panes.iter().find(|pane| pane.pane_id == root_id) else {
+        return Vec::new();
+    };
+    if root.kind == "leaf" {
+        return Vec::new();
+    }
+    let mut nodes = vec![root];
+    for child in tmux_team_children(detail, root_id) {
+        nodes.extend(tmux_team_split_nodes(detail, &child.pane_id));
+    }
+    nodes
+}
+
+fn tmux_team_collect_reflow_updates(
+    detail: &WorkspaceDetailResult,
+    root_id: &str,
+    updates: &mut Vec<(String, f64, f64)>,
+) {
+    let Some(root) = detail.panes.iter().find(|pane| pane.pane_id == root_id) else {
+        return;
+    };
+    if root.kind == "leaf" {
+        return;
+    }
+    let children = tmux_team_children(detail, root_id);
+    if children.len() != 2 {
+        return;
+    }
+    let first_count = tmux_team_leaf_ids(detail, &children[0].pane_id).len();
+    let second_count = tmux_team_leaf_ids(detail, &children[1].pane_id).len();
+    let total = first_count + second_count;
+    if total > 0 {
+        updates.push((
+            root.pane_id.clone(),
+            first_count as f64 / total as f64,
+            root.split_ratio.unwrap_or(0.5),
+        ));
+    }
+    for child in children {
+        tmux_team_collect_reflow_updates(detail, &child.pane_id, updates);
+    }
 }
 
 fn agent_integration_from_env() -> Option<String> {
@@ -10535,7 +11192,9 @@ fn agent_integration_from_env() -> Option<String> {
 }
 
 fn tmux_integration_child_env() -> Vec<EnvVarParam> {
-    if agent_integration_from_env().is_none() {
+    if agent_integration_from_env().is_none()
+        && non_empty_environment_value("AGENTMUX_TEAM_ID").is_none()
+    {
         return Vec::new();
     }
     const INHERITED_KEYS: &[&str] = &[
@@ -10549,6 +11208,14 @@ fn tmux_integration_child_env() -> Vec<EnvVarParam> {
         "AGENTMUX_ORIGINAL_NODE_OPTIONS",
         "CMUX_ORIGINAL_NODE_OPTIONS",
         "NODE_OPTIONS",
+        "AGENTMUX_TEAM_ID",
+        "AGENTMUX_TEAM_ROLE",
+        "AGENTMUX_TEAM_MAIN_SESSION_ID",
+        "AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID",
+        "AGENTMUX_TEAM_MAIN_RATIO",
+        "AGENTMUX_TEAM_MAX_WORKERS",
+        "AGENTMUX_TEAM_WORKER_NAME",
+        "AGENTMUX_TEAM_AUTO_ADOPT",
     ];
     INHERITED_KEYS
         .iter()
@@ -10563,41 +11230,71 @@ fn tmux_integration_child_env() -> Vec<EnvVarParam> {
 
 fn build_tmux_agent_team_metadata(
     integration: &str,
-    workspace_id: &str,
-    session_id: &str,
-    parent_pane_id: Option<&str>,
-    action: &str,
-    pane_id: Option<&str>,
+    context: &TmuxAgentTeamMetadataContext<'_>,
 ) -> TmuxAgentTeamMetadata {
     let integration = integration.trim().to_string();
-    let pane_label = pane_id
+    let team = context
+        .mutation
+        .map(|mutation| mutation.team.clone())
+        .unwrap_or_default();
+    let pane_label = context
+        .pane_id
         .map(agentmux_pane_to_tmux_pane)
         .unwrap_or_else(|| "unknown-pane".to_string());
-    let parent_label = parent_pane_id.map(agentmux_pane_to_tmux_pane);
+    let parent_label = context.parent_pane_id.map(agentmux_pane_to_tmux_pane);
     let reason = match parent_label {
-        Some(parent) => format!("{integration} {action} worker {pane_label} from {parent}"),
-        None => format!("{integration} {action} worker {pane_label}"),
+        Some(parent) => format!(
+            "{integration} {} worker {pane_label} from {parent}",
+            context.action
+        ),
+        None => format!("{integration} {} worker {pane_label}", context.action),
     };
     let sidebar_label = format!("{integration} team active");
-    let sidebar_message = format!("{reason}; session {session_id}");
+    let sidebar_message = format!("{reason}; session {}", context.session_id);
     TmuxAgentTeamMetadata {
         integration: integration.clone(),
         agent_state: AgentSetStateParams {
-            session_id: session_id.to_string(),
+            session_id: context.session_id.to_string(),
             state: "running".to_string(),
             reason: Some(reason),
             telemetry: Some(AgentTelemetry {
                 activity: Some("agent_team".to_string()),
-                session: Some(format!("{integration}:{action}")),
+                session: Some(format!("{integration}:{}", context.action)),
                 cost: None,
                 tokens: None,
                 cache: None,
                 rate: None,
-                ctx: pane_id.map(str::to_string),
+                ctx: context.pane_id.map(str::to_string),
+                team_id: team.team_id.clone(),
+                team_role: team.team_id.as_ref().map(|_| "descendant".to_string()),
+                worker_name: team.worker_name.map(|name| format!("{name}/{pane_label}")),
+                parent_session_id: team
+                    .team_id
+                    .as_ref()
+                    .and_then(|_| context.parent_session_id.map(str::to_string)),
+                layout_root_pane_id: team.layout_root_pane_id,
+                main_ratio: team.main_ratio,
+                max_workers: team.max_workers,
+                worker_index: None,
+                default_worker_kind: None,
+                distribution: None,
+                team_cwd: None,
+                durability: None,
+                team_mode: None,
+                team_status: None,
+                team_layout: None,
+                team_generation: context.mutation.map(|mutation| mutation.generation),
+                team_mutation_id: context
+                    .mutation
+                    .map(|mutation| mutation.mutation_id.clone()),
+                team_mutation_owner_id: None,
+                team_auto_adopt: team.team_id.as_ref().map(|_| true),
+                team_idempotency_key: None,
+                team_member_idempotency_key: None,
             }),
         },
         sidebar_status: SidebarStatusSetParams {
-            workspace_id: Some(workspace_id.to_string()),
+            workspace_id: Some(context.workspace_id.to_string()),
             key: format!("agent-team.{}", metadata_key_fragment(&integration)),
             label: sidebar_label,
             icon: Some("bot".to_string()),
@@ -10605,12 +11302,46 @@ fn build_tmux_agent_team_metadata(
             priority: Some(70),
         },
         sidebar_log: SidebarLogAddParams {
-            workspace_id: Some(workspace_id.to_string()),
+            workspace_id: Some(context.workspace_id.to_string()),
             level: Some("info".to_string()),
             source: Some(integration.clone()),
             message: sidebar_message,
         },
     }
+}
+
+#[derive(Clone, Default)]
+struct TmuxAgentTeamEnvironment {
+    team_id: Option<String>,
+    main_session_id: Option<String>,
+    worker_name: Option<String>,
+    layout_root_pane_id: Option<String>,
+    main_ratio: Option<String>,
+    max_workers: Option<u16>,
+}
+
+fn tmux_agent_team_environment() -> TmuxAgentTeamEnvironment {
+    let auto_adopt = non_empty_environment_value("AGENTMUX_TEAM_AUTO_ADOPT")
+        .is_none_or(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"));
+    if !auto_adopt {
+        return TmuxAgentTeamEnvironment::default();
+    }
+    TmuxAgentTeamEnvironment {
+        team_id: non_empty_environment_value("AGENTMUX_TEAM_ID"),
+        main_session_id: non_empty_environment_value("AGENTMUX_TEAM_MAIN_SESSION_ID"),
+        worker_name: non_empty_environment_value("AGENTMUX_TEAM_WORKER_NAME"),
+        layout_root_pane_id: non_empty_environment_value("AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID"),
+        main_ratio: non_empty_environment_value("AGENTMUX_TEAM_MAIN_RATIO"),
+        max_workers: non_empty_environment_value("AGENTMUX_TEAM_MAX_WORKERS")
+            .and_then(|value| value.parse().ok()),
+    }
+}
+
+fn non_empty_environment_value(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn metadata_key_fragment(value: &str) -> String {
@@ -11869,7 +12600,7 @@ fn setup_agent_integration_files(
 
 fn write_tmux_shim_files(shim_dir: &Path) -> Result<(), CliError> {
     let script_path = shim_dir.join("tmux");
-    let script = "#!/usr/bin/env sh\nAGENTMUX_WSL_PATH=$PATH\nexport AGENTMUX_WSL_PATH\nfor agentmux_key in AGENTMUX_AGENT_INTEGRATION CMUX_AGENT_INTEGRATION AGENTMUX_EXE CMUX_EXE AGENTMUX_WSL_PATH CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS OPENCODE_CONFIG_DIR AGENTMUX_ORIGINAL_NODE_OPTIONS CMUX_ORIGINAL_NODE_OPTIONS NODE_OPTIONS; do\n  case \":${WSLENV-}:\" in\n    *\":${agentmux_key}:\"*) ;;\n    *) WSLENV=\"${WSLENV:+${WSLENV}:}${agentmux_key}\" ;;\n  esac\ndone\nexport WSLENV\nif [ -n \"$AGENTMUX_EXE\" ]; then\n  exec \"$AGENTMUX_EXE\" __tmux-compat \"$@\"\nfi\nif [ -n \"$CMUX_EXE\" ]; then\n  exec \"$CMUX_EXE\" __tmux-compat \"$@\"\nfi\nif command -v agentmux >/dev/null 2>&1; then\n  exec agentmux __tmux-compat \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux __tmux-compat \"$@\"\nfi\nexec agentmux.exe __tmux-compat \"$@\"\n";
+    let script = "#!/usr/bin/env sh\nAGENTMUX_WSL_PATH=$PATH\nexport AGENTMUX_WSL_PATH\nfor agentmux_key in AGENTMUX_AGENT_INTEGRATION CMUX_AGENT_INTEGRATION AGENTMUX_EXE CMUX_EXE AGENTMUX_WSL_PATH CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS OPENCODE_CONFIG_DIR AGENTMUX_ORIGINAL_NODE_OPTIONS CMUX_ORIGINAL_NODE_OPTIONS NODE_OPTIONS AGENTMUX_TEAM_ID AGENTMUX_TEAM_ROLE AGENTMUX_TEAM_MAIN_SESSION_ID AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID AGENTMUX_TEAM_MAIN_RATIO AGENTMUX_TEAM_MAX_WORKERS AGENTMUX_TEAM_WORKER_NAME AGENTMUX_TEAM_AUTO_ADOPT; do\n  case \":${WSLENV-}:\" in\n    *\":${agentmux_key}:\"*) ;;\n    *) WSLENV=\"${WSLENV:+${WSLENV}:}${agentmux_key}\" ;;\n  esac\ndone\nexport WSLENV\nif [ -n \"$AGENTMUX_EXE\" ]; then\n  exec \"$AGENTMUX_EXE\" __tmux-compat \"$@\"\nfi\nif [ -n \"$CMUX_EXE\" ]; then\n  exec \"$CMUX_EXE\" __tmux-compat \"$@\"\nfi\nif command -v agentmux >/dev/null 2>&1; then\n  exec agentmux __tmux-compat \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux __tmux-compat \"$@\"\nfi\nexec agentmux.exe __tmux-compat \"$@\"\n";
     fs::write(&script_path, script).map_err(CliError::Io)?;
     set_executable_if_supported(&script_path)?;
 
@@ -17123,11 +17854,15 @@ HKEY_CURRENT_USER\Environment
 
         let metadata = build_tmux_agent_team_metadata(
             "claude-teams",
-            "ws_1",
-            "ses_worker",
-            Some("pane_main"),
-            "split-window",
-            Some("pane_worker"),
+            &TmuxAgentTeamMetadataContext {
+                workspace_id: "ws_1",
+                session_id: "ses_worker",
+                parent_session_id: Some("ses_main"),
+                parent_pane_id: Some("pane_main"),
+                action: "split-window",
+                pane_id: Some("pane_worker"),
+                mutation: None,
+            },
         );
         assert_eq!(metadata.integration, "claude-teams");
         assert_eq!(metadata.agent_state.state, "running");
@@ -17264,12 +17999,18 @@ HKEY_CURRENT_USER\Environment
         let previous_marker = std::env::var_os("AGENTMUX_AGENT_INTEGRATION");
         let previous_path = std::env::var_os("PATH");
         let previous_wsl_path = std::env::var_os("AGENTMUX_WSL_PATH");
+        let previous_team_id = std::env::var_os("AGENTMUX_TEAM_ID");
+        let previous_main_session_id = std::env::var_os("AGENTMUX_TEAM_MAIN_SESSION_ID");
+        let previous_worker_name = std::env::var_os("AGENTMUX_TEAM_WORKER_NAME");
         std::env::set_var("AGENTMUX_AGENT_INTEGRATION", "claude-teams");
         std::env::set_var("PATH", r"C:\Windows\System32");
         std::env::set_var(
             "AGENTMUX_WSL_PATH",
             "/tmp/agentmux-shim:/usr/local/bin:/usr/bin:/bin",
         );
+        std::env::set_var("AGENTMUX_TEAM_ID", "team_1");
+        std::env::set_var("AGENTMUX_TEAM_MAIN_SESSION_ID", "session_main");
+        std::env::set_var("AGENTMUX_TEAM_WORKER_NAME", "worker_1");
 
         let env = tmux_integration_child_env();
         assert!(env.iter().any(|entry| {
@@ -17280,6 +18021,15 @@ HKEY_CURRENT_USER\Environment
                 && entry.value == "/tmp/agentmux-shim:/usr/local/bin:/usr/bin:/bin"
         }));
         assert!(!env.iter().any(|entry| entry.key == "PATH"));
+        assert!(env
+            .iter()
+            .any(|entry| { entry.key == "AGENTMUX_TEAM_ID" && entry.value == "team_1" }));
+        assert!(env.iter().any(|entry| {
+            entry.key == "AGENTMUX_TEAM_MAIN_SESSION_ID" && entry.value == "session_main"
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.key == "AGENTMUX_TEAM_WORKER_NAME" && entry.value == "worker_1"
+        }));
 
         if let Some(value) = previous_marker {
             std::env::set_var("AGENTMUX_AGENT_INTEGRATION", value);
@@ -17295,6 +18045,279 @@ HKEY_CURRENT_USER\Environment
             std::env::set_var("AGENTMUX_WSL_PATH", value);
         } else {
             std::env::remove_var("AGENTMUX_WSL_PATH");
+        }
+        if let Some(value) = previous_team_id {
+            std::env::set_var("AGENTMUX_TEAM_ID", value);
+        } else {
+            std::env::remove_var("AGENTMUX_TEAM_ID");
+        }
+        if let Some(value) = previous_main_session_id {
+            std::env::set_var("AGENTMUX_TEAM_MAIN_SESSION_ID", value);
+        } else {
+            std::env::remove_var("AGENTMUX_TEAM_MAIN_SESSION_ID");
+        }
+        if let Some(value) = previous_worker_name {
+            std::env::set_var("AGENTMUX_TEAM_WORKER_NAME", value);
+        } else {
+            std::env::remove_var("AGENTMUX_TEAM_WORKER_NAME");
+        }
+    }
+
+    #[test]
+    fn tmux_agent_team_metadata_inherits_parent_team_context() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let keys = [
+            "AGENTMUX_TEAM_ID",
+            "AGENTMUX_TEAM_MAIN_SESSION_ID",
+            "AGENTMUX_TEAM_WORKER_NAME",
+            "AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID",
+            "AGENTMUX_TEAM_MAIN_RATIO",
+            "AGENTMUX_TEAM_MAX_WORKERS",
+        ];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("AGENTMUX_TEAM_ID", "team_alpha");
+        std::env::set_var("AGENTMUX_TEAM_MAIN_SESSION_ID", "ses_main");
+        std::env::set_var("AGENTMUX_TEAM_WORKER_NAME", "researcher");
+        std::env::set_var("AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID", "pane_root");
+        std::env::set_var("AGENTMUX_TEAM_MAIN_RATIO", "0.55");
+        std::env::set_var("AGENTMUX_TEAM_MAX_WORKERS", "4");
+
+        let mutation = TmuxAgentTeamMutation {
+            team: tmux_agent_team_environment(),
+            generation: 2,
+            mutation_id: "tmux:test".to_string(),
+        };
+        let metadata = build_tmux_agent_team_metadata(
+            "claude-teams",
+            &TmuxAgentTeamMetadataContext {
+                workspace_id: "ws_1",
+                session_id: "ses_worker",
+                parent_session_id: Some("ses_main"),
+                parent_pane_id: Some("pane_main"),
+                action: "split-window",
+                pane_id: Some("pane_worker"),
+                mutation: Some(&mutation),
+            },
+        );
+        let telemetry = metadata.agent_state.telemetry.expect("team telemetry");
+        assert_eq!(
+            tmux_agent_team_environment().main_session_id.as_deref(),
+            Some("ses_main")
+        );
+        assert_eq!(telemetry.team_id.as_deref(), Some("team_alpha"));
+        assert_eq!(telemetry.team_role.as_deref(), Some("descendant"));
+        assert_eq!(
+            telemetry.worker_name.as_deref(),
+            Some("researcher/%pane_worker")
+        );
+        assert_eq!(telemetry.parent_session_id.as_deref(), Some("ses_main"));
+        assert_eq!(telemetry.layout_root_pane_id.as_deref(), Some("pane_root"));
+        assert_eq!(telemetry.main_ratio.as_deref(), Some("0.55"));
+        assert_eq!(telemetry.max_workers, Some(4));
+        assert_eq!(telemetry.team_generation, Some(2));
+        assert_eq!(telemetry.team_mutation_id.as_deref(), Some("tmux:test"));
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn tmux_agent_team_split_recovers_abandoned_provisioning_before_reserving() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let keys = ["AGENTMUX_TEAM_ID", "AGENTMUX_TEAM_MAIN_SESSION_ID"];
+        let previous = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        std::env::set_var("AGENTMUX_TEAM_ID", "team_alpha");
+        std::env::set_var("AGENTMUX_TEAM_MAIN_SESSION_ID", "ses_main");
+
+        let pipe_name = format!(
+            r"\\.\pipe\agentmux-tmux-team-recovery-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut options = ControlInvokeOptions::from_env();
+        options.pipe_name = pipe_name.clone();
+        options.token = Some("test-control-token".to_string());
+
+        let detail = WorkspaceDetailResult {
+            workspace: WorkspaceSummaryResult {
+                workspace_id: "ws_1".to_string(),
+                name: "Project".to_string(),
+                root_pane_id: "pane_main".to_string(),
+                active_pane_id: "pane_main".to_string(),
+                project_root: None,
+                environment_profile_id: None,
+                description: None,
+                icon: None,
+                color: None,
+                default_wsl_distribution: None,
+                default_terminal_profile: None,
+                default_agent_command: None,
+            },
+            panes: vec![PaneSummaryResult {
+                pane_id: "pane_main".to_string(),
+                workspace_id: "ws_1".to_string(),
+                parent_pane_id: None,
+                kind: "leaf".to_string(),
+                split_axis: None,
+                split_ratio: None,
+                mounted_surface_id: Some("surf_main".to_string()),
+            }],
+            surfaces: vec![SurfaceSummaryResult {
+                surface_id: "surf_main".to_string(),
+                workspace_id: "ws_1".to_string(),
+                surface_type: "terminal".to_string(),
+                title: "main".to_string(),
+                session_id: Some("ses_main".to_string()),
+                browser_id: None,
+            }],
+            sessions: Vec::new(),
+        };
+        let provisioning = AgentAttentionListResult {
+            sessions: vec![AgentStateResult {
+                session_id: "ses_main".to_string(),
+                workspace_id: "ws_1".to_string(),
+                state: "running".to_string(),
+                attention: false,
+                reason: None,
+                updated_at: None,
+                telemetry: Some(AgentTelemetry {
+                    team_id: Some("team_alpha".to_string()),
+                    team_role: Some("main".to_string()),
+                    layout_root_pane_id: Some("pane_main".to_string()),
+                    team_generation: Some(2),
+                    team_mutation_id: Some("tmux:team_alpha:4294967294:abandoned".to_string()),
+                    team_mutation_owner_id: Some(
+                        "tmux:team_alpha:4294967294:abandoned".to_string(),
+                    ),
+                    team_status: Some("provisioning".to_string()),
+                    team_auto_adopt: Some(true),
+                    ..AgentTelemetry::default()
+                }),
+            }],
+        };
+        let recovered = AgentAttentionListResult {
+            sessions: vec![AgentStateResult {
+                session_id: "ses_main".to_string(),
+                workspace_id: "ws_1".to_string(),
+                state: "running".to_string(),
+                attention: false,
+                reason: None,
+                updated_at: None,
+                telemetry: Some(AgentTelemetry {
+                    team_id: Some("team_alpha".to_string()),
+                    team_role: Some("main".to_string()),
+                    layout_root_pane_id: Some("pane_main".to_string()),
+                    team_generation: Some(2),
+                    team_status: Some("layout_dirty".to_string()),
+                    team_auto_adopt: Some(true),
+                    ..AgentTelemetry::default()
+                }),
+            }],
+        };
+
+        let server_pipe = pipe_name.clone();
+        let server = std::thread::spawn(move || {
+            for step in 0..6 {
+                let detail = detail.clone();
+                let provisioning = provisioning.clone();
+                let recovered = recovered.clone();
+                agentmux_ipc::serve_one_named_pipe_request(
+                    &server_pipe,
+                    move |request| match step {
+                        0 | 3 => {
+                            assert_eq!(request.method, "workspace.get");
+                            ResponseEnvelope::ok_typed(request.id, &detail)
+                        }
+                        1 => {
+                            assert_eq!(request.method, "agent.list");
+                            ResponseEnvelope::ok_typed(request.id, &provisioning)
+                        }
+                        2 => {
+                            assert_eq!(request.method, "agent.team.recover");
+                            let params: AgentTeamRecoverParams = request.parse_params().unwrap();
+                            assert_eq!(params.generation, 2);
+                            assert_eq!(params.mutation_id, "tmux:team_alpha:4294967294:abandoned");
+                            let caller = request.caller.expect("tmux recovery caller");
+                            assert_eq!(caller.source, "tmux");
+                            assert_eq!(caller.profile.as_deref(), Some("standard"));
+                            assert!(caller
+                                .client_session_id
+                                .as_deref()
+                                .is_some_and(|owner| owner.starts_with(&format!(
+                                    "tmux:team_alpha:{}:",
+                                    std::process::id()
+                                ))));
+                            ResponseEnvelope::ok_typed(
+                                request.id,
+                                &AgentTeamRecoverResult {
+                                    team_id: "team_alpha".to_string(),
+                                    main_session_id: "ses_main".to_string(),
+                                    generation: 2,
+                                    recovered: true,
+                                },
+                            )
+                        }
+                        4 => {
+                            assert_eq!(request.method, "agent.list");
+                            ResponseEnvelope::ok_typed(request.id, &recovered)
+                        }
+                        5 => {
+                            assert_eq!(request.method, "agent.team.reserve");
+                            let params: AgentTeamReserveParams = request.parse_params().unwrap();
+                            assert_eq!(params.expected_generation, 2);
+                            assert_eq!(params.next_generation, 3);
+                            ResponseEnvelope::ok_typed(
+                                request.id,
+                                &AgentTeamReserveResult {
+                                    team_id: "team_alpha".to_string(),
+                                    main_session_id: "ses_main".to_string(),
+                                    generation: 3,
+                                    mutation_id: params.mutation_id,
+                                    reused: false,
+                                    acquired: true,
+                                    recovered: false,
+                                },
+                            )
+                        }
+                        _ => unreachable!(),
+                    },
+                )
+                .unwrap();
+            }
+        });
+
+        let plan = resolve_tmux_agent_team_split_plan(&options, "ws_1", "pane_main", "horizontal")
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(plan.target_pane_id, "pane_main");
+        assert_eq!(plan.axis, "vertical");
+        let mutation = plan.team_mutation.expect("team mutation");
+        assert_eq!(mutation.generation, 3);
+        assert!(mutation
+            .mutation_id
+            .starts_with(&format!("tmux:team_alpha:{}:", std::process::id())));
+
+        for (key, value) in previous {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
         }
     }
 

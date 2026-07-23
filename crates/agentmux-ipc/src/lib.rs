@@ -292,6 +292,8 @@ pub struct TerminalSplitParams {
     pub backend_profile: Option<String>,
     #[serde(default)]
     pub command: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVarParam>,
     pub cwd: Option<String>,
     pub columns: Option<u16>,
     pub rows: Option<u16>,
@@ -553,6 +555,27 @@ pub struct AgentTelemetry {
     pub cache: Option<String>,
     pub rate: Option<String>,
     pub ctx: Option<String>,
+    pub team_id: Option<String>,
+    pub team_role: Option<String>,
+    pub worker_name: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub layout_root_pane_id: Option<String>,
+    pub main_ratio: Option<String>,
+    pub max_workers: Option<u16>,
+    pub worker_index: Option<u16>,
+    pub default_worker_kind: Option<String>,
+    pub distribution: Option<String>,
+    pub team_cwd: Option<String>,
+    pub durability: Option<String>,
+    pub team_mode: Option<String>,
+    pub team_status: Option<String>,
+    pub team_layout: Option<String>,
+    pub team_generation: Option<u64>,
+    pub team_mutation_id: Option<String>,
+    pub team_mutation_owner_id: Option<String>,
+    pub team_auto_adopt: Option<bool>,
+    pub team_idempotency_key: Option<String>,
+    pub team_member_idempotency_key: Option<String>,
 }
 
 impl AgentTelemetry {
@@ -564,6 +587,27 @@ impl AgentTelemetry {
             && self.cache.is_none()
             && self.rate.is_none()
             && self.ctx.is_none()
+            && self.team_id.is_none()
+            && self.team_role.is_none()
+            && self.worker_name.is_none()
+            && self.parent_session_id.is_none()
+            && self.layout_root_pane_id.is_none()
+            && self.main_ratio.is_none()
+            && self.max_workers.is_none()
+            && self.worker_index.is_none()
+            && self.default_worker_kind.is_none()
+            && self.distribution.is_none()
+            && self.team_cwd.is_none()
+            && self.durability.is_none()
+            && self.team_mode.is_none()
+            && self.team_status.is_none()
+            && self.team_layout.is_none()
+            && self.team_generation.is_none()
+            && self.team_mutation_id.is_none()
+            && self.team_mutation_owner_id.is_none()
+            && self.team_auto_adopt.is_none()
+            && self.team_idempotency_key.is_none()
+            && self.team_member_idempotency_key.is_none()
     }
 }
 
@@ -574,6 +618,36 @@ pub struct AgentSetStateParams {
     pub reason: Option<String>,
     #[serde(default)]
     pub telemetry: Option<AgentTelemetry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTeamReserveParams {
+    pub team_id: String,
+    pub main_session_id: String,
+    pub expected_generation: u64,
+    pub next_generation: u64,
+    pub mutation_id: Option<String>,
+    #[serde(default)]
+    pub claim: bool,
+    #[serde(default)]
+    pub claim_telemetry: Option<AgentTelemetry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTeamSettleParams {
+    pub team_id: String,
+    pub main_session_id: String,
+    pub generation: u64,
+    pub mutation_id: String,
+    pub telemetry: AgentTelemetry,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTeamRecoverParams {
+    pub team_id: String,
+    pub main_session_id: String,
+    pub generation: u64,
+    pub mutation_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1084,6 +1158,36 @@ pub struct AgentStateResult {
     pub updated_at: Option<String>,
     #[serde(default)]
     pub telemetry: Option<AgentTelemetry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTeamReserveResult {
+    pub team_id: String,
+    pub main_session_id: String,
+    pub generation: u64,
+    pub mutation_id: Option<String>,
+    #[serde(default)]
+    pub reused: bool,
+    #[serde(default)]
+    pub acquired: bool,
+    #[serde(default)]
+    pub recovered: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTeamSettleResult {
+    pub team_id: String,
+    pub main_session_id: String,
+    pub generation: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTeamRecoverResult {
+    pub team_id: String,
+    pub main_session_id: String,
+    pub generation: u64,
+    pub recovered: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2320,6 +2424,50 @@ mod tests {
         assert_eq!(params.backend_profile, None);
         assert_eq!(params.command[0], "cmd.exe");
         assert_eq!(params.columns, 80);
+    }
+
+    #[test]
+    fn parses_terminal_split_params_with_optional_environment() {
+        let omitted = RequestEnvelope::new(
+            "req_terminal_split_default_env",
+            "terminal.split",
+            r#"{"workspace_id":"ws_1","pane_id":"pane_1","axis":"vertical","ratio":null,"behavior":"clone_current","backend":null,"backend_profile":null,"command":[],"cwd":null,"columns":null,"rows":null,"durability":null}"#,
+            "token",
+        );
+        let params: TerminalSplitParams = omitted.parse_params().unwrap();
+        assert!(params.env.is_empty());
+
+        let supplied = RequestEnvelope::new(
+            "req_terminal_split_env",
+            "terminal.split",
+            r#"{"workspace_id":"ws_1","pane_id":"pane_1","axis":"vertical","ratio":null,"behavior":"clone_current","backend":null,"backend_profile":null,"command":[],"env":[{"key":"TEAM","value":"worker"}],"cwd":null,"columns":null,"rows":null,"durability":null}"#,
+            "token",
+        );
+        let params: TerminalSplitParams = supplied.parse_params().unwrap();
+        assert_eq!(
+            params.env,
+            vec![EnvVarParam {
+                key: "TEAM".to_string(),
+                value: "worker".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn agent_telemetry_team_fields_are_not_empty() {
+        let mut telemetry = AgentTelemetry::default();
+        assert!(telemetry.is_empty());
+
+        telemetry.team_generation = Some(1);
+        assert!(!telemetry.is_empty());
+
+        telemetry.team_generation = None;
+        telemetry.team_mutation_id = Some("mutation-1".to_string());
+        assert!(!telemetry.is_empty());
+
+        telemetry.team_mutation_id = None;
+        telemetry.team_auto_adopt = Some(false);
+        assert!(!telemetry.is_empty());
     }
 
     #[test]

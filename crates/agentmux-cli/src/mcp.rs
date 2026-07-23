@@ -31,6 +31,7 @@ const MAX_TERMINAL_READ_BYTES: usize = 1_048_576;
 const MAX_EVENT_COUNT: usize = 500;
 const DEFAULT_BROWSER_READ_BYTES: usize = 262_144;
 const MAX_BROWSER_READ_BYTES: usize = 1_048_576;
+const MAX_AGENT_TEAM_WORKERS: usize = 8;
 const READ_TOOL_NAMES: &[&str] = &[
     "agentmux_context",
     "workspace_list",
@@ -39,6 +40,7 @@ const READ_TOOL_NAMES: &[&str] = &[
     "terminal_read",
     "agent_attention_list",
     "agent_worker_list",
+    "agent_team_list",
     "agent_integration_status",
     "event_poll",
     "browser_snapshot",
@@ -63,6 +65,9 @@ const STANDARD_TOOL_NAMES: &[&str] = &[
     "team_task_complete",
     "agent_set_state",
     "agent_worker_start",
+    "agent_team_start",
+    "agent_team_spawn",
+    "agent_team_reflow",
     "agent_worker_send",
 ];
 #[cfg(test)]
@@ -80,6 +85,9 @@ const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
     "team_task_complete",
     "agent_set_state",
     "agent_worker_start",
+    "agent_team_start",
+    "agent_team_spawn",
+    "agent_team_reflow",
     "agent_worker_send",
 ];
 #[cfg(test)]
@@ -94,6 +102,7 @@ const FULL_TOOL_NAMES: &[&str] = &[
     "action_run",
     "notification_clear",
     "agent_worker_stop",
+    "agent_team_release",
     "agent_integration_setup",
 ];
 
@@ -571,6 +580,7 @@ impl ControlTransport for NamedPipeTransport {
 pub(super) struct AgentMuxMcpServer {
     profile: McpProfile,
     control: Arc<dyn ControlTransport>,
+    team_operations: Arc<tokio::sync::Mutex<()>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -598,6 +608,7 @@ impl AgentMuxMcpServer {
         Self {
             profile,
             control,
+            team_operations: Arc::new(tokio::sync::Mutex::new(())),
             tool_router,
         }
     }
@@ -910,6 +921,59 @@ impl AgentMuxMcpServer {
             });
         }
         CallToolResult::structured(value)
+    }
+
+    /// List adaptive teams reconstructed from persisted agent telemetry.
+    #[tool(
+        name = "agent_team_list",
+        annotations(
+            title = "List adaptive agent teams",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_team_list(
+        &self,
+        Parameters(params): Parameters<AgentTeamListToolParams>,
+    ) -> CallToolResult {
+        let listed = match self
+            .invoke_value("agent.list", json!({ "workspace_id": params.workspace_id }))
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => return control_error_result("agent.list", message),
+        };
+        let mut team_ids = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|session| {
+                session
+                    .pointer("/telemetry/team_id")
+                    .and_then(Value::as_str)
+            })
+            .filter(|team_id| {
+                params
+                    .team_id
+                    .as_deref()
+                    .is_none_or(|requested| requested == *team_id)
+            })
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        team_ids.sort();
+        team_ids.dedup();
+        let mut teams = Vec::with_capacity(team_ids.len());
+        for team_id in team_ids {
+            match self.load_agent_team(&team_id).await {
+                Ok(team) => teams.push(agent_team_summary(&team, false)),
+                Err(message) => {
+                    teams.push(json!({ "team_id": team_id, "status": "invalid", "error": message }))
+                }
+            }
+        }
+        CallToolResult::structured(json!({ "teams": teams }))
     }
 
     /// Diagnose Claude Teams, OMX, OMC, or OMO tmux-compatible integration readiness without changing files.
@@ -1637,25 +1701,67 @@ impl AgentMuxMcpServer {
         .await
     }
 
-    /// Start a Claude Teams lead, tmux-compatible integration, or independent Codex worker in a new AgentMux pane.
-    #[tool(
-        name = "agent_worker_start",
-        annotations(
-            title = "Start agent worker",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
-        )
-    )]
-    async fn agent_worker_start(
+    async fn register_agent_worker_state(
         &self,
-        Parameters(params): Parameters<AgentWorkerStartToolParams>,
+        kind: AgentWorkerKind,
+        worker_name: Option<&str>,
+        session_id: &str,
+        pane_id: Option<&str>,
+        team: Option<&AgentTeamWorkerRegistration>,
+    ) -> Result<(), String> {
+        let label = kind.label();
+        let worker_session = worker_name.map_or_else(
+            || format!("{}:worker", kind.key()),
+            |name| format!("{}:{name}", kind.key()),
+        );
+        let reason = worker_name.map_or_else(
+            || format!("{label} worker started"),
+            |name| format!("{label} worker '{name}' started"),
+        );
+        let mut telemetry = json!({
+            "activity": kind.activity(),
+            "session": worker_session,
+            "ctx": pane_id,
+        });
+        if let (Some(team), Some(telemetry)) = (team, telemetry.as_object_mut()) {
+            telemetry.insert("team_id".to_string(), json!(team.team_id));
+            telemetry.insert("team_role".to_string(), json!("worker"));
+            telemetry.insert("worker_name".to_string(), json!(team.worker_name));
+            telemetry.insert("parent_session_id".to_string(), json!(team.main_session_id));
+            telemetry.insert(
+                "layout_root_pane_id".to_string(),
+                json!(team.layout_root_pane_id),
+            );
+            telemetry.insert("main_ratio".to_string(), json!(team.main_ratio.to_string()));
+            telemetry.insert("max_workers".to_string(), json!(team.max_workers as u16));
+            telemetry.insert("worker_index".to_string(), json!(team.worker_index as u16));
+            telemetry.insert("team_generation".to_string(), json!(team.generation));
+            telemetry.insert("team_auto_adopt".to_string(), json!(team.auto_adopt_tmux));
+            telemetry.insert(
+                "team_member_idempotency_key".to_string(),
+                json!(team.member_idempotency_key),
+            );
+        }
+        self.invoke_value(
+            "agent.set_state",
+            json!({
+                "session_id": session_id,
+                "state": "running",
+                "reason": reason,
+                "telemetry": telemetry,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn start_agent_worker_resolved(
+        &self,
+        params: AgentWorkerStartToolParams,
+        context: ResolvedContext,
+        register_agent_state: bool,
+        team: Option<&AgentTeamWorkerRegistration>,
     ) -> CallToolResult {
-        let context = match self.resolve_context(params.workspace_id.clone()).await {
-            Ok(context) => context,
-            Err(message) => return control_error_result("system.identify", message),
-        };
         let Some(workspace_id) = params.workspace_id.or(context.workspace_id) else {
             return missing_context_result("workspace_id");
         };
@@ -1670,12 +1776,23 @@ impl AgentMuxMcpServer {
                 "placement must be 'split' or 'new_tab'".to_string(),
             );
         }
+        let worker_name = match params.name.as_deref() {
+            Some(name) if name.trim().is_empty() => {
+                return control_error_result(
+                    "agent.worker.start",
+                    "worker name must not be empty".to_string(),
+                );
+            }
+            Some(name) => Some(name.trim().to_string()),
+            None => None,
+        };
         let kind = AgentWorkerKind::from(params.kind);
         let command = match build_agent_worker_command(kind, params.args) {
             Ok(command) => command,
             Err(message) => return control_error_result("agent.worker.start", message),
         };
         let cwd = params.cwd.or(context.cwd);
+        let team_env = team.map(agent_team_launch_env).unwrap_or_default();
         let launch = if placement == "new_tab" {
             self.invoke_value(
                 "terminal.open",
@@ -1686,7 +1803,7 @@ impl AgentMuxMcpServer {
                     "backend_profile": params.distribution,
                     "command": command,
                     "cwd": cwd,
-                    "env": [],
+                    "env": team_env,
                     "columns": params.columns,
                     "rows": params.rows,
                     "durability": params.durability.unwrap_or_else(|| "durable".to_string()),
@@ -1710,6 +1827,7 @@ impl AgentMuxMcpServer {
                     "backend_profile": params.distribution,
                     "command": command,
                     "cwd": cwd,
+                    "env": team_env,
                     "columns": params.columns,
                     "rows": params.rows,
                     "durability": params.durability.unwrap_or_else(|| "durable".to_string()),
@@ -1721,46 +1839,18 @@ impl AgentMuxMcpServer {
             Ok(value) => value,
             Err(message) => return control_error_result("agent.worker.start", message),
         };
+        let pane_id = launch
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let Some(session_id) = launch
             .get("session_id")
             .and_then(Value::as_str)
             .map(ToString::to_string)
         else {
-            return control_error_result(
-                "agent.worker.start",
-                "terminal launch returned no session_id".to_string(),
-            );
-        };
-        let pane_id = launch
-            .get("pane_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let label = kind.label();
-        if let Err(message) = self
-            .invoke_value(
-                "agent.set_state",
-                json!({
-                    "session_id": session_id.clone(),
-                    "state": "running",
-                    "reason": format!("{label} worker started"),
-                    "telemetry": {
-                        "activity": kind.activity(),
-                        "session": format!("{}:worker", kind.key()),
-                        "ctx": pane_id,
-                    },
-                }),
-            )
-            .await
-        {
-            let terminate = self
-                .invoke_value(
-                    "session.terminate",
-                    json!({ "session_id": session_id, "mode": "kill" }),
-                )
-                .await;
-            let close_pane = match pane_id.as_deref() {
-                Some(pane_id) => {
-                    self.invoke_value(
+            let pane_closed = match pane_id.as_deref() {
+                Some(pane_id) => self
+                    .invoke_value(
                         "pane.close",
                         json!({
                             "workspace_id": workspace_id,
@@ -1769,19 +1859,59 @@ impl AgentMuxMcpServer {
                         }),
                     )
                     .await
-                }
-                None => Ok(json!({ "skipped": true })),
+                    .is_ok(),
+                None => false,
             };
             return control_error_result(
                 "agent.worker.start",
                 format!(
-                    "worker metadata registration failed: {message}; compensation: session_terminated={}, pane_closed={}",
-                    terminate.is_ok(),
-                    close_pane.is_ok()
+                    "terminal launch returned no session_id; compensation: pane_closed={pane_closed}"
                 ),
             );
+        };
+        if register_agent_state {
+            if let Err(message) = self
+                .register_agent_worker_state(
+                    kind,
+                    worker_name.as_deref(),
+                    &session_id,
+                    pane_id.as_deref(),
+                    team,
+                )
+                .await
+            {
+                let terminate = self
+                    .invoke_value(
+                        "session.terminate",
+                        json!({ "session_id": session_id, "mode": "kill" }),
+                    )
+                    .await;
+                let close_pane = match pane_id.as_deref() {
+                    Some(pane_id) => {
+                        self.invoke_value(
+                            "pane.close",
+                            json!({
+                                "workspace_id": workspace_id,
+                                "pane_id": pane_id,
+                                "surface_policy": "close_surface",
+                            }),
+                        )
+                        .await
+                    }
+                    None => Ok(json!({ "skipped": true })),
+                };
+                return control_error_result(
+                    "agent.worker.start",
+                    format!(
+                        "worker metadata registration failed: {message}; compensation: session_terminated={}, pane_closed={}",
+                        terminate.is_ok(),
+                        close_pane.is_ok()
+                    ),
+                );
+            }
         }
         CallToolResult::structured(json!({
+            "name": worker_name,
             "kind": kind.key(),
             "controller": kind.controller(),
             "workspace_id": workspace_id,
@@ -1789,7 +1919,1834 @@ impl AgentMuxMcpServer {
             "pane_id": launch.get("pane_id"),
             "surface_id": launch.get("surface_id"),
             "placement": placement,
-            "agent_state_registered": true,
+            "agent_state_registered": register_agent_state,
+        }))
+    }
+
+    /// Start a Claude Teams lead, tmux-compatible integration, or independent Codex worker in a new AgentMux pane.
+    #[tool(
+        name = "agent_worker_start",
+        annotations(
+            title = "Start agent worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_worker_start(
+        &self,
+        Parameters(params): Parameters<AgentWorkerStartToolParams>,
+    ) -> CallToolResult {
+        let context = match self.resolve_context(params.workspace_id.clone()).await {
+            Ok(context) => context,
+            Err(message) => return control_error_result("system.identify", message),
+        };
+        self.start_agent_worker_resolved(params, context, true, None)
+            .await
+    }
+
+    async fn load_agent_team(&self, team_id: &str) -> Result<LoadedAgentTeam, String> {
+        let value = self
+            .invoke_value("agent.list", json!({ "workspace_id": Value::Null }))
+            .await?;
+        let sessions = value
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "agent.list returned no sessions array".to_string())?;
+        let members = sessions
+            .iter()
+            .filter(|session| {
+                session
+                    .pointer("/telemetry/team_id")
+                    .and_then(Value::as_str)
+                    == Some(team_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let main = members
+            .iter()
+            .find(|session| {
+                session
+                    .pointer("/telemetry/team_role")
+                    .and_then(Value::as_str)
+                    == Some("main")
+            })
+            .cloned()
+            .ok_or_else(|| format!("agent team '{team_id}' was not found"))?;
+        let telemetry = main
+            .get("telemetry")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("agent team '{team_id}' has no manifest telemetry"))?;
+        let workspace_id = main
+            .get("workspace_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("agent team '{team_id}' has no workspace_id"))?
+            .to_string();
+        let main_session_id = main
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("agent team '{team_id}' has no main session"))?
+            .to_string();
+        let layout_root_pane_id = telemetry
+            .get("layout_root_pane_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("agent team '{team_id}' has no layout root"))?
+            .to_string();
+        let main_ratio = telemetry_f64(telemetry.get("main_ratio")).unwrap_or(0.5);
+        let max_workers = telemetry
+            .get("max_workers")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(MAX_AGENT_TEAM_WORKERS)
+            .clamp(1, MAX_AGENT_TEAM_WORKERS);
+        Ok(LoadedAgentTeam {
+            team_id: team_id.to_string(),
+            workspace_id,
+            main_session_id,
+            layout_root_pane_id,
+            main_ratio,
+            max_workers,
+            generation: telemetry
+                .get("team_generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+            status: telemetry
+                .get("team_status")
+                .and_then(Value::as_str)
+                .unwrap_or("active")
+                .to_string(),
+            mutation_id: telemetry
+                .get("team_mutation_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            auto_adopt_tmux: telemetry
+                .get("team_auto_adopt")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            idempotency_key: telemetry
+                .get("team_idempotency_key")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            mode: telemetry
+                .get("team_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("adaptive")
+                .to_string(),
+            default_worker_kind: telemetry
+                .get("default_worker_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("codex-pane")
+                .to_string(),
+            distribution: telemetry
+                .get("distribution")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            cwd: telemetry
+                .get("team_cwd")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            durability: telemetry
+                .get("durability")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            main,
+            members,
+        })
+    }
+
+    async fn find_agent_team_by_idempotency(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<LoadedAgentTeam>, String> {
+        let listed = self
+            .invoke_value("agent.list", json!({ "workspace_id": workspace_id }))
+            .await?;
+        let team_id = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| {
+                sessions.iter().find_map(|session| {
+                    let telemetry = session.get("telemetry")?;
+                    (telemetry.get("team_role").and_then(Value::as_str) == Some("main")
+                        && telemetry
+                            .get("team_idempotency_key")
+                            .and_then(Value::as_str)
+                            == Some(idempotency_key))
+                    .then(|| {
+                        telemetry
+                            .get("team_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .flatten()
+                })
+            });
+        match team_id {
+            Some(team_id) => self.load_agent_team(&team_id).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_agent_team_for_main_session(
+        &self,
+        workspace_id: &str,
+        main_session_id: &str,
+    ) -> Result<Option<LoadedAgentTeam>, String> {
+        let listed = self
+            .invoke_value("agent.list", json!({ "workspace_id": workspace_id }))
+            .await?;
+        let owner = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| {
+                sessions.iter().find_map(|session| {
+                    (session.get("session_id").and_then(Value::as_str) == Some(main_session_id))
+                        .then(|| session.get("telemetry"))
+                        .flatten()
+                        .and_then(|telemetry| telemetry.get("team_id"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+            });
+        match owner {
+            Some(team_id) => self.load_agent_team(&team_id).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn agent_team_main_state_payload(
+        &self,
+        team: &LoadedAgentTeam,
+        team_status: &str,
+    ) -> Result<Value, String> {
+        let listed = self
+            .invoke_value("agent.list", json!({ "workspace_id": team.workspace_id }))
+            .await?;
+        let current = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .and_then(|sessions| {
+                sessions.iter().find(|session| {
+                    session.get("session_id").and_then(Value::as_str)
+                        == Some(team.main_session_id.as_str())
+                })
+            });
+        if let Some(existing_team_id) = current
+            .and_then(|session| session.pointer("/telemetry/team_id"))
+            .and_then(Value::as_str)
+            .filter(|team_id| *team_id != team.team_id)
+        {
+            return Err(format!(
+                "main session '{}' is already owned by team '{existing_team_id}'",
+                team.main_session_id
+            ));
+        }
+        let state = current
+            .and_then(|session| session.get("state"))
+            .and_then(Value::as_str)
+            .unwrap_or("running");
+        let reason = current
+            .and_then(|session| session.get("reason"))
+            .cloned()
+            .unwrap_or_else(|| json!("Adaptive agent team active"));
+        let mut telemetry = current
+            .and_then(|session| session.get("telemetry"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        telemetry
+            .entry("activity".to_string())
+            .or_insert_with(|| json!("agent"));
+        telemetry.insert("team_id".to_string(), json!(team.team_id));
+        telemetry.insert("team_role".to_string(), json!("main"));
+        telemetry.insert("team_mode".to_string(), json!(team.mode));
+        telemetry.insert("team_status".to_string(), json!(team_status));
+        telemetry.insert(
+            "team_layout".to_string(),
+            json!(AgentTeamLayoutParam::MainLeftWorkersRight.key()),
+        );
+        telemetry.insert(
+            "layout_root_pane_id".to_string(),
+            json!(team.layout_root_pane_id),
+        );
+        telemetry.insert("main_ratio".to_string(), json!(team.main_ratio.to_string()));
+        telemetry.insert("max_workers".to_string(), json!(team.max_workers as u16));
+        telemetry.insert("team_generation".to_string(), json!(team.generation));
+        telemetry.remove("team_mutation_id");
+        telemetry.remove("team_mutation_owner_id");
+        telemetry.insert("team_auto_adopt".to_string(), json!(team.auto_adopt_tmux));
+        telemetry.insert(
+            "default_worker_kind".to_string(),
+            json!(team.default_worker_kind),
+        );
+        telemetry.insert("distribution".to_string(), json!(team.distribution));
+        telemetry.insert("team_cwd".to_string(), json!(team.cwd));
+        telemetry.insert("durability".to_string(), json!(team.durability));
+        telemetry.insert(
+            "team_idempotency_key".to_string(),
+            json!(team.idempotency_key),
+        );
+        Ok(json!({
+            "session_id": team.main_session_id,
+            "state": state,
+            "reason": reason,
+            "telemetry": telemetry,
+        }))
+    }
+
+    async fn claim_agent_team_provisioning(
+        &self,
+        team: &mut LoadedAgentTeam,
+        mutation_id: &str,
+    ) -> Result<AgentTeamReservation, String> {
+        // The host owns this compare-and-claim operation. Do not write a provisional
+        // manifest first: that creates a race where a second starter can overwrite it.
+        let generation = team.generation.saturating_add(1);
+        let result = self
+            .invoke_value(
+                "agent.team.reserve",
+                json!({
+                        "team_id": team.team_id,
+                        "main_session_id": team.main_session_id,
+                        "expected_generation": team.generation,
+                    "next_generation": generation,
+                    "mutation_id": mutation_id,
+                    "claim": true,
+                    "claim_telemetry": {
+                        "activity": "agent",
+                        "team_id": team.team_id,
+                        "team_role": "main",
+                        "team_mode": team.mode,
+                        "team_status": "provisioning",
+                        "team_layout": AgentTeamLayoutParam::MainLeftWorkersRight.key(),
+                        "layout_root_pane_id": team.layout_root_pane_id,
+                        "main_ratio": team.main_ratio.to_string(),
+                        "max_workers": team.max_workers as u16,
+                        "team_generation": generation,
+                        "team_auto_adopt": team.auto_adopt_tmux,
+                        "team_idempotency_key": team.idempotency_key,
+                        "default_worker_kind": team.default_worker_kind,
+                        "distribution": team.distribution,
+                        "team_cwd": team.cwd,
+                        "durability": team.durability,
+                    },
+                }),
+            )
+            .await?;
+        team.team_id = result
+            .get("team_id")
+            .and_then(Value::as_str)
+            .unwrap_or(team.team_id.as_str())
+            .to_string();
+        team.generation = result
+            .get("generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(generation);
+        team.status = "provisioning".to_string();
+        team.mutation_id = Some(mutation_id.to_string());
+        Ok(AgentTeamReservation::from_control_result(
+            &result,
+            team.generation,
+            mutation_id,
+        ))
+    }
+
+    async fn reserve_agent_team_generation(
+        &self,
+        team: &LoadedAgentTeam,
+        mutation_id: &str,
+    ) -> Result<AgentTeamReservation, String> {
+        let next_generation = team.generation.saturating_add(1);
+        let result = self
+            .invoke_value(
+                "agent.team.reserve",
+                json!({
+                    "team_id": team.team_id,
+                    "main_session_id": team.main_session_id,
+                    "expected_generation": team.generation,
+                    "next_generation": next_generation,
+                    "mutation_id": mutation_id,
+                }),
+            )
+            .await?;
+        Ok(AgentTeamReservation::from_control_result(
+            &result,
+            next_generation,
+            mutation_id,
+        ))
+    }
+
+    async fn settle_agent_team_mutation(
+        &self,
+        team: &LoadedAgentTeam,
+        mutation_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let payload = self.agent_team_main_state_payload(team, status).await?;
+        let telemetry = payload
+            .get("telemetry")
+            .cloned()
+            .ok_or_else(|| "team settlement payload has no telemetry".to_string())?;
+        self.invoke_value(
+            "agent.team.settle",
+            json!({
+                "team_id": team.team_id,
+                "main_session_id": team.main_session_id,
+                "generation": team.generation,
+                "mutation_id": mutation_id,
+                "telemetry": telemetry,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn settle_agent_team_after_failed_mutation(
+        &self,
+        team: &LoadedAgentTeam,
+        mutation_id: &str,
+    ) {
+        let _ = self
+            .settle_agent_team_mutation(team, mutation_id, "layout_dirty")
+            .await;
+    }
+
+    async fn recover_agent_team_if_abandoned(
+        &self,
+        team: &LoadedAgentTeam,
+    ) -> Result<bool, String> {
+        if team.status != "provisioning" {
+            return Ok(false);
+        }
+        let mutation_id = team
+            .mutation_id
+            .as_deref()
+            .ok_or_else(|| "provisioning team has no mutation id".to_string())?;
+        self.invoke_value(
+            "agent.team.recover",
+            json!({
+                "team_id": team.team_id,
+                "main_session_id": team.main_session_id,
+                "generation": team.generation,
+                "mutation_id": mutation_id,
+            }),
+        )
+        .await
+        .map(|_| true)
+    }
+
+    async fn clear_agent_team_membership(&self, member: &Value) -> Result<(), String> {
+        let session_id = member
+            .get("session_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "team member has no session_id".to_string())?;
+        let state = member
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("running");
+        let reason = member.get("reason").cloned().unwrap_or(Value::Null);
+        let mut telemetry = member
+            .get("telemetry")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for key in AGENT_TEAM_TELEMETRY_KEYS {
+            telemetry.remove(*key);
+        }
+        self.invoke_value(
+            "agent.set_state",
+            json!({
+                "session_id": session_id,
+                "state": state,
+                "reason": reason,
+                "telemetry": telemetry,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn reflow_agent_team(
+        &self,
+        team: &mut LoadedAgentTeam,
+        dry_run: bool,
+    ) -> Result<Value, String> {
+        let current = self.load_agent_team(&team.team_id).await?;
+        if current.generation != team.generation {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!(
+                    "team generation changed during reflow: expected {}, current {}",
+                    team.generation, current.generation
+                ),
+            ));
+        }
+        let topology = self
+            .invoke_value(
+                "workspace.get",
+                json!({ "workspace_id": team.workspace_id }),
+            )
+            .await?;
+        let Some((_, main_pane_id)) = worker_location_for_session(&topology, &team.main_session_id)
+        else {
+            return Err(format!(
+                "could not resolve main session '{}' to a pane",
+                team.main_session_id
+            ));
+        };
+        let panes = agent_team_topology_panes(&topology);
+        let root_id = team.layout_root_pane_id.clone();
+        let Some(root) = panes.iter().find(|pane| pane.pane_id == root_id) else {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!("team layout root '{root_id}' no longer exists"),
+            ));
+        };
+        if root.kind == "leaf" {
+            let managed_members = agent_team_managed_members(team);
+            if !managed_members.is_empty() {
+                return Ok(agent_team_layout_conflict(
+                    &team.team_id,
+                    format!(
+                        "layout root '{root_id}' collapsed while {} managed members remain",
+                        managed_members.len()
+                    ),
+                ));
+            }
+            return Ok(json!({
+                "team_id": team.team_id,
+                "status": "empty",
+                "layout_dirty": false,
+                "mutated": false,
+                "updates": [],
+            }));
+        }
+        if root.split_axis.as_deref() != Some("vertical") {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!("layout root '{root_id}' is not a vertical split"),
+            ));
+        }
+        let children = agent_team_children(&panes, &root_id);
+        if children.len() != 2 {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!("layout root '{root_id}' does not have exactly two children"),
+            ));
+        }
+        let main_child_index = children
+            .iter()
+            .position(|child| agent_team_subtree_contains(&panes, &child.pane_id, &main_pane_id));
+        let Some(main_child_index) = main_child_index else {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                "main pane is outside the managed layout root".to_string(),
+            ));
+        };
+        let worker_root = &children[1 - main_child_index];
+        if agent_team_split_nodes(&panes, &worker_root.pane_id)
+            .iter()
+            .any(|pane| pane.split_axis.as_deref() != Some("horizontal"))
+        {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                "managed worker subtree contains a non-horizontal split".to_string(),
+            ));
+        }
+        let worker_leaf_ids = agent_team_leaf_ids(&panes, &worker_root.pane_id);
+        let managed_members = agent_team_managed_members(team);
+        let unresolved_members = managed_members
+            .iter()
+            .filter_map(|member| {
+                let name = member
+                    .get("telemetry")
+                    .and_then(|telemetry| telemetry.get("worker_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed worker");
+                match member.get("session_id").and_then(Value::as_str) {
+                    Some(session_id)
+                        if worker_location_for_session(&topology, session_id).is_none() =>
+                    {
+                        Some(session_id.to_string())
+                    }
+                    None => Some(format!("{name} (missing session_id)")),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if !unresolved_members.is_empty() {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!(
+                    "managed sessions could not be resolved to panes: {}",
+                    unresolved_members.join(", ")
+                ),
+            ));
+        }
+        let managed_leaf_ids = managed_members
+            .iter()
+            .filter_map(|member| member.get("session_id").and_then(Value::as_str))
+            .filter_map(|session_id| worker_location_for_session(&topology, session_id))
+            .map(|(_, pane_id)| pane_id)
+            .collect::<std::collections::HashSet<_>>();
+        let foreign = worker_leaf_ids
+            .iter()
+            .filter(|pane_id| !managed_leaf_ids.contains(*pane_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !foreign.is_empty() {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!(
+                    "foreign panes found under managed worker subtree: {}",
+                    foreign.join(", ")
+                ),
+            ));
+        }
+        let missing = managed_leaf_ids
+            .iter()
+            .filter(|pane_id| !worker_leaf_ids.contains(*pane_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!(
+                    "team worker panes are outside the managed subtree: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        let root_ratio = if main_child_index == 0 {
+            team.main_ratio
+        } else {
+            1.0 - team.main_ratio
+        };
+        let mut updates = vec![(root_id, root_ratio, root.split_ratio.unwrap_or(0.5))];
+        agent_team_collect_reflow_updates(&panes, &worker_root.pane_id, &mut updates);
+        // Re-read immediately before applying layout updates. A successful reservation from a
+        // competing mutation makes this topology stale even if the first snapshot was valid.
+        let latest = self.load_agent_team(&team.team_id).await?;
+        if latest.generation != team.generation {
+            return Ok(agent_team_layout_conflict(
+                &team.team_id,
+                format!(
+                    "team generation changed before layout apply: expected {}, current {}",
+                    team.generation, latest.generation
+                ),
+            ));
+        }
+        if !dry_run {
+            let mut applied = Vec::with_capacity(updates.len());
+            for (pane_id, ratio, previous_ratio) in &updates {
+                if let Err(message) = self
+                    .invoke_value(
+                        "pane.resize_layout",
+                        json!({
+                            "workspace_id": team.workspace_id,
+                            "pane_id": pane_id,
+                            "ratio": ratio,
+                        }),
+                    )
+                    .await
+                {
+                    let mut restored = true;
+                    for (applied_pane_id, applied_previous_ratio) in applied.iter().rev() {
+                        restored &= self
+                            .invoke_value(
+                                "pane.resize_layout",
+                                json!({
+                                    "workspace_id": team.workspace_id,
+                                    "pane_id": applied_pane_id,
+                                    "ratio": applied_previous_ratio,
+                                }),
+                            )
+                            .await
+                            .is_ok();
+                    }
+                    return Err(format!(
+                        "layout resize failed at pane '{pane_id}': {message}; previous ratios restored={restored}"
+                    ));
+                }
+                applied.push((pane_id.clone(), *previous_ratio));
+            }
+        }
+        Ok(json!({
+            "team_id": team.team_id,
+            "status": "ok",
+            "layout_dirty": false,
+            "mutated": !dry_run,
+            "updates": updates
+                .into_iter()
+                .map(|(pane_id, ratio, previous_ratio)| json!({
+                    "pane_id": pane_id,
+                    "ratio": ratio,
+                    "previous_ratio": previous_ratio,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn rollback_agent_team_workers(
+        &self,
+        workspace_id: &str,
+        workers: &[StartedAgentTeamWorker],
+    ) -> Vec<Value> {
+        let mut rollback = Vec::with_capacity(workers.len());
+        for worker in workers.iter().rev() {
+            let session_id = worker
+                .result
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let topology = self
+                .invoke_value("workspace.get", json!({ "workspace_id": workspace_id }))
+                .await;
+            let resolved_pane_id = session_id.as_deref().and_then(|session_id| {
+                topology
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| worker_location_for_session(value, session_id))
+                    .map(|(_, pane_id)| pane_id)
+            });
+            let topology_resolved = resolved_pane_id.is_some();
+            let pane_id = resolved_pane_id.or_else(|| worker.rollback_pane_id.clone());
+            let session_terminated = match session_id.as_deref() {
+                Some(session_id) => self
+                    .invoke_value(
+                        "session.terminate",
+                        json!({ "session_id": session_id, "mode": "kill" }),
+                    )
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            let pane_closed = match pane_id.as_deref() {
+                Some(pane_id) => self
+                    .invoke_value(
+                        "pane.close",
+                        json!({
+                            "workspace_id": workspace_id,
+                            "pane_id": pane_id,
+                            "surface_policy": "close_surface",
+                        }),
+                    )
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            rollback.push(json!({
+                "name": worker.result.get("name"),
+                "session_id": session_id,
+                "pane_id": pane_id,
+                "layout_anchor_pane_id": worker.rollback_pane_id.as_deref(),
+                "topology_resolved": topology_resolved,
+                "session_terminated": session_terminated,
+                "pane_closed": pane_closed,
+            }));
+        }
+        rollback
+    }
+
+    /// Create a main-left, equal-height worker-stack-right layout and start all named workers.
+    #[tool(
+        name = "agent_team_start",
+        annotations(
+            title = "Start visible agent team",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_team_start(
+        &self,
+        Parameters(params): Parameters<AgentTeamStartToolParams>,
+    ) -> CallToolResult {
+        let _team_guard = self.team_operations.lock().await;
+        let context = match self.resolve_context(params.workspace_id.clone()).await {
+            Ok(context) => context,
+            Err(message) => return control_error_result("system.identify", message),
+        };
+        let Some(workspace_id) = params
+            .workspace_id
+            .clone()
+            .or_else(|| context.workspace_id.clone())
+        else {
+            return missing_context_result("workspace_id");
+        };
+        let Some(main_pane_id) = params.pane_id.clone().or_else(|| context.pane_id.clone()) else {
+            return missing_context_result("pane_id");
+        };
+        if let Some(idempotency_key) = params
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            match self
+                .find_agent_team_by_idempotency(&workspace_id, idempotency_key)
+                .await
+            {
+                Ok(Some(team)) => {
+                    if team.status == "provisioning" {
+                        match self.recover_agent_team_if_abandoned(&team).await {
+                            Ok(true) => match self.load_agent_team(&team.team_id).await {
+                                Ok(recovered) => {
+                                    return CallToolResult::structured(
+                                        agent_team_summary_with_recovery(&recovered, true),
+                                    );
+                                }
+                                Err(message) => {
+                                    return control_error_result("agent.list", message);
+                                }
+                            },
+                            Ok(false) => {}
+                            Err(_) => {
+                                return CallToolResult::structured(agent_team_summary(&team, true));
+                            }
+                        }
+                    }
+                    return CallToolResult::structured(agent_team_summary(&team, true));
+                }
+                Ok(None) => {}
+                Err(message) => return control_error_result("agent.list", message),
+            }
+        }
+        let mode = params.mode.unwrap_or(AgentTeamModeParam::Adaptive);
+        let max_workers = params
+            .max_workers
+            .map(usize::from)
+            .unwrap_or(MAX_AGENT_TEAM_WORKERS);
+        if params.workers.len() > max_workers {
+            return control_error_result(
+                "agent.team.start",
+                format!("workers must not exceed max_workers ({max_workers})"),
+            );
+        }
+        if mode == AgentTeamModeParam::Fixed && params.workers.is_empty() {
+            return control_error_result(
+                "agent.team.start",
+                "fixed teams require at least one seed worker".to_string(),
+            );
+        }
+        let layout = params
+            .layout
+            .unwrap_or(AgentTeamLayoutParam::MainLeftWorkersRight);
+        let main_ratio = params.main_ratio.unwrap_or(0.5);
+        if !(0.1..=0.9).contains(&main_ratio) {
+            return control_error_result(
+                "agent.team.start",
+                "main_ratio must be between 0.1 and 0.9".to_string(),
+            );
+        }
+
+        let mut names = std::collections::HashSet::with_capacity(params.workers.len());
+        for worker in &params.workers {
+            let name = worker.name.trim();
+            if name.is_empty() || name.chars().count() > 64 {
+                return control_error_result(
+                    "agent.team.start",
+                    "each worker name must contain between 1 and 64 characters".to_string(),
+                );
+            }
+            if !names.insert(name.to_ascii_lowercase()) {
+                return control_error_result(
+                    "agent.team.start",
+                    format!("worker name '{name}' is duplicated"),
+                );
+            }
+        }
+
+        let initial_topology = match self
+            .invoke_value(
+                "workspace.get",
+                json!({ "workspace_id": workspace_id.clone() }),
+            )
+            .await
+        {
+            Ok(topology) => topology,
+            Err(message) => return control_error_result("workspace.get", message),
+        };
+        let Some((_, main_session_id)) =
+            terminal_location_for_pane(&initial_topology, &main_pane_id)
+        else {
+            return control_error_result(
+                "agent.team.start",
+                format!("main pane '{main_pane_id}' must be a leaf pane with a terminal session"),
+            );
+        };
+
+        match self
+            .find_agent_team_for_main_session(&workspace_id, &main_session_id)
+            .await
+        {
+            Ok(Some(existing)) => {
+                let requested_key = params.idempotency_key.as_deref().map(str::trim);
+                if requested_key.is_some_and(|key| !key.is_empty())
+                    && existing.idempotency_key.as_deref() == requested_key
+                {
+                    if existing.status == "provisioning" {
+                        match self.recover_agent_team_if_abandoned(&existing).await {
+                            Ok(true) => match self.load_agent_team(&existing.team_id).await {
+                                Ok(recovered) => {
+                                    return CallToolResult::structured(
+                                        agent_team_summary_with_recovery(&recovered, true),
+                                    );
+                                }
+                                Err(message) => {
+                                    return control_error_result("agent.list", message);
+                                }
+                            },
+                            Ok(false) => {}
+                            Err(_) => {
+                                return CallToolResult::structured(agent_team_summary(
+                                    &existing, true,
+                                ));
+                            }
+                        }
+                    }
+                    return CallToolResult::structured(agent_team_summary(&existing, true));
+                }
+                if existing.status == "provisioning" {
+                    return match self.recover_agent_team_if_abandoned(&existing).await {
+                        Ok(true) => match self.load_agent_team(&existing.team_id).await {
+                            Ok(recovered) => CallToolResult::structured(
+                                agent_team_summary_with_recovery(&recovered, true),
+                            ),
+                            Err(message) => control_error_result("agent.list", message),
+                        },
+                        Ok(false) => {
+                            CallToolResult::structured(agent_team_summary(&existing, true))
+                        }
+                        Err(message) => control_error_result("agent.team.recover", message),
+                    };
+                }
+                return control_error_result(
+                    "agent.team.start",
+                    format!(
+                        "main session '{main_session_id}' is already owned by team '{}'",
+                        existing.team_id
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(message) => return control_error_result("agent.list", message),
+        }
+
+        let team_id = new_agent_team_id();
+        let team_cwd = params.cwd.clone().or_else(|| context.cwd.clone());
+        let default_worker_kind = params
+            .default_worker_kind
+            .unwrap_or(AgentWorkerKindParam::CodexPane);
+        let mut team = LoadedAgentTeam {
+            team_id: team_id.clone(),
+            workspace_id: workspace_id.clone(),
+            main_session_id: main_session_id.clone(),
+            layout_root_pane_id: main_pane_id.clone(),
+            main_ratio,
+            max_workers,
+            generation: 0,
+            status: "new".to_string(),
+            mutation_id: None,
+            auto_adopt_tmux: params.auto_adopt_tmux.unwrap_or(true),
+            idempotency_key: params.idempotency_key.clone(),
+            mode: mode.key().to_string(),
+            default_worker_kind: default_worker_kind.key().to_string(),
+            distribution: params.distribution.clone(),
+            cwd: team_cwd.clone(),
+            durability: params.durability.clone(),
+            main: json!({ "session_id": main_session_id, "workspace_id": workspace_id }),
+            members: Vec::new(),
+        };
+        let start_mutation_id =
+            new_agent_team_mutation_id("start", &team.team_id, params.idempotency_key.as_deref());
+        let reservation = match self
+            .claim_agent_team_provisioning(&mut team, &start_mutation_id)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(message) => return control_error_result("agent.team.reserve", message),
+        };
+        if !reservation.acquired {
+            return CallToolResult::structured(json!({
+                "team_id": team.team_id,
+                "mode": team.mode,
+                "status": "provisioning",
+                "generation": team.generation,
+                "max_workers": team.max_workers,
+                "workspace_id": team.workspace_id,
+                "worker_count": 0,
+                "workers": [],
+                "reused": true,
+                "message": "an idempotent team start is already in progress"
+            }));
+        }
+        let start_mutation_id = reservation.mutation_id.clone();
+        let mut split_source_pane_id = main_pane_id.clone();
+        let mut started_workers = Vec::with_capacity(params.workers.len());
+        let worker_count = params.workers.len();
+
+        for (index, worker) in params.workers.into_iter().enumerate() {
+            let worker_name = worker.name.trim().to_string();
+            let worker_kind = AgentWorkerKind::from(worker.kind);
+            let registration = AgentTeamWorkerRegistration {
+                team_id: team_id.clone(),
+                main_session_id: main_session_id.clone(),
+                layout_root_pane_id: main_pane_id.clone(),
+                main_ratio,
+                max_workers,
+                worker_name: worker_name.clone(),
+                worker_index: index + 1,
+                generation: team.generation,
+                auto_adopt_tmux: team.auto_adopt_tmux,
+                member_idempotency_key: None,
+            };
+            let (axis, ratio) = if index == 0 {
+                ("vertical", main_ratio)
+            } else {
+                let represented_worker_count = worker_count - index + 1;
+                ("horizontal", 1.0 / represented_worker_count as f64)
+            };
+            let launch_result = self
+                .start_agent_worker_resolved(
+                    AgentWorkerStartToolParams {
+                        workspace_id: Some(workspace_id.clone()),
+                        pane_id: Some(split_source_pane_id.clone()),
+                        name: Some(worker_name.clone()),
+                        kind: worker.kind,
+                        distribution: worker.distribution.or_else(|| params.distribution.clone()),
+                        placement: Some("split".to_string()),
+                        axis: Some(axis.to_string()),
+                        ratio: Some(ratio),
+                        cwd: worker.cwd.or_else(|| team_cwd.clone()),
+                        args: worker.args,
+                        columns: params.columns,
+                        rows: params.rows,
+                        durability: worker.durability.or_else(|| params.durability.clone()),
+                    },
+                    ResolvedContext {
+                        workspace_id: Some(workspace_id.clone()),
+                        pane_id: Some(split_source_pane_id.clone()),
+                        surface_id: None,
+                        session_id: None,
+                        cwd: team_cwd.clone(),
+                    },
+                    false,
+                    Some(&registration),
+                )
+                .await;
+            if launch_result.is_error == Some(true) {
+                let message = call_tool_result_error_message(&launch_result);
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(worker_name, index, message, rollback);
+            }
+            let Some(launch) = launch_result.structured_content else {
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    worker_name,
+                    index,
+                    "worker launch returned no structured result".to_string(),
+                    rollback,
+                );
+            };
+            let next_pane_id = launch
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            started_workers.push(StartedAgentTeamWorker {
+                name: worker_name.clone(),
+                kind: worker_kind,
+                rollback_pane_id: next_pane_id.clone(),
+                result: launch,
+            });
+            let Some(next_pane_id) = next_pane_id else {
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    worker_name,
+                    index,
+                    "split worker launch returned no pane_id".to_string(),
+                    rollback,
+                );
+            };
+            split_source_pane_id = next_pane_id;
+        }
+
+        let topology = match self
+            .invoke_value("workspace.get", json!({ "workspace_id": workspace_id }))
+            .await
+        {
+            Ok(topology) => topology,
+            Err(message) => {
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    "topology-reconcile".to_string(),
+                    worker_count,
+                    format!("could not reconcile final worker panes: {message}"),
+                    rollback,
+                );
+            }
+        };
+
+        for index in 0..started_workers.len() {
+            let worker_name = started_workers[index].name.clone();
+            let worker_kind = started_workers[index].kind;
+            let Some(session_id) = started_workers[index]
+                .result
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+            else {
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    worker_name,
+                    index,
+                    "worker result lost its session_id during topology reconciliation".to_string(),
+                    rollback,
+                );
+            };
+            let Some((surface_id, pane_id)) = worker_location_for_session(&topology, &session_id)
+            else {
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    worker_name,
+                    index,
+                    format!("could not resolve the final leaf pane for session '{session_id}'"),
+                    rollback,
+                );
+            };
+            if let Value::Object(result) = &mut started_workers[index].result {
+                result.insert("pane_id".to_string(), json!(pane_id));
+                result.insert("surface_id".to_string(), json!(surface_id));
+            }
+            if let Err(message) = self
+                .register_agent_worker_state(
+                    worker_kind,
+                    Some(&worker_name),
+                    &session_id,
+                    Some(&pane_id),
+                    Some(&AgentTeamWorkerRegistration {
+                        team_id: team_id.clone(),
+                        main_session_id: main_session_id.clone(),
+                        layout_root_pane_id: main_pane_id.clone(),
+                        main_ratio,
+                        max_workers,
+                        worker_name: worker_name.clone(),
+                        worker_index: index + 1,
+                        generation: team.generation,
+                        auto_adopt_tmux: team.auto_adopt_tmux,
+                        member_idempotency_key: None,
+                    }),
+                )
+                .await
+            {
+                let rollback = self
+                    .rollback_agent_team_workers(&workspace_id, &started_workers)
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    worker_name,
+                    index,
+                    format!("worker metadata registration failed: {message}"),
+                    rollback,
+                );
+            }
+            if let Value::Object(result) = &mut started_workers[index].result {
+                result.insert("agent_state_registered".to_string(), json!(true));
+            }
+        }
+
+        let main_location = worker_location_for_session(&topology, &main_session_id);
+        let worker_results = started_workers
+            .into_iter()
+            .map(|worker| worker.result)
+            .collect::<Vec<_>>();
+        if let Err(message) = self
+            .settle_agent_team_mutation(&team, &start_mutation_id, "ready")
+            .await
+        {
+            let rollback_workers = worker_results
+                .iter()
+                .map(|result| StartedAgentTeamWorker {
+                    name: result
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("worker")
+                        .to_string(),
+                    kind: AgentWorkerKind::CodexPane,
+                    rollback_pane_id: result
+                        .get("pane_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    result: result.clone(),
+                })
+                .collect::<Vec<_>>();
+            let rollback = self
+                .rollback_agent_team_workers(&workspace_id, &rollback_workers)
+                .await;
+            self.settle_agent_team_after_failed_mutation(&team, &start_mutation_id)
+                .await;
+            return agent_team_error_result(
+                "team-manifest".to_string(),
+                worker_count,
+                format!("could not persist adaptive team manifest: {message}"),
+                rollback,
+            );
+        }
+
+        CallToolResult::structured(json!({
+            "team_id": team_id,
+            "mode": mode.key(),
+            "status": "ready",
+            "generation": team.generation,
+            "max_workers": max_workers,
+            "auto_adopt_tmux": team.auto_adopt_tmux,
+            "workspace_id": workspace_id,
+            "layout": layout.key(),
+            "main": {
+                "layout_root_pane_id": main_pane_id,
+                "pane_id": main_location.as_ref().map(|(_, pane_id)| pane_id),
+                "surface_id": main_location.as_ref().map(|(surface_id, _)| surface_id),
+                "session_id": main_session_id,
+                "ratio": main_ratio,
+            },
+            "worker_count": worker_results.len(),
+            "workers": worker_results,
+            "rollback_policy": "reverse-created-workers-on-failure",
+        }))
+    }
+
+    /// Add one worker to an adaptive team and safely reflow the managed worker subtree.
+    #[tool(
+        name = "agent_team_spawn",
+        annotations(
+            title = "Spawn adaptive team worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn agent_team_spawn(
+        &self,
+        Parameters(params): Parameters<AgentTeamSpawnToolParams>,
+    ) -> CallToolResult {
+        let _team_guard = self.team_operations.lock().await;
+        let mut team = match self.load_agent_team(&params.team_id).await {
+            Ok(team) => team,
+            Err(message) => return control_error_result("agent.team.spawn", message),
+        };
+        if team.status == "provisioning" {
+            if let Err(message) = self.recover_agent_team_if_abandoned(&team).await {
+                return control_error_result("agent.team.recover", message);
+            }
+            team = match self.load_agent_team(&params.team_id).await {
+                Ok(team) => team,
+                Err(message) => return control_error_result("agent.list", message),
+            };
+        }
+        if team.mode != "adaptive" {
+            return control_error_result(
+                "agent.team.spawn",
+                format!(
+                    "team '{}' is fixed and cannot accept dynamic workers",
+                    team.team_id
+                ),
+            );
+        }
+        if let Some(key) = params
+            .idempotency_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(existing) = team.members.iter().find(|member| {
+                member
+                    .pointer("/telemetry/team_member_idempotency_key")
+                    .and_then(Value::as_str)
+                    == Some(key)
+            }) {
+                return CallToolResult::structured(json!({
+                    "team_id": team.team_id,
+                    "generation": team.generation,
+                    "reused": true,
+                    "worker": existing,
+                }));
+            }
+        }
+        if let Some(expected) = params.expected_generation {
+            if expected != team.generation {
+                return agent_team_generation_conflict(&team, expected);
+            }
+        }
+        let managed_member_count = agent_team_managed_members(&team).len();
+        let top_workers = agent_team_top_workers(&team)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if managed_member_count >= team.max_workers {
+            return control_error_result(
+                "agent.team.spawn",
+                format!(
+                    "team '{}' reached max_workers ({}) across all managed members",
+                    team.team_id, team.max_workers,
+                ),
+            );
+        }
+        let existing_names = team
+            .members
+            .iter()
+            .filter_map(|member| {
+                member
+                    .pointer("/telemetry/worker_name")
+                    .and_then(Value::as_str)
+            })
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let worker_name = match params.name.as_deref().map(str::trim) {
+            Some("") => {
+                return control_error_result(
+                    "agent.team.spawn",
+                    "worker name must not be empty".to_string(),
+                )
+            }
+            Some(name) if name.chars().count() > 64 => {
+                return control_error_result(
+                    "agent.team.spawn",
+                    "worker name must contain at most 64 characters".to_string(),
+                )
+            }
+            Some(name) => name.to_string(),
+            None => next_agent_team_worker_name(&existing_names),
+        };
+        if existing_names.contains(&worker_name.to_ascii_lowercase()) {
+            return control_error_result(
+                "agent.team.spawn",
+                format!("worker name '{worker_name}' is already in use"),
+            );
+        }
+        let worker_kind_param = match params.kind {
+            Some(kind) => kind,
+            None => match AgentWorkerKindParam::from_key(&team.default_worker_kind) {
+                Some(kind) => kind,
+                None => {
+                    return control_error_result(
+                        "agent.team.spawn",
+                        format!(
+                            "team default worker kind '{}' is invalid",
+                            team.default_worker_kind
+                        ),
+                    )
+                }
+            },
+        };
+        let topology = match self
+            .invoke_value(
+                "workspace.get",
+                json!({ "workspace_id": team.workspace_id }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => return control_error_result("workspace.get", message),
+        };
+        let (anchor_pane_id, axis, ratio) = if top_workers.is_empty() {
+            let Some((_, pane_id)) = worker_location_for_session(&topology, &team.main_session_id)
+            else {
+                return control_error_result(
+                    "agent.team.spawn",
+                    "could not resolve the team main pane".to_string(),
+                );
+            };
+            team.layout_root_pane_id = pane_id.clone();
+            (pane_id, "vertical", team.main_ratio)
+        } else {
+            let anchor = top_workers
+                .iter()
+                .max_by_key(|member| {
+                    member
+                        .pointer("/telemetry/worker_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .expect("non-empty top workers");
+            let Some(session_id) = anchor.get("session_id").and_then(Value::as_str) else {
+                return control_error_result(
+                    "agent.team.spawn",
+                    "the last team worker has no session_id".to_string(),
+                );
+            };
+            let Some((_, pane_id)) = worker_location_for_session(&topology, session_id) else {
+                return control_error_result(
+                    "agent.team.spawn",
+                    format!("could not resolve worker session '{session_id}' to a pane"),
+                );
+            };
+            (pane_id, "horizontal", 0.5)
+        };
+        let worker_index = top_workers
+            .iter()
+            .filter_map(|member| {
+                member
+                    .pointer("/telemetry/worker_index")
+                    .and_then(Value::as_u64)
+            })
+            .max()
+            .unwrap_or(0) as usize
+            + 1;
+        let mutation_id =
+            new_agent_team_mutation_id("spawn", &team.team_id, params.idempotency_key.as_deref());
+        let reservation = match self
+            .reserve_agent_team_generation(&team, &mutation_id)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(message) => return control_error_result("agent.team.reserve", message),
+        };
+        if !reservation.acquired {
+            return CallToolResult::structured(json!({
+                "team_id": team.team_id,
+                "generation": reservation.generation,
+                "status": "provisioning",
+                "reused": true,
+                "message": "the same worker mutation is already in progress",
+            }));
+        }
+        let next_generation = reservation.generation;
+        let mutation_id = reservation.mutation_id;
+        team.generation = next_generation;
+        team.status = "provisioning".to_string();
+        team.mutation_id = Some(mutation_id.clone());
+        let mut registration = AgentTeamWorkerRegistration {
+            team_id: team.team_id.clone(),
+            main_session_id: team.main_session_id.clone(),
+            layout_root_pane_id: team.layout_root_pane_id.clone(),
+            main_ratio: team.main_ratio,
+            max_workers: team.max_workers,
+            worker_name: worker_name.clone(),
+            worker_index,
+            generation: next_generation,
+            auto_adopt_tmux: team.auto_adopt_tmux,
+            member_idempotency_key: params.idempotency_key.clone(),
+        };
+        let launch = self
+            .start_agent_worker_resolved(
+                AgentWorkerStartToolParams {
+                    workspace_id: Some(team.workspace_id.clone()),
+                    pane_id: Some(anchor_pane_id),
+                    name: Some(worker_name.clone()),
+                    kind: worker_kind_param,
+                    distribution: params.distribution.or_else(|| team.distribution.clone()),
+                    placement: Some("split".to_string()),
+                    axis: Some(axis.to_string()),
+                    ratio: Some(ratio),
+                    cwd: params.cwd.or_else(|| team.cwd.clone()),
+                    args: params.args,
+                    columns: params.columns,
+                    rows: params.rows,
+                    durability: params.durability.or_else(|| team.durability.clone()),
+                },
+                ResolvedContext {
+                    workspace_id: Some(team.workspace_id.clone()),
+                    pane_id: None,
+                    surface_id: None,
+                    session_id: None,
+                    cwd: team.cwd.clone(),
+                },
+                false,
+                Some(&registration),
+            )
+            .await;
+        if launch.is_error == Some(true) {
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return launch;
+        }
+        let Some(mut worker) = launch.structured_content else {
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return control_error_result(
+                "agent.team.spawn",
+                "worker launch returned no structured result".to_string(),
+            );
+        };
+        let Some(session_id) = worker
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        else {
+            let rollback = self
+                .rollback_agent_team_workers(
+                    &team.workspace_id,
+                    &[StartedAgentTeamWorker {
+                        name: worker_name,
+                        kind: AgentWorkerKind::from(worker_kind_param),
+                        rollback_pane_id: worker
+                            .get("pane_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        result: worker,
+                    }],
+                )
+                .await;
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return agent_team_error_result(
+                "launch-session".to_string(),
+                worker_index,
+                "worker launch returned no session_id".to_string(),
+                rollback,
+            );
+        };
+        let topology = match self
+            .invoke_value(
+                "workspace.get",
+                json!({ "workspace_id": team.workspace_id }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => {
+                let rollback = self
+                    .rollback_agent_team_workers(
+                        &team.workspace_id,
+                        &[StartedAgentTeamWorker {
+                            name: worker_name,
+                            kind: AgentWorkerKind::from(worker_kind_param),
+                            rollback_pane_id: worker
+                                .get("pane_id")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            result: worker,
+                        }],
+                    )
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    "topology-reconcile".to_string(),
+                    worker_index,
+                    message,
+                    rollback,
+                );
+            }
+        };
+        let Some((surface_id, pane_id)) = worker_location_for_session(&topology, &session_id)
+        else {
+            let rollback = self
+                .rollback_agent_team_workers(
+                    &team.workspace_id,
+                    &[StartedAgentTeamWorker {
+                        name: worker_name,
+                        kind: AgentWorkerKind::from(worker_kind_param),
+                        rollback_pane_id: worker
+                            .get("pane_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        result: worker,
+                    }],
+                )
+                .await;
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return agent_team_error_result(
+                "topology-reconcile".to_string(),
+                worker_index,
+                format!("could not resolve the new worker session '{session_id}'"),
+                rollback,
+            );
+        };
+        if let Value::Object(result) = &mut worker {
+            result.insert("pane_id".to_string(), json!(pane_id));
+            result.insert("surface_id".to_string(), json!(surface_id));
+        }
+        if top_workers.is_empty() {
+            if let Some((_, main_pane_id)) =
+                worker_location_for_session(&topology, &team.main_session_id)
+            {
+                let panes = agent_team_topology_panes(&topology);
+                if let Some(layout_root_pane_id) =
+                    agent_team_lowest_common_ancestor(&panes, &main_pane_id, &pane_id)
+                {
+                    team.layout_root_pane_id = layout_root_pane_id;
+                    registration.layout_root_pane_id = team.layout_root_pane_id.clone();
+                }
+            }
+        }
+        if let Err(message) = self
+            .register_agent_worker_state(
+                AgentWorkerKind::from(worker_kind_param),
+                Some(&worker_name),
+                &session_id,
+                Some(&pane_id),
+                Some(&registration),
+            )
+            .await
+        {
+            let rollback = self
+                .rollback_agent_team_workers(
+                    &team.workspace_id,
+                    &[StartedAgentTeamWorker {
+                        name: worker_name,
+                        kind: AgentWorkerKind::from(worker_kind_param),
+                        rollback_pane_id: Some(pane_id),
+                        result: worker,
+                    }],
+                )
+                .await;
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return agent_team_error_result(
+                "metadata-registration".to_string(),
+                worker_index,
+                message,
+                rollback,
+            );
+        }
+        let mut refreshed = match self.load_agent_team(&team.team_id).await {
+            Ok(team) => team,
+            Err(message) => {
+                let rollback = self
+                    .rollback_agent_team_workers(
+                        &team.workspace_id,
+                        &[StartedAgentTeamWorker {
+                            name: worker_name,
+                            kind: AgentWorkerKind::from(worker_kind_param),
+                            rollback_pane_id: Some(pane_id),
+                            result: worker,
+                        }],
+                    )
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    "team-refresh".to_string(),
+                    worker_index,
+                    message,
+                    rollback,
+                );
+            }
+        };
+        refreshed.generation = next_generation;
+        refreshed.layout_root_pane_id = team.layout_root_pane_id;
+        let reflow = match self.reflow_agent_team(&mut refreshed, false).await {
+            Ok(value) if value.get("status").and_then(Value::as_str) == Some("ok") => value,
+            Ok(value) => {
+                let rollback = self
+                    .rollback_agent_team_workers(
+                        &refreshed.workspace_id,
+                        &[StartedAgentTeamWorker {
+                            name: worker_name,
+                            kind: AgentWorkerKind::from(worker_kind_param),
+                            rollback_pane_id: Some(pane_id),
+                            result: worker,
+                        }],
+                    )
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&refreshed, &mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    "layout-reflow".to_string(),
+                    worker_index,
+                    value.to_string(),
+                    rollback,
+                );
+            }
+            Err(message) => {
+                let rollback = self
+                    .rollback_agent_team_workers(
+                        &refreshed.workspace_id,
+                        &[StartedAgentTeamWorker {
+                            name: worker_name,
+                            kind: AgentWorkerKind::from(worker_kind_param),
+                            rollback_pane_id: Some(pane_id),
+                            result: worker,
+                        }],
+                    )
+                    .await;
+                self.settle_agent_team_after_failed_mutation(&refreshed, &mutation_id)
+                    .await;
+                return agent_team_error_result(
+                    "layout-reflow".to_string(),
+                    worker_index,
+                    message,
+                    rollback,
+                );
+            }
+        };
+        if let Some(key) = params.idempotency_key.as_deref() {
+            if let Some(member) = refreshed.members.iter_mut().find(|member| {
+                member.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+            }) {
+                let state = member
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("running");
+                let reason = member.get("reason").cloned().unwrap_or(Value::Null);
+                let mut telemetry = member
+                    .get("telemetry")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                telemetry.insert("team_member_idempotency_key".to_string(), json!(key));
+                if let Err(message) = self
+                    .invoke_value(
+                        "agent.set_state",
+                        json!({
+                            "session_id": session_id,
+                            "state": state,
+                            "reason": reason,
+                            "telemetry": telemetry,
+                        }),
+                    )
+                    .await
+                {
+                    return control_error_result("agent.set_state", message);
+                }
+            }
+        }
+        refreshed.generation = next_generation;
+        refreshed.status = "provisioning".to_string();
+        refreshed.mutation_id = Some(mutation_id.clone());
+        if let Err(message) = self
+            .settle_agent_team_mutation(&refreshed, &mutation_id, "ready")
+            .await
+        {
+            return control_error_result("agent.team.settle", message);
+        }
+        CallToolResult::structured(json!({
+            "team_id": refreshed.team_id,
+            "generation": refreshed.generation,
+            "worker": worker,
+            "worker_count": agent_team_managed_members(&refreshed).len(),
+            "layout": reflow,
+            "reused": false,
+        }))
+    }
+
+    /// Recompute equal worker ratios without moving foreign panes.
+    #[tool(
+        name = "agent_team_reflow",
+        annotations(
+            title = "Reflow adaptive agent team",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_team_reflow(
+        &self,
+        Parameters(params): Parameters<AgentTeamIdToolParams>,
+    ) -> CallToolResult {
+        let _team_guard = self.team_operations.lock().await;
+        let mut team = match self.load_agent_team(&params.team_id).await {
+            Ok(team) => team,
+            Err(message) => return control_error_result("agent.team.reflow", message),
+        };
+        if let Some(expected) = params.expected_generation {
+            if expected != team.generation {
+                return agent_team_generation_conflict(&team, expected);
+            }
+        }
+        let dry_run = params.dry_run.unwrap_or(false);
+        if dry_run {
+            if team.status == "provisioning" {
+                return control_error_result(
+                    "agent.team.reflow",
+                    "team mutation is still provisioning; dry-run does not recover it".to_string(),
+                );
+            }
+            return match self.reflow_agent_team(&mut team, true).await {
+                Ok(value) => CallToolResult::structured(value),
+                Err(message) => control_error_result("agent.team.reflow", message),
+            };
+        }
+        if team.status == "provisioning" {
+            if let Err(message) = self.recover_agent_team_if_abandoned(&team).await {
+                return control_error_result("agent.team.recover", message);
+            }
+            team = match self.load_agent_team(&params.team_id).await {
+                Ok(team) => team,
+                Err(message) => return control_error_result("agent.list", message),
+            };
+        }
+        let mutation_id = format!(
+            "reflow:{}:{}",
+            team.team_id,
+            team.generation.saturating_add(1)
+        );
+        let reservation = match self
+            .reserve_agent_team_generation(&team, &mutation_id)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(message) => return control_error_result("agent.team.reserve", message),
+        };
+        if !reservation.acquired {
+            return CallToolResult::structured(json!({
+                "team_id": team.team_id,
+                "generation": reservation.generation,
+                "status": "provisioning",
+                "reused": true,
+                "message": "the same reflow mutation is already in progress",
+            }));
+        }
+        let next_generation = reservation.generation;
+        team.generation = next_generation;
+        team.status = "provisioning".to_string();
+        team.mutation_id = Some(mutation_id.clone());
+        let layout = match self.reflow_agent_team(&mut team, false).await {
+            Ok(value) => value,
+            Err(message) => {
+                self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                    .await;
+                return control_error_result("agent.team.reflow", message);
+            }
+        };
+        let status = if layout.get("status").and_then(Value::as_str) == Some("ok") {
+            "ready"
+        } else {
+            "layout_dirty"
+        };
+        if let Err(message) = self
+            .settle_agent_team_mutation(&team, &mutation_id, status)
+            .await
+        {
+            return control_error_result("agent.team.settle", message);
+        }
+        CallToolResult::structured(json!({
+            "team_id": team.team_id,
+            "generation": next_generation,
+            "layout": layout,
+            "status": status,
         }))
     }
 
@@ -1872,6 +3829,208 @@ impl AgentMuxMcpServer {
             }),
         )
         .await
+    }
+
+    /// Release a worker owned by an adaptive team, close its pane, and reflow remaining workers.
+    #[tool(
+        name = "agent_team_release",
+        annotations(
+            title = "Release adaptive team worker",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn agent_team_release(
+        &self,
+        Parameters(params): Parameters<AgentTeamReleaseToolParams>,
+    ) -> CallToolResult {
+        let _team_guard = self.team_operations.lock().await;
+        let mut team = match self.load_agent_team(&params.team_id).await {
+            Ok(team) => team,
+            Err(message) => return control_error_result("agent.team.release", message),
+        };
+        if team.status == "provisioning" {
+            if let Err(message) = self.recover_agent_team_if_abandoned(&team).await {
+                return control_error_result("agent.team.recover", message);
+            }
+            team = match self.load_agent_team(&params.team_id).await {
+                Ok(team) => team,
+                Err(message) => return control_error_result("agent.list", message),
+            };
+        }
+        if let Some(expected) = params.expected_generation {
+            if expected != team.generation {
+                return agent_team_generation_conflict(&team, expected);
+            }
+        }
+        if params.session_id.is_none() && params.name.is_none() {
+            return control_error_result(
+                "agent.team.release",
+                "session_id or name is required".to_string(),
+            );
+        }
+        let candidates = team
+            .members
+            .iter()
+            .filter(|member| {
+                member
+                    .pointer("/telemetry/team_role")
+                    .and_then(Value::as_str)
+                    != Some("main")
+            })
+            .filter(|member| {
+                params.session_id.as_deref().is_none_or(|session_id| {
+                    member.get("session_id").and_then(Value::as_str) == Some(session_id)
+                })
+            })
+            .filter(|member| {
+                params.name.as_deref().is_none_or(|name| {
+                    member
+                        .pointer("/telemetry/worker_name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|worker_name| worker_name.eq_ignore_ascii_case(name))
+                })
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return control_error_result(
+                "agent.team.release",
+                format!(
+                    "worker selector matched {} team members; expected exactly one",
+                    candidates.len()
+                ),
+            );
+        }
+        let member = candidates[0].clone();
+        let session_id = member
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("selected member has session id")
+            .to_string();
+        let topology = match self
+            .invoke_value(
+                "workspace.get",
+                json!({ "workspace_id": team.workspace_id }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => return control_error_result("workspace.get", message),
+        };
+        let pane_id =
+            worker_location_for_session(&topology, &session_id).map(|(_, pane_id)| pane_id);
+        let mutation_id = format!("release:{session_id}");
+        let reservation = match self
+            .reserve_agent_team_generation(&team, &mutation_id)
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(message) => return control_error_result("agent.team.reserve", message),
+        };
+        if !reservation.acquired {
+            return CallToolResult::structured(json!({
+                "team_id": team.team_id,
+                "generation": reservation.generation,
+                "status": "provisioning",
+                "reused": true,
+                "message": "the same release mutation is already in progress",
+            }));
+        }
+        let next_generation = reservation.generation;
+        team.generation = next_generation;
+        team.status = "provisioning".to_string();
+        team.mutation_id = Some(mutation_id.clone());
+        let already_terminal = member
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| matches!(state, "exited" | "failed" | "terminated"));
+        let terminated = already_terminal
+            || self
+                .invoke_value(
+                    "session.terminate",
+                    json!({
+                        "session_id": session_id,
+                        "mode": params.mode.unwrap_or_else(|| "soft".to_string()),
+                    }),
+                )
+                .await
+                .is_ok();
+        if !terminated {
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return control_error_result(
+                "agent.team.release",
+                format!("could not terminate session '{session_id}'; team membership was retained"),
+            );
+        }
+        let pane_closed = match pane_id.as_deref() {
+            Some(pane_id) => self
+                .invoke_value(
+                    "pane.close",
+                    json!({
+                        "workspace_id": team.workspace_id,
+                        "pane_id": pane_id,
+                        "surface_policy": "close_surface",
+                    }),
+                )
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if let Err(message) = self.clear_agent_team_membership(&member).await {
+            self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                .await;
+            return control_error_result(
+                "agent.team.release",
+                format!(
+                    "session '{session_id}' terminated but team membership could not be cleared: {message}"
+                ),
+            );
+        }
+        let mut refreshed = match self.load_agent_team(&team.team_id).await {
+            Ok(team) => team,
+            Err(message) => {
+                self.settle_agent_team_after_failed_mutation(&team, &mutation_id)
+                    .await;
+                return control_error_result("agent.list", message);
+            }
+        };
+        refreshed.generation = next_generation;
+        refreshed.status = "provisioning".to_string();
+        refreshed.mutation_id = Some(mutation_id.clone());
+        let layout = match self.reflow_agent_team(&mut refreshed, false).await {
+            Ok(value) => value,
+            Err(message) => json!({
+                "status": "layout_dirty",
+                "layout_dirty": true,
+                "mutated": false,
+                "error": message,
+            }),
+        };
+        let final_status = if layout.get("layout_dirty").and_then(Value::as_bool) == Some(true) {
+            "layout_dirty"
+        } else {
+            "ready"
+        };
+        if let Err(message) = self
+            .settle_agent_team_mutation(&refreshed, &mutation_id, final_status)
+            .await
+        {
+            return control_error_result("agent.team.settle", message);
+        }
+        CallToolResult::structured(json!({
+            "team_id": refreshed.team_id,
+            "generation": refreshed.generation,
+            "released_session_id": session_id,
+            "pane_id": pane_id,
+            "session_terminated": terminated,
+            "pane_closed": pane_closed,
+            "status": if pane_closed { "released" } else { "released_with_open_pane" },
+            "worker_count": agent_team_managed_members(&refreshed).len(),
+            "layout": layout,
+        }))
     }
 
     /// Install AgentMux tmux-compatibility shims and report integration readiness. Full profile only.
@@ -2188,11 +4347,83 @@ fn control_error_result(method: &str, message: String) -> CallToolResult {
     }))
 }
 
+fn call_tool_result_error_message(result: &CallToolResult) -> String {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("agent worker launch failed without an error message")
+        .to_string()
+}
+
+fn agent_team_error_result(
+    worker_name: String,
+    worker_index: usize,
+    message: String,
+    rollback: Vec<Value>,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": {
+            "code": "agentmux_agent_team_start_failed",
+            "method": "agent.team.start",
+            "message": message,
+            "failed_worker": {
+                "name": worker_name,
+                "index": worker_index,
+            },
+            "rollback": rollback,
+        }
+    }))
+}
+
 fn missing_context_result(field: &str) -> CallToolResult {
     control_error_result(
         "system.identify",
         format!("{field} was not supplied and could not be resolved from AgentMux caller context"),
     )
+}
+
+fn worker_location_for_session(topology: &Value, session_id: &str) -> Option<(String, String)> {
+    let surface_id = topology
+        .get("surfaces")?
+        .as_array()?
+        .iter()
+        .find(|surface| surface.get("session_id").and_then(Value::as_str) == Some(session_id))?
+        .get("surface_id")?
+        .as_str()?;
+    let pane_id = topology
+        .get("panes")?
+        .as_array()?
+        .iter()
+        .find(|pane| {
+            pane.get("kind").and_then(Value::as_str) == Some("leaf")
+                && pane.get("mounted_surface_id").and_then(Value::as_str) == Some(surface_id)
+        })?
+        .get("pane_id")?
+        .as_str()?;
+    Some((surface_id.to_string(), pane_id.to_string()))
+}
+
+fn terminal_location_for_pane(topology: &Value, pane_id: &str) -> Option<(String, String)> {
+    let surface_id = topology
+        .get("panes")?
+        .as_array()?
+        .iter()
+        .find(|pane| {
+            pane.get("pane_id").and_then(Value::as_str) == Some(pane_id)
+                && pane.get("kind").and_then(Value::as_str) == Some("leaf")
+        })?
+        .get("mounted_surface_id")?
+        .as_str()?;
+    let session_id = topology
+        .get("surfaces")?
+        .as_array()?
+        .iter()
+        .find(|surface| surface.get("surface_id").and_then(Value::as_str) == Some(surface_id))?
+        .get("session_id")?
+        .as_str()?;
+    Some((surface_id.to_string(), session_id.to_string()))
 }
 
 fn empty_split_target(detail: &Value, source_pane_id: &str) -> Option<String> {
@@ -2494,6 +4725,8 @@ struct AgentIntegrationStatusToolParams {
 struct AgentWorkerStartToolParams {
     workspace_id: Option<String>,
     pane_id: Option<String>,
+    /// Optional stable worker role used in agent status metadata.
+    name: Option<String>,
     /// codex-pane starts an independent Codex CLI. Other values start tmux-compatible integrations.
     kind: AgentWorkerKindParam,
     distribution: Option<String>,
@@ -2509,6 +4742,147 @@ struct AgentWorkerStartToolParams {
     rows: Option<u16>,
     durability: Option<String>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentTeamStartToolParams {
+    workspace_id: Option<String>,
+    /// Main terminal pane. Defaults to the calling agent's active pane.
+    pane_id: Option<String>,
+    /// Currently supported layout: main-left-workers-right.
+    layout: Option<AgentTeamLayoutParam>,
+    /// Width assigned to the main pane. Defaults to 0.5.
+    #[schemars(range(min = 0.1, max = 0.9))]
+    main_ratio: Option<f64>,
+    /// adaptive (default) permits workers to be added and released on demand.
+    mode: Option<AgentTeamModeParam>,
+    /// Automatically adopt descendants created through the AgentMux tmux shim. Defaults to true.
+    auto_adopt_tmux: Option<bool>,
+    /// Optional caller-stable key used to discover an existing team after retries.
+    idempotency_key: Option<String>,
+    /// Safety ceiling for top-level workers. Defaults to 8.
+    #[schemars(range(min = 1, max = 8))]
+    max_workers: Option<u8>,
+    /// Worker kind used when agent_team_spawn omits kind.
+    default_worker_kind: Option<AgentWorkerKindParam>,
+    distribution: Option<String>,
+    cwd: Option<String>,
+    columns: Option<u16>,
+    rows: Option<u16>,
+    durability: Option<String>,
+    /// Optional seed workers. Adaptive teams may start empty.
+    #[serde(default)]
+    #[schemars(length(max = 8))]
+    workers: Vec<AgentTeamWorkerSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AgentTeamModeParam {
+    Adaptive,
+    Fixed,
+}
+
+impl AgentTeamModeParam {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Fixed => "fixed",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentTeamWorkerSpec {
+    /// Unique role name shown in AgentMux agent status metadata.
+    #[schemars(length(min = 1, max = 64))]
+    name: String,
+    kind: AgentWorkerKindParam,
+    distribution: Option<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    durability: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum AgentTeamLayoutParam {
+    MainLeftWorkersRight,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
+struct AgentTeamListToolParams {
+    workspace_id: Option<String>,
+    team_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentTeamSpawnToolParams {
+    team_id: String,
+    expected_generation: Option<u64>,
+    idempotency_key: Option<String>,
+    /// Optional role name. AgentMux generates worker-N when omitted.
+    name: Option<String>,
+    /// Defaults to the team's configured worker kind.
+    kind: Option<AgentWorkerKindParam>,
+    distribution: Option<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    columns: Option<u16>,
+    rows: Option<u16>,
+    durability: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentTeamIdToolParams {
+    team_id: String,
+    expected_generation: Option<u64>,
+    /// Return the planned ratios without mutating layout. Defaults to false.
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct AgentTeamReleaseToolParams {
+    team_id: String,
+    expected_generation: Option<u64>,
+    session_id: Option<String>,
+    name: Option<String>,
+    /// soft (default), graceful, or kill.
+    mode: Option<String>,
+}
+
+impl AgentTeamLayoutParam {
+    fn key(self) -> &'static str {
+        match self {
+            Self::MainLeftWorkersRight => "main-left-workers-right",
+        }
+    }
+}
+
+const AGENT_TEAM_TELEMETRY_KEYS: &[&str] = &[
+    "team_id",
+    "team_role",
+    "worker_name",
+    "parent_session_id",
+    "layout_root_pane_id",
+    "main_ratio",
+    "max_workers",
+    "worker_index",
+    "team_mode",
+    "team_status",
+    "team_layout",
+    "team_generation",
+    "team_mutation_id",
+    "team_mutation_owner_id",
+    "team_auto_adopt",
+    "team_idempotency_key",
+    "team_member_idempotency_key",
+    "default_worker_kind",
+    "distribution",
+    "team_cwd",
+    "durability",
+];
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct AgentWorkerSendToolParams {
@@ -2552,6 +4926,82 @@ enum AgentWorkerKind {
     Integration(AgentIntegrationKind),
 }
 
+#[derive(Debug)]
+struct StartedAgentTeamWorker {
+    name: String,
+    kind: AgentWorkerKind,
+    rollback_pane_id: Option<String>,
+    result: Value,
+}
+
+#[derive(Clone, Debug)]
+struct AgentTeamWorkerRegistration {
+    team_id: String,
+    main_session_id: String,
+    layout_root_pane_id: String,
+    main_ratio: f64,
+    max_workers: usize,
+    worker_name: String,
+    worker_index: usize,
+    generation: u64,
+    auto_adopt_tmux: bool,
+    member_idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct AgentTeamReservation {
+    generation: u64,
+    mutation_id: String,
+    acquired: bool,
+}
+
+impl AgentTeamReservation {
+    fn from_control_result(result: &Value, generation: u64, mutation_id: &str) -> Self {
+        Self {
+            generation: result
+                .get("generation")
+                .and_then(Value::as_u64)
+                .unwrap_or(generation),
+            mutation_id: result
+                .get("mutation_id")
+                .and_then(Value::as_str)
+                .unwrap_or(mutation_id)
+                .to_string(),
+            acquired: result
+                .get("acquired")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    !result
+                        .get("reused")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LoadedAgentTeam {
+    team_id: String,
+    workspace_id: String,
+    main_session_id: String,
+    layout_root_pane_id: String,
+    main_ratio: f64,
+    max_workers: usize,
+    generation: u64,
+    status: String,
+    mutation_id: Option<String>,
+    auto_adopt_tmux: bool,
+    idempotency_key: Option<String>,
+    mode: String,
+    default_worker_kind: String,
+    distribution: Option<String>,
+    cwd: Option<String>,
+    durability: Option<String>,
+    main: Value,
+    members: Vec<Value>,
+}
+
 impl From<AgentWorkerKindParam> for AgentWorkerKind {
     fn from(value: AgentWorkerKindParam) -> Self {
         match value {
@@ -2562,6 +5012,23 @@ impl From<AgentWorkerKindParam> for AgentWorkerKind {
             AgentWorkerKindParam::Omo => Self::Integration(AgentIntegrationKind::Omo),
             AgentWorkerKindParam::Omx => Self::Integration(AgentIntegrationKind::Omx),
             AgentWorkerKindParam::Omc => Self::Integration(AgentIntegrationKind::Omc),
+        }
+    }
+}
+
+impl AgentWorkerKindParam {
+    fn key(self) -> &'static str {
+        AgentWorkerKind::from(self).key()
+    }
+
+    fn from_key(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex-pane" => Some(Self::CodexPane),
+            "claude-teams" => Some(Self::ClaudeTeams),
+            "omo" => Some(Self::Omo),
+            "omx" => Some(Self::Omx),
+            "omc" => Some(Self::Omc),
+            _ => None,
         }
     }
 }
@@ -2597,6 +5064,302 @@ impl AgentWorkerKind {
             Self::Integration(_) => "agent_team",
         }
     }
+}
+
+fn new_agent_team_id() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("team-{}-{nonce:x}", std::process::id())
+}
+
+fn new_agent_team_mutation_id(kind: &str, team_id: &str, stable_key: Option<&str>) -> String {
+    let stable_key = stable_key.map(str::trim).filter(|value| !value.is_empty());
+    match stable_key {
+        Some(key) => format!("{kind}:{team_id}:key:{key}"),
+        None => {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{kind}:{team_id}:{}:{nonce:x}", std::process::id())
+        }
+    }
+}
+
+fn telemetry_f64(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+fn agent_team_launch_env(team: &AgentTeamWorkerRegistration) -> Vec<Value> {
+    [
+        ("AGENTMUX_TEAM_ID", team.team_id.clone()),
+        ("AGENTMUX_TEAM_ROLE", "worker".to_string()),
+        (
+            "AGENTMUX_TEAM_MAIN_SESSION_ID",
+            team.main_session_id.clone(),
+        ),
+        (
+            "AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID",
+            team.layout_root_pane_id.clone(),
+        ),
+        ("AGENTMUX_TEAM_MAIN_RATIO", team.main_ratio.to_string()),
+        ("AGENTMUX_TEAM_MAX_WORKERS", team.max_workers.to_string()),
+        ("AGENTMUX_TEAM_WORKER_NAME", team.worker_name.clone()),
+        (
+            "AGENTMUX_TEAM_AUTO_ADOPT",
+            if team.auto_adopt_tmux { "1" } else { "0" }.to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| json!({ "key": key, "value": value }))
+    .collect()
+}
+
+fn agent_team_top_workers(team: &LoadedAgentTeam) -> Vec<&Value> {
+    team.members
+        .iter()
+        .filter(|member| {
+            member
+                .pointer("/telemetry/team_role")
+                .and_then(Value::as_str)
+                == Some("worker")
+        })
+        .collect()
+}
+
+fn agent_team_managed_members(team: &LoadedAgentTeam) -> Vec<&Value> {
+    team.members
+        .iter()
+        .filter(|member| {
+            member
+                .pointer("/telemetry/team_role")
+                .and_then(Value::as_str)
+                != Some("main")
+        })
+        .collect()
+}
+
+fn next_agent_team_worker_name(existing: &std::collections::HashSet<String>) -> String {
+    (1..=MAX_AGENT_TEAM_WORKERS + 1)
+        .map(|index| format!("worker-{index}"))
+        .find(|name| !existing.contains(name))
+        .unwrap_or_else(|| format!("worker-{}", existing.len() + 1))
+}
+
+fn agent_team_summary(team: &LoadedAgentTeam, reused: bool) -> Value {
+    let workers = team
+        .members
+        .iter()
+        .filter(|member| {
+            member
+                .pointer("/telemetry/team_role")
+                .and_then(Value::as_str)
+                != Some("main")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    json!({
+        "team_id": team.team_id,
+        "workspace_id": team.workspace_id,
+        "mode": team.mode,
+        "status": team
+            .main
+            .pointer("/telemetry/team_status")
+            .and_then(Value::as_str)
+            .unwrap_or("active"),
+        "generation": team.generation,
+        "max_workers": team.max_workers,
+        "auto_adopt_tmux": team.auto_adopt_tmux,
+        "main": team.main,
+        "worker_count": agent_team_managed_members(team).len(),
+        "descendant_count": workers.len().saturating_sub(agent_team_top_workers(team).len()),
+        "workers": workers,
+        "reused": reused,
+    })
+}
+
+fn agent_team_summary_with_recovery(team: &LoadedAgentTeam, reused: bool) -> Value {
+    let mut summary = agent_team_summary(team, reused);
+    if let Value::Object(fields) = &mut summary {
+        fields.insert("recovered".to_string(), json!(true));
+        fields.insert(
+            "message".to_string(),
+            json!("an abandoned provisioning reservation was recovered as layout_dirty"),
+        );
+    }
+    summary
+}
+
+fn agent_team_generation_conflict(team: &LoadedAgentTeam, expected: u64) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "error": {
+            "code": "generation_conflict",
+            "method": "agent.team.generation",
+            "message": format!(
+                "team '{}' generation conflict: expected {expected}, current {}",
+                team.team_id, team.generation
+            ),
+            "team_id": team.team_id,
+            "expected_generation": expected,
+            "current_generation": team.generation,
+        }
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct AgentTeamTopologyPane {
+    pane_id: String,
+    parent_pane_id: Option<String>,
+    kind: String,
+    split_axis: Option<String>,
+    split_ratio: Option<f64>,
+}
+
+fn agent_team_topology_panes(topology: &Value) -> Vec<AgentTeamTopologyPane> {
+    topology
+        .get("panes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|pane| {
+            Some(AgentTeamTopologyPane {
+                pane_id: pane.get("pane_id")?.as_str()?.to_string(),
+                parent_pane_id: pane
+                    .get("parent_pane_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                kind: pane
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("leaf")
+                    .to_string(),
+                split_axis: pane
+                    .get("split_axis")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                split_ratio: pane.get("split_ratio").and_then(Value::as_f64),
+            })
+        })
+        .collect()
+}
+
+fn agent_team_children<'a>(
+    panes: &'a [AgentTeamTopologyPane],
+    parent_id: &str,
+) -> Vec<&'a AgentTeamTopologyPane> {
+    panes
+        .iter()
+        .filter(|pane| pane.parent_pane_id.as_deref() == Some(parent_id))
+        .collect()
+}
+
+fn agent_team_subtree_contains(
+    panes: &[AgentTeamTopologyPane],
+    root_id: &str,
+    target_id: &str,
+) -> bool {
+    root_id == target_id
+        || agent_team_children(panes, root_id)
+            .iter()
+            .any(|child| agent_team_subtree_contains(panes, &child.pane_id, target_id))
+}
+
+fn agent_team_lowest_common_ancestor(
+    panes: &[AgentTeamTopologyPane],
+    first_pane_id: &str,
+    second_pane_id: &str,
+) -> Option<String> {
+    let parents = panes
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), pane.parent_pane_id.as_deref()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut first_ancestors = std::collections::HashSet::new();
+    let mut current = Some(first_pane_id);
+    while let Some(pane_id) = current {
+        first_ancestors.insert(pane_id);
+        current = parents.get(pane_id).copied().flatten();
+    }
+    let mut current = Some(second_pane_id);
+    while let Some(pane_id) = current {
+        if first_ancestors.contains(pane_id) {
+            return Some(pane_id.to_string());
+        }
+        current = parents.get(pane_id).copied().flatten();
+    }
+    None
+}
+
+fn agent_team_leaf_ids(panes: &[AgentTeamTopologyPane], root_id: &str) -> Vec<String> {
+    let Some(root) = panes.iter().find(|pane| pane.pane_id == root_id) else {
+        return Vec::new();
+    };
+    if root.kind == "leaf" {
+        return vec![root.pane_id.clone()];
+    }
+    agent_team_children(panes, root_id)
+        .into_iter()
+        .flat_map(|child| agent_team_leaf_ids(panes, &child.pane_id))
+        .collect()
+}
+
+fn agent_team_split_nodes<'a>(
+    panes: &'a [AgentTeamTopologyPane],
+    root_id: &str,
+) -> Vec<&'a AgentTeamTopologyPane> {
+    let Some(root) = panes.iter().find(|pane| pane.pane_id == root_id) else {
+        return Vec::new();
+    };
+    if root.kind == "leaf" {
+        return Vec::new();
+    }
+    let mut splits = vec![root];
+    for child in agent_team_children(panes, root_id) {
+        splits.extend(agent_team_split_nodes(panes, &child.pane_id));
+    }
+    splits
+}
+
+fn agent_team_collect_reflow_updates(
+    panes: &[AgentTeamTopologyPane],
+    root_id: &str,
+    updates: &mut Vec<(String, f64, f64)>,
+) {
+    let Some(root) = panes.iter().find(|pane| pane.pane_id == root_id) else {
+        return;
+    };
+    if root.kind == "leaf" {
+        return;
+    }
+    let children = agent_team_children(panes, root_id);
+    if children.len() != 2 {
+        return;
+    }
+    let first_count = agent_team_leaf_ids(panes, &children[0].pane_id).len();
+    let second_count = agent_team_leaf_ids(panes, &children[1].pane_id).len();
+    let total = first_count + second_count;
+    if total > 0 {
+        let ratio = (first_count as f64 / total as f64).clamp(0.1, 0.9);
+        updates.push((root.pane_id.clone(), ratio, root.split_ratio.unwrap_or(0.5)));
+    }
+    for child in children {
+        agent_team_collect_reflow_updates(panes, &child.pane_id, updates);
+    }
+}
+
+fn agent_team_layout_conflict(team_id: &str, conflict: String) -> Value {
+    json!({
+        "team_id": team_id,
+        "status": "layout_conflict",
+        "layout_dirty": true,
+        "mutated": false,
+        "conflicts": [conflict],
+    })
 }
 
 fn is_managed_worker_session(session: &Value) -> bool {
@@ -2764,7 +5527,7 @@ struct NotificationClearToolParams {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -2774,6 +5537,11 @@ mod tests {
     #[derive(Default)]
     struct FakeTransport {
         responses: HashMap<String, Value>,
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    struct ScriptedTransport {
+        responses: Mutex<VecDeque<(String, Result<Value, String>)>>,
         calls: Mutex<Vec<(String, Value)>>,
     }
 
@@ -2787,6 +5555,29 @@ mod tests {
                 .get(method)
                 .cloned()
                 .ok_or_else(|| format!("missing fake response for {method}"))
+        }
+    }
+
+    impl ControlTransport for ScriptedTransport {
+        fn invoke(&self, method: &str, params: Value) -> Result<Value, String> {
+            self.calls
+                .lock()
+                .expect("scripted calls lock")
+                .push((method.to_string(), params));
+            let Some((expected_method, result)) = self
+                .responses
+                .lock()
+                .expect("scripted responses lock")
+                .pop_front()
+            else {
+                return Err(format!("missing scripted response for {method}"));
+            };
+            if expected_method != method {
+                return Err(format!(
+                    "expected scripted method '{expected_method}', received '{method}'"
+                ));
+            }
+            result
         }
     }
 
@@ -2805,6 +5596,26 @@ mod tests {
                 .into_iter()
                 .map(|(method, response)| (method.to_string(), response))
                 .collect(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let server = AgentMuxMcpServer::with_transport(
+            profile,
+            Arc::clone(&transport) as Arc<dyn ControlTransport>,
+        );
+        (server, transport)
+    }
+
+    fn scripted_server_for_profile(
+        profile: McpProfile,
+        responses: impl IntoIterator<Item = (&'static str, Result<Value, String>)>,
+    ) -> (AgentMuxMcpServer, Arc<ScriptedTransport>) {
+        let transport = Arc::new(ScriptedTransport {
+            responses: Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|(method, response)| (method.to_string(), response))
+                    .collect(),
+            ),
             calls: Mutex::new(Vec::new()),
         });
         let server = AgentMuxMcpServer::with_transport(
@@ -2859,6 +5670,7 @@ mod tests {
             vec![
                 "agent_attention_list",
                 "agent_integration_status",
+                "agent_team_list",
                 "agent_worker_list",
                 "agentmux_context",
                 "browser_get",
@@ -3029,10 +5841,12 @@ mod tests {
         assert!(McpProfile::Standard.allows_tool("workspace_list"));
         assert!(McpProfile::Standard.allows_tool("terminal_open"));
         assert!(!McpProfile::Standard.allows_tool("workspace_close"));
+        assert!(!McpProfile::Standard.allows_tool("agent_team_release"));
 
         assert!(McpProfile::Full.allows_tool("workspace_list"));
         assert!(McpProfile::Full.allows_tool("terminal_open"));
         assert!(McpProfile::Full.allows_tool("workspace_close"));
+        assert!(McpProfile::Full.allows_tool("agent_team_release"));
         assert!(!McpProfile::Full.allows_tool("unclassified_future_tool"));
     }
 
@@ -3052,6 +5866,7 @@ mod tests {
             "browser_evaluate",
             "action_run",
             "agent_worker_start",
+            "agent_team_start",
             "agent_worker_send",
         ] {
             let tool = full
@@ -3077,6 +5892,37 @@ mod tests {
         assert_eq!(
             value.pointer("/$defs/AgentWorkerKindParam/enum"),
             Some(&json!(["codex-pane", "claude-teams", "omo", "omx", "omc"]))
+        );
+    }
+
+    #[test]
+    fn agent_team_start_schema_exposes_layout_and_runtime_bounds() {
+        let schema = schemars::schema_for!(AgentTeamStartToolParams);
+        let value = serde_json::to_value(schema).expect("agent team start schema");
+        assert_eq!(
+            value.pointer("/$defs/AgentTeamLayoutParam/enum"),
+            Some(&json!(["main-left-workers-right"]))
+        );
+        assert_eq!(
+            value.pointer("/properties/main_ratio/minimum"),
+            Some(&json!(0.1))
+        );
+        assert_eq!(
+            value.pointer("/properties/main_ratio/maximum"),
+            Some(&json!(0.9))
+        );
+        assert_eq!(value.pointer("/properties/workers/minItems"), None);
+        assert_eq!(
+            value.pointer("/properties/workers/maxItems"),
+            Some(&json!(8))
+        );
+        assert_eq!(
+            value.pointer("/$defs/AgentTeamWorkerSpec/properties/name/minLength"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            value.pointer("/$defs/AgentTeamWorkerSpec/properties/name/maxLength"),
+            Some(&json!(64))
         );
     }
 
@@ -3198,6 +6044,7 @@ mod tests {
             .agent_worker_start(Parameters(AgentWorkerStartToolParams {
                 workspace_id: None,
                 pane_id: None,
+                name: None,
                 kind: AgentWorkerKindParam::ClaudeTeams,
                 distribution: Some("Ubuntu".to_string()),
                 placement: None,
@@ -3231,6 +6078,1342 @@ mod tests {
         assert_eq!(calls[2].0, "agent.set_state");
         assert_eq!(calls[2].1["telemetry"]["activity"], "agent_team");
         assert_eq!(calls[2].1["telemetry"]["session"], "claude-teams:worker");
+    }
+
+    #[tokio::test]
+    async fn adaptive_agent_team_can_start_without_seed_workers() {
+        let topology = json!({
+            "panes": [
+                {"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}
+            ],
+            "surfaces": [
+                {"surface_id": "surface-main", "session_id": "session-main"}
+            ]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-main",
+                        "session_id": "session-main",
+                        "cwd": "/workspace/project"
+                    })),
+                ),
+                ("agent.list", Ok(json!({"sessions": []}))),
+                ("workspace.get", Ok(topology.clone())),
+                ("agent.list", Ok(json!({"sessions": []}))),
+                ("agent.team.reserve", Ok(json!({"claimed": true}))),
+                ("workspace.get", Ok(topology)),
+                (
+                    "agent.list",
+                    Ok(json!({
+                        "sessions": [{
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {"activity": "agent", "session": "codex"}
+                        }]
+                    })),
+                ),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_start(Parameters(AgentTeamStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                layout: None,
+                main_ratio: None,
+                mode: None,
+                auto_adopt_tmux: None,
+                idempotency_key: Some("project-analysis".to_string()),
+                max_workers: Some(4),
+                default_worker_kind: Some(AgentWorkerKindParam::CodexPane),
+                distribution: None,
+                cwd: None,
+                columns: None,
+                rows: None,
+                durability: None,
+                workers: Vec::new(),
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("adaptive team result");
+        assert_eq!(value["mode"], "adaptive");
+        assert_eq!(value["worker_count"], 0);
+        assert_eq!(value["max_workers"], 4);
+        assert_eq!(value["generation"], 1);
+        assert_eq!(value["status"], "ready");
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls.iter().all(|(method, _)| method != "terminal.split"));
+        assert_eq!(calls[4].0, "agent.team.reserve");
+        assert_eq!(calls[4].1["claim"], true);
+        let manifest = calls.last().expect("main manifest call");
+        assert_eq!(manifest.0, "agent.team.settle");
+        assert_eq!(manifest.1["telemetry"]["team_mode"], "adaptive");
+        assert_eq!(
+            manifest.1["telemetry"]["team_idempotency_key"],
+            "project-analysis"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_team_spawn_rejects_a_stale_generation_before_mutation() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [(
+                "agent.list",
+                Ok(json!({
+                    "sessions": [{
+                        "session_id": "session-main",
+                        "workspace_id": "workspace-1",
+                        "state": "running",
+                        "telemetry": {
+                            "team_id": "team-1",
+                            "team_role": "main",
+                            "team_mode": "adaptive",
+                            "layout_root_pane_id": "pane-main",
+                            "team_generation": 3
+                        }
+                    }]
+                })),
+            )],
+        );
+        let result = server
+            .agent_team_spawn(Parameters(AgentTeamSpawnToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(2),
+                idempotency_key: None,
+                name: None,
+                kind: None,
+                distribution: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.expect("generation conflict");
+        assert_eq!(value["error"]["code"], "generation_conflict");
+        assert_eq!(value["error"]["current_generation"], 3);
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "agent.list");
+    }
+
+    #[tokio::test]
+    async fn agent_team_spawn_reused_reservation_does_not_repeat_side_effects() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "agent.list",
+                    Ok(json!({
+                        "sessions": [{
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {
+                                "team_id": "team-1",
+                                "team_role": "main",
+                                "team_mode": "adaptive",
+                                "layout_root_pane_id": "pane-main",
+                                "team_generation": 1,
+                                "max_workers": 2,
+                                "default_worker_kind": "codex-pane"
+                            }
+                        }]
+                    })),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [{"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}],
+                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}]
+                    })),
+                ),
+                (
+                    "agent.team.reserve",
+                    Ok(json!({
+                        "generation": 2,
+                        "mutation_id": "spawn:team-1:docs",
+                        "reused": true,
+                        "acquired": false
+                    })),
+                ),
+            ],
+        );
+
+        let result = server
+            .agent_team_spawn(Parameters(AgentTeamSpawnToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                idempotency_key: Some("docs".to_string()),
+                name: Some("docs".to_string()),
+                kind: None,
+                distribution: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("in-progress reservation");
+        assert_eq!(value["status"], "provisioning");
+        assert_eq!(value["reused"], true);
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|(method, _)| {
+            method != "terminal.split"
+                && method != "pane.resize_layout"
+                && method != "agent.team.settle"
+        }));
+    }
+
+    #[tokio::test]
+    async fn agent_team_spawn_reuses_a_completed_idempotency_key_before_generation_check() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [(
+                "agent.list",
+                Ok(json!({
+                    "sessions": [
+                        {
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {
+                                "team_id": "team-1",
+                                "team_role": "main",
+                                "team_mode": "adaptive",
+                                "layout_root_pane_id": "pane-root",
+                                "team_generation": 3
+                            }
+                        },
+                        {
+                            "session_id": "session-worker",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {
+                                "team_id": "team-1",
+                                "team_role": "worker",
+                                "team_member_idempotency_key": "spawn-frontend"
+                            }
+                        }
+                    ]
+                })),
+            )],
+        );
+        let result = server
+            .agent_team_spawn(Parameters(AgentTeamSpawnToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(2),
+                idempotency_key: Some("spawn-frontend".to_string()),
+                name: Some("frontend".to_string()),
+                kind: None,
+                distribution: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("reused worker");
+        assert_eq!(value["reused"], true);
+        assert_eq!(value["generation"], 3);
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "agent.list");
+    }
+
+    #[tokio::test]
+    async fn agent_team_spawn_reserves_then_registers_and_reflows_a_worker() {
+        let initial = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-main",
+                    "team_generation": 1,
+                    "main_ratio": "0.5",
+                    "max_workers": 2,
+                    "default_worker_kind": "codex-pane"
+                }
+            }]
+        });
+        let refreshed = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-root",
+                        "team_generation": 2,
+                        "main_ratio": "0.5",
+                        "max_workers": 2,
+                        "default_worker_kind": "codex-pane"
+                    }
+                },
+                {
+                    "session_id": "session-worker",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "backend",
+                        "worker_index": 1,
+                        "team_generation": 2
+                    }
+                }
+            ]
+        });
+        let split_topology = json!({
+            "panes": [
+                {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                {"pane_id": "pane-main", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                {"pane_id": "pane-worker", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+            ],
+            "surfaces": [
+                {"surface_id": "surface-main", "session_id": "session-main"},
+                {"surface_id": "surface-worker", "session_id": "session-worker"}
+            ]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(initial)),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [{"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}],
+                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}]
+                    })),
+                ),
+                ("agent.team.reserve", Ok(json!({"generation": 2}))),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "pane_id": "pane-worker-anchor",
+                        "surface_id": "surface-worker",
+                        "session_id": "session-worker"
+                    })),
+                ),
+                ("workspace.get", Ok(split_topology.clone())),
+                (
+                    "agent.set_state",
+                    Ok(json!({"session_id": "session-worker"})),
+                ),
+                ("agent.list", Ok(refreshed.clone())),
+                ("agent.list", Ok(refreshed.clone())),
+                ("workspace.get", Ok(split_topology)),
+                ("agent.list", Ok(refreshed.clone())),
+                ("pane.resize_layout", Ok(json!({"resized": true}))),
+                ("agent.list", Ok(refreshed)),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_spawn(Parameters(AgentTeamSpawnToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                idempotency_key: None,
+                name: Some("backend".to_string()),
+                kind: None,
+                distribution: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("spawned worker");
+        assert_eq!(value["generation"], 2);
+        assert_eq!(value["worker_count"], 1);
+        assert_eq!(value["reused"], false);
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls[2].0, "agent.team.reserve");
+        assert_eq!(calls[3].0, "terminal.split");
+        assert_eq!(calls[10].0, "pane.resize_layout");
+    }
+
+    #[tokio::test]
+    async fn agent_team_spawn_counts_descendants_against_max_workers() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [(
+                "agent.list",
+                Ok(json!({
+                    "sessions": [
+                        {
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {
+                                "team_id": "team-1",
+                                "team_role": "main",
+                                "team_mode": "adaptive",
+                                "layout_root_pane_id": "pane-root",
+                                "team_generation": 1,
+                                "max_workers": 1
+                            }
+                        },
+                        {
+                            "session_id": "session-descendant",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {
+                                "team_id": "team-1",
+                                "team_role": "descendant",
+                                "worker_name": "nested-worker"
+                            }
+                        }
+                    ]
+                })),
+            )],
+        );
+        let result = server
+            .agent_team_spawn(Parameters(AgentTeamSpawnToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                idempotency_key: None,
+                name: Some("another-worker".to_string()),
+                kind: None,
+                distribution: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.expect("capacity error");
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("all managed members")));
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_team_reflow_returns_conflict_when_layout_root_is_lost() {
+        let team_state = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-root-lost",
+                    "team_generation": 1
+                }
+            }]
+        });
+        let reserved_state = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-root-lost",
+                    "team_generation": 2,
+                    "team_status": "provisioning"
+                }
+            }]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(team_state)),
+                ("agent.team.reserve", Ok(json!({"generation": 2}))),
+                ("agent.list", Ok(reserved_state.clone())),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [{"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}],
+                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}]
+                    })),
+                ),
+                ("agent.list", Ok(reserved_state)),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_reflow(Parameters(AgentTeamIdToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                dry_run: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("root conflict");
+        assert_eq!(value["status"], "layout_dirty");
+        assert_eq!(value["layout"]["status"], "layout_conflict");
+        assert!(value["layout"]["conflicts"][0]
+            .as_str()
+            .is_some_and(|message| message.contains("no longer exists")));
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls
+            .iter()
+            .all(|(method, _)| method != "pane.resize_layout"));
+    }
+
+    #[tokio::test]
+    async fn agent_team_reflow_rejects_a_collapsed_root_with_managed_workers() {
+        let state = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-main",
+                        "team_generation": 1
+                    }
+                },
+                {
+                    "session_id": "session-worker",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "worker-1"
+                    }
+                }
+            ]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(state.clone())),
+                ("agent.list", Ok(state)),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-worker", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-worker", "session_id": "session-worker"}
+                        ]
+                    })),
+                ),
+            ],
+        );
+
+        let result = server
+            .agent_team_reflow(Parameters(AgentTeamIdToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                dry_run: Some(true),
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("collapsed-root conflict");
+        assert_eq!(value["status"], "layout_conflict");
+        assert!(value["conflicts"][0]
+            .as_str()
+            .is_some_and(|message| message.contains("collapsed")));
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls
+            .iter()
+            .all(|(method, _)| method != "pane.resize_layout"));
+    }
+
+    #[tokio::test]
+    async fn agent_team_reflow_rejects_a_managed_member_without_a_session() {
+        let state = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-root",
+                        "team_generation": 1
+                    }
+                },
+                {
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "orphaned-worker"
+                    }
+                }
+            ]
+        });
+        let (server, _) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(state.clone())),
+                ("agent.list", Ok(state)),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                            {"pane_id": "pane-main", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-worker", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-worker", "session_id": "unmanaged-session"}
+                        ]
+                    })),
+                ),
+            ],
+        );
+
+        let result = server
+            .agent_team_reflow(Parameters(AgentTeamIdToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                dry_run: Some(true),
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("missing-session conflict");
+        assert_eq!(value["status"], "layout_conflict");
+        assert!(value["conflicts"][0]
+            .as_str()
+            .is_some_and(|message| message.contains("missing session_id")));
+    }
+
+    #[tokio::test]
+    async fn agent_team_release_retains_membership_when_termination_fails() {
+        let members = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-root",
+                        "team_generation": 1
+                    }
+                },
+                {
+                    "session_id": "session-worker",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "backend"
+                    }
+                }
+            ]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Full,
+            [
+                ("agent.list", Ok(members.clone())),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [{"pane_id": "pane-worker", "kind": "leaf", "mounted_surface_id": "surface-worker"}],
+                        "surfaces": [{"surface_id": "surface-worker", "session_id": "session-worker"}]
+                    })),
+                ),
+                ("agent.team.reserve", Ok(json!({"generation": 2}))),
+                (
+                    "session.terminate",
+                    Err("synthetic terminate failure".to_string()),
+                ),
+                ("agent.list", Ok(members)),
+                ("agent.list", Ok(json!({"sessions": []}))),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_release(Parameters(AgentTeamReleaseToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                session_id: Some("session-worker".to_string()),
+                name: None,
+                mode: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.expect("release error");
+        assert!(value["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("membership was retained")));
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls.iter().all(|(method, params)| {
+            method != "pane.close"
+                && !(method == "agent.set_state" && params["session_id"] == "session-worker")
+        }));
+    }
+
+    #[tokio::test]
+    async fn agent_team_release_terminates_then_clears_membership_and_reflows() {
+        let before = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-root",
+                        "team_generation": 1
+                    }
+                },
+                {
+                    "session_id": "session-worker",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "backend"
+                    }
+                }
+            ]
+        });
+        let after = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-root",
+                    "team_generation": 2
+                }
+            }]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Full,
+            [
+                ("agent.list", Ok(before)),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                            {"pane_id": "pane-main", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-worker", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-worker", "session_id": "session-worker"}
+                        ]
+                    })),
+                ),
+                ("agent.team.reserve", Ok(json!({"generation": 2}))),
+                ("session.terminate", Ok(json!({"terminated": true}))),
+                ("pane.close", Ok(json!({"closed": true}))),
+                (
+                    "agent.set_state",
+                    Ok(json!({"session_id": "session-worker"})),
+                ),
+                ("agent.list", Ok(after.clone())),
+                ("agent.list", Ok(after.clone())),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [{"pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"}],
+                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}]
+                    })),
+                ),
+                ("agent.list", Ok(after)),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_release(Parameters(AgentTeamReleaseToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                session_id: Some("session-worker".to_string()),
+                name: None,
+                mode: Some("soft".to_string()),
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("released worker");
+        assert_eq!(value["status"], "released");
+        assert_eq!(value["worker_count"], 0);
+        assert_eq!(value["layout"]["status"], "empty");
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls[3].0, "session.terminate");
+        assert_eq!(calls[4].0, "pane.close");
+        assert_eq!(calls[5].0, "agent.set_state");
+        assert_eq!(calls[5].1["session_id"], "session-worker");
+    }
+
+    #[tokio::test]
+    async fn agent_team_reflow_preserves_foreign_panes() {
+        let team_state = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-root",
+                    "team_generation": 1
+                }
+            }]
+        });
+        let reserved_state = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-root",
+                    "team_generation": 2,
+                    "team_status": "provisioning"
+                }
+            }]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(team_state)),
+                ("agent.team.reserve", Ok(json!({"generation": 2}))),
+                ("agent.list", Ok(reserved_state.clone())),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                            {"pane_id": "pane-main", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-foreign", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-foreign"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-foreign", "session_id": "session-foreign"}
+                        ]
+                    })),
+                ),
+                ("agent.list", Ok(reserved_state)),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_reflow(Parameters(AgentTeamIdToolParams {
+                team_id: "team-1".to_string(),
+                expected_generation: Some(1),
+                dry_run: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("layout conflict result");
+        assert_eq!(value["status"], "layout_dirty");
+        assert_eq!(value["generation"], 2);
+        assert_eq!(value["layout"]["status"], "layout_conflict");
+        assert!(value["layout"]["conflicts"][0]
+            .as_str()
+            .is_some_and(|message| message.contains("foreign panes")));
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls
+            .iter()
+            .all(|(method, _)| method != "pane.resize_layout"));
+    }
+
+    #[tokio::test]
+    async fn agent_team_start_builds_main_left_with_equal_worker_stack() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-other",
+                        "session_id": "session-other",
+                        "cwd": "/workspace/project"
+                    })),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"}
+                        ]
+                    })),
+                ),
+                ("agent.list", Ok(json!({"sessions": []}))),
+                ("agent.team.reserve", Ok(json!({"claimed": true}))),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker-1",
+                        "surface_id": "surface-worker-1",
+                        "session_id": "session-worker-1"
+                    })),
+                ),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker-2",
+                        "surface_id": "surface-worker-2",
+                        "session_id": "session-worker-2"
+                    })),
+                ),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker-3",
+                        "surface_id": "surface-worker-3",
+                        "session_id": "session-worker-3"
+                    })),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-main-leaf", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-worker-1-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker-1"},
+                            {"pane_id": "pane-worker-2-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker-2"},
+                            {"pane_id": "pane-worker-3", "kind": "leaf", "mounted_surface_id": "surface-worker-3"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-worker-1", "session_id": "session-worker-1"},
+                            {"surface_id": "surface-worker-2", "session_id": "session-worker-2"},
+                            {"surface_id": "surface-worker-3", "session_id": "session-worker-3"}
+                        ]
+                    })),
+                ),
+                (
+                    "agent.set_state",
+                    Ok(json!({"session_id": "session-worker-1"})),
+                ),
+                (
+                    "agent.set_state",
+                    Ok(json!({"session_id": "session-worker-2"})),
+                ),
+                (
+                    "agent.set_state",
+                    Ok(json!({"session_id": "session-worker-3"})),
+                ),
+                (
+                    "agent.list",
+                    Ok(json!({
+                        "sessions": [{
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {"activity": "agent", "session": "codex"}
+                        }]
+                    })),
+                ),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+        let result = server
+            .agent_team_start(Parameters(AgentTeamStartToolParams {
+                workspace_id: None,
+                pane_id: Some("pane-main".to_string()),
+                layout: None,
+                main_ratio: Some(0.55),
+                mode: None,
+                auto_adopt_tmux: None,
+                idempotency_key: None,
+                max_workers: None,
+                default_worker_kind: None,
+                distribution: Some("Ubuntu".to_string()),
+                cwd: None,
+                columns: None,
+                rows: None,
+                durability: None,
+                workers: vec![
+                    AgentTeamWorkerSpec {
+                        name: "backend".to_string(),
+                        kind: AgentWorkerKindParam::CodexPane,
+                        distribution: None,
+                        cwd: None,
+                        args: vec!["--model".to_string(), "gpt-5.6-sol".to_string()],
+                        durability: None,
+                    },
+                    AgentTeamWorkerSpec {
+                        name: "frontend".to_string(),
+                        kind: AgentWorkerKindParam::CodexPane,
+                        distribution: None,
+                        cwd: None,
+                        args: Vec::new(),
+                        durability: None,
+                    },
+                    AgentTeamWorkerSpec {
+                        name: "tests".to_string(),
+                        kind: AgentWorkerKindParam::CodexPane,
+                        distribution: None,
+                        cwd: None,
+                        args: Vec::new(),
+                        durability: None,
+                    },
+                ],
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("team result");
+        assert_eq!(value["layout"], "main-left-workers-right");
+        assert_eq!(value["main"]["session_id"], "session-main");
+        assert_eq!(value["main"]["pane_id"], "pane-main-leaf");
+        assert_eq!(value["main"]["layout_root_pane_id"], "pane-main");
+        assert_eq!(value["worker_count"], 3);
+        assert_eq!(value["workers"][0]["name"], "backend");
+        assert_eq!(value["workers"][0]["pane_id"], "pane-worker-1-leaf");
+        assert_eq!(value["workers"][1]["pane_id"], "pane-worker-2-leaf");
+        assert_eq!(value["workers"][2]["pane_id"], "pane-worker-3");
+
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        let split_calls = [&calls[4], &calls[5], &calls[6]];
+        assert_eq!(split_calls[0].1["pane_id"], "pane-main");
+        assert_eq!(split_calls[0].1["axis"], "vertical");
+        assert_eq!(split_calls[0].1["ratio"], 0.55);
+        assert_eq!(split_calls[1].1["pane_id"], "pane-worker-1");
+        assert_eq!(split_calls[1].1["axis"], "horizontal");
+        assert!((split_calls[1].1["ratio"].as_f64().unwrap() - (1.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(split_calls[2].1["pane_id"], "pane-worker-2");
+        assert_eq!(split_calls[2].1["axis"], "horizontal");
+        assert_eq!(split_calls[2].1["ratio"], 0.5);
+        assert_eq!(calls[7].0, "workspace.get");
+        assert_eq!(calls[8].1["telemetry"]["session"], "codex-pane:backend");
+        assert_eq!(calls[8].1["telemetry"]["ctx"], "pane-worker-1-leaf");
+        assert_eq!(calls[9].1["telemetry"]["session"], "codex-pane:frontend");
+        assert_eq!(calls[9].1["telemetry"]["ctx"], "pane-worker-2-leaf");
+        assert_eq!(calls[10].1["telemetry"]["session"], "codex-pane:tests");
+    }
+
+    #[tokio::test]
+    async fn agent_team_start_rolls_back_created_workers_in_reverse_order() {
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-main",
+                        "cwd": "/workspace/project"
+                    })),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"}
+                        ]
+                    })),
+                ),
+                ("agent.list", Ok(json!({"sessions": []}))),
+                ("agent.team.reserve", Ok(json!({"claimed": true}))),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "pane_id": "pane-worker-1",
+                        "session_id": "session-worker-1"
+                    })),
+                ),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "pane_id": "pane-worker-2",
+                        "session_id": "session-worker-2"
+                    })),
+                ),
+                (
+                    "terminal.split",
+                    Err("synthetic third worker failure".to_string()),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-worker-1-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker-1"},
+                            {"pane_id": "pane-worker-2-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker-2"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-worker-1", "session_id": "session-worker-1"},
+                            {"surface_id": "surface-worker-2", "session_id": "session-worker-2"}
+                        ]
+                    })),
+                ),
+                ("session.terminate", Ok(json!({"terminated": true}))),
+                (
+                    "pane.close",
+                    Err("synthetic pane close failure".to_string()),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-worker-1-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker-1"},
+                            {"pane_id": "pane-worker-2-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker-2"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-worker-1", "session_id": "session-worker-1"},
+                            {"surface_id": "surface-worker-2", "session_id": "session-worker-2"}
+                        ]
+                    })),
+                ),
+                ("session.terminate", Ok(json!({"terminated": true}))),
+                ("pane.close", Ok(json!({"closed": true}))),
+                (
+                    "agent.list",
+                    Ok(json!({
+                        "sessions": [{
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {"team_id": "team-rollback", "team_role": "main"}
+                        }]
+                    })),
+                ),
+                (
+                    "agent.list",
+                    Ok(json!({
+                        "sessions": [{
+                            "session_id": "session-main",
+                            "workspace_id": "workspace-1",
+                            "state": "running",
+                            "telemetry": {"team_id": "team-rollback", "team_role": "main"}
+                        }]
+                    })),
+                ),
+                ("agent.set_state", Ok(json!({"session_id": "session-main"}))),
+            ],
+        );
+        let workers = ["one", "two", "three"]
+            .into_iter()
+            .map(|name| AgentTeamWorkerSpec {
+                name: name.to_string(),
+                kind: AgentWorkerKindParam::CodexPane,
+                distribution: None,
+                cwd: None,
+                args: Vec::new(),
+                durability: None,
+            })
+            .collect();
+        let result = server
+            .agent_team_start(Parameters(AgentTeamStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                layout: Some(AgentTeamLayoutParam::MainLeftWorkersRight),
+                main_ratio: None,
+                mode: None,
+                auto_adopt_tmux: None,
+                idempotency_key: None,
+                max_workers: None,
+                default_worker_kind: None,
+                distribution: None,
+                cwd: None,
+                columns: None,
+                rows: None,
+                durability: None,
+                workers,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.expect("team error");
+        assert_eq!(value["error"]["failed_worker"]["name"], "three");
+        assert_eq!(value["error"]["rollback"][0]["name"], "two");
+        assert_eq!(value["error"]["rollback"][1]["name"], "one");
+        assert_eq!(value["error"]["rollback"][0]["pane_closed"], false);
+        assert_eq!(value["error"]["rollback"][1]["pane_closed"], true);
+
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls[7].0, "workspace.get");
+        assert_eq!(calls[8].0, "session.terminate");
+        assert_eq!(calls[8].1["session_id"], "session-worker-2");
+        assert_eq!(calls[9].0, "pane.close");
+        assert_eq!(calls[9].1["pane_id"], "pane-worker-2-leaf");
+        assert_eq!(calls[10].0, "workspace.get");
+        assert_eq!(calls[11].1["session_id"], "session-worker-1");
+        assert_eq!(calls[12].1["pane_id"], "pane-worker-1-leaf");
+    }
+
+    #[tokio::test]
+    async fn agent_team_start_rolls_back_the_worker_whose_registration_fails() {
+        let topology = json!({
+            "panes": [
+                {"pane_id": "pane-main-leaf", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                {"pane_id": "pane-worker-leaf", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+            ],
+            "surfaces": [
+                {"surface_id": "surface-main", "session_id": "session-main"},
+                {"surface_id": "surface-worker", "session_id": "session-worker"}
+            ]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    Ok(json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-main",
+                        "cwd": "/workspace/project"
+                    })),
+                ),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-main", "kind": "leaf", "mounted_surface_id": "surface-main"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"}
+                        ]
+                    })),
+                ),
+                ("agent.list", Ok(json!({"sessions": []}))),
+                ("agent.team.reserve", Ok(json!({"claimed": true}))),
+                (
+                    "terminal.split",
+                    Ok(json!({
+                        "pane_id": "pane-worker-anchor",
+                        "surface_id": "surface-worker",
+                        "session_id": "session-worker"
+                    })),
+                ),
+                ("workspace.get", Ok(topology.clone())),
+                (
+                    "agent.set_state",
+                    Err("synthetic metadata failure".to_string()),
+                ),
+                ("workspace.get", Ok(topology)),
+                ("session.terminate", Ok(json!({"terminated": true}))),
+                ("pane.close", Ok(json!({"closed": true}))),
+            ],
+        );
+        let result = server
+            .agent_team_start(Parameters(AgentTeamStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                layout: None,
+                main_ratio: None,
+                mode: None,
+                auto_adopt_tmux: None,
+                idempotency_key: None,
+                max_workers: None,
+                default_worker_kind: None,
+                distribution: None,
+                cwd: None,
+                columns: None,
+                rows: None,
+                durability: None,
+                workers: vec![AgentTeamWorkerSpec {
+                    name: "backend".to_string(),
+                    kind: AgentWorkerKindParam::CodexPane,
+                    distribution: None,
+                    cwd: None,
+                    args: Vec::new(),
+                    durability: None,
+                }],
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.expect("team error");
+        assert_eq!(value["error"]["failed_worker"]["name"], "backend");
+        assert_eq!(value["error"]["rollback"][0]["name"], "backend");
+        assert_eq!(
+            value["error"]["rollback"][0]["session_id"],
+            "session-worker"
+        );
+        assert_eq!(value["error"]["rollback"][0]["pane_id"], "pane-worker-leaf");
+        assert_eq!(value["error"]["rollback"][0]["pane_closed"], true);
+
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert_eq!(calls[6].0, "agent.set_state");
+        assert_eq!(calls[7].0, "workspace.get");
+        assert_eq!(calls[8].1["session_id"], "session-worker");
+        assert_eq!(calls[9].1["pane_id"], "pane-worker-leaf");
     }
 
     #[tokio::test]
@@ -3329,6 +7512,7 @@ mod tests {
             .agent_worker_start(Parameters(AgentWorkerStartToolParams {
                 workspace_id: None,
                 pane_id: None,
+                name: None,
                 kind: AgentWorkerKindParam::CodexPane,
                 distribution: Some("Ubuntu".to_string()),
                 placement: None,
@@ -3346,6 +7530,54 @@ mod tests {
         assert_eq!(calls[2].0, "agent.set_state");
         assert_eq!(calls[3].0, "session.terminate");
         assert_eq!(calls[4].0, "pane.close");
+    }
+
+    #[tokio::test]
+    async fn agent_worker_start_closes_a_pane_when_launch_omits_session_id() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-source",
+                        "cwd": "/workspace/project"
+                    }),
+                ),
+                (
+                    "terminal.split",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker",
+                        "surface_id": "surface-worker"
+                    }),
+                ),
+                ("pane.close", json!({"closed": true})),
+            ],
+        );
+        let result = server
+            .agent_worker_start(Parameters(AgentWorkerStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                name: Some("worker".to_string()),
+                kind: AgentWorkerKindParam::CodexPane,
+                distribution: Some("Ubuntu".to_string()),
+                placement: None,
+                axis: None,
+                ratio: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, "pane.close");
+        assert_eq!(calls[2].1["pane_id"], "pane-worker");
     }
 
     #[tokio::test]
@@ -3420,7 +7652,7 @@ mod tests {
         let listed: Value =
             serde_json::from_str(&read_protocol_message(&mut lines, "tools/list response").await)
                 .expect("parse tools");
-        assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(14));
+        assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(15));
 
         write_protocol_message(
             &mut client_write,
