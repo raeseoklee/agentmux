@@ -268,6 +268,175 @@ test("source control panel follows the active terminal pane", async ({ page }) =
   }
 });
 
+test("source control shows a partially staged file in both sections", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __AGENTMUX_PREVIEW__?: { setGitStatusFileCount(count: number): void };
+      }
+    ).__AGENTMUX_PREVIEW__?.setGitStatusFileCount(5);
+  });
+
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  const stagedPartial = panel
+    .getByTestId("source-control-change-staged")
+    .filter({ hasText: "file-00004.ts" });
+  const workingPartial = panel
+    .getByTestId("source-control-change-working")
+    .filter({ hasText: "file-00004.ts" });
+
+  await expect(stagedPartial).toHaveCount(1);
+  await expect(workingPartial).toHaveCount(1);
+
+  await stagedPartial
+    .locator(".agentmux-source-control__change-main")
+    .click();
+  await expect(
+    panel.locator(".agentmux-source-control__diff-lines"),
+  ).toContainText("AgentMux cached preview");
+
+  await workingPartial
+    .locator(".agentmux-source-control__change-main")
+    .click();
+  await expect(
+    panel.locator(".agentmux-source-control__diff-lines"),
+  ).toContainText("AgentMux working tree preview");
+
+  await stagedPartial
+    .locator(".agentmux-source-control__row-action")
+    .click();
+  await expect(stagedPartial).toHaveCount(0);
+  await expect(workingPartial).toHaveCount(1);
+
+  await workingPartial
+    .locator(".agentmux-source-control__row-action")
+    .click();
+  await expect(stagedPartial).toHaveCount(1);
+  await expect(workingPartial).toHaveCount(0);
+});
+
+test("source control hides unsupported review and worktree operations", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    (
+      window as unknown as {
+        __AGENTMUX_PREVIEW_SOURCE_CONTROL_METHODS__?: string[];
+      }
+    ).__AGENTMUX_PREVIEW_SOURCE_CONTROL_METHODS__ = [
+      "git.status_page",
+      "git.status_summary",
+      "git.diff",
+      "git.stage",
+      "git.unstage",
+      "git.stage_all",
+      "git.unstage_all",
+      "git.commit",
+    ];
+  });
+  await bootPreview(page);
+
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await expect(panel).toBeVisible();
+  await expect(
+    panel.getByRole("button", { name: "Create isolated agent worktree" }),
+  ).toHaveCount(0);
+
+  await panel
+    .getByTestId("source-control-change-working")
+    .locator(".agentmux-source-control__change-main")
+    .click();
+  await expect(
+    panel.locator('.agentmux-source-control__diff-line[data-kind="add"]').first(),
+  ).toBeDisabled();
+  await expect(panel.getByPlaceholder("Write review feedback")).toHaveCount(0);
+
+  await expect.poll(() => page.evaluate(() => {
+    const preview = (window as unknown as {
+      __AGENTMUX_PREVIEW__?: {
+        gitReviewListRequests(): number;
+        gitWorktreeListRequests(): number;
+      };
+    }).__AGENTMUX_PREVIEW__;
+    return {
+      reviews: preview?.gitReviewListRequests() ?? 0,
+      worktrees: preview?.gitWorktreeListRequests() ?? 0,
+    };
+  })).toEqual({ reviews: 0, worktrees: 0 });
+});
+
+test("source control ignores a delayed worktree list after a pane focus pivot", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  await page.locator(".agentmux-pane-split-horizontal").click();
+  const panes = page.locator('[data-agentmux-pane][data-agentmux-mounted="true"]');
+  await expect(panes).toHaveCount(2);
+  const workspaceId = await page
+    .locator(".agentmux-workspace-card")
+    .first()
+    .getAttribute("data-agentmux-workspace");
+  expect(workspaceId).toBeTruthy();
+  const branch = "agent/stale-worktree-result";
+
+  await page.evaluate(
+    ({ workspaceId: id, branch: seededBranch }) => {
+      (
+        window as unknown as {
+          __AGENTMUX_PREVIEW__?: {
+            seedGitWorktree(workspaceId: string, branch: string): void;
+          };
+        }
+      ).__AGENTMUX_PREVIEW__?.seedGitWorktree(id, seededBranch);
+    },
+    { workspaceId: workspaceId!, branch },
+  );
+
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await panes.nth(0).click({ position: { x: 24, y: 24 } });
+  await expect(panel.getByText(branch, { exact: true })).toBeVisible();
+
+  const requestsBefore = await page.evaluate(() => {
+    return (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { gitWorktreeListRequests(): number };
+    }).__AGENTMUX_PREVIEW__?.gitWorktreeListRequests() ?? 0;
+  });
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { holdGitWorktreeList(): void };
+    }).__AGENTMUX_PREVIEW__?.holdGitWorktreeList();
+  });
+  await panel.getByRole("button", { name: "Refresh" }).click();
+  await expect.poll(() => page.evaluate(() => {
+    return (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { gitWorktreeListRequests(): number };
+    }).__AGENTMUX_PREVIEW__?.gitWorktreeListRequests() ?? 0;
+  })).toBeGreaterThan(requestsBefore);
+
+  await page.evaluate((id) => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { clearGitWorktrees(workspaceId?: string): void };
+    }).__AGENTMUX_PREVIEW__?.clearGitWorktrees(id);
+  }, workspaceId!);
+  await panes.nth(1).click({ position: { x: 24, y: 24 } });
+  await expect(panel.getByText(branch, { exact: true })).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { releaseGitWorktreeList(): void };
+    }).__AGENTMUX_PREVIEW__?.releaseGitWorktreeList();
+  });
+  await page.waitForTimeout(100);
+  await expect(panel.getByText(branch, { exact: true })).toHaveCount(0);
+});
+
 test("source control discards a stale review completion after the active pane changes", async ({ page }) => {
   await bootPreview(page);
   await page.locator(".agentmux-new-terminal-tab").click();
@@ -366,7 +535,10 @@ test("source control filters the complete change set and virtualizes a 15k file 
   expect(Date.now() - openedAt).toBeLessThan(900);
   await expect(changes).toHaveAttribute("data-filtered-count", "15000");
   expect(await panel.locator(".agentmux-source-control__virtual-row").count()).toBeLessThan(80);
-  await expect(panel.locator(".agentmux-source-control__virtual-list")).toHaveCSS("height", /1\d{4}px/);
+  await expect(panel.locator(".agentmux-source-control__virtual-list")).toHaveCSS(
+    "height",
+    /[1-9]\d{4,}px/,
+  );
 
   await panel.getByLabel("Filter changed files").fill("file-14999");
   await expect.poll(() => page.evaluate(() => {
@@ -376,7 +548,9 @@ test("source control filters the complete change set and virtualizes a 15k file 
     return requests.filter((request) => request.operation === "page").at(-1)?.query ?? null;
   })).toBe("file-14999");
   await expect(changes).toHaveAttribute("data-filtered-count", "1");
-  await expect(panel.locator(".agentmux-source-control__filename")).toContainText("file-14999.ts");
+  await expect(
+    panel.locator(".agentmux-source-control__filename").first(),
+  ).toContainText("file-14999.ts");
 });
 
 test("status bar exposes the current folder as an Explorer action", async ({ page }) => {

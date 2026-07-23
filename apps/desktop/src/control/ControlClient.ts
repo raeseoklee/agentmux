@@ -300,6 +300,77 @@ export interface GitCommitResult {
   summary: string;
 }
 
+export const SOURCE_CONTROL_METHODS = [
+  "git.status",
+  "git.status_summary",
+  "git.status_page",
+  "git.diff",
+  "git.stage",
+  "git.unstage",
+  "git.stage_all",
+  "git.unstage_all",
+  "git.discard",
+  "git.commit",
+  "agent.worktree.create",
+  "agent.worktree.list",
+  "agent.worktree.recover",
+  "agent.worktree.remove",
+  "git.review_thread.create",
+  "git.review_thread.list",
+  "git.review_thread.update",
+  "git.review_thread.delete",
+  "git.review_thread.mark_stale",
+  "git.review_thread.deliver",
+  "git.review_comment.list",
+  "git.review_comment.create",
+  "git.review_comment.update",
+  "git.review_comment.delete",
+] as const;
+
+export type SourceControlMethod = (typeof SOURCE_CONTROL_METHODS)[number];
+
+export interface GitMutationOptions {
+  repositoryId: string;
+  paneId?: string | null;
+  idempotencyKey: string;
+}
+
+export function createGitMutationParams(
+  workspaceId: string,
+  options: GitMutationOptions,
+  params: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    ...params,
+    workspace_id: workspaceId,
+    repository_id: options.repositoryId,
+    pane_id: options.paneId ?? null,
+    idempotency_key: options.idempotencyKey,
+  };
+}
+
+export function createSourceControlActionIdempotencyKey(input: {
+  method: SourceControlMethod;
+  workspaceId: string;
+  repositoryId?: string | null;
+  paneId?: string | null;
+  actionId: string;
+}): string {
+  const segment = (value?: string | null) =>
+    (value ?? "none")
+      .trim()
+      .replace(/[^A-Za-z0-9._-]+/g, "_")
+      .slice(0, 160) || "none";
+  return [
+    "ui-source-control",
+    segment(input.method),
+    segment(input.workspaceId),
+    segment(input.repositoryId),
+    segment(input.paneId),
+    segment(input.actionId),
+  ].join(":");
+}
+
 export interface GitChangeSummary {
   path: string;
   originalPath?: string | null;
@@ -776,6 +847,7 @@ export interface BrowserClickTarget {
 
 export interface ControlClient {
   readonly supportsSourceControl: boolean;
+  supportsSourceControlMethod(method: SourceControlMethod): boolean;
   listWorkspaces(): Promise<WorkspaceSummary[]>;
   createWorkspace(
     name: string,
@@ -1129,31 +1201,31 @@ export interface ControlClient {
   ): Promise<GitPagedDiff>;
   stageGitFiles(
     workspaceId: string,
-    paths?: string[],
-    options?: { repositoryId?: string | null; paneId?: string | null },
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void>;
   unstageGitFiles(
     workspaceId: string,
-    paths?: string[],
-    options?: { repositoryId?: string | null; paneId?: string | null },
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void>;
   discardGitFiles(
     workspaceId: string,
     paths: string[],
-    options?: { repositoryId?: string | null; paneId?: string | null },
+    options: GitMutationOptions,
   ): Promise<void>;
   stageAllGitFiles(
     workspaceId: string,
-    options?: { repositoryId?: string | null; paneId?: string | null },
+    options: GitMutationOptions,
   ): Promise<void>;
   unstageAllGitFiles(
     workspaceId: string,
-    options?: { repositoryId?: string | null; paneId?: string | null },
+    options: GitMutationOptions,
   ): Promise<void>;
   commitGitChanges(
     workspaceId: string,
     message: string,
-    options?: { repositoryId?: string | null; paneId?: string | null },
+    options: GitMutationOptions,
   ): Promise<GitCommitResult>;
   listGitReviewThreads(
     workspaceId: string,
@@ -1219,12 +1291,12 @@ export interface ControlClient {
   ): Promise<AgentWorktreeOperation[]>;
   recoverAgentWorktree(input: {
     operationId?: string | null;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation>;
   removeAgentWorktree(input: {
     worktreeId: string;
     force?: boolean;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation>;
   listDevelopmentServerCandidates(
     workspaceId?: string | null,
@@ -1320,6 +1392,7 @@ declare global {
     __AGENTMUX_PREVIEW__?: BrowserPreviewApi;
     __AGENTMUX_PREVIEW_READY__?: boolean;
     __AGENTMUX_PREVIEW_SEED_WORKSPACE__?: boolean;
+    __AGENTMUX_PREVIEW_SOURCE_CONTROL_METHODS__?: string[];
     __AGENTMUX_PREVIEW_WSL_DISTRIBUTIONS__?: WslDistribution[];
     __AGENTMUX_PREVIEW_TMUX_AVAILABLE__?: boolean;
   }
@@ -1343,6 +1416,10 @@ class TauriControlClient implements ControlClient {
   private controlToken?: Promise<string>;
 
   constructor(private readonly invoke: TauriCore["invoke"]) {}
+
+  supportsSourceControlMethod(_method: SourceControlMethod): boolean {
+    return true;
+  }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
     const result = await this.call<{ workspaces: WorkspaceSummaryWire[] }>(
@@ -2825,75 +2902,51 @@ class TauriControlClient implements ControlClient {
 
   async stageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.call("git.stage", {
-      workspace_id: workspaceId,
-      paths,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.call("git.stage", createGitMutationParams(workspaceId, options, { paths }));
   }
 
   async unstageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.call("git.unstage", {
-      workspace_id: workspaceId,
-      paths,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.call("git.unstage", createGitMutationParams(workspaceId, options, { paths }));
   }
 
   async discardGitFiles(
     workspaceId: string,
     paths: string[],
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.call("git.discard", {
-      workspace_id: workspaceId,
-      paths,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.call("git.discard", createGitMutationParams(workspaceId, options, { paths }));
   }
 
   async stageAllGitFiles(
     workspaceId: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.call("git.stage_all", {
-      workspace_id: workspaceId,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.call("git.stage_all", createGitMutationParams(workspaceId, options));
   }
 
   async unstageAllGitFiles(
     workspaceId: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.call("git.unstage_all", {
-      workspace_id: workspaceId,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.call("git.unstage_all", createGitMutationParams(workspaceId, options));
   }
 
   async commitGitChanges(
     workspaceId: string,
     message: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<GitCommitResult> {
-    const result = await this.call<GitCommitResultWire>("git.commit", {
-      workspace_id: workspaceId,
-      message,
-      pane_id: options.paneId ?? null,
-    });
+    const result = await this.call<GitCommitResultWire>(
+      "git.commit",
+      createGitMutationParams(workspaceId, options, { message, amend: false }),
+    );
     return {
       commit: result.commit,
       summary: result.summary,
@@ -3062,25 +3115,25 @@ class TauriControlClient implements ControlClient {
   }
   async recoverAgentWorktree(input: {
     operationId?: string | null;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation> {
     return mapAgentWorktreeOperation(
       await this.call<AgentWorktreeOperationWire>("agent.worktree.recover", {
         operation_id: input.operationId ?? null,
-        idempotency_key: input.idempotencyKey ?? null,
+        idempotency_key: input.idempotencyKey,
       }),
     );
   }
   async removeAgentWorktree(input: {
     worktreeId: string;
     force?: boolean;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation> {
     return mapAgentWorktreeOperation(
       await this.call<AgentWorktreeOperationWire>("agent.worktree.remove", {
         worktree_id: input.worktreeId,
         force: input.force ?? false,
-        idempotency_key: input.idempotencyKey ?? null,
+        idempotency_key: input.idempotencyKey,
       }),
     );
   }
@@ -3164,7 +3217,10 @@ interface ControlResponse {
 }
 
 class BrowserPreviewControlClient implements ControlClient {
-  readonly supportsSourceControl: boolean = true;
+  private readonly sourceControlMethods = new Set<string>(
+    window.__AGENTMUX_PREVIEW_SOURCE_CONTROL_METHODS__ ??
+      SOURCE_CONTROL_METHODS,
+  );
   private readonly configStorageKey = "agentmux.preview.config.v1";
   private readonly projectConfigStoragePrefix =
     "agentmux.preview.project.config.v1.";
@@ -3196,6 +3252,15 @@ class BrowserPreviewControlClient implements ControlClient {
     reject: (reason: Error) => void;
   } | null = null;
   private gitReviewListRequestCount = 0;
+  private heldGitWorktreeList: {
+    wait: Promise<void>;
+    release: () => void;
+  } | null = null;
+  private activeGitWorktreeList: {
+    wait: Promise<void>;
+    release: () => void;
+  } | null = null;
+  private gitWorktreeListRequestCount = 0;
   private readonly agentWorktrees = new Map<string, AgentWorktreeOperation>();
   private gitReviewCounter = 0;
   private gitReviewCommentCounter = 0;
@@ -3295,6 +3360,12 @@ class BrowserPreviewControlClient implements ControlClient {
       releaseGitReviewList: () => this.releaseGitReviewList(),
       failGitReviewList: () => this.failGitReviewList(),
       gitReviewListRequests: () => this.gitReviewListRequestCount,
+      holdGitWorktreeList: () => this.holdGitWorktreeList(),
+      releaseGitWorktreeList: () => this.releaseGitWorktreeList(),
+      gitWorktreeListRequests: () => this.gitWorktreeListRequestCount,
+      seedGitWorktree: (workspaceId, branch) =>
+        this.seedGitWorktree(workspaceId, branch),
+      clearGitWorktrees: (workspaceId) => this.clearGitWorktrees(workspaceId),
     };
     window.__AGENTMUX_PREVIEW__ = previewApi;
     if (window.__AGENTMUX_PREVIEW_SEED_WORKSPACE__ === true) {
@@ -3312,6 +3383,14 @@ class BrowserPreviewControlClient implements ControlClient {
         (event as CustomEvent<SyntheticAgentStateDetail>).detail,
       );
     });
+  }
+
+  get supportsSourceControl(): boolean {
+    return this.supportsSourceControlMethod("git.status_page");
+  }
+
+  supportsSourceControlMethod(method: SourceControlMethod): boolean {
+    return this.sourceControlMethods.has(method);
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -5170,13 +5249,17 @@ class BrowserPreviewControlClient implements ControlClient {
               ? "?"
               : ".",
         worktreeStatus:
-          remainder === 0 || remainder === 3
+          remainder === 0 || remainder === 3 || remainder === 4
             ? "M"
             : remainder === 2
               ? "?"
               : ".",
         staged: remainder === 1 || remainder === 4,
-        unstaged: remainder === 0 || remainder === 2 || remainder === 3,
+        unstaged:
+          remainder === 0 ||
+          remainder === 2 ||
+          remainder === 3 ||
+          remainder === 4,
         untracked: remainder === 2,
         conflict: false,
       };
@@ -5226,6 +5309,47 @@ class BrowserPreviewControlClient implements ControlClient {
     );
   }
 
+  private holdGitWorktreeList(): void {
+    if (this.heldGitWorktreeList) return;
+    let release: () => void = () => {};
+    const wait = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    this.heldGitWorktreeList = { wait, release };
+  }
+
+  private releaseGitWorktreeList(): void {
+    const held = this.heldGitWorktreeList ?? this.activeGitWorktreeList;
+    this.heldGitWorktreeList = null;
+    this.activeGitWorktreeList = null;
+    held?.release();
+  }
+
+  private seedGitWorktree(workspaceId: string, branch: string): void {
+    const worktreeId = `worktree_preview_${++this.agentWorktreeCounter}`;
+    this.agentWorktrees.set(worktreeId, {
+      operationId: `worktree_seed_${this.agentWorktreeCounter}`,
+      worktreeId,
+      workspaceId,
+      branch,
+      path: `D:\\Workspace\\${branch.replace(/[^A-Za-z0-9_-]+/g, "-")}`,
+      state: "completed",
+      surfaceId: null,
+      paneId: null,
+      sessionId: null,
+      reused: false,
+      recovered: false,
+    });
+  }
+
+  private clearGitWorktrees(workspaceId?: string): void {
+    for (const [worktreeId, operation] of this.agentWorktrees) {
+      if (!workspaceId || operation.workspaceId === workspaceId) {
+        this.agentWorktrees.delete(worktreeId);
+      }
+    }
+  }
+
   async getGitStatus(workspaceId: string): Promise<GitStatus> {
     const workspace = this.findWorkspace(workspaceId);
     return cloneGitStatus(
@@ -5271,8 +5395,8 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async stageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
-    _options: { repositoryId?: string | null; paneId?: string | null } = {},
+    paths: string[],
+    _options: GitMutationOptions,
   ): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status) return;
@@ -5300,8 +5424,8 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async unstageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
-    _options: { repositoryId?: string | null; paneId?: string | null } = {},
+    paths: string[],
+    _options: GitMutationOptions,
   ): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status) return;
@@ -5327,7 +5451,7 @@ class BrowserPreviewControlClient implements ControlClient {
   async commitGitChanges(
     workspaceId: string,
     message: string,
-    _options: { repositoryId?: string | null; paneId?: string | null } = {},
+    _options: GitMutationOptions,
   ): Promise<GitCommitResult> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status || !status.files.some((change) => change.staged)) {
@@ -5395,7 +5519,7 @@ class BrowserPreviewControlClient implements ControlClient {
   async discardGitFiles(
     workspaceId: string,
     paths: string[],
-    _options: { repositoryId?: string | null; paneId?: string | null } = {},
+    _options: GitMutationOptions,
   ): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (status)
@@ -5407,13 +5531,13 @@ class BrowserPreviewControlClient implements ControlClient {
   }
   async stageAllGitFiles(
     workspaceId: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
     await this.stageGitFiles(workspaceId, [], options);
   }
   async unstageAllGitFiles(
     workspaceId: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
     await this.unstageGitFiles(workspaceId, [], options);
   }
@@ -5616,15 +5740,29 @@ class BrowserPreviewControlClient implements ControlClient {
     workspaceId?: string | null,
     _includeCompleted = true,
   ): Promise<AgentWorktreeOperation[]> {
-    return [...this.agentWorktrees.values()]
+    this.gitWorktreeListRequestCount += 1;
+    const worktrees = [...this.agentWorktrees.values()]
       .filter(
         (operation) => !workspaceId || operation.workspaceId === workspaceId,
       )
       .map((operation) => ({ ...operation }));
+    const held = this.heldGitWorktreeList;
+    if (held) {
+      this.heldGitWorktreeList = null;
+      this.activeGitWorktreeList = held;
+      try {
+        await held.wait;
+      } finally {
+        if (this.activeGitWorktreeList === held) {
+          this.activeGitWorktreeList = null;
+        }
+      }
+    }
+    return worktrees;
   }
   async recoverAgentWorktree(input: {
     operationId?: string | null;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation> {
     const operation = [...this.agentWorktrees.values()].find(
       (candidate) =>
@@ -5641,7 +5779,7 @@ class BrowserPreviewControlClient implements ControlClient {
   async removeAgentWorktree(input: {
     worktreeId: string;
     force?: boolean;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation> {
     const operation = this.agentWorktrees.get(input.worktreeId);
     if (!operation)
@@ -6494,7 +6632,7 @@ interface ServerWebSocketTicketResult {
 }
 
 class ServerControlClient extends BrowserPreviewControlClient {
-  override supportsSourceControl: boolean;
+  private serverControlMethods = new Set<string>();
   private readonly serverBaseUrl: string;
   private readonly serverToken: string | null;
   private readonly serverDefaults: NonNullable<
@@ -6513,10 +6651,18 @@ class ServerControlClient extends BrowserPreviewControlClient {
     this.serverBaseUrl = (bootstrap.baseUrl ?? "").replace(/\/+$/, "");
     this.serverToken = bootstrap.token?.trim() || null;
     this.serverDefaults = bootstrap.defaults ?? {};
-    this.supportsSourceControl = serverSupportsSourceControl(
+    this.setServerCapabilities(
       bootstrap.capabilities,
       bootstrap.mode,
     );
+  }
+
+  override get supportsSourceControl(): boolean {
+    return this.supportsSourceControlMethod("git.status_page");
+  }
+
+  override supportsSourceControlMethod(method: SourceControlMethod): boolean {
+    return this.serverControlMethods.has(method);
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -7222,74 +7368,64 @@ class ServerControlClient extends BrowserPreviewControlClient {
 
   async stageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.serverControl("git.stage", {
-      workspace_id: workspaceId,
-      paths,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.serverControl(
+      "git.stage",
+      createGitMutationParams(workspaceId, options, { paths }),
+    );
   }
   async unstageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.serverControl("git.unstage", {
-      workspace_id: workspaceId,
-      paths,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.serverControl(
+      "git.unstage",
+      createGitMutationParams(workspaceId, options, { paths }),
+    );
   }
   async discardGitFiles(
     workspaceId: string,
     paths: string[],
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.serverControl("git.discard", {
-      workspace_id: workspaceId,
-      paths,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.serverControl(
+      "git.discard",
+      createGitMutationParams(workspaceId, options, { paths }),
+    );
   }
   async stageAllGitFiles(
     workspaceId: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.serverControl("git.stage_all", {
-      workspace_id: workspaceId,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.serverControl(
+      "git.stage_all",
+      createGitMutationParams(workspaceId, options),
+    );
   }
   async unstageAllGitFiles(
     workspaceId: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.serverControl("git.unstage_all", {
-      workspace_id: workspaceId,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-    });
+    await this.serverControl(
+      "git.unstage_all",
+      createGitMutationParams(workspaceId, options),
+    );
   }
 
   async commitGitChanges(
     workspaceId: string,
     message: string,
-    options: { repositoryId?: string | null; paneId?: string | null } = {},
+    options: GitMutationOptions,
   ): Promise<GitCommitResult> {
     const result = await this.serverControl<
       GitCommitResultWire | GitMutationResultWire
-    >("git.commit", {
-      workspace_id: workspaceId,
-      repository_id: options.repositoryId ?? null,
-      pane_id: options.paneId ?? null,
-      message,
-    });
+    >(
+      "git.commit",
+      createGitMutationParams(workspaceId, options, { message, amend: false }),
+    );
     return mapServerGitCommitResult(result, message);
   }
 
@@ -7467,14 +7603,14 @@ class ServerControlClient extends BrowserPreviewControlClient {
   }
   async recoverAgentWorktree(input: {
     operationId?: string | null;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation> {
     return mapAgentWorktreeOperation(
       await this.serverControl<AgentWorktreeOperationWire>(
         "agent.worktree.recover",
         {
           operation_id: input.operationId ?? null,
-          idempotency_key: input.idempotencyKey ?? null,
+          idempotency_key: input.idempotencyKey,
         },
       ),
     );
@@ -7482,7 +7618,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
   async removeAgentWorktree(input: {
     worktreeId: string;
     force?: boolean;
-    idempotencyKey?: string | null;
+    idempotencyKey: string;
   }): Promise<AgentWorktreeOperation> {
     return mapAgentWorktreeOperation(
       await this.serverControl<AgentWorktreeOperationWire>(
@@ -7490,7 +7626,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
         {
           worktree_id: input.worktreeId,
           force: input.force ?? false,
-          idempotency_key: input.idempotencyKey ?? null,
+          idempotency_key: input.idempotencyKey,
         },
       ),
     );
@@ -7544,7 +7680,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
 
   private async hydrateServerState(): Promise<ServerStateResult> {
     const state = await this.serverApi<ServerStateResult>("/api/state");
-    this.supportsSourceControl = serverSupportsSourceControl(
+    this.setServerCapabilities(
       state.capabilities,
       state.mode,
     );
@@ -7552,6 +7688,13 @@ class ServerControlClient extends BrowserPreviewControlClient {
       this.ensureServerWorkspace(mapWorkspace(wire));
     }
     return state;
+  }
+
+  private setServerCapabilities(
+    capabilities: ServerCapabilitiesWire | undefined,
+    mode?: string,
+  ): void {
+    this.serverControlMethods = serverSourceControlMethods(capabilities, mode);
   }
 
   private ensureServerWorkspace(workspace: WorkspaceSummary): WorkspaceSummary {
@@ -7846,10 +7989,19 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return data.result as T;
   }
 
-  private serverControl<T = unknown>(
+  private async serverControl<T = unknown>(
     method: string,
     params: unknown,
   ): Promise<T> {
+    if (
+      SOURCE_CONTROL_METHODS.includes(method as SourceControlMethod) &&
+      !this.supportsSourceControlMethod(method as SourceControlMethod)
+    ) {
+      throw new ControlClientError(
+        `Server does not advertise '${method}'.`,
+        "unsupported_method",
+      );
+    }
     return this.serverApi<T>("/api/control", {
       method: "POST",
       body: JSON.stringify({ method, params }),
@@ -8007,16 +8159,67 @@ interface BrowserPreviewApi {
   releaseGitReviewList(): void;
   failGitReviewList(): void;
   gitReviewListRequests(): number;
+  holdGitWorktreeList(): void;
+  releaseGitWorktreeList(): void;
+  gitWorktreeListRequests(): number;
+  seedGitWorktree(workspaceId: string, branch: string): void;
+  clearGitWorktrees(workspaceId?: string): void;
+}
+
+const LEGACY_DESKTOP_SOURCE_CONTROL_METHODS: readonly SourceControlMethod[] =
+  SOURCE_CONTROL_METHODS;
+const LEGACY_LOCAL_SOURCE_CONTROL_METHODS: readonly SourceControlMethod[] = [
+  "git.status",
+  "git.status_summary",
+  "git.status_page",
+  "git.diff",
+  "git.stage",
+  "git.unstage",
+  "git.stage_all",
+  "git.unstage_all",
+  "git.commit",
+];
+
+export function serverSourceControlMethods(
+  capabilities: ServerCapabilitiesWire | undefined,
+  mode?: string,
+): Set<string> {
+  if (Array.isArray(capabilities?.control_methods)) {
+    return new Set(
+      capabilities.control_methods.filter(
+        (method): method is string => typeof method === "string" && method.length > 0,
+      ),
+    );
+  }
+  if (capabilities?.source_control === false) {
+    return new Set();
+  }
+  if (mode === "desktop-bridge") {
+    return new Set(LEGACY_DESKTOP_SOURCE_CONTROL_METHODS);
+  }
+  if (capabilities?.source_control) {
+    return new Set(LEGACY_LOCAL_SOURCE_CONTROL_METHODS);
+  }
+  return new Set();
+}
+
+export function serverSupportsSourceControlMethod(
+  capabilities: ServerCapabilitiesWire | undefined,
+  method: SourceControlMethod,
+  mode?: string,
+): boolean {
+  return serverSourceControlMethods(capabilities, mode).has(method);
 }
 
 export function serverSupportsSourceControl(
   capabilities: ServerCapabilitiesWire | undefined,
   mode?: string,
 ): boolean {
-  if (typeof capabilities?.source_control === "boolean") {
-    return capabilities.source_control;
-  }
-  return mode === "desktop-bridge";
+  return serverSupportsSourceControlMethod(
+    capabilities,
+    "git.status_page",
+    mode,
+  );
 }
 
 export function mapServerGitCommitResult(
