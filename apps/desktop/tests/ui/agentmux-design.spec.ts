@@ -129,6 +129,146 @@ test("status bar shows git branch and short hash", async ({ page }) => {
   );
 });
 
+test("source control panel stages, previews, and commits workspace changes", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText("Source Control")).toBeVisible();
+
+  const [bodyBox, workbenchBox, panelBox] = await Promise.all([
+    page.locator(".agentmux-shell-body").boundingBox(),
+    page.locator(".agentmux-workbench").boundingBox(),
+    panel.boundingBox(),
+  ]);
+  expect(bodyBox).not.toBeNull();
+  expect(workbenchBox).not.toBeNull();
+  expect(panelBox).not.toBeNull();
+  expect(panelBox!.x).toBeGreaterThanOrEqual(
+    workbenchBox!.x + workbenchBox!.width - 1,
+  );
+  expect(panelBox!.y).toBeGreaterThanOrEqual(bodyBox!.y);
+  expect(panelBox!.y + panelBox!.height).toBeLessThanOrEqual(
+    bodyBox!.y + bodyBox!.height + 1,
+  );
+
+  await expect(
+    panel.getByTestId("source-control-change-working"),
+  ).toHaveCount(1);
+  await expect(
+    panel.getByTestId("source-control-change-staged"),
+  ).toHaveCount(1);
+  await expect(
+    panel.locator(".agentmux-source-control__filename").first(),
+  ).toHaveCSS("font-size", "12.5px");
+  await expect(
+    panel.locator(".agentmux-source-control__directory").first(),
+  ).toHaveCSS("font-size", "11.5px");
+  await expect(
+    panel.locator(".agentmux-source-control__diff pre"),
+  ).toHaveCSS("font-size", "11.5px");
+
+  const changesPane = panel.locator(".agentmux-source-control__changes");
+  const diffPane = panel.locator(".agentmux-source-control__diff");
+  const splitter = panel.getByRole("separator", {
+    name: "Resize file list and diff preview",
+  });
+  const [changesBefore, diffBefore] = await Promise.all([
+    changesPane.boundingBox(),
+    diffPane.boundingBox(),
+  ]);
+  expect(changesBefore).not.toBeNull();
+  expect(diffBefore).not.toBeNull();
+  await splitter.focus();
+  await page.keyboard.press("ArrowDown");
+  const [changesAfter, diffAfter] = await Promise.all([
+    changesPane.boundingBox(),
+    diffPane.boundingBox(),
+  ]);
+  expect(changesAfter!.height).toBeGreaterThan(changesBefore!.height);
+  expect(diffAfter!.height).toBeLessThan(diffBefore!.height);
+
+  const splitterBox = await splitter.boundingBox();
+  expect(splitterBox).not.toBeNull();
+  await page.mouse.move(
+    splitterBox!.x + splitterBox!.width / 2,
+    splitterBox!.y + splitterBox!.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    splitterBox!.x + splitterBox!.width / 2,
+    splitterBox!.y + splitterBox!.height / 2 - 48,
+  );
+  await page.mouse.up();
+  const [changesAfterDrag, diffAfterDrag] = await Promise.all([
+    changesPane.boundingBox(),
+    diffPane.boundingBox(),
+  ]);
+  expect(changesAfterDrag!.height).toBeLessThan(changesAfter!.height);
+  expect(diffAfterDrag!.height).toBeGreaterThan(diffAfter!.height);
+
+  await panel
+    .getByTestId("source-control-change-working")
+    .locator(".agentmux-source-control__change-main")
+    .click();
+  await expect(panel.locator(".agentmux-source-control__diff pre")).toContainText(
+    "AgentMux working tree preview",
+  );
+
+  await panel
+    .getByTestId("source-control-change-working")
+    .locator(".agentmux-source-control__row-action")
+    .click();
+  await expect(
+    panel.getByTestId("source-control-change-working"),
+  ).toHaveCount(0);
+  await expect(
+    panel.getByTestId("source-control-change-staged"),
+  ).toHaveCount(2);
+
+  const commitButton = panel.getByRole("button", {
+    name: "Commit staged changes",
+  });
+  await expect(commitButton).toBeDisabled();
+  await expect(commitButton).toHaveAttribute("title", "Enter a commit message.");
+  await panel.getByLabel("Commit message (Ctrl+Enter)").fill("feat: add source control");
+  await expect(commitButton).toBeEnabled();
+  await commitButton.click();
+  await expect(panel.getByText("Working tree is clean.")).toBeVisible();
+  await expect(commitButton).toBeDisabled();
+  await expect(commitButton).toHaveAttribute(
+    "title",
+    "Stage at least one change before committing.",
+  );
+});
+
+test("status bar exposes the current folder as an Explorer action", async ({ page }) => {
+  await bootPreview(page);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as {
+        __AGENTMUX_PREVIEW__?: {
+          sidebarState: (detail: { cwd?: string | null }) => void;
+        };
+      }
+    ).__AGENTMUX_PREVIEW__?.sidebarState({
+      cwd: "/mnt/d/Projects/sample",
+    });
+  });
+
+  const path = page.locator(".agentmux-status-path");
+  await expect(path).toContainText("/mnt/d/Projects/sample");
+  await expect(path).toHaveAttribute(
+    "title",
+    "Open /mnt/d/Projects/sample in File Explorer",
+  );
+  await expect(path).toBeDisabled();
+});
+
 test("opens a live terminal", async ({ page }) => {
   await bootPreview(page);
   await page.locator(".agentmux-new-terminal-tab").click();

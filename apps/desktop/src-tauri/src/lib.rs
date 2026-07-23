@@ -5,7 +5,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,8 +18,8 @@ use agentmux_backend_conpty::ConptyBackend;
 use agentmux_backend_ssh::SshDirectBackend;
 use agentmux_backend_tmux::{posix_shell_quote, TmuxControlBackend};
 use agentmux_backend_wsl::{
-    discover_wsl_distributions as discover_wsl_distributions_from_backend, PipeBackend,
-    WslDiagnosticCode, WslDirectBackend, WslDirectConfig, WslDistribution,
+    discover_wsl_distributions as discover_wsl_distributions_from_backend, resolve_wsl_cwd,
+    PipeBackend, WslDiagnosticCode, WslDirectBackend, WslDirectConfig, WslDistribution,
 };
 use agentmux_browser::{
     BrowserAutomation, BrowserAutomationError, BrowserAutomationErrorCode, BrowserCommand,
@@ -110,6 +110,10 @@ const TEXT_BOX_MAX_LINES: u8 = 12;
 const TERMINAL_INNER_MARGIN_MIN: u8 = 0;
 const TERMINAL_INNER_MARGIN_MAX: u8 = 32;
 const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(3);
+const GIT_REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(60);
+const GIT_REPOSITORY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+const MAX_GIT_STATUS_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GIT_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const TMUX_SESSION_EXISTS_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Clone)]
@@ -120,6 +124,98 @@ struct GitStatusCacheEntry {
 }
 
 static GIT_STATUS_CACHE: OnceLock<Mutex<HashMap<String, GitStatusCacheEntry>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct GitRepositoryCacheEntry {
+    captured_at: Instant,
+    repository: Option<GitCommandContext>,
+}
+
+static GIT_REPOSITORY_CACHE: OnceLock<Mutex<HashMap<String, GitRepositoryCacheEntry>>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GitWorkspaceParams {
+    workspace_id: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GitFilesParams {
+    workspace_id: String,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GitDiffParams {
+    workspace_id: String,
+    path: String,
+    #[serde(default)]
+    staged: bool,
+    #[serde(default)]
+    untracked: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct GitCommitParams {
+    workspace_id: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Eq, PartialEq)]
+struct GitFileChangeResult {
+    path: String,
+    original_path: Option<String>,
+    index_status: String,
+    worktree_status: String,
+    staged: bool,
+    unstaged: bool,
+    untracked: bool,
+    conflict: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Eq, PartialEq)]
+struct GitStatusResult {
+    is_repository: bool,
+    repository_root: Option<String>,
+    branch: Option<String>,
+    head: Option<String>,
+    upstream: Option<String>,
+    ahead: u64,
+    behind: u64,
+    files: Vec<GitFileChangeResult>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Eq, PartialEq)]
+struct GitDiffResult {
+    path: String,
+    staged: bool,
+    patch: String,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Eq, PartialEq)]
+struct GitMutationResult {
+    ok: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Eq, PartialEq)]
+struct GitCommitResult {
+    commit: String,
+    summary: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GitHost {
+    Native,
+    Wsl { distribution: Option<String> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitCommandContext {
+    host: GitHost,
+    cwd: String,
+}
 
 type DesktopRuntimeControl = RuntimeControlPlane<DesktopBackendRouter>;
 
@@ -2518,6 +2614,11 @@ impl DesktopControlState {
             "sidebar.clear_log" => self.handle_sidebar_clear_log(&request),
             "sidebar.list_log" => self.handle_sidebar_list_log(&request),
             "sidebar.state" => self.handle_sidebar_state(&request),
+            "git.status" => self.handle_git_status(&request),
+            "git.diff" => self.handle_git_diff(&request),
+            "git.stage" => self.handle_git_stage(&request),
+            "git.unstage" => self.handle_git_unstage(&request),
+            "git.commit" => self.handle_git_commit(&request),
             "profile.list" => self.handle_profile_list(&request),
             "profile.create" => self.handle_profile_create(&request),
             "profile.update" => self.handle_profile_update(&request),
@@ -6471,6 +6572,92 @@ impl DesktopControlState {
         ))
     }
 
+    fn handle_git_status(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: GitWorkspaceParams = request.parse_params()?;
+        let context = self.workspace_git_context(&params.workspace_id)?;
+        let result = git_status_result(&context)?;
+        Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
+    }
+
+    fn handle_git_diff(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: GitDiffParams = request.parse_params()?;
+        validate_git_relative_path(&params.path)?;
+        let context = self.workspace_git_context(&params.workspace_id)?;
+        let result = git_diff_result(&context, &params.path, params.staged, params.untracked)?;
+        Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
+    }
+
+    fn handle_git_stage(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: GitFilesParams = request.parse_params()?;
+        validate_git_paths(&params.paths)?;
+        let context = self.workspace_git_context(&params.workspace_id)?;
+        git_stage(&context, &params.paths)?;
+        invalidate_git_status_cache();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &GitMutationResult { ok: true },
+        ))
+    }
+
+    fn handle_git_unstage(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: GitFilesParams = request.parse_params()?;
+        validate_git_paths(&params.paths)?;
+        let context = self.workspace_git_context(&params.workspace_id)?;
+        git_unstage(&context, &params.paths)?;
+        invalidate_git_status_cache();
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &GitMutationResult { ok: true },
+        ))
+    }
+
+    fn handle_git_commit(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: GitCommitParams = request.parse_params()?;
+        let message = params.message.trim();
+        if message.is_empty() {
+            return Err(control_invalid_request("Commit message is required."));
+        }
+        let context = self.workspace_git_context(&params.workspace_id)?;
+        let result = git_commit(&context, message)?;
+        invalidate_git_status_cache();
+        Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
+    }
+
+    fn workspace_git_context(
+        &self,
+        workspace_id: &str,
+    ) -> Result<GitCommandContext, DesktopHostError> {
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let bundle = store
+            .load_workspace_bundle(workspace_id)?
+            .ok_or_else(|| workspace_not_found(workspace_id))?;
+        let launch_spec = active_session_id(&bundle)
+            .as_deref()
+            .map(|session_id| store.load_session_launch_spec(session_id))
+            .transpose()?
+            .flatten();
+        workspace_git_context_with_launch_spec(&bundle, launch_spec.as_ref())
+    }
+
     fn handle_profile_list(
         &self,
         request: &RequestEnvelope,
@@ -7700,6 +7887,11 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "session.resize",
         "session.terminate",
         "session.read_recent",
+        "git.status",
+        "git.diff",
+        "git.stage",
+        "git.unstage",
+        "git.commit",
         "agent.set_state",
         "agent.team.reserve",
         "agent.team.settle",
@@ -11024,6 +11216,11 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "sidebar.clear_log"
             | "sidebar.list_log"
             | "sidebar.state"
+            | "git.status"
+            | "git.diff"
+            | "git.stage"
+            | "git.unstage"
+            | "git.commit"
             | "profile.list"
             | "profile.create"
             | "profile.update"
@@ -12975,6 +13172,7 @@ fn default_windows_shell_cwd() -> Option<String> {
 fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);
+    configure_read_only_git_command(&mut command);
     hide_console_window(&mut command);
     let output = command.output().ok()?;
     if !output.status.success() {
@@ -12985,6 +13183,521 @@ fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(value)
+    }
+}
+
+fn workspace_git_context_with_launch_spec(
+    bundle: &WorkspaceBundle,
+    launch_spec: Option<&PersistedSessionLaunchSpec>,
+) -> Result<GitCommandContext, DesktopHostError> {
+    let active_session_id = active_session_id(bundle);
+    let active_session = bundle
+        .sessions
+        .iter()
+        .find(|session| Some(session.session_id.as_str()) == active_session_id.as_deref());
+    let cwd = bundle
+        .sessions
+        .iter()
+        .find(|session| Some(session.session_id.as_str()) == active_session_id.as_deref())
+        .and_then(|session| clean_optional_text(session.cwd.clone()))
+        .or_else(|| clean_optional_text(bundle.workspace.project_root.clone()))
+        .ok_or_else(|| control_invalid_request("The workspace has no directory to inspect."))?;
+
+    let uses_wsl = active_session.is_some_and(|session| {
+        matches!(
+            session.backend_kind.as_str(),
+            "wsl-direct" | "wsl-tmux-control"
+        )
+    }) || active_session.is_none() && cwd.starts_with('/');
+    if uses_wsl {
+        let distribution = launch_spec
+            .and_then(|spec| clean_optional_text(spec.backend_profile.clone()))
+            .or_else(|| clean_optional_text(bundle.workspace.default_wsl_distribution.clone()));
+        let cwd = resolve_wsl_cwd(Some(&cwd), "~")
+            .map_err(|diagnostic| control_invalid_request(diagnostic.message))?;
+        return Ok(GitCommandContext {
+            host: GitHost::Wsl { distribution },
+            cwd,
+        });
+    }
+
+    Ok(GitCommandContext {
+        host: GitHost::Native,
+        cwd: translate_wsl_path(&cwd),
+    })
+}
+
+fn run_git_command(
+    context: &GitCommandContext,
+    args: &[String],
+) -> Result<Output, DesktopHostError> {
+    let mut command = build_git_command(context);
+    command.args(args);
+    hide_console_window(&mut command);
+    command
+        .output()
+        .map_err(|error| DesktopHostError::StateUnavailable(format!("Failed to run Git: {error}")))
+}
+
+fn run_git_read_command(
+    context: &GitCommandContext,
+    args: &[String],
+) -> Result<Output, DesktopHostError> {
+    let mut command = build_git_command(context);
+    configure_read_only_git_command(&mut command);
+    command.args(args);
+    hide_console_window(&mut command);
+    command
+        .output()
+        .map_err(|error| DesktopHostError::StateUnavailable(format!("Failed to run Git: {error}")))
+}
+
+fn build_git_command(context: &GitCommandContext) -> Command {
+    match &context.host {
+        GitHost::Native => {
+            let mut command = Command::new("git");
+            command
+                .arg("-C")
+                .arg(&context.cwd)
+                .arg("--literal-pathspecs");
+            command
+        }
+        GitHost::Wsl { distribution } => {
+            let mut command = Command::new("wsl.exe");
+            if let Some(distribution) = distribution {
+                command.arg("--distribution").arg(distribution);
+            }
+            command
+                .arg("--exec")
+                .arg("git")
+                .arg("-C")
+                .arg(&context.cwd)
+                .arg("--literal-pathspecs");
+            command
+        }
+    }
+}
+
+fn configure_read_only_git_command(command: &mut Command) {
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("LC_ALL", "C");
+}
+
+fn git_repository_context(
+    context: &GitCommandContext,
+) -> Result<Option<GitCommandContext>, DesktopHostError> {
+    let key = git_repository_cache_key(context);
+    if let Ok(cache) = git_repository_cache().lock() {
+        if let Some(entry) = cache.get(&key) {
+            let ttl = if entry.repository.is_some() {
+                GIT_REPOSITORY_CACHE_TTL
+            } else {
+                GIT_REPOSITORY_NEGATIVE_CACHE_TTL
+            };
+            if entry.captured_at.elapsed() <= ttl {
+                return Ok(entry.repository.clone());
+            }
+        }
+    }
+
+    let repository = match &context.host {
+        GitHost::Native => discover_native_git_repository(context),
+        GitHost::Wsl { .. } => {
+            let output = run_git_read_command(
+                context,
+                &["rev-parse".to_string(), "--show-toplevel".to_string()],
+            )?;
+            if !output.status.success() {
+                None
+            } else {
+                let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (!root.is_empty()).then(|| GitCommandContext {
+                    host: context.host.clone(),
+                    cwd: root,
+                })
+            }
+        }
+    };
+    if let Ok(mut cache) = git_repository_cache().lock() {
+        cache.insert(
+            key,
+            GitRepositoryCacheEntry {
+                captured_at: Instant::now(),
+                repository: repository.clone(),
+            },
+        );
+    }
+    Ok(repository)
+}
+
+fn discover_native_git_repository(context: &GitCommandContext) -> Option<GitCommandContext> {
+    let mut current = PathBuf::from(&context.cwd);
+    if !current.is_dir() {
+        current = current.parent()?.to_path_buf();
+    }
+    for ancestor in current.ancestors() {
+        let marker = ancestor.join(".git");
+        if marker.is_dir() || marker.is_file() {
+            return Some(GitCommandContext {
+                host: context.host.clone(),
+                cwd: ancestor.to_string_lossy().to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn git_repository_cache() -> &'static Mutex<HashMap<String, GitRepositoryCacheEntry>> {
+    GIT_REPOSITORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn git_repository_cache_key(context: &GitCommandContext) -> String {
+    match &context.host {
+        GitHost::Native => format!("native:{}", context.cwd),
+        GitHost::Wsl { distribution } => {
+            format!("wsl:{:?}:{}", distribution, context.cwd)
+        }
+    }
+}
+
+fn require_git_repository_context(
+    context: &GitCommandContext,
+) -> Result<GitCommandContext, DesktopHostError> {
+    git_repository_context(context)?.ok_or_else(|| {
+        DesktopHostError::Control(ControlError::new(
+            ErrorCode::Conflict,
+            "The active workspace directory is not a Git repository.",
+        ))
+    })
+}
+
+fn git_status_result(context: &GitCommandContext) -> Result<GitStatusResult, DesktopHostError> {
+    let Some(repository) = git_repository_context(context)? else {
+        return Ok(GitStatusResult {
+            is_repository: false,
+            repository_root: None,
+            branch: None,
+            head: None,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            files: Vec::new(),
+        });
+    };
+    let output = run_git_read_command(
+        &repository,
+        &[
+            "-c".to_string(),
+            "core.quotePath=false".to_string(),
+            "status".to_string(),
+            "--porcelain=v2".to_string(),
+            "--branch".to_string(),
+            "-z".to_string(),
+            "--untracked-files=all".to_string(),
+        ],
+    )?;
+    ensure_git_success(&output, "read repository status")?;
+    if output.stdout.len() > MAX_GIT_STATUS_BYTES {
+        return Err(DesktopHostError::StateUnavailable(format!(
+            "Git status output exceeded {} MiB.",
+            MAX_GIT_STATUS_BYTES / (1024 * 1024)
+        )));
+    }
+    parse_git_porcelain_v2(&output.stdout, repository.cwd)
+}
+
+fn parse_git_porcelain_v2(
+    output: &[u8],
+    repository_root: String,
+) -> Result<GitStatusResult, DesktopHostError> {
+    let records = output.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let mut branch = None;
+    let mut head = None;
+    let mut upstream = None;
+    let mut ahead = 0;
+    let mut behind = 0;
+    let mut files = Vec::new();
+    let mut index = 0;
+
+    while index < records.len() {
+        let record = String::from_utf8_lossy(records[index]).to_string();
+        index += 1;
+        if record.is_empty() {
+            continue;
+        }
+        if let Some(value) = record.strip_prefix("# branch.oid ") {
+            if value != "(initial)" {
+                head = Some(value.to_string());
+            }
+            continue;
+        }
+        if let Some(value) = record.strip_prefix("# branch.head ") {
+            branch = Some(if value == "(detached)" {
+                "detached".to_string()
+            } else {
+                value.to_string()
+            });
+            continue;
+        }
+        if let Some(value) = record.strip_prefix("# branch.upstream ") {
+            upstream = Some(value.to_string());
+            continue;
+        }
+        if let Some(value) = record.strip_prefix("# branch.ab ") {
+            for token in value.split_whitespace() {
+                if let Some(value) = token.strip_prefix('+') {
+                    ahead = value.parse().unwrap_or(0);
+                } else if let Some(value) = token.strip_prefix('-') {
+                    behind = value.parse().unwrap_or(0);
+                }
+            }
+            continue;
+        }
+
+        let (xy, path, original_path, conflict) = if record.starts_with("1 ") {
+            let fields = record.splitn(9, ' ').collect::<Vec<_>>();
+            if fields.len() != 9 {
+                return Err(control_invalid_request(
+                    "Git returned an invalid status record.",
+                ));
+            }
+            (fields[1], fields[8].to_string(), None, false)
+        } else if record.starts_with("2 ") {
+            let fields = record.splitn(10, ' ').collect::<Vec<_>>();
+            if fields.len() != 10 {
+                return Err(control_invalid_request(
+                    "Git returned an invalid rename record.",
+                ));
+            }
+            let original = records
+                .get(index)
+                .map(|value| String::from_utf8_lossy(value).to_string());
+            index = index.saturating_add(1);
+            (fields[1], fields[9].to_string(), original, false)
+        } else if record.starts_with("u ") {
+            let fields = record.splitn(11, ' ').collect::<Vec<_>>();
+            if fields.len() != 11 {
+                return Err(control_invalid_request(
+                    "Git returned an invalid conflict record.",
+                ));
+            }
+            (fields[1], fields[10].to_string(), None, true)
+        } else if let Some(path) = record.strip_prefix("? ") {
+            ("??", path.to_string(), None, false)
+        } else {
+            continue;
+        };
+
+        let mut statuses = xy.chars();
+        let index_status = statuses.next().unwrap_or('.');
+        let worktree_status = statuses.next().unwrap_or('.');
+        let untracked = index_status == '?' && worktree_status == '?';
+        files.push(GitFileChangeResult {
+            path,
+            original_path,
+            index_status: index_status.to_string(),
+            worktree_status: worktree_status.to_string(),
+            staged: !matches!(index_status, '.' | '?'),
+            unstaged: !matches!(worktree_status, '.' | '?') || untracked,
+            untracked,
+            conflict,
+        });
+    }
+
+    Ok(GitStatusResult {
+        is_repository: true,
+        repository_root: Some(repository_root),
+        branch,
+        head,
+        upstream,
+        ahead,
+        behind,
+        files,
+    })
+}
+
+fn git_diff_result(
+    context: &GitCommandContext,
+    path: &str,
+    staged: bool,
+    untracked: bool,
+) -> Result<GitDiffResult, DesktopHostError> {
+    let repository = require_git_repository_context(context)?;
+    let mut args = if untracked {
+        vec![
+            "diff".to_string(),
+            "--no-index".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+            "--".to_string(),
+            "/dev/null".to_string(),
+            path.to_string(),
+        ]
+    } else {
+        let mut args = vec![
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+        ];
+        if staged {
+            args.push("--cached".to_string());
+        }
+        args.extend(["--".to_string(), path.to_string()]);
+        args
+    };
+    args.insert(0, "core.quotePath=false".to_string());
+    args.insert(0, "-c".to_string());
+    let output = run_git_read_command(&repository, &args)?;
+    if !(output.status.success() || untracked && output.status.code() == Some(1)) {
+        return Err(git_command_error(&output, "read the file diff"));
+    }
+    let truncated = output.stdout.len() > MAX_GIT_DIFF_BYTES;
+    let bytes = &output.stdout[..output.stdout.len().min(MAX_GIT_DIFF_BYTES)];
+    Ok(GitDiffResult {
+        path: path.to_string(),
+        staged,
+        patch: String::from_utf8_lossy(bytes).to_string(),
+        truncated,
+    })
+}
+
+fn git_stage(context: &GitCommandContext, paths: &[String]) -> Result<(), DesktopHostError> {
+    let repository = require_git_repository_context(context)?;
+    let mut args = vec!["add".to_string(), "-A".to_string(), "--".to_string()];
+    if paths.is_empty() {
+        args.push(".".to_string());
+    } else {
+        args.extend(paths.iter().cloned());
+    }
+    let output = run_git_command(&repository, &args)?;
+    ensure_git_success(&output, "stage changes")
+}
+
+fn git_unstage(context: &GitCommandContext, paths: &[String]) -> Result<(), DesktopHostError> {
+    let repository = require_git_repository_context(context)?;
+    let head = run_git_read_command(
+        &repository,
+        &[
+            "rev-parse".to_string(),
+            "--verify".to_string(),
+            "HEAD".to_string(),
+        ],
+    )?;
+    let mut args = if head.status.success() {
+        vec![
+            "reset".to_string(),
+            "-q".to_string(),
+            "HEAD".to_string(),
+            "--".to_string(),
+        ]
+    } else {
+        vec![
+            "rm".to_string(),
+            "-r".to_string(),
+            "--cached".to_string(),
+            "--ignore-unmatch".to_string(),
+            "--".to_string(),
+        ]
+    };
+    if paths.is_empty() {
+        args.push(".".to_string());
+    } else {
+        args.extend(paths.iter().cloned());
+    }
+    let output = run_git_command(&repository, &args)?;
+    ensure_git_success(&output, "unstage changes")
+}
+
+fn git_commit(
+    context: &GitCommandContext,
+    message: &str,
+) -> Result<GitCommitResult, DesktopHostError> {
+    if message.len() > 64 * 1024 {
+        return Err(control_invalid_request("Commit message is too long."));
+    }
+    let repository = require_git_repository_context(context)?;
+    let output = run_git_command(
+        &repository,
+        &["commit".to_string(), "-m".to_string(), message.to_string()],
+    )?;
+    ensure_git_success(&output, "create the commit")?;
+    let commit_output = run_git_read_command(
+        &repository,
+        &[
+            "rev-parse".to_string(),
+            "--short".to_string(),
+            "HEAD".to_string(),
+        ],
+    )?;
+    ensure_git_success(&commit_output, "read the new commit")?;
+    let summary = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(GitCommitResult {
+        commit: String::from_utf8_lossy(&commit_output.stdout)
+            .trim()
+            .to_string(),
+        summary,
+    })
+}
+
+fn validate_git_paths(paths: &[String]) -> Result<(), DesktopHostError> {
+    for path in paths {
+        validate_git_relative_path(path)?;
+    }
+    Ok(())
+}
+
+fn validate_git_relative_path(path: &str) -> Result<(), DesktopHostError> {
+    let path = path.trim();
+    let normalized = path.replace('\\', "/");
+    let has_drive_prefix = normalized
+        .as_bytes()
+        .get(1)
+        .is_some_and(|character| *character == b':');
+    if path.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("//")
+        || has_drive_prefix
+        || normalized.split('/').any(|segment| segment == "..")
+    {
+        return Err(control_invalid_request(
+            "Git file paths must stay inside the workspace repository.",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_git_success(output: &Output, operation: &str) -> Result<(), DesktopHostError> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_command_error(output, operation))
+    }
+}
+
+fn git_command_error(output: &Output, operation: &str) -> DesktopHostError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    DesktopHostError::Control(ControlError::new(
+        ErrorCode::Conflict,
+        if detail.is_empty() {
+            format!("Git could not {operation}.")
+        } else {
+            format!("Git could not {operation}: {detail}")
+        },
+    ))
+}
+
+fn control_invalid_request(message: impl Into<String>) -> DesktopHostError {
+    DesktopHostError::Control(ControlError::new(ErrorCode::InvalidRequest, message.into()))
+}
+
+fn invalidate_git_status_cache() {
+    if let Ok(mut cache) = git_status_cache().lock() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = git_repository_cache().lock() {
+        cache.clear();
     }
 }
 
@@ -13103,6 +13816,9 @@ fn is_mutating_control_method(method: &str) -> bool {
             | "team.task.set_dependency"
             | "team.message.send"
             | "team.message.mark_read"
+            | "git.stage"
+            | "git.unstage"
+            | "git.commit"
             | "browser.navigate"
             | "browser.reload"
             | "browser.back"
@@ -14092,6 +14808,255 @@ mod tests {
             translate_wsl_path("D:\\already\\windows"),
             "D:\\already\\windows"
         );
+    }
+
+    #[test]
+    fn native_git_root_discovery_walks_ancestors_and_accepts_git_files() {
+        let repository =
+            std::env::temp_dir().join(format!("agentmux-git-root-discovery-{}", unique_time_id()));
+        let nested = repository.join("src").join("nested");
+        fs::create_dir_all(&nested).expect("nested repository path should be created");
+        fs::create_dir(repository.join(".git")).expect("git marker directory should be created");
+
+        let context = GitCommandContext {
+            host: GitHost::Native,
+            cwd: nested.to_string_lossy().to_string(),
+        };
+        let discovered = discover_native_git_repository(&context).expect("root should be found");
+        assert_eq!(
+            normalized_path_text(Path::new(&discovered.cwd)),
+            normalized_path_text(&repository)
+        );
+
+        fs::remove_dir_all(repository.join(".git")).expect("git marker should be removed");
+        fs::write(repository.join(".git"), "gitdir: C:/worktrees/repository\n")
+            .expect("git worktree marker file should be created");
+        let discovered = discover_native_git_repository(&context).expect("git file should work");
+        assert_eq!(
+            normalized_path_text(Path::new(&discovered.cwd)),
+            normalized_path_text(&repository)
+        );
+
+        fs::remove_dir_all(repository).expect("temporary repository should be removed");
+    }
+
+    #[test]
+    fn git_repository_context_caches_positive_and_negative_results() {
+        let repository =
+            std::env::temp_dir().join(format!("agentmux-git-context-cache-{}", unique_time_id()));
+        let nested = repository.join("src");
+        fs::create_dir_all(&nested).expect("nested repository path should be created");
+        fs::create_dir(repository.join(".git")).expect("git marker directory should be created");
+
+        let context = GitCommandContext {
+            host: GitHost::Native,
+            cwd: nested.to_string_lossy().to_string(),
+        };
+        let first = git_repository_context(&context)
+            .expect("repository lookup should succeed")
+            .expect("repository should be found");
+        fs::remove_dir_all(repository.join(".git")).expect("git marker should be removed");
+        let cached = git_repository_context(&context)
+            .expect("cached lookup should succeed")
+            .expect("positive result should be cached");
+        assert_eq!(cached.cwd, first.cwd);
+
+        invalidate_git_status_cache();
+        assert!(git_repository_context(&context)
+            .expect("fresh lookup should succeed")
+            .is_none());
+
+        fs::create_dir(repository.join(".git")).expect("git marker should be recreated");
+        let negative_cached = git_repository_context(&context).expect("cached lookup should work");
+        assert!(negative_cached.is_none());
+
+        invalidate_git_status_cache();
+        assert!(git_repository_context(&context)
+            .expect("fresh lookup should succeed")
+            .is_some());
+
+        fs::remove_dir_all(repository).expect("temporary repository should be removed");
+    }
+
+    #[test]
+    fn git_porcelain_v2_parser_preserves_structured_changes() {
+        let output = concat!(
+            "# branch.oid 0123456789abcdef\0",
+            "# branch.head feature/source-control\0",
+            "# branch.upstream origin/feature/source-control\0",
+            "# branch.ab +2 -1\0",
+            "1 .M N... 100644 100644 100644 1111111 2222222 src/main.rs\0",
+            "2 R. N... 100644 100644 100644 3333333 4444444 R100 docs/new name.md\0",
+            "docs/old name.md\0",
+            "u UU N... 100644 100644 100644 100644 aaaaaaa bbbbbbb ccccccc conflict.txt\0",
+            "? notes/new file.txt\0",
+        );
+
+        let status = parse_git_porcelain_v2(output.as_bytes(), "D:\\repo".to_string())
+            .expect("porcelain v2 should parse");
+
+        assert!(status.is_repository);
+        assert_eq!(status.branch.as_deref(), Some("feature/source-control"));
+        assert_eq!(
+            status.upstream.as_deref(),
+            Some("origin/feature/source-control")
+        );
+        assert_eq!((status.ahead, status.behind), (2, 1));
+        assert_eq!(status.files.len(), 4);
+        assert!(status.files[0].unstaged);
+        assert_eq!(
+            status.files[1].original_path.as_deref(),
+            Some("docs/old name.md")
+        );
+        assert!(status.files[1].staged);
+        assert!(status.files[2].conflict);
+        assert!(status.files[3].untracked);
+    }
+
+    #[test]
+    fn git_paths_reject_repository_escape_and_absolute_paths() {
+        assert!(validate_git_relative_path("src/main.rs").is_ok());
+        assert!(validate_git_relative_path("docs/file with spaces.md").is_ok());
+        assert!(validate_git_relative_path("../outside.txt").is_err());
+        assert!(validate_git_relative_path("C:\\outside.txt").is_err());
+        assert!(validate_git_relative_path("/home/user/outside.txt").is_err());
+    }
+
+    #[test]
+    fn git_commands_force_literal_pathspecs_for_native_and_wsl_hosts() {
+        let native = build_git_command(&GitCommandContext {
+            host: GitHost::Native,
+            cwd: r"D:\repo".to_string(),
+        });
+        let native_args = native
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(native_args
+            .iter()
+            .any(|value| value == "--literal-pathspecs"));
+
+        let wsl = build_git_command(&GitCommandContext {
+            host: GitHost::Wsl {
+                distribution: Some("Ubuntu".to_string()),
+            },
+            cwd: "/mnt/d/repo".to_string(),
+        });
+        let wsl_args = wsl
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(wsl_args.iter().any(|value| value == "--literal-pathspecs"));
+    }
+
+    #[test]
+    fn git_context_follows_active_session_backend_and_distribution() {
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.panes[1].mounted_surface_id = Some("surf_terminal".to_string());
+        bundle.sessions[0].backend_kind = "wsl-direct".to_string();
+        bundle.sessions[0].cwd = Some(r"D:\Projects\sample".to_string());
+        let launch_spec = PersistedSessionLaunchSpec {
+            session_id: "ses_surface".to_string(),
+            workspace_id: "ws_surface".to_string(),
+            backend_profile: Some("Ubuntu-24.04".to_string()),
+            env: Vec::new(),
+            columns: 120,
+            rows: 40,
+            updated_at: "now".to_string(),
+        };
+
+        let context = workspace_git_context_with_launch_spec(&bundle, Some(&launch_spec))
+            .expect("WSL Git context should resolve");
+        assert_eq!(context.cwd, "/mnt/d/Projects/sample");
+        assert_eq!(
+            context.host,
+            GitHost::Wsl {
+                distribution: Some("Ubuntu-24.04".to_string())
+            }
+        );
+
+        bundle.sessions[0].backend_kind = "conpty".to_string();
+        bundle.sessions[0].cwd = Some("/mnt/d/Projects/sample".to_string());
+        let context = workspace_git_context_with_launch_spec(&bundle, None)
+            .expect("native Git context should resolve");
+        assert_eq!(context.host, GitHost::Native);
+        assert_eq!(context.cwd, r"D:\Projects\sample");
+    }
+
+    #[test]
+    fn git_workspace_flow_handles_diff_stage_unstage_and_commit() {
+        let repository =
+            std::env::temp_dir().join(format!("agentmux-source-control-{}", unique_time_id()));
+        fs::create_dir_all(&repository).expect("temporary repository should be created");
+        let context = GitCommandContext {
+            host: GitHost::Native,
+            cwd: repository.to_string_lossy().to_string(),
+        };
+        let git = |args: &[&str]| {
+            let args = args
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect::<Vec<_>>();
+            let output = run_git_command(&context, &args).expect("git should start");
+            ensure_git_success(&output, "prepare the source control test repository")
+                .expect("git setup command should succeed");
+        };
+
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "AgentMux Test"]);
+        git(&["config", "user.email", "agentmux@example.invalid"]);
+        fs::write(repository.join("tracked.txt"), "before\n")
+            .expect("tracked fixture should be written");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        fs::write(repository.join("tracked.txt"), "before\nafter\n")
+            .expect("tracked fixture should be updated");
+        fs::write(repository.join("untracked.txt"), "new note\n")
+            .expect("untracked fixture should be written");
+
+        let status = git_status_result(&context).expect("status should be readable");
+        assert!(status.is_repository);
+        assert_eq!(status.files.len(), 2);
+        assert!(status
+            .files
+            .iter()
+            .any(|file| file.path == "tracked.txt" && file.unstaged));
+        assert!(status
+            .files
+            .iter()
+            .any(|file| file.path == "untracked.txt" && file.untracked));
+
+        let tracked_diff = git_diff_result(&context, "tracked.txt", false, false)
+            .expect("tracked diff should be readable");
+        assert!(tracked_diff.patch.contains("+after"));
+        let untracked_diff = git_diff_result(&context, "untracked.txt", false, true)
+            .expect("untracked diff should be readable");
+        assert!(untracked_diff.patch.contains("+new note"));
+
+        git_stage(&context, &[]).expect("all changes should stage");
+        let staged = git_status_result(&context).expect("staged status should be readable");
+        assert!(staged.files.iter().all(|file| file.staged));
+        assert!(staged.files.iter().all(|file| !file.unstaged));
+
+        git_unstage(&context, &["untracked.txt".to_string()])
+            .expect("selected change should unstage");
+        let unstaged = git_status_result(&context).expect("unstaged status should be readable");
+        assert!(unstaged
+            .files
+            .iter()
+            .any(|file| file.path == "untracked.txt" && file.untracked));
+
+        git_stage(&context, &[]).expect("all changes should restage");
+        let commit = git_commit(&context, "source control integration")
+            .expect("staged changes should commit");
+        assert!(!commit.commit.is_empty());
+        assert!(git_status_result(&context)
+            .expect("clean status should be readable")
+            .files
+            .is_empty());
+
+        fs::remove_dir_all(repository).expect("temporary repository should be removed");
     }
 
     #[test]

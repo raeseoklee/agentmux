@@ -266,6 +266,40 @@ export interface SidebarState {
   logs: SidebarLogEntry[];
 }
 
+export interface GitFileChange {
+  path: string;
+  originalPath?: string | null;
+  indexStatus: string;
+  worktreeStatus: string;
+  staged: boolean;
+  unstaged: boolean;
+  untracked: boolean;
+  conflict: boolean;
+}
+
+export interface GitStatus {
+  isRepository: boolean;
+  repositoryRoot?: string | null;
+  branch?: string | null;
+  head?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  files: GitFileChange[];
+}
+
+export interface GitDiff {
+  path: string;
+  staged: boolean;
+  patch: string;
+  truncated: boolean;
+}
+
+export interface GitCommitResult {
+  commit: string;
+  summary: string;
+}
+
 export type TerminalProfile = "wsl" | "powershell" | "cmd";
 
 export interface WorkspaceSummary {
@@ -617,6 +651,7 @@ export interface BrowserClickTarget {
 }
 
 export interface ControlClient {
+  readonly supportsSourceControl: boolean;
   listWorkspaces(): Promise<WorkspaceSummary[]>;
   createWorkspace(
     name: string,
@@ -925,6 +960,18 @@ export interface ControlClient {
   ): Promise<TeamMessage[]>;
   sendTeamMessage(input: TeamMessageSendInput): Promise<TeamMessage>;
   markTeamMessageRead(messageId: string): Promise<void>;
+  getGitStatus(workspaceId: string): Promise<GitStatus>;
+  getGitDiff(
+    workspaceId: string,
+    path: string,
+    options?: { staged?: boolean; untracked?: boolean },
+  ): Promise<GitDiff>;
+  stageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
+  unstageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
+  commitGitChanges(
+    workspaceId: string,
+    message: string,
+  ): Promise<GitCommitResult>;
   getSidebarState(workspaceId?: string | null): Promise<SidebarState>;
 }
 
@@ -1017,6 +1064,7 @@ export function createControlClient(): ControlClient {
 }
 
 class TauriControlClient implements ControlClient {
+  readonly supportsSourceControl = true;
   private requestCounter = 0;
   private controlToken?: Promise<string>;
 
@@ -2418,6 +2466,58 @@ class TauriControlClient implements ControlClient {
     });
   }
 
+  async getGitStatus(workspaceId: string): Promise<GitStatus> {
+    const result = await this.call<GitStatusWire>("git.status", {
+      workspace_id: workspaceId,
+    });
+    return mapGitStatus(result);
+  }
+
+  async getGitDiff(
+    workspaceId: string,
+    path: string,
+    options: { staged?: boolean; untracked?: boolean } = {},
+  ): Promise<GitDiff> {
+    const result = await this.call<GitDiffWire>("git.diff", {
+      workspace_id: workspaceId,
+      path,
+      staged: options.staged ?? false,
+      untracked: options.untracked ?? false,
+    });
+    return mapGitDiff(result);
+  }
+
+  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
+    await this.call("git.stage", {
+      workspace_id: workspaceId,
+      paths,
+    });
+  }
+
+  async unstageGitFiles(
+    workspaceId: string,
+    paths: string[] = [],
+  ): Promise<void> {
+    await this.call("git.unstage", {
+      workspace_id: workspaceId,
+      paths,
+    });
+  }
+
+  async commitGitChanges(
+    workspaceId: string,
+    message: string,
+  ): Promise<GitCommitResult> {
+    const result = await this.call<GitCommitResultWire>("git.commit", {
+      workspace_id: workspaceId,
+      message,
+    });
+    return {
+      commit: result.commit,
+      summary: result.summary,
+    };
+  }
+
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
     const result = await this.call<SidebarStateWire>("sidebar.state", {
       workspace_id: workspaceId ?? null,
@@ -2476,6 +2576,7 @@ interface ControlResponse {
 }
 
 class BrowserPreviewControlClient implements ControlClient {
+  readonly supportsSourceControl: boolean = true;
   private readonly configStorageKey = "agentmux.preview.config.v1";
   private readonly projectConfigStoragePrefix =
     "agentmux.preview.project.config.v1.";
@@ -2495,6 +2596,7 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly teamTasks = new Map<string, TeamTask>();
   private readonly teamMessages: TeamMessage[] = [];
   private readonly sidebarStates = new Map<string, SidebarState>();
+  private readonly gitStatuses = new Map<string, GitStatus>();
   private readonly terminalSurfaces: SurfaceSummary[] = [];
   private readonly sessions = new Map<string, TerminalSession>();
   private readonly outputs = new Map<string, string>();
@@ -2627,6 +2729,39 @@ class BrowserPreviewControlClient implements ControlClient {
         mountedSurfaceId: null,
       },
     ]);
+    this.gitStatuses.set(workspace.workspaceId, {
+      isRepository: Boolean(projectRoot),
+      repositoryRoot: projectRoot ?? null,
+      branch: projectRoot ? "main" : null,
+      head: projectRoot ? "a1b2c3d4" : null,
+      upstream: projectRoot ? "origin/main" : null,
+      ahead: 0,
+      behind: 0,
+      files: projectRoot
+        ? [
+            {
+              path: "apps/desktop/src/agentmux/AgentmuxTerminalApp.tsx",
+              originalPath: null,
+              indexStatus: ".",
+              worktreeStatus: "M",
+              staged: false,
+              unstaged: true,
+              untracked: false,
+              conflict: false,
+            },
+            {
+              path: "docs/en/source-control.md",
+              originalPath: null,
+              indexStatus: "A",
+              worktreeStatus: ".",
+              staged: true,
+              unstaged: false,
+              untracked: false,
+              conflict: false,
+            },
+          ]
+        : [],
+    });
     return { ...workspace };
   }
 
@@ -2703,6 +2838,7 @@ class BrowserPreviewControlClient implements ControlClient {
     this.workspaces.splice(index, 1);
     this.panes.delete(workspaceId);
     this.sidebarStates.delete(workspaceId);
+    this.gitStatuses.delete(workspaceId);
     for (let i = this.terminalSurfaces.length - 1; i >= 0; i -= 1) {
       if (this.terminalSurfaces[i].workspaceId === workspaceId) {
         const sessionId = this.terminalSurfaces[i].sessionId;
@@ -4281,6 +4417,114 @@ class BrowserPreviewControlClient implements ControlClient {
     }
   }
 
+  async getGitStatus(workspaceId: string): Promise<GitStatus> {
+    const workspace = this.findWorkspace(workspaceId);
+    return cloneGitStatus(
+      this.gitStatuses.get(workspaceId) ?? {
+        isRepository: false,
+        repositoryRoot: workspace.projectRoot ?? null,
+        branch: null,
+        head: null,
+        upstream: null,
+        ahead: 0,
+        behind: 0,
+        files: [],
+      },
+    );
+  }
+
+  async getGitDiff(
+    workspaceId: string,
+    path: string,
+    options: { staged?: boolean; untracked?: boolean } = {},
+  ): Promise<GitDiff> {
+    const status = await this.getGitStatus(workspaceId);
+    const change = status.files.find((candidate) => candidate.path === path);
+    if (!change) {
+      throw new ControlClientError("Git change was not found.", "not_found");
+    }
+    const prefix = options.staged ? "cached" : "working tree";
+    return {
+      path,
+      staged: options.staged ?? false,
+      truncated: false,
+      patch: [
+        `diff --git a/${path} b/${path}`,
+        `--- a/${path}`,
+        `+++ b/${path}`,
+        "@@ -1,3 +1,4 @@",
+        `-// ${prefix} preview`,
+        `+// AgentMux ${prefix} preview`,
+        "+export const sourceControl = true;",
+      ].join("\n"),
+    };
+  }
+
+  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
+    const status = this.gitStatuses.get(workspaceId);
+    if (!status) return;
+    const selected = new Set(paths);
+    for (const change of status.files) {
+      if (
+        selected.size > 0 &&
+        !selected.has(change.path) &&
+        !(change.originalPath && selected.has(change.originalPath))
+      ) {
+        continue;
+      }
+      const stagedStatus = change.untracked
+        ? "A"
+        : change.worktreeStatus === "."
+          ? change.indexStatus
+          : change.worktreeStatus;
+      change.indexStatus = stagedStatus;
+      change.worktreeStatus = ".";
+      change.staged = true;
+      change.unstaged = false;
+      change.untracked = false;
+    }
+  }
+
+  async unstageGitFiles(
+    workspaceId: string,
+    paths: string[] = [],
+  ): Promise<void> {
+    const status = this.gitStatuses.get(workspaceId);
+    if (!status) return;
+    const selected = new Set(paths);
+    for (const change of status.files) {
+      if (
+        !change.staged ||
+        (selected.size > 0 &&
+          !selected.has(change.path) &&
+          !(change.originalPath && selected.has(change.originalPath)))
+      ) {
+        continue;
+      }
+      change.worktreeStatus = change.indexStatus === "A" ? "?" : change.indexStatus;
+      change.indexStatus = change.indexStatus === "A" ? "?" : ".";
+      change.staged = false;
+      change.unstaged = true;
+      change.untracked = change.worktreeStatus === "?";
+    }
+  }
+
+  async commitGitChanges(
+    workspaceId: string,
+    message: string,
+  ): Promise<GitCommitResult> {
+    const status = this.gitStatuses.get(workspaceId);
+    if (!status || !status.files.some((change) => change.staged)) {
+      throw new ControlClientError("There are no staged changes.", "conflict");
+    }
+    status.files = status.files.filter((change) => !change.staged);
+    status.head = `preview${Date.now().toString(36).slice(-5)}`;
+    return {
+      commit: status.head,
+      summary: `[${status.branch ?? "main"} ${status.head}] ${message.trim()}`,
+    };
+  }
+
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
     const workspace = workspaceId
       ? this.findWorkspace(workspaceId)
@@ -5106,6 +5350,7 @@ interface ServerStateResult {
 }
 
 class ServerControlClient extends BrowserPreviewControlClient {
+  override readonly supportsSourceControl = false;
   private readonly serverBaseUrl: string;
   private readonly serverToken: string | null;
   private readonly serverDefaults: NonNullable<AgentmuxServerBootstrap["defaults"]>;
@@ -5737,6 +5982,51 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return mapTmuxDiagnostics(result);
   }
 
+  async getGitStatus(_workspaceId: string): Promise<GitStatus> {
+    throw new ControlClientError(
+      "Source control is not available through the server transport yet.",
+      "unsupported_method",
+    );
+  }
+
+  async getGitDiff(
+    _workspaceId: string,
+    _path: string,
+    _options: { staged?: boolean; untracked?: boolean } = {},
+  ): Promise<GitDiff> {
+    throw new ControlClientError(
+      "Source control is not available through the server transport yet.",
+      "unsupported_method",
+    );
+  }
+
+  async stageGitFiles(_workspaceId: string, _paths: string[] = []): Promise<void> {
+    throw new ControlClientError(
+      "Source control is not available through the server transport yet.",
+      "unsupported_method",
+    );
+  }
+
+  async unstageGitFiles(
+    _workspaceId: string,
+    _paths: string[] = [],
+  ): Promise<void> {
+    throw new ControlClientError(
+      "Source control is not available through the server transport yet.",
+      "unsupported_method",
+    );
+  }
+
+  async commitGitChanges(
+    _workspaceId: string,
+    _message: string,
+  ): Promise<GitCommitResult> {
+    throw new ControlClientError(
+      "Source control is not available through the server transport yet.",
+      "unsupported_method",
+    );
+  }
+
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
     await this.hydrateServerState();
     const workspace = workspaceId
@@ -6292,6 +6582,40 @@ interface SidebarStateWire {
   logs: SidebarLogWire[];
 }
 
+interface GitFileChangeWire {
+  path: string;
+  original_path?: string | null;
+  index_status: string;
+  worktree_status: string;
+  staged: boolean;
+  unstaged: boolean;
+  untracked: boolean;
+  conflict: boolean;
+}
+
+interface GitStatusWire {
+  is_repository: boolean;
+  repository_root?: string | null;
+  branch?: string | null;
+  head?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  files: GitFileChangeWire[];
+}
+
+interface GitDiffWire {
+  path: string;
+  staged: boolean;
+  patch: string;
+  truncated: boolean;
+}
+
+interface GitCommitResultWire {
+  commit: string;
+  summary: string;
+}
+
 interface RecoveryDiagnosticsWire {
   workspace_count: number;
   pane_count: number;
@@ -6763,6 +7087,44 @@ function mapSidebarState(value: SidebarStateWire): SidebarState {
     statuses: value.statuses.map(mapSidebarStatus),
     progress: value.progress ? mapSidebarProgress(value.progress) : null,
     logs: value.logs.map(mapSidebarLog),
+  };
+}
+
+function mapGitStatus(value: GitStatusWire): GitStatus {
+  return {
+    isRepository: value.is_repository,
+    repositoryRoot: value.repository_root,
+    branch: value.branch,
+    head: value.head,
+    upstream: value.upstream,
+    ahead: value.ahead,
+    behind: value.behind,
+    files: value.files.map((change) => ({
+      path: change.path,
+      originalPath: change.original_path,
+      indexStatus: change.index_status,
+      worktreeStatus: change.worktree_status,
+      staged: change.staged,
+      unstaged: change.unstaged,
+      untracked: change.untracked,
+      conflict: change.conflict,
+    })),
+  };
+}
+
+function mapGitDiff(value: GitDiffWire): GitDiff {
+  return {
+    path: value.path,
+    staged: value.staged,
+    patch: value.patch,
+    truncated: value.truncated,
+  };
+}
+
+function cloneGitStatus(value: GitStatus): GitStatus {
+  return {
+    ...value,
+    files: value.files.map((change) => ({ ...change })),
   };
 }
 

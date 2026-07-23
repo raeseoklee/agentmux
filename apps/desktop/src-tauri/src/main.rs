@@ -68,11 +68,14 @@ impl DesktopNotificationAdapter for TauriDesktopNotificationAdapter {
 }
 
 #[tauri::command]
-fn agentmux_control(
+async fn agentmux_control(
     state: tauri::State<'_, Arc<DesktopControlState>>,
     request: RequestEnvelope,
-) -> ResponseEnvelope {
-    handle_agentmux_control(state.inner().as_ref(), request)
+) -> Result<ResponseEnvelope, String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || handle_agentmux_control(state.as_ref(), request))
+        .await
+        .map_err(|error| format!("AgentMux control task failed: {error}"))
 }
 
 #[tauri::command]
@@ -252,6 +255,130 @@ fn open_external_url(url: String) -> Result<(), String> {
     open_url_in_system_browser(target).map_err(|error| error.to_string())
 }
 
+fn normalized_windows_explorer_path(path: &str) -> Result<Option<String>, String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path must not be empty".to_string());
+    }
+    if path.len() > 32_767 {
+        return Err("path is too long".to_string());
+    }
+    if path.chars().any(char::is_control) {
+        return Err("path must not contain control characters".to_string());
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return Ok(Some(path.replace('/', "\\")));
+    }
+    if bytes.len() >= 4
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && matches!(bytes[3], b'/' | b'\\')
+    {
+        return Ok(Some(path[1..].replace('/', "\\")));
+    }
+    if bytes.len() >= 6
+        && bytes[..5].eq_ignore_ascii_case(b"/mnt/")
+        && bytes[5].is_ascii_alphabetic()
+        && (bytes.len() == 6 || bytes[6] == b'/')
+    {
+        let drive = (bytes[5] as char).to_ascii_uppercase();
+        let suffix = path.get(6..).unwrap_or_default().replace('/', "\\");
+        return Ok(Some(if suffix.is_empty() {
+            format!("{drive}:\\")
+        } else {
+            format!("{drive}:{suffix}")
+        }));
+    }
+    if path.starts_with("\\\\") || path.starts_with("//") {
+        return Ok(Some(path.replace('/', "\\")));
+    }
+    if path.starts_with('/') {
+        return Ok(None);
+    }
+
+    Err("path must be an absolute Windows or WSL path".to_string())
+}
+
+#[cfg(windows)]
+fn resolve_windows_explorer_path(path: &str, distribution: Option<&str>) -> Result<String, String> {
+    if let Some(path) = normalized_windows_explorer_path(path)? {
+        return Ok(path);
+    }
+
+    let distribution = distribution
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(distribution) = distribution {
+        if distribution.len() > 128 || distribution.chars().any(char::is_control) {
+            return Err("invalid WSL distribution name".to_string());
+        }
+    }
+
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut command = std::process::Command::new("wsl.exe");
+    if let Some(distribution) = distribution {
+        command.args(["--distribution", distribution]);
+    }
+    let output = command
+        .args(["--exec", "wslpath", "-w", path.trim()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("failed to resolve WSL path: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "WSL could not resolve the folder path".to_string()
+        } else {
+            format!("WSL could not resolve the folder path: {detail}")
+        });
+    }
+
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    normalized_windows_explorer_path(&resolved)?
+        .ok_or_else(|| "WSL returned an unsupported folder path".to_string())
+}
+
+#[cfg(windows)]
+fn open_path_in_windows_explorer(path: &str, distribution: Option<&str>) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let target = resolve_windows_explorer_path(path, distribution)?;
+    std::process::Command::new("explorer.exe")
+        .arg(target)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to open File Explorer: {error}"))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn open_path_in_explorer(path: String, distribution: Option<String>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(move || {
+            open_path_in_windows_explorer(&path, distribution.as_deref())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (path, distribution);
+        Err("File Explorer integration is available on Windows only".to_string())
+    }
+}
+
 #[cfg(windows)]
 #[tauri::command]
 async fn clipboard_materialize_attachments(
@@ -380,6 +507,7 @@ fn main() {
             session_send_paste_direct,
             session_report_output_pressure,
             open_external_url,
+            open_path_in_explorer,
             clipboard_materialize_attachments,
             show_update_available_notification
         ])
@@ -397,6 +525,33 @@ mod tests {
         assert!(validate_update_notification_field("title", "   ", 8).is_err());
         assert!(validate_update_notification_field("title", "bad\nvalue", 32).is_err());
         assert!(validate_update_notification_field("title", "too long", 3).is_err());
+    }
+
+    #[test]
+    fn explorer_path_normalization_handles_windows_and_wsl_mount_paths() {
+        assert_eq!(
+            normalized_windows_explorer_path(r"D:/Projects/sample").unwrap(),
+            Some(r"D:\Projects\sample".to_string())
+        );
+        assert_eq!(
+            normalized_windows_explorer_path("/D:/Projects/sample").unwrap(),
+            Some(r"D:\Projects\sample".to_string())
+        );
+        assert_eq!(
+            normalized_windows_explorer_path("/mnt/d/Projects/sample").unwrap(),
+            Some(r"D:\Projects\sample".to_string())
+        );
+        assert_eq!(
+            normalized_windows_explorer_path("/home/irae").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explorer_path_normalization_rejects_unsafe_or_relative_paths() {
+        assert!(normalized_windows_explorer_path("  ").is_err());
+        assert!(normalized_windows_explorer_path("relative/folder").is_err());
+        assert!(normalized_windows_explorer_path("C:\\bad\npath").is_err());
     }
 
     #[test]

@@ -30,7 +30,9 @@ export type I18nKey =
   | "common.empty"
   | "common.idle"
   | "common.invalid"
+  | "common.loading"
   | "common.ok"
+  | "common.refresh"
   | "common.reload"
   | "common.reset"
   | "common.save"
@@ -135,7 +137,38 @@ export type I18nKey =
   | "workspace.status.sessionCount"
   | "workspace.status.idle"
   | "workspace.settings"
+  | "statusbar.openPath"
+  | "statusbar.openPathFailed"
   | "statusbar.surfaceSummary"
+  | "sourceControl.changes"
+  | "sourceControl.clean"
+  | "sourceControl.commit"
+  | "sourceControl.commitCreated"
+  | "sourceControl.commitPlaceholder"
+  | "sourceControl.diff"
+  | "sourceControl.enterCommitMessage"
+  | "sourceControl.filterPlaceholder"
+  | "sourceControl.loading"
+  | "sourceControl.loadMore"
+  | "sourceControl.noBranch"
+  | "sourceControl.noDiff"
+  | "sourceControl.noMatchingChanges"
+  | "sourceControl.noStagedChanges"
+  | "sourceControl.notRepository"
+  | "sourceControl.notRepositoryDescription"
+  | "sourceControl.resizeFileList"
+  | "sourceControl.selectFile"
+  | "sourceControl.shownCount"
+  | "sourceControl.stageAll"
+  | "sourceControl.stageFile"
+  | "sourceControl.stagedChanges"
+  | "sourceControl.syncState"
+  | "sourceControl.title"
+  | "sourceControl.truncated"
+  | "sourceControl.unavailableServer"
+  | "sourceControl.unstageAll"
+  | "sourceControl.unstageFile"
+  | "sourceControl.updating"
   | "action.group.agent"
   | "action.group.terminal"
   | "action.group.workspace"
@@ -260,7 +293,9 @@ const en: Record<I18nKey, string> = {
   "common.empty": "empty",
   "common.idle": "idle",
   "common.invalid": "invalid",
+  "common.loading": "Loading...",
   "common.ok": "ok",
+  "common.refresh": "Refresh",
   "common.reload": "Reload",
   "common.reset": "Reset",
   "common.save": "Save",
@@ -368,6 +403,37 @@ const en: Record<I18nKey, string> = {
   "workspace.status.running": "Session running",
   "workspace.status.sessionCount": "{count} sessions",
   "workspace.status.idle": "Idle",
+  "statusbar.openPath": "Open {path} in File Explorer",
+  "statusbar.openPathFailed": "Could not open folder",
+  "sourceControl.changes": "Changes",
+  "sourceControl.clean": "Working tree is clean.",
+  "sourceControl.commit": "Commit staged changes",
+  "sourceControl.commitCreated": "Commit created",
+  "sourceControl.commitPlaceholder": "Commit message (Ctrl+Enter)",
+  "sourceControl.diff": "Diff preview",
+  "sourceControl.enterCommitMessage": "Enter a commit message.",
+  "sourceControl.filterPlaceholder": "Filter changed files",
+  "sourceControl.loading": "Loading repository status...",
+  "sourceControl.loadMore": "Show {count} more",
+  "sourceControl.noBranch": "No branch",
+  "sourceControl.noDiff": "No textual diff is available.",
+  "sourceControl.noMatchingChanges": "No matching changes.",
+  "sourceControl.noStagedChanges": "Stage at least one change before committing.",
+  "sourceControl.notRepository": "No Git repository",
+  "sourceControl.notRepositoryDescription": "Open a terminal inside a Git repository or set the workspace root.",
+  "sourceControl.resizeFileList": "Resize file list and diff preview",
+  "sourceControl.selectFile": "Select a changed file to inspect its diff.",
+  "sourceControl.shownCount": "Showing {shown} of {total}",
+  "sourceControl.stageAll": "Stage all",
+  "sourceControl.stageFile": "Stage {path}",
+  "sourceControl.stagedChanges": "Staged changes",
+  "sourceControl.syncState": "{ahead} ahead / {behind} behind",
+  "sourceControl.title": "Source Control",
+  "sourceControl.truncated": "Preview truncated",
+  "sourceControl.unavailableServer": "Source control is not available in server mode yet.",
+  "sourceControl.unstageAll": "Unstage all",
+  "sourceControl.unstageFile": "Unstage {path}",
+  "sourceControl.updating": "Updating repository...",
   "statusbar.surfaceSummary": "{surfaces} surfaces · {terminals} terminals · {running} running",
   "action.group.agent": "Agent",
   "action.group.terminal": "Terminal",
@@ -634,6 +700,8 @@ const ko: Record<I18nKey, string> = {
   "workspace.status.running": "세션 실행 중",
   "workspace.status.sessionCount": "{count}개 세션",
   "workspace.status.idle": "대기 중",
+  "statusbar.openPath": "파일 탐색기에서 {path} 열기",
+  "statusbar.openPathFailed": "폴더를 열 수 없습니다",
   "statusbar.surfaceSummary": "{surfaces} surface · {terminals} 터미널 · {running} 실행",
   "action.group.agent": "에이전트",
   "action.group.terminal": "터미널",
@@ -679,6 +747,37 @@ const ko: Record<I18nKey, string> = {
   "workspace.group.iconLabel": "그룹 아이콘",
   "workspace.group.invalidColor": "#58A6FF 같은 색상을 사용하세요.",
   "workspace.group.nameLabel": "그룹 이름",
+  "common.loading": "불러오는 중...",
+  "common.refresh": "새로 고침",
+  "sourceControl.changes": "변경 사항",
+  "sourceControl.clean": "작업 트리가 깨끗합니다.",
+  "sourceControl.commit": "스테이징된 변경 커밋",
+  "sourceControl.commitCreated": "커밋 생성됨",
+  "sourceControl.commitPlaceholder": "커밋 메시지 (Ctrl+Enter)",
+  "sourceControl.diff": "Diff 미리 보기",
+  "sourceControl.enterCommitMessage": "커밋 메시지를 입력하세요.",
+  "sourceControl.filterPlaceholder": "변경된 파일 필터",
+  "sourceControl.loading": "저장소 상태를 불러오는 중...",
+  "sourceControl.loadMore": "{count}개 더 보기",
+  "sourceControl.noBranch": "브랜치 없음",
+  "sourceControl.noDiff": "표시할 텍스트 Diff가 없습니다.",
+  "sourceControl.noMatchingChanges": "일치하는 변경 사항이 없습니다.",
+  "sourceControl.noStagedChanges": "변경 사항을 하나 이상 스테이징한 뒤 커밋하세요.",
+  "sourceControl.notRepository": "Git 저장소가 아닙니다",
+  "sourceControl.notRepositoryDescription": "Git 저장소 안에서 터미널을 열거나 워크스페이스 루트를 설정하세요.",
+  "sourceControl.resizeFileList": "파일 목록과 Diff 미리 보기 크기 조절",
+  "sourceControl.selectFile": "변경된 파일을 선택하면 Diff를 확인할 수 있습니다.",
+  "sourceControl.shownCount": "{total}개 중 {shown}개 표시",
+  "sourceControl.stageAll": "모두 스테이징",
+  "sourceControl.stageFile": "{path} 스테이징",
+  "sourceControl.stagedChanges": "스테이징된 변경 사항",
+  "sourceControl.syncState": "앞섬 {ahead} / 뒤처짐 {behind}",
+  "sourceControl.title": "소스 제어",
+  "sourceControl.truncated": "미리 보기 일부만 표시됨",
+  "sourceControl.unavailableServer": "서버 모드의 소스 제어는 아직 지원되지 않습니다.",
+  "sourceControl.unstageAll": "모두 스테이징 해제",
+  "sourceControl.unstageFile": "{path} 스테이징 해제",
+  "sourceControl.updating": "저장소 변경 적용 중...",
 };
 
 const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {
