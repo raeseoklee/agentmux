@@ -422,10 +422,78 @@ fn backup_and_atomic_write(path: &Path, content: &str) -> Result<(), CliError> {
     }
     let temporary = path.with_extension(format!("tmp-{}", timestamp()));
     fs::write(&temporary, content).map_err(CliError::Io)?;
-    fs::rename(&temporary, path).map_err(|error| {
+    atomic_replace(&temporary, path, path.exists()).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         CliError::Io(error)
     })
+}
+
+#[cfg(windows)]
+fn atomic_replace(temp: &Path, target: &Path, target_exists: bool) -> std::io::Result<()> {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+
+    const REPLACEFILE_WRITE_THROUGH: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut c_void,
+            reserved: *mut c_void,
+        ) -> i32;
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let temp = wide(temp);
+    let target = wide(target);
+    // SAFETY: both paths are NUL-terminated UTF-16 buffers that remain alive
+    // for the duration of the Win32 call, and optional pointers are null.
+    let success = unsafe {
+        if target_exists {
+            ReplaceFileW(
+                target.as_ptr(),
+                temp.as_ptr(),
+                ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        } else {
+            MoveFileExW(temp.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH)
+        }
+    };
+    if success == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(temp: &Path, target: &Path, target_exists: bool) -> std::io::Result<()> {
+    if !target_exists {
+        return fs::rename(temp, target);
+    }
+    let rollback = target.with_extension(format!("rollback-{}", timestamp()));
+    fs::rename(target, &rollback)?;
+    match fs::rename(temp, target) {
+        Ok(()) => fs::remove_file(rollback),
+        Err(error) => {
+            let _ = fs::rename(rollback, target);
+            Err(error)
+        }
+    }
 }
 
 fn timestamp() -> u128 {
@@ -515,5 +583,24 @@ mod tests {
         assert!(script.contains("$session = $env:AGENTMUX_SESSION_ID"));
         assert!(!script.contains("$payload.session_id"));
         assert!(!script.contains("Invoke-Expression"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_configuration_and_keeps_backup() {
+        let home = temp_home("replace-existing");
+        let config = home.join("settings.json");
+        fs::write(&config, "old").unwrap();
+
+        backup_and_atomic_write(&config, "new").unwrap();
+
+        assert_eq!(fs::read_to_string(&config).unwrap(), "new");
+        let backups = fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains("bak-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read_to_string(backups[0].path()).unwrap(), "old");
+        let _ = fs::remove_dir_all(home);
     }
 }

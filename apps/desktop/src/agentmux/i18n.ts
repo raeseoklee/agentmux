@@ -177,6 +177,10 @@ export type I18nKey =
   | "sourceControl.worktreeCreateTitle"
   | "sourceControl.worktreeDestination"
   | "sourceControl.worktreeStarted"
+  | "devServer.detectedTitle"
+  | "devServer.detectedDescription"
+  | "devServer.openInSplit"
+  | "devServer.openFailed"
   | "action.group.agent"
   | "action.group.terminal"
   | "action.group.workspace"
@@ -450,6 +454,10 @@ const en: Record<I18nKey, string> = {
   "sourceControl.worktreeCreateTitle": "Create isolated agent worktree",
   "sourceControl.worktreeDestination": "Destination",
   "sourceControl.worktreeStarted": "Worktree operation started",
+  "devServer.detectedTitle": "Development server detected",
+  "devServer.detectedDescription": "{url} is ready to open beside the terminal.",
+  "devServer.openInSplit": "Open in split",
+  "devServer.openFailed": "Could not open the development server",
   "statusbar.surfaceSummary": "{surfaces} surfaces · {terminals} terminals · {running} running",
   "action.group.agent": "Agent",
   "action.group.terminal": "Terminal",
@@ -802,6 +810,10 @@ const ko: Record<I18nKey, string> = {
   "sourceControl.worktreeCreateTitle": "격리된 에이전트 worktree 만들기",
   "sourceControl.worktreeDestination": "대상 경로",
   "sourceControl.worktreeStarted": "worktree 작업 시작됨",
+  "devServer.detectedTitle": "개발 서버 감지됨",
+  "devServer.detectedDescription": "{url}을(를) 터미널 옆에서 열 수 있습니다.",
+  "devServer.openInSplit": "분할로 열기",
+  "devServer.openFailed": "개발 서버를 열지 못했습니다",
 };
 
 const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {

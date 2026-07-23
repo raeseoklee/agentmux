@@ -2046,6 +2046,7 @@ export function AgentmuxTerminalApp() {
   const updateNotificationSessionRef = useRef(
     createUpdateNotificationSession(),
   );
+  const announcedDevServerCandidatesRef = useRef<Set<string>>(new Set());
 
   const [theme, setTheme] = useState<ThemeName>("dark");
   const [language, setLanguage] = useState<AppLocaleLanguage>("en");
@@ -2345,6 +2346,50 @@ export function AgentmuxTerminalApp() {
 
   const T = THEMES[theme];
   const t = useMemo(() => createTranslator(language), [language]);
+  useEffect(() => {
+    const eventApi = (
+      window as Window & {
+        __TAURI__?: {
+          event?: {
+            listen?: (
+              event: string,
+              handler: (event: { payload?: unknown }) => void,
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+    if (!eventApi?.listen) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void eventApi.listen("dev_server.candidate_detected", (event) => {
+      const payload = event.payload as { candidate_id?: unknown; url?: unknown } | undefined;
+      const candidateId = typeof payload?.candidate_id === "string" ? payload.candidate_id : "";
+      const url = typeof payload?.url === "string" ? payload.url : "";
+      if (!candidateId || !url || announcedDevServerCandidatesRef.current.has(candidateId)) return;
+      announcedDevServerCandidatesRef.current.add(candidateId);
+      dialogs.toast({
+        title: t("devServer.detectedTitle"),
+        description: t("devServer.detectedDescription", { url }),
+        actionLabel: t("devServer.openInSplit"),
+        durationMs: 15_000,
+        testId: "dev-server-detected-toast",
+        onAction: () => {
+          void client.openDevelopmentServerCandidateInSplit(candidateId).catch((cause) => {
+            dialogs.toast({
+              title: t("devServer.openFailed"),
+              description: cause instanceof Error ? cause.message : String(cause),
+              tone: "danger",
+            });
+          });
+        },
+      });
+    }).then((stopListening) => {
+      if (disposed) stopListening(); else unlisten = stopListening;
+    }).catch(() => undefined);
+    return () => { disposed = true; unlisten?.(); };
+  }, [client, dialogs, t]);
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
