@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 43
+        equals: 50
       - kind: contains
         path: $.tools[*].name
         value: terminal_open
