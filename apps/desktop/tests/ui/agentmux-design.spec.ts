@@ -168,7 +168,7 @@ test("source control panel stages, previews, and commits workspace changes", asy
     panel.locator(".agentmux-source-control__directory").first(),
   ).toHaveCSS("font-size", "11.5px");
   await expect(
-    panel.locator(".agentmux-source-control__diff pre"),
+    panel.locator(".agentmux-source-control__diff-line").first(),
   ).toHaveCSS("font-size", "11.5px");
 
   const changesPane = panel.locator(".agentmux-source-control__changes");
@@ -214,7 +214,7 @@ test("source control panel stages, previews, and commits workspace changes", asy
     .getByTestId("source-control-change-working")
     .locator(".agentmux-source-control__change-main")
     .click();
-  await expect(panel.locator(".agentmux-source-control__diff pre")).toContainText(
+  await expect(panel.locator(".agentmux-source-control__diff-lines")).toContainText(
     "AgentMux working tree preview",
   );
 
