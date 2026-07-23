@@ -28,8 +28,8 @@ agentmux mcp setup --help
 | 프로필 | 권한 | 권장 용도 |
 | --- | --- | --- |
 | `read` | 워크스페이스, 세션, 에이전트 주의 상태, 페인 워커, 통합 준비 상태, worktree 작업, Git 상태/diff/review, 개발 서버 후보, 팀 메시지와 태스크 조회, 터미널 출력, 브라우저 스냅샷, 이벤트, 컨텍스트 및 진단 읽기 | 모니터링, 검토와 최초 설정 |
-| `standard` | `read` 권한과 함께 페인 포커스, 터미널 열기/분할/입력, 페인 워커 시작/전달, worktree 생성/복구, 리뷰 작성, 개발 서버 분할 열기, 브라우저 조작, 팀 메시지와 태스크 갱신, 에이전트 상태 갱신 | 명령 실행이나 추가형 쓰기가 필요한 신뢰된 대화형 에이전트 작업 |
-| `full` | `standard` 권한과 함께 워커 회수, worktree 제거, Git 스테이징/폐기/커밋, 리뷰 전달/삭제, 통합 shim 설치, 워크스페이스/페인/서피스 닫기, 세션 종료, 설정 변경, 브라우저 JavaScript 실행, 액션 실행, 알림 삭제 | 파괴적이거나 영향이 큰 작업이 필요한 신뢰된 자동화 |
+| `standard` | `read` 권한과 함께 페인 포커스, 터미널 열기/분할/입력, 페인 워커 시작/전달, worktree 생성/복구, 호출자의 고정된 페인·저장소 범위에서 Git 스테이징/스테이징 해제/non-amend 커밋, 호출자 소유 리뷰 작성/전달/댓글 삭제, 개발 서버 분할 열기, 브라우저 조작, 팀 메시지와 태스크 갱신, 에이전트 상태 갱신 | 명령 실행이나 호출자의 고정된 컨텍스트에 제한된 쓰기가 필요한 신뢰된 대화형 에이전트 작업 |
+| `full` | `standard` 권한과 함께 워커 회수, worktree 제거, 저장소 전체 Git 스테이징/스테이징 해제, 변경 폐기, 관리형 커밋 권한, 리뷰 스레드 삭제, 통합 shim 설치, 워크스페이스/페인/서피스 닫기, 세션 종료, 설정 변경, 브라우저 JavaScript 실행, 액션 실행, 알림 삭제 | 파괴적이거나 컨텍스트를 넘나들거나 영향이 큰 작업이 필요한 신뢰된 자동화 |
 
 `standard`는 안전하거나 비파괴적인 프로필이 아닙니다. 명령 실행과 터미널,
 브라우저, 공유 협업 상태 변경을 허용할 수 있는 클라이언트에만 부여하세요.
@@ -54,15 +54,16 @@ agentmux mcp setup --help
 
 | 워크플로 | `read` | `standard` | `full` |
 | --- | --- | --- | --- |
-| Git | `git_status_summary`, `git_status_page`, `git_diff` | - | `git_stage`, `git_unstage`, `git_stage_all`, `git_unstage_all`, `git_discard`, `git_commit` |
+| Git | `git_status_summary`, `git_status_page`, `git_diff` | 호출자의 고정된 페인·저장소 범위로 제한된 `git_stage`, `git_unstage`, non-amend `git_commit` | `git_stage_all`, `git_unstage_all`, `git_discard`, amend 및 컨텍스트 간 커밋 권한 |
 | 에이전트 worktree | `agent_worktree_list` | `agent_worktree_create`, `agent_worktree_recover` | `agent_worktree_remove` |
-| Diff 리뷰 | `git_review_thread_list`, `git_review_comment_list` | thread/comment 생성·수정, thread stale 표시 | thread 전달·삭제, comment 삭제 |
+| Diff 리뷰 | `git_review_thread_list`, `git_review_comment_list` | 호출자 소유 thread/comment 생성·수정, 소유 thread stale 표시, 허용된 대상에 소유 thread 전달, 소유 comment 삭제 | thread 삭제 및 호출자 소유 범위를 벗어난 리뷰 관리 |
 | 개발 서버 | `development_server_candidate_list` | 후보 무시 또는 브라우저 분할로 열기 | - |
 
 worktree 생성은 복구 가능한 saga입니다. Git worktree, AgentMux 워크스페이스,
 터미널과 에이전트 실행 중 뒤 단계가 실패하면 앞 단계를 역순으로 보상합니다.
-리뷰 전달은 에이전트 mailbox나 터미널에 입력하므로 명시적으로 수행하며 `full`
-권한이 필요합니다. 예제와 복구 절차는
+리뷰 전달은 에이전트 mailbox나 터미널에 입력하므로 명시적으로 수행합니다.
+`standard`는 호출자의 고정된 페인 컨텍스트가 허용하는 대상에 호출자 소유 리뷰만
+전달할 수 있고, `full`은 컨텍스트 간 관리 권한을 유지합니다. 예제와 복구 절차는
 [고급 에이전트 워크플로](./advanced-agent-workflows.md)를 참고하십시오.
 
 ## 에이전트 페인 워커와 tmux 통합
