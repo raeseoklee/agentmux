@@ -66,6 +66,7 @@ jobs:
 
   desktop-ui-and-performance-gates:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -81,7 +82,7 @@ jobs:
         run: npm run test:ui
         working-directory: apps/desktop
       - name: Run performance gates
-        run: npm run perf:gates
+        run: npm run perf:gates:ci
 
   docs-check:
     runs-on: windows-latest

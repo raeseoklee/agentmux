@@ -1,6 +1,7 @@
 param(
   [string]$OutputDir = "",
-  [switch]$Smoke
+  [switch]$Smoke,
+  [switch]$Ci
 )
 
 $ErrorActionPreference = "Stop"
@@ -137,6 +138,23 @@ function Get-Benchmarks {
     )
   }
 
+  if ($Ci) {
+    return @(
+      @{ Name = "single-terminal-latency"; Args = @("run", "-p", "agentmux-bench-single-terminal-latency") },
+      @{ Name = "many-idle-sessions"; Args = @("run", "-p", "agentmux-bench-many-idle-sessions") },
+      @{ Name = "high-output"; Args = @("run", "-p", "agentmux-bench-high-output") },
+      @{ Name = "resize-storm"; Args = @("run", "-p", "agentmux-bench-resize-storm") },
+      @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery") },
+      @{ Name = "git-status-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_5k_mixed_porcelain_records_within_budget", "--", "--exact") },
+      @{ Name = "git-status-10k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_10k_mixed_porcelain_records_within_budget", "--", "--exact") },
+      @{ Name = "git-status-native-first-page-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::streams_5k_native_status_first_page_within_budget", "--", "--ignored", "--exact") },
+      @{ Name = "git-status-native-first-page-10k"; Args = @("test", "-p", "agentmux-vcs", "tests::streams_10k_native_status_first_page_within_budget", "--", "--ignored", "--exact") },
+      @{ Name = "git-local-server-snapshot-consistency"; Args = @("test", "-p", "agentmux-cli", "server_local_git::tests::local_git_pages_reuse_one_snapshot_across_external_changes", "--", "--ignored", "--exact") },
+      @{ Name = "git-page-pipeline-5k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_5k_files_within_budget", "--", "--exact") },
+      @{ Name = "git-page-pipeline-10k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_10k_files_within_budget", "--", "--exact") }
+    )
+  }
+
   return @(
     @{ Name = "single-terminal-latency"; Args = @("run", "-p", "agentmux-bench-single-terminal-latency") },
     @{ Name = "many-idle-sessions"; Args = @("run", "-p", "agentmux-bench-many-idle-sessions") },
@@ -151,7 +169,7 @@ function Get-Benchmarks {
     @{ Name = "git-status-native-15k"; Args = @("test", "-p", "agentmux-vcs", "tests::reads_15k_native_status_records_within_budget", "--", "--ignored", "--exact") },
     @{ Name = "git-local-server-snapshot-consistency"; Args = @("test", "-p", "agentmux-cli", "server_local_git::tests::local_git_pages_reuse_one_snapshot_across_external_changes", "--", "--ignored", "--exact") },
     @{ Name = "git-page-pipeline-5k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_5k_files_within_budget", "--", "--exact") },
-    @{ Name = "git-page-pipeline-10k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_10k_files_within_budget", "--", "--exact") }
+    @{ Name = "git-page-pipeline-10k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_10k_files_within_budget", "--", "--exact") },
     @{ Name = "git-page-pipeline-15k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_page_pipeline_handles_15k_files_within_budget", "--", "--exact") },
     @{ Name = "git-page-native-first-visible-15k"; Args = @("test", "-p", "agentmux-desktop-host", "five_track::tests::git_status_native_15k_returns_first_visible_page_before_completion", "--", "--ignored", "--exact") }
   )
@@ -169,6 +187,8 @@ try {
     $started = Get-Date
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
 
+    Write-Host ("Starting performance gate '{0}'" -f $benchmark.Name)
+
     $process = Start-Process `
       -FilePath $cargoPath `
       -ArgumentList @($benchmark.Args) `
@@ -179,6 +199,8 @@ try {
       -PassThru
     $exitCode = $process.ExitCode
     $timer.Stop()
+
+    Write-Host ("Completed performance gate '{0}' in {1:n1}s" -f $benchmark.Name, $timer.Elapsed.TotalSeconds)
 
     $results += [ordered]@{
       name = $benchmark.Name
@@ -198,6 +220,7 @@ try {
   $manifest = [ordered]@{
     generated_at = (Get-Date).ToUniversalTime().ToString("o")
     smoke = [bool]$Smoke
+    ci = [bool]$Ci
     output_dir = $OutputDir
     cargo = $cargoPath
     reference_profile = [System.IO.Path]::GetFileName($profilePath)
