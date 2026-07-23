@@ -208,6 +208,11 @@ try {
     }
 
     if ($exitCode -ne 0) {
+      if (Test-Path $stderrPath) {
+        Write-Host "::group::Performance gate stderr: $($benchmark.Name)"
+        Get-Content -Path $stderrPath -Tail 200 | ForEach-Object { Write-Host $_ }
+        Write-Host "::endgroup::"
+      }
       throw "Benchmark '$($benchmark.Name)' failed with exit code $exitCode. See $stderrPath"
     }
   }

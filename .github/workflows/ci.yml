@@ -93,6 +93,14 @@ jobs:
         with:
           shared-key: desktop-performance-gates
           cache-on-failure: true
+      - name: Prepare desktop sidecars
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-desktop-bundle-binaries.ps1 -BuildProfile Debug
+      - name: Prepare desktop resource stub
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/desktop/dist | Out-Null
+          Set-Content -Path apps/desktop/dist/index.html -Value '<!doctype html><html><body>ci</body></html>' -Encoding UTF8
       - name: Run performance gates
         run: npm run perf:gates:ci
 
