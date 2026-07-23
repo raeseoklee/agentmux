@@ -1158,6 +1158,7 @@ export interface ControlClient {
   listGitReviewThreads(
     workspaceId: string,
     options?: {
+      paneId?: string | null;
       repositoryId?: string | null;
       path?: string | null;
       includeResolved?: boolean;
@@ -1167,6 +1168,7 @@ export interface ControlClient {
   ): Promise<GitReviewThread[]>;
   createGitReviewThread(input: {
     workspaceId: string;
+    paneId?: string | null;
     repositoryId?: string | null;
     anchor: GitReviewLineAnchor;
     body: string;
@@ -2908,6 +2910,7 @@ class TauriControlClient implements ControlClient {
   async listGitReviewThreads(
     workspaceId: string,
     options: {
+      paneId?: string | null;
       repositoryId?: string | null;
       path?: string | null;
       includeResolved?: boolean;
@@ -2919,6 +2922,7 @@ class TauriControlClient implements ControlClient {
       "git.review_thread.list",
       {
         workspace_id: workspaceId,
+        pane_id: options.paneId ?? null,
         repository_id: options.repositoryId ?? null,
         path: options.path ?? null,
         include_resolved: options.includeResolved ?? false,
@@ -2930,6 +2934,7 @@ class TauriControlClient implements ControlClient {
   }
   async createGitReviewThread(input: {
     workspaceId: string;
+    paneId?: string | null;
     repositoryId?: string | null;
     anchor: GitReviewLineAnchor;
     body: string;
@@ -2938,6 +2943,7 @@ class TauriControlClient implements ControlClient {
     return mapGitReviewThread(
       await this.call<GitReviewThreadWire>("git.review_thread.create", {
         workspace_id: input.workspaceId,
+        pane_id: input.paneId ?? null,
         repository_id: input.repositoryId ?? null,
         anchor: toGitReviewAnchorWire(input.anchor),
         body: input.body,
@@ -5442,6 +5448,7 @@ class BrowserPreviewControlClient implements ControlClient {
   }
   async createGitReviewThread(input: {
     workspaceId: string;
+    paneId?: string | null;
     repositoryId?: string | null;
     anchor: GitReviewLineAnchor;
     body: string;
@@ -7289,6 +7296,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
   async listGitReviewThreads(
     workspaceId: string,
     options: {
+      paneId?: string | null;
       repositoryId?: string | null;
       path?: string | null;
       includeResolved?: boolean;
@@ -7300,6 +7308,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
       "git.review_thread.list",
       {
         workspace_id: workspaceId,
+        pane_id: options.paneId ?? null,
         repository_id: options.repositoryId ?? null,
         path: options.path ?? null,
         include_resolved: options.includeResolved ?? false,
@@ -7311,6 +7320,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
   }
   async createGitReviewThread(input: {
     workspaceId: string;
+    paneId?: string | null;
     repositoryId?: string | null;
     anchor: GitReviewLineAnchor;
     body: string;
@@ -7321,6 +7331,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
         "git.review_thread.create",
         {
           workspace_id: input.workspaceId,
+          pane_id: input.paneId ?? null,
           repository_id: input.repositoryId ?? null,
           anchor: toGitReviewAnchorWire(input.anchor),
           body: input.body,

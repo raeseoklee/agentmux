@@ -1,8 +1,11 @@
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(not(test))]
+use std::{fs, path::PathBuf};
 
 use agentmux_backend_wsl::fallback_windows_path_to_wsl;
 use agentmux_ipc::{
@@ -11,6 +14,7 @@ use agentmux_ipc::{
     GitStatusPageParams, GitStatusPageResult, GitStatusSummaryResult, RequestEnvelope,
     ResponseEnvelope,
 };
+use agentmux_store::{GitMutationReceiptLookup, PersistedGitMutationReceipt, SqliteStore};
 use agentmux_vcs::{
     DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost, Repository, StatusScan,
     StatusScanFirstPage, StatusSnapshot, StatusSummary,
@@ -29,14 +33,14 @@ const LOCAL_GIT_MUTATION_METHODS: &[&str] = &[
     "git.unstage_all",
     "git.commit",
 ];
-const MAX_IDEMPOTENCY_RESULTS: usize = 256;
+const MAX_IDEMPOTENCY_RECEIPTS: usize = 512;
 
 pub(crate) struct ServerLocalGit {
     client: GitClient,
     repository: Repository,
     repository_id: String,
     workspace_id: String,
-    idempotency_results: HashMap<String, CachedMutationResult>,
+    receipt_store: SqliteStore,
     status_snapshot: Option<Arc<StatusSnapshot>>,
     status_scan: Option<LocalStatusScan>,
     status_refresh_count: u64,
@@ -48,18 +52,28 @@ struct LocalStatusScan {
     scan: StatusScan,
 }
 
-#[derive(Clone)]
-struct CachedMutationResult {
-    request_fingerprint: String,
-    result: GitMutationResult,
-}
-
 impl ServerLocalGit {
     pub(crate) fn probe(
         workspace_id: &str,
         backend: Option<&str>,
         backend_profile: Option<&str>,
         cwd: Option<&str>,
+    ) -> Option<Self> {
+        Self::probe_with_store(
+            workspace_id,
+            backend,
+            backend_profile,
+            cwd,
+            open_server_git_receipt_store().ok()?,
+        )
+    }
+
+    fn probe_with_store(
+        workspace_id: &str,
+        backend: Option<&str>,
+        backend_profile: Option<&str>,
+        cwd: Option<&str>,
+        receipt_store: SqliteStore,
     ) -> Option<Self> {
         let context = local_git_context(backend, backend_profile, cwd)?;
         let client = GitClient::default();
@@ -70,7 +84,7 @@ impl ServerLocalGit {
             repository,
             repository_id,
             workspace_id: workspace_id.to_string(),
-            idempotency_results: HashMap::new(),
+            receipt_store,
             status_snapshot: None,
             status_scan: None,
             status_refresh_count: 0,
@@ -442,7 +456,7 @@ impl ServerLocalGit {
             params.idempotency_key.as_deref(),
             fingerprint,
             &result,
-        );
+        )?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -482,7 +496,7 @@ impl ServerLocalGit {
             params.idempotency_key.as_deref(),
             fingerprint,
             &result,
-        );
+        )?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -521,7 +535,7 @@ impl ServerLocalGit {
             params.idempotency_key.as_deref(),
             fingerprint,
             &result,
-        );
+        )?;
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
@@ -572,19 +586,25 @@ impl ServerLocalGit {
         let Some(idempotency_key) = idempotency_key else {
             return Ok(None);
         };
-        let key = mutation_key(method, &self.repository_id, idempotency_key);
-        let Some(cached) = self.idempotency_results.get(&key) else {
-            return Ok(None);
-        };
-        if cached.request_fingerprint != request_fingerprint {
-            return Err(ControlError::new(
-                ErrorCode::Conflict,
-                "idempotency_key was already used with a different Git mutation request.",
-            ));
+        match self
+            .receipt_store
+            .load_git_mutation_receipt(
+                method,
+                &self.repository_id,
+                idempotency_key,
+                request_fingerprint,
+            )
+            .map_err(receipt_store_error)?
+        {
+            GitMutationReceiptLookup::Missing => Ok(None),
+            GitMutationReceiptLookup::Match(receipt) => {
+                let mut result = serde_json::from_str::<GitMutationResult>(&receipt.response_json)
+                    .map_err(|_| receipt_store_error("stored response is invalid"))?;
+                result.reused = true;
+                Ok(Some(result))
+            }
+            GitMutationReceiptLookup::FingerprintMismatch { .. } => Err(idempotency_conflict()),
         }
-        let mut result = cached.result.clone();
-        result.reused = true;
-        Ok(Some(result))
     }
 
     fn remember_result(
@@ -593,22 +613,35 @@ impl ServerLocalGit {
         idempotency_key: Option<&str>,
         request_fingerprint: String,
         result: &GitMutationResult,
-    ) {
+    ) -> Result<(), ControlError> {
         let Some(idempotency_key) = idempotency_key else {
-            return;
+            return Ok(());
         };
-        if self.idempotency_results.len() >= MAX_IDEMPOTENCY_RESULTS {
-            if let Some(key) = self.idempotency_results.keys().next().cloned() {
-                self.idempotency_results.remove(&key);
+        let receipt = PersistedGitMutationReceipt {
+            method: method.to_string(),
+            repository_id: self.repository_id.clone(),
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint,
+            response_json: serde_json::to_string(result)
+                .map_err(|_| receipt_store_error("could not encode the Git mutation response"))?,
+            created_at: refreshed_at(),
+        };
+        match self
+            .receipt_store
+            .create_or_load_git_mutation_receipt(&receipt)
+            .map_err(receipt_store_error)?
+        {
+            GitMutationReceiptLookup::Match(_) => {
+                self.receipt_store
+                    .prune_git_mutation_receipts(MAX_IDEMPOTENCY_RECEIPTS)
+                    .map_err(receipt_store_error)?;
+                Ok(())
             }
+            GitMutationReceiptLookup::FingerprintMismatch { .. } => Err(idempotency_conflict()),
+            GitMutationReceiptLookup::Missing => Err(receipt_store_error(
+                "successful Git mutation receipt was not persisted",
+            )),
         }
-        self.idempotency_results.insert(
-            mutation_key(method, &self.repository_id, idempotency_key),
-            CachedMutationResult {
-                request_fingerprint,
-                result: result.clone(),
-            },
-        );
     }
 }
 
@@ -719,8 +752,44 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
-fn mutation_key(method: &str, repository_id: &str, idempotency_key: &str) -> String {
-    format!("{method}|{repository_id}|{idempotency_key}")
+fn idempotency_conflict() -> ControlError {
+    ControlError::new(
+        ErrorCode::Conflict,
+        "idempotency_key was already used with a different Git mutation request.",
+    )
+}
+
+fn receipt_store_error(error: impl std::fmt::Display) -> ControlError {
+    ControlError::new(
+        ErrorCode::BackendUnavailable,
+        format!("Git mutation receipt store is unavailable: {error}"),
+    )
+}
+
+#[cfg(test)]
+fn open_server_git_receipt_store() -> Result<SqliteStore, String> {
+    SqliteStore::in_memory().map_err(|error| error.to_string())
+}
+
+#[cfg(not(test))]
+fn open_server_git_receipt_store() -> Result<SqliteStore, String> {
+    let path = default_server_git_receipt_store_path()?;
+    SqliteStore::open(path).map_err(|error| error.to_string())
+}
+
+#[cfg(not(test))]
+fn default_server_git_receipt_store_path() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("AGENTMUX_STORE_PATH") {
+        return Ok(PathBuf::from(path));
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| "unable to resolve AgentMux store path".to_string())?;
+    let directory = base.join("AgentMux");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create AgentMux store directory: {error}"))?;
+    Ok(directory.join("agentmux.sqlite3"))
 }
 
 fn mutation_request_fingerprint<T>(params: &T) -> Result<String, ControlError>
@@ -966,6 +1035,31 @@ mod tests {
             r#"{"workspace_id":"ws_server","query":"tracked","limit":25}"#,
             "token",
         )));
+        let page = if page.total_count.is_none() {
+            let summary: GitStatusSummaryResult = decode(git.handle_request(RequestEnvelope::new(
+                "page-summary",
+                "git.status_summary",
+                r#"{"workspace_id":"ws_server"}"#,
+                "token",
+            )));
+            decode(
+                git.handle_request(RequestEnvelope::new(
+                    "page-complete",
+                    "git.status_page",
+                    serde_json::json!({
+                        "workspace_id": "ws_server",
+                        "repository_id": summary.repository_id,
+                        "generation": summary.generation,
+                        "query": "tracked",
+                        "limit": 25
+                    })
+                    .to_string(),
+                    "token",
+                )),
+            )
+        } else {
+            page
+        };
         assert_eq!(page.total_count, Some(1));
         assert!(page.changes[0].unstaged);
 
@@ -1103,6 +1197,91 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "runs native Git and verifies a durable idempotency receipt"]
+    fn local_git_commit_idempotency_survives_server_restart() {
+        if Command::new("git").arg("--version").status().is_err() {
+            return;
+        }
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("agentmux-server-local-git-restart-{suffix}"));
+        let state =
+            std::env::temp_dir().join(format!("agentmux-server-local-git-receipts-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "AgentMux Test"]);
+        run_git(&root, &["config", "user.email", "agentmux@example.invalid"]);
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        run_git(&root, &["add", "tracked.txt"]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        run_git(&root, &["add", "tracked.txt"]);
+        let database = state.join("agentmux.sqlite3");
+        let request = r#"{"workspace_id":"ws_server","message":"durable server commit","idempotency_key":"durable-commit-key"}"#;
+
+        let commit = {
+            let store = SqliteStore::open(&database).expect("receipt store");
+            let mut git = ServerLocalGit::probe_with_store(
+                "ws_server",
+                Some("conpty"),
+                None,
+                Some(&root.to_string_lossy()),
+                store,
+            )
+            .expect("repository probe");
+            let result: GitMutationResult = decode(git.handle_request(RequestEnvelope::new(
+                "commit-before-restart",
+                "git.commit",
+                request,
+                "token",
+            )));
+            assert!(!result.reused);
+            result
+        };
+
+        let store = SqliteStore::open(&database).expect("reopened receipt store");
+        let mut restarted = ServerLocalGit::probe_with_store(
+            "ws_server",
+            Some("conpty"),
+            None,
+            Some(&root.to_string_lossy()),
+            store,
+        )
+        .expect("repository probe after restart");
+        let replay: GitMutationResult = decode(restarted.handle_request(RequestEnvelope::new(
+            "commit-after-restart",
+            "git.commit",
+            request,
+            "token",
+        )));
+        assert!(replay.reused);
+        assert_eq!(replay.commit_oid, commit.commit_oid);
+
+        let conflict = control_error(restarted.handle_request(RequestEnvelope::new(
+            "commit-after-restart-conflict",
+            "git.commit",
+            r#"{"workspace_id":"ws_server","message":"different request","idempotency_key":"durable-commit-key"}"#,
+            "token",
+        )));
+        assert_eq!(conflict.code, ErrorCode::Conflict);
+        assert_eq!(
+            git_output(&root, &["rev-list", "--count", "HEAD"]).trim(),
+            "2"
+        );
+
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(state).unwrap();
     }
 
     #[test]

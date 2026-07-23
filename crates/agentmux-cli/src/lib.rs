@@ -2212,6 +2212,7 @@ fn parse_review_thread_list_options(
 ) -> Result<(ControlInvokeOptions, GitReviewThreadListParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut path = None;
     let mut include_resolved = false;
@@ -2225,6 +2226,10 @@ fn parse_review_thread_list_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -2269,6 +2274,7 @@ fn parse_review_thread_list_options(
                 workspace_id,
                 "git review thread list requires --workspace or AGENTMUX_WORKSPACE_ID.",
             )?,
+            pane_id,
             repository_id,
             path,
             include_resolved,
@@ -2283,6 +2289,7 @@ fn parse_review_thread_create_options(
 ) -> Result<(ControlInvokeOptions, GitReviewThreadCreateParams), CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut repository_id = None;
     let mut path = None;
     let mut side = None;
@@ -2302,6 +2309,10 @@ fn parse_review_thread_create_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
                 index += 2;
             }
             "--repository" | "--repository-id" => {
@@ -2383,6 +2394,7 @@ fn parse_review_thread_create_options(
                 workspace_id,
                 "git review thread create requires --workspace or AGENTMUX_WORKSPACE_ID.",
             )?,
+            pane_id,
             repository_id,
             anchor: GitReviewLineAnchor {
                 path: required_cli_value(path, "git review thread create requires --path.")?,
@@ -17995,6 +18007,32 @@ mod tests {
         ];
         let (_, commit) = parse_git_commit_options(&commit_args).unwrap();
         assert_eq!(commit.pane_id.as_deref(), Some("pane_1"));
+
+        let review_list_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane".to_string(),
+            "pane_1".to_string(),
+        ];
+        let (_, review_list) = parse_review_thread_list_options(&review_list_args).unwrap();
+        assert_eq!(review_list.pane_id.as_deref(), Some("pane_1"));
+
+        let review_create_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane-id".to_string(),
+            "pane_1".to_string(),
+            "--path".to_string(),
+            "src/lib.rs".to_string(),
+            "--side".to_string(),
+            "right".to_string(),
+            "--line".to_string(),
+            "42".to_string(),
+            "--body".to_string(),
+            "review".to_string(),
+        ];
+        let (_, review_create) = parse_review_thread_create_options(&review_create_args).unwrap();
+        assert_eq!(review_create.pane_id.as_deref(), Some("pane_1"));
     }
 
     #[test]

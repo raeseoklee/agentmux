@@ -2527,6 +2527,8 @@ impl GitReviewLineAnchor {
 pub struct GitReviewThreadListParams {
     pub workspace_id: String,
     #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
     pub repository_id: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
@@ -2546,6 +2548,11 @@ impl GitReviewThreadListParams {
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
             "repository_id",
             self.repository_id.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
@@ -2562,6 +2569,8 @@ impl GitReviewThreadListParams {
 pub struct GitReviewThreadCreateParams {
     pub workspace_id: String,
     #[serde(default)]
+    pub pane_id: Option<String>,
+    #[serde(default)]
     pub repository_id: Option<String>,
     pub anchor: GitReviewLineAnchor,
     pub body: String,
@@ -2574,6 +2583,11 @@ impl GitReviewThreadCreateParams {
         validate_required(
             "workspace_id",
             &self.workspace_id,
+            MAX_IDEMPOTENCY_KEY_BYTES,
+        )?;
+        validate_optional(
+            "pane_id",
+            self.pane_id.as_deref(),
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional(
@@ -4480,10 +4494,11 @@ mod tests {
     #[test]
     fn review_contracts_preserve_anchor_and_comment_history() {
         let create: GitReviewThreadCreateParams = serde_json::from_str(
-            r#"{"workspace_id":"ws_1","repository_id":"repo_1","anchor":{"path":"src/lib.rs","side":"right","line":42,"start_line":40,"base_revision":"base","head_revision":"head","hunk_header":"@@ -40,3 +40,5 @@","diff_hash":"hash"},"body":"Please handle the error path.","author_session_id":"ses_1"}"#,
+            r#"{"workspace_id":"ws_1","pane_id":"pane_1","repository_id":"repo_1","anchor":{"path":"src/lib.rs","side":"right","line":42,"start_line":40,"base_revision":"base","head_revision":"head","hunk_header":"@@ -40,3 +40,5 @@","diff_hash":"hash"},"body":"Please handle the error path.","author_session_id":"ses_1"}"#,
         )
         .unwrap();
         create.validate().unwrap();
+        assert_eq!(create.pane_id.as_deref(), Some("pane_1"));
 
         let invalid_anchor: GitReviewThreadCreateParams = serde_json::from_str(
             r#"{"workspace_id":"ws_1","anchor":{"path":"src/lib.rs","side":"right","line":7,"start_line":8},"body":"note"}"#,

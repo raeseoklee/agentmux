@@ -869,6 +869,7 @@ impl AgentMuxMcpServer {
                 METHOD_GIT_REVIEW_THREAD_LIST,
                 json!(GitReviewThreadListParams {
                     workspace_id: scope.workspace_id.clone(),
+                    pane_id: Some(scope.pane_id.clone()),
                     repository_id: Some(scope.repository_id.clone()),
                     path: None,
                     include_resolved: true,
@@ -1628,8 +1629,9 @@ impl AgentMuxMcpServer {
         &self,
         Parameters(params): Parameters<GitReviewThreadListToolParams>,
     ) -> CallToolResult {
-        let request = GitReviewThreadListParams {
+        let mut request = GitReviewThreadListParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             path: params.path,
             include_resolved: params.include_resolved,
@@ -1638,6 +1640,23 @@ impl AgentMuxMcpServer {
         };
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_LIST, error);
+        }
+        if self.profile == McpProfile::Standard {
+            let scope = match self
+                .authorize_standard_git_scope(
+                    "git_review_thread_list",
+                    &request.workspace_id,
+                    request.pane_id.as_deref(),
+                    request.repository_id.as_deref(),
+                )
+                .await
+            {
+                Ok(scope) => scope,
+                Err(result) => return result,
+            };
+            request.workspace_id = scope.workspace_id;
+            request.pane_id = Some(scope.pane_id);
+            request.repository_id = Some(scope.repository_id);
         }
         self.call(METHOD_GIT_REVIEW_THREAD_LIST, json!(request))
             .await
@@ -1772,6 +1791,7 @@ impl AgentMuxMcpServer {
     ) -> CallToolResult {
         let mut request = GitReviewThreadCreateParams {
             workspace_id: params.workspace_id,
+            pane_id: params.pane_id,
             repository_id: params.repository_id,
             anchor: params.anchor.into(),
             body: params.body,
@@ -1785,7 +1805,7 @@ impl AgentMuxMcpServer {
                 .authorize_standard_git_scope(
                     "git_review_thread_create",
                     &request.workspace_id,
-                    None,
+                    request.pane_id.as_deref(),
                     request.repository_id.as_deref(),
                 )
                 .await
@@ -1804,6 +1824,7 @@ impl AgentMuxMcpServer {
                 );
             }
             request.workspace_id = scope.workspace_id;
+            request.pane_id = Some(scope.pane_id);
             request.repository_id = Some(scope.repository_id);
             request.author_session_id = Some(scope.session_id);
         }
@@ -6938,6 +6959,7 @@ impl From<GitReviewLineAnchorToolParams> for GitReviewLineAnchor {
 #[derive(Debug, Default, Deserialize, JsonSchema, Serialize)]
 struct GitReviewThreadListToolParams {
     workspace_id: String,
+    pane_id: Option<String>,
     repository_id: Option<String>,
     path: Option<String>,
     #[serde(default)]
@@ -6950,6 +6972,7 @@ struct GitReviewThreadListToolParams {
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct GitReviewThreadCreateToolParams {
     workspace_id: String,
+    pane_id: Option<String>,
     repository_id: Option<String>,
     anchor: GitReviewLineAnchorToolParams,
     body: String,
@@ -7634,6 +7657,7 @@ mod tests {
         let result = server
             .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
                 workspace_id: "workspace-1".to_string(),
+                pane_id: None,
                 repository_id: None,
                 anchor: GitReviewLineAnchorToolParams {
                     path: "src/lib.rs".to_string(),
@@ -7658,8 +7682,39 @@ mod tests {
         assert_eq!(calls[0].1["surface_id"], "surface-1");
         assert_eq!(calls[2].0, METHOD_GIT_REVIEW_THREAD_CREATE);
         assert_eq!(calls[2].1["workspace_id"], "workspace-1");
+        assert_eq!(calls[2].1["pane_id"], "pane-1");
         assert_eq!(calls[2].1["repository_id"], "repo-1");
         assert_eq!(calls[2].1["author_session_id"], "session-agent");
+    }
+
+    #[tokio::test]
+    async fn standard_review_list_binds_repository_lookup_to_caller_pane() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (METHOD_GIT_REVIEW_THREAD_LIST, json!({ "threads": [] })),
+            ],
+        );
+        let result = server
+            .git_review_thread_list(Parameters(GitReviewThreadListToolParams {
+                workspace_id: "workspace-1".to_string(),
+                pane_id: None,
+                repository_id: None,
+                path: None,
+                include_resolved: true,
+                include_stale: true,
+                limit: Some(25),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].0, METHOD_GIT_REVIEW_THREAD_LIST);
+        assert_eq!(calls[2].1["workspace_id"], "workspace-1");
+        assert_eq!(calls[2].1["pane_id"], "pane-1");
+        assert_eq!(calls[2].1["repository_id"], "repo-1");
     }
 
     #[tokio::test]
@@ -7674,6 +7729,7 @@ mod tests {
         let forged = server
             .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
                 workspace_id: "workspace-1".to_string(),
+                pane_id: None,
                 repository_id: Some("repo-1".to_string()),
                 anchor: GitReviewLineAnchorToolParams {
                     path: "src/lib.rs".to_string(),
@@ -7710,6 +7766,7 @@ mod tests {
             let result = server
                 .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
                     workspace_id: workspace_id.to_string(),
+                    pane_id: None,
                     repository_id: repository_id.map(ToString::to_string),
                     anchor: GitReviewLineAnchorToolParams {
                         path: "src/lib.rs".to_string(),
@@ -8046,6 +8103,7 @@ mod tests {
         let result = server
             .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
                 workspace_id: "workspace-foreign".to_string(),
+                pane_id: None,
                 repository_id: Some("repo-foreign".to_string()),
                 anchor: GitReviewLineAnchorToolParams {
                     path: "src/admin.rs".to_string(),
@@ -8497,6 +8555,7 @@ mod tests {
         let review = server
             .git_review_thread_create(Parameters(GitReviewThreadCreateToolParams {
                 workspace_id: "workspace-1".to_string(),
+                pane_id: None,
                 repository_id: None,
                 anchor: GitReviewLineAnchorToolParams {
                     path: "src/lib.rs".to_string(),

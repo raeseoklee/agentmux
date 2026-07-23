@@ -156,6 +156,7 @@ dependencies = [
  "agentmux-backend-wsl",
  "agentmux-core",
  "agentmux-ipc",
+ "agentmux-store",
  "agentmux-vcs",
  "axum",
  "bytes",

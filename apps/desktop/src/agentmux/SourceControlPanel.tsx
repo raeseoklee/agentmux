@@ -197,13 +197,13 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
     }
     try {
       const nextThreads = await client.listGitReviewThreads(workspace.workspaceId, {
-        repositoryId, path: path ?? null, includeResolved: true, includeStale: true,
+        paneId: activePaneId, repositoryId, path: path ?? null, includeResolved: true, includeStale: true,
       });
       if (sequence === threadSequence.current && isCurrentTarget(expectedTarget)) setThreads(nextThreads);
     } catch (cause) {
       if (sequence === threadSequence.current && isCurrentTarget(expectedTarget)) setError(cause instanceof Error ? cause.message : String(cause));
     }
-  }, [captureTarget, client, isCurrentTarget, workspace.workspaceId]);
+  }, [activePaneId, captureTarget, client, isCurrentTarget, workspace.workspaceId]);
 
   const refresh = useCallback(async (showLoading = false, reuseLoadedSnapshot = false) => {
     const sequence = ++refreshSequence.current;
@@ -439,7 +439,7 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
     const operationTarget = captureTarget();
     setBusy(true);
     try {
-      const thread = await client.createGitReviewThread({ workspaceId: workspace.workspaceId, repositoryId: summary.repositoryId, anchor: reviewAnchor, body: reviewBody });
+      const thread = await client.createGitReviewThread({ workspaceId: workspace.workspaceId, paneId: activePaneId, repositoryId: summary.repositoryId, anchor: reviewAnchor, body: reviewBody });
       if (deliverySession) await client.deliverGitReviewThread(thread.threadId, { target: delivery, targetSessionId: deliverySession, includeContext: true });
       if (!isCurrentTarget(operationTarget)) return;
       setReviewBody("");
@@ -450,7 +450,7 @@ export function SourceControlPanel({ client, workspace, activePaneId, activeSess
     } finally {
       setBusy(false);
     }
-  }, [busy, captureTarget, client, delivery, deliverySession, isCurrentTarget, loadThreads, reviewAnchor, reviewBody, selection?.path, summary, workspace.workspaceId]);
+  }, [activePaneId, busy, captureTarget, client, delivery, deliverySession, isCurrentTarget, loadThreads, reviewAnchor, reviewBody, selection?.path, summary, workspace.workspaceId]);
 
   const createWorktree = useCallback(async () => {
     const values = await dialogs.form({ title: t("sourceControl.worktreeCreateTitle"), description: t("sourceControl.worktreeCreateDescription"), confirmLabel: t("sourceControl.worktreeCreateConfirm"), testId: "source-control-worktree-form", fields: [

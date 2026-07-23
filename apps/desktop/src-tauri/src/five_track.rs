@@ -43,9 +43,10 @@ use agentmux_ipc::{
     METHOD_GIT_STATUS_PAGE, METHOD_GIT_STATUS_SUMMARY, METHOD_GIT_UNSTAGE, METHOD_GIT_UNSTAGE_ALL,
 };
 use agentmux_store::{
-    GitReviewDeliveryUpdate, PersistedGitReviewComment, PersistedGitReviewDeliveryAttempt,
-    PersistedGitReviewThread, PersistedNotification, PersistedTeamMessage,
-    PersistedVerifiedAgentHook, PersistedWorktreeOperation, WorktreeOperationState,
+    GitMutationReceiptLookup, GitReviewDeliveryUpdate, PersistedGitMutationReceipt,
+    PersistedGitReviewComment, PersistedGitReviewDeliveryAttempt, PersistedGitReviewThread,
+    PersistedNotification, PersistedTeamMessage, PersistedVerifiedAgentHook,
+    PersistedWorktreeOperation, WorktreeOperationState,
 };
 use agentmux_vcs::{
     DiffRequest, GitClient, GitContext, GitError, GitFileChange, GitHost as VcsGitHost, Repository,
@@ -59,7 +60,7 @@ const REPOSITORY_EVENT_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_WATCHER_STARTS_PER_TICK: usize = 2;
 const MAX_FALLBACK_STATUS_READS_PER_TICK: usize = 1;
 const MAX_OBSERVED_REPOSITORIES: usize = 64;
-const MAX_MUTATION_IDEMPOTENCY_RESULTS: usize = 512;
+const MAX_MUTATION_IDEMPOTENCY_RECEIPTS: usize = 512;
 const MAX_DEV_SERVER_CANDIDATES: usize = 500;
 const MAX_DEV_SERVER_CANDIDATES_PER_SESSION: usize = 32;
 const MAX_STATUS_QUERY_INDEXES: usize = 16;
@@ -73,7 +74,7 @@ struct FiveTrackShared {
     git_status_cache: Mutex<HashMap<String, CachedStatusSnapshot>>,
     git_status_scans: Mutex<HashMap<String, CachedStatusScan>>,
     observed_repositories: Mutex<HashMap<String, ObservedRepository>>,
-    mutation_results: Mutex<MutationResultCache>,
+    git_mutation_guard: Mutex<()>,
     monitor_started: AtomicBool,
     monitor_app: OnceLock<tauri::AppHandle>,
     worktree_saga_guard: Mutex<()>,
@@ -307,12 +308,6 @@ impl Drop for RepositoryWatchCancellation {
     }
 }
 
-#[derive(Default)]
-struct MutationResultCache {
-    values: HashMap<String, IpcGitMutationResult>,
-    order: VecDeque<String>,
-}
-
 #[derive(Clone)]
 struct VerifiedHookRecord {
     workspace_id: String,
@@ -332,7 +327,7 @@ impl FiveTrackState {
                 git_status_cache: Mutex::new(HashMap::new()),
                 git_status_scans: Mutex::new(HashMap::new()),
                 observed_repositories: Mutex::new(HashMap::new()),
-                mutation_results: Mutex::new(MutationResultCache::default()),
+                git_mutation_guard: Mutex::new(()),
                 monitor_started: AtomicBool::new(false),
                 monitor_app: OnceLock::new(),
                 worktree_saga_guard: Mutex::new(()),
@@ -1126,11 +1121,14 @@ impl DesktopControlState {
         )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
+        let request_fingerprint = git_mutation_request_fingerprint(&params)?;
+        let _mutation_guard = self.lock_git_mutation(params.idempotency_key.as_deref())?;
         if let Some(result) = self.reused_git_mutation(
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
-        ) {
+            &request_fingerprint,
+        )? {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
 
@@ -1177,8 +1175,9 @@ impl DesktopControlState {
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
+            &request_fingerprint,
             &result,
-        );
+        )?;
         self.git_repository_mutated(
             &params.workspace_id,
             &repository_id,
@@ -1203,11 +1202,14 @@ impl DesktopControlState {
         )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
+        let request_fingerprint = git_mutation_request_fingerprint(&params)?;
+        let _mutation_guard = self.lock_git_mutation(params.idempotency_key.as_deref())?;
         if let Some(result) = self.reused_git_mutation(
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
-        ) {
+            &request_fingerprint,
+        )? {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
         self.invalidate_status_snapshot(&repository_id);
@@ -1238,8 +1240,9 @@ impl DesktopControlState {
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
+            &request_fingerprint,
             &result,
-        );
+        )?;
         self.git_repository_mutated(
             &params.workspace_id,
             &repository_id,
@@ -1267,11 +1270,14 @@ impl DesktopControlState {
         )?;
         let repository_id = repository_id(&repository);
         validate_repository_selector(params.repository_id.as_deref(), &repository_id)?;
+        let request_fingerprint = git_mutation_request_fingerprint(&params)?;
+        let _mutation_guard = self.lock_git_mutation(params.idempotency_key.as_deref())?;
         if let Some(result) = self.reused_git_mutation(
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
-        ) {
+            &request_fingerprint,
+        )? {
             return Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result));
         }
 
@@ -1314,14 +1320,14 @@ impl DesktopControlState {
                 .map_err(vcs_error)?;
             (result.commit, result.summary, result.generation)
         };
-        self.git_repository_mutated(
-            &params.workspace_id,
-            &repository_id,
-            &repository,
-            generation,
-            request.method.as_str(),
-        );
         if is_legacy {
+            self.git_repository_mutated(
+                &params.workspace_id,
+                &repository_id,
+                &repository,
+                generation,
+                request.method.as_str(),
+            );
             return Ok(ResponseEnvelope::ok_typed(
                 request.id.clone(),
                 &GitCommitResult { commit, summary },
@@ -1339,9 +1345,36 @@ impl DesktopControlState {
             request.method.as_str(),
             &repository_id,
             params.idempotency_key.as_deref(),
+            &request_fingerprint,
             &result,
+        )?;
+        self.git_repository_mutated(
+            &result.workspace_id,
+            &repository_id,
+            &repository,
+            generation,
+            request.method.as_str(),
         );
         Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
+    }
+
+    fn lock_git_mutation(
+        &self,
+        idempotency_key: Option<&str>,
+    ) -> Result<Option<std::sync::MutexGuard<'_, ()>>, DesktopHostError> {
+        if idempotency_key.is_none() {
+            return Ok(None);
+        }
+        self.five_track
+            .shared
+            .git_mutation_guard
+            .lock()
+            .map(Some)
+            .map_err(|_| {
+                DesktopHostError::StateUnavailable(
+                    "Git mutation idempotency state is unavailable".to_string(),
+                )
+            })
     }
 
     fn reused_git_mutation(
@@ -1349,12 +1382,31 @@ impl DesktopControlState {
         method: &str,
         repository_id: &str,
         idempotency_key: Option<&str>,
-    ) -> Option<IpcGitMutationResult> {
-        let key = mutation_cache_key(method, repository_id, idempotency_key?);
-        let cache = self.five_track.shared.mutation_results.lock().ok()?;
-        let mut result = cache.values.get(&key)?.clone();
-        result.reused = true;
-        Some(result)
+        request_fingerprint: &str,
+    ) -> Result<Option<IpcGitMutationResult>, DesktopHostError> {
+        let Some(idempotency_key) = idempotency_key else {
+            return Ok(None);
+        };
+        let store = self.store.lock().map_err(|_| {
+            DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+        })?;
+        match store.load_git_mutation_receipt(
+            method,
+            repository_id,
+            idempotency_key,
+            request_fingerprint,
+        )? {
+            GitMutationReceiptLookup::Missing => Ok(None),
+            GitMutationReceiptLookup::Match(receipt) => {
+                let mut result =
+                    serde_json::from_str::<IpcGitMutationResult>(&receipt.response_json)?;
+                result.reused = true;
+                Ok(Some(result))
+            }
+            GitMutationReceiptLookup::FingerprintMismatch { .. } => {
+                Err(git_mutation_idempotency_conflict())
+            }
+        }
     }
 
     fn remember_git_mutation(
@@ -1362,23 +1414,34 @@ impl DesktopControlState {
         method: &str,
         repository_id: &str,
         idempotency_key: Option<&str>,
+        request_fingerprint: &str,
         result: &IpcGitMutationResult,
-    ) {
+    ) -> Result<(), DesktopHostError> {
         let Some(idempotency_key) = idempotency_key else {
-            return;
+            return Ok(());
         };
-        let key = mutation_cache_key(method, repository_id, idempotency_key);
-        let Ok(mut cache) = self.five_track.shared.mutation_results.lock() else {
-            return;
+        let receipt = PersistedGitMutationReceipt {
+            method: method.to_string(),
+            repository_id: repository_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            request_fingerprint: request_fingerprint.to_string(),
+            response_json: serde_json::to_string(result)?,
+            created_at: timestamp(),
         };
-        if !cache.values.contains_key(&key) {
-            cache.order.push_back(key.clone());
-        }
-        cache.values.insert(key, result.clone());
-        while cache.order.len() > MAX_MUTATION_IDEMPOTENCY_RESULTS {
-            if let Some(oldest) = cache.order.pop_front() {
-                cache.values.remove(&oldest);
+        let mut store = self.store.lock().map_err(|_| {
+            DesktopHostError::StateUnavailable("desktop store state is unavailable".to_string())
+        })?;
+        match store.create_or_load_git_mutation_receipt(&receipt)? {
+            GitMutationReceiptLookup::Match(_) => {
+                store.prune_git_mutation_receipts(MAX_MUTATION_IDEMPOTENCY_RECEIPTS)?;
+                Ok(())
             }
+            GitMutationReceiptLookup::FingerprintMismatch { .. } => {
+                Err(git_mutation_idempotency_conflict())
+            }
+            GitMutationReceiptLookup::Missing => Err(DesktopHostError::StateUnavailable(
+                "Git mutation receipt was not persisted".to_string(),
+            )),
         }
     }
 
@@ -1424,8 +1487,17 @@ impl DesktopControlState {
     }
 }
 
-fn mutation_cache_key(method: &str, repository_id: &str, idempotency_key: &str) -> String {
-    format!("{method}|{repository_id}|{idempotency_key}")
+fn git_mutation_request_fingerprint(
+    params: &impl serde::Serialize,
+) -> Result<String, DesktopHostError> {
+    serde_json::to_string(params).map_err(DesktopHostError::from)
+}
+
+fn git_mutation_idempotency_conflict() -> DesktopHostError {
+    DesktopHostError::Control(ControlError::new(
+        ErrorCode::Conflict,
+        "The Git idempotency key is already bound to a different request.",
+    ))
 }
 
 fn validate_workspace_id(workspace_id: &str) -> Result<(), DesktopHostError> {
@@ -3284,7 +3356,7 @@ impl DesktopControlState {
         params.validate()?;
         let (_, repository) = self.resolve_vcs_repository(
             &params.workspace_id,
-            None,
+            params.pane_id.as_deref(),
             params.repository_id.as_deref(),
         )?;
         let repository_id = repository_id(&repository);
@@ -3329,7 +3401,7 @@ impl DesktopControlState {
         validate_git_relative_path(&params.anchor.path)?;
         let (_, repository) = self.resolve_vcs_repository(
             &params.workspace_id,
-            None,
+            params.pane_id.as_deref(),
             params.repository_id.as_deref(),
         )?;
         let repository_id = repository_id(&repository);
@@ -5462,6 +5534,133 @@ mod tests {
     }
 
     #[test]
+    fn git_path_mutation_idempotency_reuses_only_the_same_payload() {
+        let repository = create_git_repository("mutation-receipt-paths");
+        fs::write(repository.join("first.txt"), "first\n").expect("first fixture");
+        fs::write(repository.join("second.txt"), "second\n").expect("second fixture");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        save_bundle(
+            &host,
+            &workspace_bundle(
+                "ws_mutation_receipt",
+                Some(repository.to_string_lossy().to_string()),
+                &[],
+            ),
+        );
+        let request = GitPathMutationParams {
+            workspace_id: "ws_mutation_receipt".to_string(),
+            pane_id: None,
+            repository_id: None,
+            paths: vec!["first.txt".to_string()],
+            idempotency_key: Some("stage-first".to_string()),
+        };
+        let first: IpcGitMutationResult = decode_ok(host.handle_request(test_request(
+            "mutation_receipt_first",
+            METHOD_GIT_STAGE,
+            &request,
+        )));
+        assert!(!first.reused);
+        let retry: IpcGitMutationResult = decode_ok(host.handle_request(test_request(
+            "mutation_receipt_retry",
+            METHOD_GIT_STAGE,
+            &request,
+        )));
+        assert!(retry.reused);
+        assert_eq!(retry.repository_id, first.repository_id);
+        assert_eq!(retry.affected_paths, first.affected_paths);
+
+        let conflict = host.handle_request(test_request(
+            "mutation_receipt_conflict",
+            METHOD_GIT_STAGE,
+            &GitPathMutationParams {
+                paths: vec!["second.txt".to_string()],
+                ..request
+            },
+        ));
+        assert_eq!(error_code(conflict), ErrorCode::Conflict);
+        fs::remove_dir_all(repository).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn git_commit_idempotency_receipt_survives_desktop_restart() {
+        let repository = create_git_repository("mutation-receipt-commit");
+        fs::write(repository.join("tracked.txt"), "changed\n").expect("changed fixture");
+        run_git(&repository, &["add", "tracked.txt"]);
+        let state_dir = temporary_path("mutation-receipt-store");
+        fs::create_dir_all(&state_dir).expect("state directory");
+        let database = state_dir.join("agentmux.db");
+        let config = state_dir.join("agentmux.json");
+        let request = IpcGitCommitParams {
+            workspace_id: "ws_commit_receipt".to_string(),
+            pane_id: None,
+            repository_id: None,
+            message: "persist receipt".to_string(),
+            amend: false,
+            idempotency_key: Some("commit-once".to_string()),
+        };
+
+        let first = {
+            let host = DesktopControlState::open_with_token_and_config(
+                &database,
+                DESKTOP_CONTROL_TOKEN,
+                &config,
+            )
+            .expect("persistent desktop state");
+            save_bundle(
+                &host,
+                &workspace_bundle(
+                    "ws_commit_receipt",
+                    Some(repository.to_string_lossy().to_string()),
+                    &[],
+                ),
+            );
+            let result: IpcGitMutationResult = decode_ok(host.handle_request(test_request(
+                "commit_receipt_first",
+                METHOD_GIT_COMMIT,
+                &request,
+            )));
+            assert!(!result.reused);
+            result
+        };
+
+        let host = DesktopControlState::open_with_token_and_config(
+            &database,
+            DESKTOP_CONTROL_TOKEN,
+            &config,
+        )
+        .expect("reopened desktop state");
+        let retry: IpcGitMutationResult = decode_ok(host.handle_request(test_request(
+            "commit_receipt_retry",
+            METHOD_GIT_COMMIT,
+            &request,
+        )));
+        assert!(retry.reused);
+        assert_eq!(retry.commit_oid, first.commit_oid);
+
+        let conflict = host.handle_request(test_request(
+            "commit_receipt_conflict",
+            METHOD_GIT_COMMIT,
+            &IpcGitCommitParams {
+                message: "different payload".to_string(),
+                ..request
+            },
+        ));
+        assert_eq!(error_code(conflict), ErrorCode::Conflict);
+        let count = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .expect("git rev-list should start");
+        assert!(count.status.success());
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+
+        drop(host);
+        fs::remove_dir_all(repository).expect("temporary repository cleanup");
+        fs::remove_dir_all(state_dir).expect("temporary state cleanup");
+    }
+
+    #[test]
     fn pane_repository_resolution_rejects_cached_parent_for_nested_repository() {
         let parent = create_git_repository("nested_repository_parent");
         let nested = parent.join("nested");
@@ -5525,6 +5724,102 @@ mod tests {
             &nested
         ));
         fs::remove_dir_all(parent).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn review_repository_resolution_stays_bound_to_explicit_pane_after_focus_moves() {
+        let repository_a = create_git_repository("review-pane-a");
+        let repository_b = create_git_repository("review-pane-b");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let mut bundle = workspace_bundle(
+            "ws_review_focus",
+            Some(repository_b.to_string_lossy().to_string()),
+            &[
+                ("pane_a", "surface_a", "session_a"),
+                ("pane_b", "surface_b", "session_b"),
+            ],
+        );
+        bundle.sessions[0].cwd = Some(repository_a.to_string_lossy().to_string());
+        bundle.sessions[1].cwd = Some(repository_b.to_string_lossy().to_string());
+        bundle.workspace.active_pane_id = "pane_b".to_string();
+        save_bundle(&host, &bundle);
+
+        let summary_a: GitStatusSummaryResult = decode_ok(host.handle_request(test_request(
+            "review_focus_summary_a",
+            METHOD_GIT_STATUS_SUMMARY,
+            &GitRepositoryParams {
+                workspace_id: "ws_review_focus".to_string(),
+                pane_id: Some("pane_a".to_string()),
+                repository_id: None,
+            },
+        )));
+        let summary_b: GitStatusSummaryResult = decode_ok(host.handle_request(test_request(
+            "review_focus_summary_b",
+            METHOD_GIT_STATUS_SUMMARY,
+            &GitRepositoryParams {
+                workspace_id: "ws_review_focus".to_string(),
+                pane_id: Some("pane_b".to_string()),
+                repository_id: None,
+            },
+        )));
+        assert_ne!(summary_a.repository_id, summary_b.repository_id);
+
+        let created: GitReviewThreadResult = decode_ok(host.handle_request(test_request(
+            "review_focus_create_a",
+            METHOD_GIT_REVIEW_THREAD_CREATE,
+            &GitReviewThreadCreateParams {
+                workspace_id: "ws_review_focus".to_string(),
+                pane_id: Some("pane_a".to_string()),
+                repository_id: Some(summary_a.repository_id.clone()),
+                anchor: GitReviewLineAnchor {
+                    path: "tracked.txt".to_string(),
+                    side: "right".to_string(),
+                    line: 1,
+                    start_line: None,
+                    base_revision: None,
+                    head_revision: Some("HEAD".to_string()),
+                    hunk_header: None,
+                    diff_hash: None,
+                },
+                body: "Review pane A only.".to_string(),
+                author_session_id: Some("session_a".to_string()),
+            },
+        )));
+        assert_eq!(created.repository_id, summary_a.repository_id);
+
+        let listed: GitReviewThreadListResult = decode_ok(host.handle_request(test_request(
+            "review_focus_list_a",
+            METHOD_GIT_REVIEW_THREAD_LIST,
+            &GitReviewThreadListParams {
+                workspace_id: "ws_review_focus".to_string(),
+                pane_id: Some("pane_a".to_string()),
+                repository_id: Some(summary_a.repository_id.clone()),
+                path: None,
+                include_resolved: true,
+                include_stale: true,
+                limit: Some(25),
+            },
+        )));
+        assert_eq!(listed.threads.len(), 1);
+        assert_eq!(listed.threads[0].thread_id, created.thread_id);
+
+        let focus_pivot = host.handle_request(test_request(
+            "review_focus_list_without_pane",
+            METHOD_GIT_REVIEW_THREAD_LIST,
+            &GitReviewThreadListParams {
+                workspace_id: "ws_review_focus".to_string(),
+                pane_id: None,
+                repository_id: Some(summary_a.repository_id),
+                path: None,
+                include_resolved: true,
+                include_stale: true,
+                limit: Some(25),
+            },
+        ));
+        assert_eq!(error_code(focus_pivot), ErrorCode::InvalidRequest);
+
+        fs::remove_dir_all(repository_a).expect("temporary repository cleanup");
+        fs::remove_dir_all(repository_b).expect("temporary repository cleanup");
     }
 
     #[test]
@@ -5892,6 +6187,7 @@ mod tests {
             METHOD_GIT_REVIEW_THREAD_CREATE,
             &GitReviewThreadCreateParams {
                 workspace_id: "ws_review".to_string(),
+                pane_id: None,
                 repository_id: None,
                 anchor: GitReviewLineAnchor {
                     path: "tracked.txt".to_string(),
@@ -6006,6 +6302,7 @@ mod tests {
             METHOD_GIT_REVIEW_THREAD_CREATE,
             &GitReviewThreadCreateParams {
                 workspace_id: "ws_review_stale".to_string(),
+                pane_id: None,
                 repository_id: Some(first.repository_id),
                 anchor: GitReviewLineAnchor {
                     path: "tracked.txt".to_string(),
