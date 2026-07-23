@@ -131,7 +131,8 @@ function Get-Benchmarks {
       @{ Name = "many-idle-sessions"; Args = @("run", "-p", "agentmux-bench-many-idle-sessions", "--", "--sessions", "1", "--observe-ms", "250") },
       @{ Name = "high-output"; Args = @("run", "-p", "agentmux-bench-high-output", "--", "--lines", "100", "--visible-probes", "1") },
       @{ Name = "resize-storm"; Args = @("run", "-p", "agentmux-bench-resize-storm", "--", "--iterations", "5") },
-      @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery", "--", "--sessions", "2") }
+      @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery", "--", "--sessions", "2") },
+      @{ Name = "git-status-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_5k_porcelain_records_within_generous_budget", "--", "--exact") }
     )
   }
 
@@ -140,7 +141,9 @@ function Get-Benchmarks {
     @{ Name = "many-idle-sessions"; Args = @("run", "-p", "agentmux-bench-many-idle-sessions") },
     @{ Name = "high-output"; Args = @("run", "-p", "agentmux-bench-high-output") },
     @{ Name = "resize-storm"; Args = @("run", "-p", "agentmux-bench-resize-storm") },
-    @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery") }
+    @{ Name = "restart-recovery"; Args = @("run", "-p", "agentmux-bench-restart-recovery") },
+    @{ Name = "git-status-5k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_5k_porcelain_records_within_generous_budget", "--", "--exact") },
+    @{ Name = "git-status-10k"; Args = @("test", "-p", "agentmux-vcs", "tests::parses_10k_porcelain_records_within_generous_budget", "--", "--exact") }
   )
 }
 
