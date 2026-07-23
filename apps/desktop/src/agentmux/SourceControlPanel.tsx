@@ -1,26 +1,33 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import type {
+  AgentWorktreeOperation,
   ControlClient,
-  GitDiff,
-  GitFileChange,
-  GitStatus,
+  GitChangeSummary,
+  GitPagedDiff,
+  GitReviewLineAnchor,
+  GitReviewThread,
+  GitStatusSummary,
+  TerminalSession,
   WorkspaceSummary,
 } from "../control/ControlClient";
+import {
+  GIT_EVENT_COALESCE_MS,
+  SERVER_GIT_REFRESH_MS,
+  nextGitRefreshDelay,
+  shouldRefreshForGitEvent,
+  shouldReloadGitPage,
+} from "../control/GitRefreshPolicy";
+import {
+  createAgentWorktreeIdempotencyKey,
+  parseAgentWorktreeCommand,
+} from "../control/GitWorktreeForm";
 import { useAppDialogs } from "./dialogs";
 import { IconBranch, IconClose, IconPlus, IconReset, IconSearch } from "./icons";
 import type { Translator } from "./i18n";
+import "./SourceControlPanel.css";
 
-interface SourceControlPanelProps {
+interface Props {
   client: ControlClient;
   workspace: WorkspaceSummary;
   onClose: () => void;
@@ -28,831 +35,269 @@ interface SourceControlPanelProps {
   t: Translator;
 }
 
-interface GitSelection {
-  path: string;
-  staged: boolean;
-  untracked: boolean;
+type Stage = "staged" | "working" | "untracked";
+interface Selection { path: string; stage: Stage; }
+type Row =
+  | { kind: "header"; key: string; title: string; count: number; action: "stage" | "unstage" | null }
+  | { kind: "change"; key: string; change: GitChangeSummary }
+  | { kind: "more"; key: string }
+  | { kind: "empty"; key: string; text: string };
+
+const PAGE_SIZE = 250;
+const MIN_CHANGE_HEIGHT = 120;
+const MIN_DIFF_HEIGHT = 180;
+
+function stageFor(change: GitChangeSummary): Stage {
+  return change.staged ? "staged" : change.untracked ? "untracked" : "working";
 }
 
-interface StatusRequest {
-  workspaceId: string;
-  promise: Promise<GitStatus>;
-}
-
-const STATUS_POLL_INTERVAL_MS = 15_000;
-const STATUS_CACHE_TTL_MS = STATUS_POLL_INTERVAL_MS;
-const FILTER_VISIBILITY_THRESHOLD = 12;
-const DEFAULT_CHANGES_SPLIT_RATIO = 0.52;
-const MIN_CHANGES_HEIGHT = 116;
-const MIN_DIFF_HEIGHT = 140;
-const SPLIT_KEYBOARD_STEP = 24;
-
-interface CachedGitStatus {
-  status: GitStatus;
-  updatedAt: number;
-}
-
-type GitVirtualRow =
-  | {
-      kind: "header";
-      key: string;
-      title: string;
-      changes: GitFileChange[];
-      staged: boolean;
-    }
-  | {
-      kind: "change";
-      key: string;
-      change: GitFileChange;
-      staged: boolean;
-    }
-  | {
-      kind: "message";
-      key: string;
-      text: string;
-      className: string;
-    };
-
-const statusCacheByClient = new WeakMap<ControlClient, Map<string, CachedGitStatus>>();
-const statusRequestsByClient = new WeakMap<ControlClient, Map<string, StatusRequest>>();
-
-function statusCacheFor(client: ControlClient): Map<string, CachedGitStatus> {
-  let cache = statusCacheByClient.get(client);
-  if (!cache) {
-    cache = new Map();
-    statusCacheByClient.set(client, cache);
-  }
-  return cache;
-}
-
-function statusRequestsFor(client: ControlClient): Map<string, StatusRequest> {
-  let requests = statusRequestsByClient.get(client);
-  if (!requests) {
-    requests = new Map();
-    statusRequestsByClient.set(client, requests);
-  }
-  return requests;
-}
-
-function selectionKey(selection: GitSelection): string {
-  return `${selection.staged ? "staged" : "working"}:${selection.path}`;
-}
-
-function pathsForChange(change: GitFileChange): string[] {
-  return change.originalPath
-    ? [change.path, change.originalPath]
-    : [change.path];
-}
-
-function selectionExists(status: GitStatus, selection: GitSelection): boolean {
-  return status.files.some(
-    (change) =>
-      change.path === selection.path &&
-      (selection.staged ? change.staged : change.unstaged),
-  );
-}
-
-function changeBadge(change: GitFileChange, staged: boolean): string {
-  if (change.conflict) return "!";
+function statusBadge(change: GitChangeSummary): string {
+  if (change.conflicted) return "!";
   if (change.untracked) return "?";
-  const status = staged ? change.indexStatus : change.worktreeStatus;
-  return status === "." ? "M" : status;
+  return change.status === "." ? "M" : change.status;
 }
 
-function GitChangeRow({
-  change,
-  staged,
-  selected,
-  disabled,
-  onSelect,
-  onToggleStage,
-  t,
-}: {
-  change: GitFileChange;
-  staged: boolean;
-  selected: boolean;
-  disabled: boolean;
-  onSelect: () => void;
-  onToggleStage: () => void;
-  t: Translator;
-}) {
-  const segments = change.path.replaceAll("\\", "/").split("/");
-  const name = segments.pop() ?? change.path;
-  const directory = segments.join("/");
-  const actionLabel = staged
-    ? t("sourceControl.unstageFile", { path: change.path })
-    : t("sourceControl.stageFile", { path: change.path });
-  return (
-    <div
-      className="agentmux-source-control__change"
-      data-selected={selected ? "true" : undefined}
-      data-testid={`source-control-change-${staged ? "staged" : "working"}`}
-    >
-      <button
-        type="button"
-        className="agentmux-source-control__change-main"
-        onClick={onSelect}
-        title={change.path}
-      >
-        <span
-          className="agentmux-source-control__badge"
-          data-status={changeBadge(change, staged)}
-        >
-          {changeBadge(change, staged)}
-        </span>
-        <span className="agentmux-source-control__change-label">
-          <span className="agentmux-source-control__filename">{name}</span>
-          {directory ? (
-            <span className="agentmux-source-control__directory">{directory}</span>
-          ) : null}
-        </span>
-      </button>
-      <button
-        type="button"
-        className="agentmux-source-control__row-action"
-        onClick={onToggleStage}
-        disabled={disabled}
-        title={actionLabel}
-        aria-label={actionLabel}
-      >
-        {staged ? <IconClose size={10} /> : <IconPlus size={11} />}
-      </button>
-    </div>
-  );
+function splitPath(path: string): { name: string; directory: string } {
+  const segments = path.replaceAll("\\", "/").split("/");
+  return { name: segments.pop() ?? path, directory: segments.join("/") };
 }
 
-export function SourceControlPanel({
-  client,
-  workspace,
-  onClose,
-  onRepositoryChanged,
-  t,
-}: SourceControlPanelProps) {
-  const dialogs = useAppDialogs();
-  const [status, setStatus] = useState<GitStatus | null>(null);
-  const [selection, setSelection] = useState<GitSelection | null>(null);
-  const [diff, setDiff] = useState<GitDiff | null>(null);
-  const [commitMessage, setCommitMessage] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [statusLoading, setStatusLoading] = useState(true);
-  const [filter, setFilter] = useState("");
-  const [diffRevision, setDiffRevision] = useState(0);
-  const [changesSplitRatio, setChangesSplitRatio] = useState(
-    DEFAULT_CHANGES_SPLIT_RATIO,
-  );
-  const [resizingSplit, setResizingSplit] = useState(false);
-  const busyRef = useRef(false);
-  const statusSequenceRef = useRef(0);
-  const diffSequenceRef = useRef(0);
-  const workspaceIdRef = useRef(workspace.workspaceId);
-  const splitContainerRef = useRef<HTMLDivElement>(null);
-  const splitHandleRef = useRef<HTMLDivElement>(null);
-  const changesScrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    workspaceIdRef.current = workspace.workspaceId;
-    statusSequenceRef.current += 1;
-    diffSequenceRef.current += 1;
-    setStatus(null);
-    setSelection(null);
-    setDiff(null);
-    setCommitMessage("");
-    setError(null);
-    setStatusLoading(true);
-  }, [workspace.workspaceId]);
-
-  const setChangesHeight = useCallback((requestedHeight: number) => {
-    const container = splitContainerRef.current;
-    if (!container) return;
-    const handleHeight = splitHandleRef.current?.getBoundingClientRect().height ?? 7;
-    const availableHeight = Math.max(1, container.clientHeight - handleHeight);
-    const minimum = Math.min(MIN_CHANGES_HEIGHT, availableHeight);
-    const maximum = Math.max(minimum, availableHeight - MIN_DIFF_HEIGHT);
-    const nextHeight = Math.min(maximum, Math.max(minimum, requestedHeight));
-    setChangesSplitRatio(nextHeight / availableHeight);
-  }, []);
-
-  const resizeFromPointer = useCallback(
-    (clientY: number) => {
-      const container = splitContainerRef.current;
-      if (!container) return;
-      const handleHeight = splitHandleRef.current?.getBoundingClientRect().height ?? 7;
-      const bounds = container.getBoundingClientRect();
-      setChangesHeight(clientY - bounds.top - handleHeight / 2);
-    },
-    [setChangesHeight],
-  );
-
-  const finishSplitResize = useCallback(
-    (event?: ReactPointerEvent<HTMLDivElement>) => {
-      if (
-        event &&
-        event.currentTarget.hasPointerCapture(event.pointerId)
-      ) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
-      setResizingSplit(false);
-    },
-    [],
-  );
-
-  const handleSplitPointerDown = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0) return;
-      event.preventDefault();
-      event.currentTarget.setPointerCapture(event.pointerId);
-      setResizingSplit(true);
-      resizeFromPointer(event.clientY);
-    },
-    [resizeFromPointer],
-  );
-
-  const handleSplitKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      const container = splitContainerRef.current;
-      if (!container) return;
-      const handleHeight = splitHandleRef.current?.getBoundingClientRect().height ?? 7;
-      const availableHeight = Math.max(1, container.clientHeight - handleHeight);
-      const currentHeight = changesSplitRatio * availableHeight;
-      let nextHeight: number | null = null;
-      if (event.key === "ArrowUp") nextHeight = currentHeight - SPLIT_KEYBOARD_STEP;
-      if (event.key === "ArrowDown") nextHeight = currentHeight + SPLIT_KEYBOARD_STEP;
-      if (event.key === "Home") nextHeight = MIN_CHANGES_HEIGHT;
-      if (event.key === "End") nextHeight = availableHeight - MIN_DIFF_HEIGHT;
-      if (nextHeight === null) return;
-      event.preventDefault();
-      setChangesHeight(nextHeight);
-    },
-    [changesSplitRatio, setChangesHeight],
-  );
-
-  const refreshStatus = useCallback(
-    async (options: { force?: boolean; showLoading?: boolean } = {}) => {
-      const workspaceId = workspace.workspaceId;
-      const { force = false, showLoading = false } = options;
-      const sequence = ++statusSequenceRef.current;
-      const cache = statusCacheFor(client);
-      const cached = cache.get(workspaceId);
-      if (
-        !force &&
-        cached &&
-        Date.now() - cached.updatedAt < STATUS_CACHE_TTL_MS
-      ) {
-        if (
-          workspaceId === workspaceIdRef.current &&
-          sequence === statusSequenceRef.current
-        ) {
-          setStatus(cached.status);
-          setError(null);
-          setSelection((current) =>
-            current && selectionExists(cached.status, current) ? current : null,
-          );
-          if (showLoading) setStatusLoading(false);
-        }
-        return cached.status;
-      }
-
-      if (showLoading) setStatusLoading(true);
-      const requests = statusRequestsFor(client);
-      let statusRequest = !force ? requests.get(workspaceId) : undefined;
-      if (!statusRequest) {
-        const promise = client.getGitStatus(workspaceId);
-        statusRequest = { workspaceId, promise };
-        requests.set(workspaceId, statusRequest);
-        void promise.then(
-          () => {
-            if (requests.get(workspaceId) === statusRequest) {
-              requests.delete(workspaceId);
-            }
-          },
-          () => {
-            if (requests.get(workspaceId) === statusRequest) {
-              requests.delete(workspaceId);
-            }
-          },
-        );
-      }
-      try {
-        const next = await statusRequest.promise;
-        if (
-          workspaceId !== workspaceIdRef.current ||
-          sequence !== statusSequenceRef.current
-        ) {
-          return next;
-        }
-        cache.set(workspaceId, {
-          status: next,
-          updatedAt: Date.now(),
-        });
-        setStatus(next);
-        setError(null);
-        setSelection((current) =>
-          current && selectionExists(next, current)
-            ? current
-            : null,
-        );
-        return next;
-      } catch (cause) {
-        if (
-          workspaceId === workspaceIdRef.current &&
-          sequence === statusSequenceRef.current
-        ) {
-          setError(cause instanceof Error ? cause.message : String(cause));
-        }
-        throw cause;
-      } finally {
-        if (
-          showLoading &&
-          workspaceId === workspaceIdRef.current &&
-          sequence === statusSequenceRef.current
-        ) {
-          setStatusLoading(false);
-        }
-      }
-    },
-    [client, workspace.workspaceId],
-  );
-
-  useEffect(() => {
-    void refreshStatus({ showLoading: true }).catch(() => undefined);
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        void refreshStatus().catch(() => undefined);
-      }
-    }, STATUS_POLL_INTERVAL_MS);
-    const refreshOnFocus = () => {
-      void refreshStatus().catch(() => undefined);
-    };
-    window.addEventListener("focus", refreshOnFocus);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener("focus", refreshOnFocus);
-    };
-  }, [refreshStatus]);
-
-  useEffect(() => {
-    if (!selection) {
-      diffSequenceRef.current += 1;
-      setDiff(null);
-      return;
+function diffLineAnchors(diff: GitPagedDiff | null, path: string): Array<{ text: string; kind: string; anchor: GitReviewLineAnchor | null }> {
+  let left = 0;
+  let right = 0;
+  let hunkHeader: string | null = null;
+  return (diff?.patch ?? "").split("\n").slice(0, 8_000).map((text) => {
+    if (text.startsWith("@@")) {
+      const match = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+      left = Number(match?.[1] ?? 0);
+      right = Number(match?.[2] ?? 0);
+      hunkHeader = text;
+      return { text, kind: "hunk", anchor: null };
     }
-    const sequence = ++diffSequenceRef.current;
-    setDiff(null);
-    void client
-      .getGitDiff(workspace.workspaceId, selection.path, {
-        staged: selection.staged,
-        untracked: selection.untracked,
-      })
-      .then((result) => {
-        if (sequence === diffSequenceRef.current) setDiff(result);
-      })
-      .catch((cause) => {
-        if (sequence === diffSequenceRef.current) {
-          setError(cause instanceof Error ? cause.message : String(cause));
-        }
-      });
-  }, [client, diffRevision, selection, workspace.workspaceId]);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
-  const stagedChanges = useMemo(
-    () => status?.files.filter((change) => change.staged) ?? [],
-    [status],
-  );
-  const workingChanges = useMemo(
-    () => status?.files.filter((change) => change.unstaged) ?? [],
-    [status],
-  );
-  const showFilter = (status?.files.length ?? 0) > FILTER_VISIBILITY_THRESHOLD;
-  const commitDisabledReason = busy
-    ? t("sourceControl.updating")
-    : stagedChanges.length === 0
-      ? t("sourceControl.noStagedChanges")
-      : !commitMessage.trim()
-        ? t("sourceControl.enterCommitMessage")
-        : null;
-  const normalizedFilter = showFilter ? filter.trim().toLocaleLowerCase() : "";
-
-  const matchesFilter = useCallback(
-    (change: GitFileChange) => {
-      if (!normalizedFilter) return true;
-      return [change.path, change.originalPath]
-        .filter((value): value is string => Boolean(value))
-        .some((value) => value.toLocaleLowerCase().includes(normalizedFilter));
-    },
-    [normalizedFilter],
-  );
-  const filteredStagedChanges = useMemo(
-    () => stagedChanges.filter(matchesFilter),
-    [matchesFilter, stagedChanges],
-  );
-  const filteredWorkingChanges = useMemo(
-    () => workingChanges.filter(matchesFilter),
-    [matchesFilter, workingChanges],
-  );
-  const virtualRows = useMemo<GitVirtualRow[]>(() => {
-    const rows: GitVirtualRow[] = [];
-    const appendSection = (
-      title: string,
-      changes: GitFileChange[],
-      matchingChanges: GitFileChange[],
-      staged: boolean,
-    ) => {
-      const sectionKey = staged ? "staged" : "working";
-      rows.push({
-        kind: "header",
-        key: `${sectionKey}:header`,
-        title,
-        changes,
-        staged,
-      });
-      if (matchingChanges.length === 0 && changes.length > 0) {
-        rows.push({
-          kind: "message",
-          key: `${sectionKey}:no-matches`,
-          text: t("sourceControl.noMatchingChanges"),
-          className: "agentmux-source-control__no-matches",
-        });
-      }
-      for (const change of matchingChanges) {
-        rows.push({
-          kind: "change",
-          key: `${sectionKey}:${change.path}`,
-          change,
-          staged,
-        });
-      }
-    };
-
-    appendSection(
-      t("sourceControl.stagedChanges"),
-      stagedChanges,
-      filteredStagedChanges,
-      true,
-    );
-    appendSection(
-      t("sourceControl.changes"),
-      workingChanges,
-      filteredWorkingChanges,
-      false,
-    );
-    if (status && status.files.length === 0) {
-      rows.push({
-        kind: "message",
-        key: "repository:clean",
-        text: t("sourceControl.clean"),
-        className: "agentmux-source-control__clean",
-      });
+    if (text.startsWith("+") && !text.startsWith("+++")) {
+      const anchor = right ? { path, side: "right", line: right, hunkHeader } : null;
+      right += 1;
+      return { text, kind: "add", anchor };
     }
-    return rows;
-  }, [
-    filteredStagedChanges,
-    filteredWorkingChanges,
-    stagedChanges,
-    status,
-    t,
-    workingChanges,
-  ]);
-  const changesVirtualizer = useVirtualizer({
-    count: virtualRows.length,
-    getScrollElement: () => changesScrollRef.current,
-    estimateSize: (index) => {
-      const row = virtualRows[index];
-      if (row?.kind === "header") return 39;
-      if (row?.kind === "message") return 42;
-      return 34;
-    },
-    getItemKey: (index) => virtualRows[index]?.key ?? index,
-    overscan: 14,
-    useFlushSync: false,
+    if (text.startsWith("-") && !text.startsWith("---")) {
+      const anchor = left ? { path, side: "left", line: left, hunkHeader } : null;
+      left += 1;
+      return { text, kind: "remove", anchor };
+    }
+    if (text.startsWith(" ")) {
+      const anchor = right ? { path, side: "right", line: right, hunkHeader } : null;
+      left += 1;
+      right += 1;
+      return { text, kind: "context", anchor };
+    }
+    return { text, kind: "context", anchor: null };
   });
-  const renderedDiff = useMemo(() => {
-    const lines = diff?.patch.split("\n") ?? [];
-    return lines.slice(0, 4_000).map((line, index) => {
-      const kind = line.startsWith("+") && !line.startsWith("+++")
-        ? "add"
-        : line.startsWith("-") && !line.startsWith("---")
-          ? "remove"
-          : line.startsWith("@@")
-            ? "hunk"
-            : "context";
-      return (
-        <span key={`${index}:${line}`} data-kind={kind}>
-          {line || " "}{"\n"}
-        </span>
-      );
-    });
-  }, [diff]);
+}
 
-  const mutate = useCallback(
-    async (operation: () => Promise<void>) => {
-      if (busyRef.current) return;
-      busyRef.current = true;
-      setBusy(true);
-      try {
-        await operation();
-        await refreshStatus({ force: true });
-        setDiffRevision((value) => value + 1);
-        await onRepositoryChanged();
-        setError(null);
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : String(cause));
-      } finally {
-        busyRef.current = false;
-        setBusy(false);
-      }
-    },
-    [onRepositoryChanged, refreshStatus],
-  );
+export function SourceControlPanel({ client, workspace, onClose, onRepositoryChanged, t }: Props) {
+  const dialogs = useAppDialogs();
+  const [summary, setSummary] = useState<GitStatusSummary | null>(null);
+  const [changes, setChanges] = useState<GitChangeSummary[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [selection, setSelection] = useState<Selection | null>(null);
+  const [diff, setDiff] = useState<GitPagedDiff | null>(null);
+  const [threads, setThreads] = useState<GitReviewThread[]>([]);
+  const [reviewAnchor, setReviewAnchor] = useState<GitReviewLineAnchor | null>(null);
+  const [reviewBody, setReviewBody] = useState("");
+  const [delivery, setDelivery] = useState<"mailbox" | "terminal">("mailbox");
+  const [deliverySession, setDeliverySession] = useState("");
+  const [sessions, setSessions] = useState<TerminalSession[]>([]);
+  const [worktrees, setWorktrees] = useState<AgentWorktreeOperation[]>([]);
+  const [filter, setFilter] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [ratio, setRatio] = useState(0.5);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const splitRef = useRef<HTMLDivElement>(null);
+  const refreshSequence = useRef(0);
+  const loadedGeneration = useRef<number | null>(null);
+  const lastRefresh = useRef(0);
+  const eventTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
 
-  const commit = useCallback(async () => {
-    const message = commitMessage.trim();
-    if (busyRef.current || !message || stagedChanges.length === 0) return;
-    busyRef.current = true;
-    setBusy(true);
+  const loadWorktrees = useCallback(async () => {
+    try { setWorktrees(await client.listAgentWorktrees(workspace.workspaceId, true)); } catch { /* host may still be upgrading */ }
+  }, [client, workspace.workspaceId]);
+
+  const loadThreads = useCallback(async (path?: string | null, repositoryId?: string | null) => {
+    if (!repositoryId) return;
     try {
-      const result = await client.commitGitChanges(workspace.workspaceId, message);
-      setCommitMessage("");
-      await refreshStatus({ force: true });
-      setDiffRevision((value) => value + 1);
-      await onRepositoryChanged();
-      dialogs.toast({
-        title: t("sourceControl.commitCreated"),
-        description: result.summary || result.commit,
-        tone: "success",
+      setThreads(await client.listGitReviewThreads(workspace.workspaceId, {
+        repositoryId, path: path ?? null, includeResolved: true, includeStale: true, limit: 250,
+      }));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+  }, [client, workspace.workspaceId]);
+
+  const refresh = useCallback(async (showLoading = false) => {
+    const sequence = ++refreshSequence.current;
+    if (showLoading) setLoading(true);
+    try {
+      const nextSummary = await client.getGitStatusSummary(workspace.workspaceId);
+      const page = await client.getGitStatusPage(workspace.workspaceId, {
+        repositoryId: nextSummary.repositoryId, limit: PAGE_SIZE, generation: nextSummary.generation,
       });
+      if (sequence !== refreshSequence.current) return;
+      if (shouldReloadGitPage(nextSummary.generation, page.generation)) {
+        loadedGeneration.current = null;
+        void refresh(showLoading);
+        return;
+      }
+      const scrollTop = scrollRef.current?.scrollTop ?? 0;
+      setSummary(nextSummary);
+      setChanges(page.changes);
+      setNextCursor(page.nextCursor ?? null);
+      loadedGeneration.current = page.generation;
+      lastRefresh.current = Date.now();
+      setError(null);
+      void loadWorktrees();
+      requestAnimationFrame(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollTop; });
+    } catch (cause) {
+      if (sequence === refreshSequence.current) setError(cause instanceof Error ? cause.message : String(cause));
+    } finally { if (sequence === refreshSequence.current) setLoading(false); }
+  }, [client, loadWorktrees, workspace.workspaceId]);
+
+  const loadMore = useCallback(async () => {
+    if (!summary || !nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const page = await client.getGitStatusPage(workspace.workspaceId, {
+        repositoryId: summary.repositoryId, cursor: nextCursor, limit: PAGE_SIZE, generation: summary.generation,
+      });
+      if (shouldReloadGitPage(summary.generation, page.generation)) { await refresh(); return; }
+      setChanges((current) => [...current, ...page.changes]);
+      setNextCursor(page.nextCursor ?? null);
+      loadedGeneration.current = page.generation;
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setLoadingMore(false); }
+  }, [client, loadingMore, nextCursor, refresh, summary, workspace.workspaceId]);
+
+  useEffect(() => {
+    setSummary(null); setChanges([]); setNextCursor(null); setSelection(null); setDiff(null); setThreads([]); setReviewAnchor(null); setError(null);
+    void refresh(true);
+    void client.getWorkspace(workspace.workspaceId).then((detail) => setSessions(detail.sessions)).catch(() => setSessions([]));
+  }, [client, refresh, workspace.workspaceId]);
+
+  useEffect(() => {
+    const events = (window as Window & { __TAURI__?: { event?: { listen?: (name: string, handler: (event: { payload?: unknown }) => void) => Promise<() => void> } } }).__TAURI__?.event;
+    let unlisten: (() => void) | undefined;
+    if (events?.listen) {
+      void events.listen("agentmux://git-repository-changed", (event) => {
+        const payload = event.payload as { workspace_id?: string; repository_id?: string; generation?: number } | undefined;
+        if (!shouldRefreshForGitEvent(payload, workspace.workspaceId, summary?.repositoryId, loadedGeneration.current)) return;
+        if (eventTimer.current) window.clearTimeout(eventTimer.current);
+        eventTimer.current = window.setTimeout(() => { eventTimer.current = null; void refresh(); }, nextGitRefreshDelay(Date.now(), lastRefresh.current, GIT_EVENT_COALESCE_MS));
+      }).then((stop) => { unlisten = stop; }).catch(() => undefined);
+    }
+    const timer = events?.listen ? undefined : window.setInterval(() => {
+      if (document.visibilityState === "visible") void refresh();
+    }, SERVER_GIT_REFRESH_MS);
+    return () => { if (eventTimer.current) window.clearTimeout(eventTimer.current); if (timer) window.clearInterval(timer); unlisten?.(); };
+  }, [refresh, summary?.repositoryId, workspace.workspaceId]);
+
+  useEffect(() => {
+    const isPending = worktrees.some((operation) => !["completed", "failed", "removed", "rolled_back"].includes(operation.state));
+    if (!isPending) return;
+    const timer = window.setInterval(() => { void loadWorktrees(); }, 1_500);
+    return () => window.clearInterval(timer);
+  }, [loadWorktrees, worktrees]);
+
+  useEffect(() => {
+    if (!summary || !selection) { setDiff(null); return; }
+    let current = true;
+    setDiff(null);
+    void client.getGitPagedDiff(workspace.workspaceId, selection.path, {
+      repositoryId: summary.repositoryId, stage: selection.stage, generation: summary.generation, contextLines: 4,
+    }).then((result) => { if (current) setDiff(result); }).catch((cause) => { if (current) setError(cause instanceof Error ? cause.message : String(cause)); });
+    void loadThreads(selection.path, summary.repositoryId);
+    return () => { current = false; };
+  }, [client, loadThreads, selection, summary, workspace.workspaceId]);
+
+  const visibleChanges = useMemo(() => {
+    const needle = filter.trim().toLocaleLowerCase();
+    return needle ? changes.filter((change) => `${change.path} ${change.originalPath ?? ""}`.toLocaleLowerCase().includes(needle)) : changes;
+  }, [changes, filter]);
+  const rows = useMemo<Row[]>(() => {
+    const staged = visibleChanges.filter((change) => change.staged);
+    const working = visibleChanges.filter((change) => !change.staged);
+    const next: Row[] = [
+      { kind: "header", key: "staged", title: t("sourceControl.stagedChanges"), count: summary?.stagedCount ?? 0, action: staged.length ? "unstage" : null },
+      ...staged.map((change) => ({ kind: "change" as const, key: `staged:${change.path}`, change })),
+      { kind: "header", key: "working", title: t("sourceControl.changes"), count: (summary?.unstagedCount ?? 0) + (summary?.untrackedCount ?? 0), action: working.length ? "stage" : null },
+      ...working.map((change) => ({ kind: "change" as const, key: `working:${change.path}`, change })),
+    ];
+    if (!visibleChanges.length && !nextCursor) next.push({ kind: "empty", key: "empty", text: filter ? t("sourceControl.noMatchingChanges") : t("sourceControl.clean") });
+    if (nextCursor) next.push({ kind: "more", key: "more" });
+    return next;
+  }, [filter, nextCursor, summary?.stagedCount, summary?.unstagedCount, summary?.untrackedCount, t, visibleChanges]);
+  const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => scrollRef.current, estimateSize: (index) => rows[index]?.kind === "change" ? 44 : 36, getItemKey: (index) => rows[index]?.key ?? index, overscan: 16, useFlushSync: false });
+  const diffLines = useMemo(() => diffLineAnchors(diff, selection?.path ?? ""), [diff, selection?.path]);
+  const markers = useMemo(() => new Map(threads.map((thread) => [`${thread.anchor.side}:${thread.anchor.line}`, thread])), [threads]);
+
+  const mutate = useCallback(async (operation: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(true);
+    try { await operation(); await refresh(); await onRepositoryChanged(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { setBusy(false); }
+  }, [busy, onRepositoryChanged, refresh]);
+
+  const runPanelAction = useCallback(async (action: () => Promise<void>) => {
+    try {
+      await action();
       setError(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
     }
-  }, [
-    client,
-    commitMessage,
-    dialogs,
-    onRepositoryChanged,
-    refreshStatus,
-    stagedChanges.length,
-    t,
-    workspace.workspaceId,
-  ]);
+  }, []);
 
-  return (
-    <aside
-      className="agentmux-source-control"
-      aria-label={t("sourceControl.title")}
-      aria-busy={busy || statusLoading}
-      data-testid="source-control-panel"
-    >
-      <header className="agentmux-source-control__header">
-        <div className="agentmux-source-control__title">
-          <IconBranch size={14} />
-          <span>{t("sourceControl.title")}</span>
-        </div>
-        <div className="agentmux-source-control__header-actions">
-          <button
-            type="button"
-            onClick={() => void refreshStatus({ force: true, showLoading: true }).catch(() => undefined)}
-            disabled={busy || statusLoading}
-            title={t("common.refresh")}
-            aria-label={t("common.refresh")}
-          >
-            <IconReset size={13} />
-          </button>
-          <button
-            type="button"
-            onClick={onClose}
-            title={t("common.close")}
-            aria-label={t("common.close")}
-          >
-            <IconClose size={12} />
-          </button>
-        </div>
-      </header>
+  const createReview = useCallback(() => mutate(async () => {
+    if (!summary || !reviewAnchor || !reviewBody.trim()) return;
+    const thread = await client.createGitReviewThread({ workspaceId: workspace.workspaceId, repositoryId: summary.repositoryId, anchor: reviewAnchor, body: reviewBody });
+    if (deliverySession) await client.deliverGitReviewThread(thread.threadId, { target: delivery, targetSessionId: deliverySession, includeContext: true });
+    setReviewBody(""); setReviewAnchor(null); await loadThreads(selection?.path, summary.repositoryId);
+  }), [client, delivery, deliverySession, loadThreads, mutate, reviewAnchor, reviewBody, selection?.path, summary, workspace.workspaceId]);
 
-      <div className="agentmux-source-control__repository">
-        <strong>{status?.branch ?? t("sourceControl.noBranch")}</strong>
-        {status?.upstream ? <span>{status.upstream}</span> : null}
-        {status && (status.ahead > 0 || status.behind > 0) ? (
-          <span>
-            {t("sourceControl.syncState", {
-              ahead: status.ahead,
-              behind: status.behind,
-            })}
-          </span>
-        ) : null}
-        <small title={status?.repositoryRoot ?? undefined}>
-          {status?.repositoryRoot ?? workspace.projectRoot ?? workspace.name}
-        </small>
-      </div>
+  const createWorktree = useCallback(async () => {
+    const values = await dialogs.form({ title: t("sourceControl.worktreeCreateTitle"), description: t("sourceControl.worktreeCreateDescription"), confirmLabel: t("sourceControl.worktreeCreateConfirm"), testId: "source-control-worktree-form", fields: [
+      { id: "branch", label: t("sourceControl.worktreeBranch"), placeholder: "agent/review-api", required: true },
+      { id: "base", label: t("sourceControl.worktreeBase"), initialValue: "HEAD" },
+      { id: "destination", label: t("sourceControl.worktreeDestination"), placeholder: "D:\\workspace\\agent-review", required: true },
+      { id: "command", label: t("sourceControl.worktreeCommand"), placeholder: "claude --dangerously-skip-permissions" },
+    ] });
+    if (!values) return;
+    await mutate(async () => {
+      const branch = String(values.branch).trim();
+      const destination = String(values.destination).trim();
+      const result = await client.createAgentWorktree({ workspaceId: workspace.workspaceId, branch, destination, baseRevision: String(values.base).trim() || null, createBranch: true, command: parseAgentWorktreeCommand(String(values.command)), cwd: destination, idempotencyKey: createAgentWorktreeIdempotencyKey(workspace.workspaceId, branch, destination) });
+      await loadWorktrees();
+      dialogs.toast({ title: t("sourceControl.worktreeStarted"), description: `${result.branch} · ${result.state}`, tone: "success" });
+    });
+  }, [client, dialogs, loadWorktrees, mutate, t, workspace.workspaceId]);
 
-      {error ? (
-        <div className="agentmux-source-control__error" role="status">
-          {error}
-        </div>
-      ) : null}
+  const updateRatio = (clientY: number) => {
+    const node = splitRef.current; if (!node) return;
+    const available = Math.max(1, node.clientHeight - 7);
+    const proposed = clientY - node.getBoundingClientRect().top;
+    const height = Math.min(Math.max(proposed, Math.min(MIN_CHANGE_HEIGHT, available)), Math.max(MIN_CHANGE_HEIGHT, available - MIN_DIFF_HEIGHT));
+    setRatio(height / available);
+  };
 
-      {busy ? (
-        <div className="agentmux-source-control__activity" role="status">
-          <span className="agentmux-term-booting-spinner" aria-hidden="true" />
-          <span>{t("sourceControl.updating")}</span>
-        </div>
-      ) : null}
-
-      {statusLoading && status === null ? (
-        <div className="agentmux-source-control__loading" role="status">
-          {t("sourceControl.loading")}
-        </div>
-      ) : status && !status.isRepository ? (
-        <div className="agentmux-source-control__empty">
-          <IconBranch size={24} />
-          <strong>{t("sourceControl.notRepository")}</strong>
-          <span>{t("sourceControl.notRepositoryDescription")}</span>
-        </div>
-      ) : (
-        <>
-          <div className="agentmux-source-control__content" ref={splitContainerRef}>
-            <div
-              className="agentmux-source-control__changes"
-              data-filter-visible={showFilter ? "true" : undefined}
-              style={{ flexBasis: `${changesSplitRatio * 100}%` }}
-            >
-              {showFilter ? (
-                <label className="agentmux-source-control__filter">
-                  <IconSearch size={13} />
-                  <input
-                    type="search"
-                    value={filter}
-                    onChange={(event) => setFilter(event.currentTarget.value)}
-                    placeholder={t("sourceControl.filterPlaceholder")}
-                    aria-label={t("sourceControl.filterPlaceholder")}
-                  />
-                </label>
-              ) : null}
-              <div
-                ref={changesScrollRef}
-                className="agentmux-source-control__virtual-scroll agentmux-scroll"
-              >
-                <div
-                  className="agentmux-source-control__virtual-list"
-                  style={{ height: `${changesVirtualizer.getTotalSize()}px` }}
-                >
-                  {changesVirtualizer.getVirtualItems().map((virtualRow) => {
-                    const row = virtualRows[virtualRow.index];
-                    if (!row) return null;
-                    let content: ReactNode;
-                    if (row.kind === "header") {
-                      content = (
-                        <div className="agentmux-source-control__section-header">
-                          <span>{row.title}</span>
-                          <span className="agentmux-source-control__count">
-                            {row.changes.length}
-                          </span>
-                          {row.changes.length > 0 ? (
-                            <button
-                              type="button"
-                              className="agentmux-source-control__section-action"
-                              onClick={() =>
-                                void mutate(() =>
-                                  row.staged
-                                    ? client.unstageGitFiles(workspace.workspaceId)
-                                    : client.stageGitFiles(workspace.workspaceId),
-                                )
-                              }
-                              disabled={busy}
-                            >
-                              {row.staged
-                                ? t("sourceControl.unstageAll")
-                                : t("sourceControl.stageAll")}
-                            </button>
-                          ) : null}
-                        </div>
-                      );
-                    } else if (row.kind === "message") {
-                      content = <div className={row.className}>{row.text}</div>;
-                    } else {
-                      const nextSelection = {
-                        path: row.change.path,
-                        staged: row.staged,
-                        untracked: !row.staged && row.change.untracked,
-                      };
-                      content = (
-                        <GitChangeRow
-                          change={row.change}
-                          staged={row.staged}
-                          selected={
-                            selection !== null &&
-                            selectionKey(selection) === selectionKey(nextSelection)
-                          }
-                          disabled={busy}
-                          onSelect={() => setSelection(nextSelection)}
-                          onToggleStage={() =>
-                            void mutate(() =>
-                              row.staged
-                                ? client.unstageGitFiles(
-                                    workspace.workspaceId,
-                                    pathsForChange(row.change),
-                                  )
-                                : client.stageGitFiles(
-                                    workspace.workspaceId,
-                                    pathsForChange(row.change),
-                                  ),
-                            )
-                          }
-                          t={t}
-                        />
-                      );
-                    }
-                    return (
-                      <div
-                        key={row.key}
-                        className="agentmux-source-control__virtual-row"
-                        data-index={virtualRow.index}
-                        ref={changesVirtualizer.measureElement}
-                        style={{ transform: `translateY(${virtualRow.start}px)` }}
-                      >
-                        {content}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-
-            <div
-              ref={splitHandleRef}
-              className="agentmux-source-control__splitter"
-              data-resizing={resizingSplit ? "true" : undefined}
-              role="separator"
-              aria-label={t("sourceControl.resizeFileList")}
-              aria-orientation="horizontal"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={Math.round(changesSplitRatio * 100)}
-              tabIndex={0}
-              title={t("sourceControl.resizeFileList")}
-              onPointerDown={handleSplitPointerDown}
-              onPointerMove={(event) => {
-                if (resizingSplit) resizeFromPointer(event.clientY);
-              }}
-              onPointerUp={finishSplitResize}
-              onPointerCancel={finishSplitResize}
-              onLostPointerCapture={() => setResizingSplit(false)}
-              onKeyDown={handleSplitKeyDown}
-            />
-
-            <div className="agentmux-source-control__diff">
-              <div className="agentmux-source-control__diff-header">
-                <span title={selection?.path}>{selection?.path ?? t("sourceControl.diff")}</span>
-                {diff?.truncated ? <em>{t("sourceControl.truncated")}</em> : null}
-              </div>
-              <pre className="agentmux-scroll">
-                {diff
-                  ? renderedDiff.length > 0
-                    ? renderedDiff
-                    : t("sourceControl.noDiff")
-                  : selection
-                    ? t("common.loading")
-                    : t("sourceControl.selectFile")}
-              </pre>
-            </div>
-          </div>
-
-          <div className="agentmux-source-control__commit">
-            <textarea
-              value={commitMessage}
-              disabled={busy}
-              onChange={(event) => setCommitMessage(event.target.value)}
-              onKeyDown={(event) => {
-                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                  event.preventDefault();
-                  void commit();
-                }
-              }}
-              rows={2}
-              placeholder={t("sourceControl.commitPlaceholder")}
-              aria-label={t("sourceControl.commitPlaceholder")}
-            />
-            <button
-              type="button"
-              onClick={() => void commit()}
-              disabled={commitDisabledReason !== null}
-              title={commitDisabledReason ?? t("sourceControl.commit")}
-            >
-              {t("sourceControl.commit")}
-            </button>
-          </div>
-        </>
-      )}
-    </aside>
-  );
+  const path = summary?.repositoryRoot ?? workspace.projectRoot ?? workspace.name;
+  return <aside className="agentmux-source-control" aria-label={t("sourceControl.title")} aria-busy={loading || busy} data-testid="source-control-panel">
+    <header className="agentmux-source-control__header"><div className="agentmux-source-control__title"><IconBranch size={14} /><span>{t("sourceControl.title")}</span></div><div className="agentmux-source-control__header-actions"><button type="button" title="Create isolated agent worktree" aria-label="Create isolated agent worktree" onClick={() => void createWorktree()}><IconPlus size={13} /></button><button type="button" title={t("common.refresh")} aria-label={t("common.refresh")} disabled={loading || busy} onClick={() => void refresh(true)}><IconReset size={13} /></button><button type="button" title={t("common.close")} aria-label={t("common.close")} onClick={onClose}><IconClose size={12} /></button></div></header>
+    <div className="agentmux-source-control__repository"><strong>{summary?.branch ?? t("sourceControl.noBranch")}</strong>{summary?.upstream ? <span>{summary.upstream}</span> : null}{summary && (summary.ahead || summary.behind) ? <span>{t("sourceControl.syncState", { ahead: summary.ahead, behind: summary.behind })}</span> : null}<small title={path}>{path}</small></div>
+    {error ? <div className="agentmux-source-control__error" role="status">{error}</div> : null}
+    {worktrees.length ? <div className="agentmux-source-control__worktrees"><span>Agent worktrees</span>{worktrees.slice(0, 3).map((operation) => <div className="agentmux-source-control__worktree" key={operation.worktreeId}><button type="button" title="Recover operation" onClick={() => void runPanelAction(async () => { await client.recoverAgentWorktree({ operationId: operation.operationId }); await loadWorktrees(); })}>{operation.branch}</button><small>{operation.state}</small><button type="button" onClick={() => void dialogs.confirm({ title: "Remove isolated worktree?", description: operation.path, detail: "Only AgentMux-owned worktree resources will be removed.", confirmLabel: "Remove", tone: "danger" }).then((confirmed) => { if (confirmed) void runPanelAction(async () => { await client.removeAgentWorktree({ worktreeId: operation.worktreeId }); await loadWorktrees(); }); })}>Remove</button></div>)}</div> : null}
+    {loading && !summary ? <div className="agentmux-source-control__loading">{t("sourceControl.loading")}</div> : <div ref={splitRef} className="agentmux-source-control__content">
+      <section className="agentmux-source-control__changes" style={{ flexBasis: `${ratio * 100}%` }}><label className="agentmux-source-control__filter"><IconSearch size={13} /><input type="search" value={filter} onChange={(event) => setFilter(event.currentTarget.value)} placeholder={t("sourceControl.filterPlaceholder")} aria-label={t("sourceControl.filterPlaceholder")} /></label><div ref={scrollRef} className="agentmux-source-control__virtual-scroll agentmux-scroll" onScroll={(event) => { const target = event.currentTarget; if (nextCursor && target.scrollTop + target.clientHeight > target.scrollHeight - 180) void loadMore(); }}><div className="agentmux-source-control__virtual-list" style={{ height: `${virtualizer.getTotalSize()}px` }}>{virtualizer.getVirtualItems().map((item) => { const row = rows[item.index]; if (!row) return null; let content: ReactNode; if (row.kind === "header") content = <div className="agentmux-source-control__section-header"><span>{row.title}</span><span className="agentmux-source-control__count">{row.count}</span>{row.action ? <button type="button" className="agentmux-source-control__section-action" onClick={() => void mutate(() => row.action === "stage" ? client.stageAllGitFiles(workspace.workspaceId) : client.unstageAllGitFiles(workspace.workspaceId))}>{row.action === "stage" ? t("sourceControl.stageAll") : t("sourceControl.unstageAll")}</button> : null}</div>; else if (row.kind === "more") content = <button type="button" className="agentmux-source-control__load-more" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : t("sourceControl.loadMore", { count: PAGE_SIZE })}</button>; else if (row.kind === "empty") content = <div className="agentmux-source-control__clean">{row.text}</div>; else { const next = { path: row.change.path, stage: stageFor(row.change) }; const selected = selection?.path === next.path && selection.stage === next.stage; const label = splitPath(row.change.path); content = <div className="agentmux-source-control__change" data-selected={selected || undefined}><button type="button" className="agentmux-source-control__change-main" onClick={() => setSelection(next)}><span className="agentmux-source-control__badge" data-status={statusBadge(row.change)}>{statusBadge(row.change)}</span><span className="agentmux-source-control__change-label"><span className="agentmux-source-control__filename">{label.name}</span>{label.directory ? <span className="agentmux-source-control__directory">{label.directory}</span> : null}</span></button><button type="button" className="agentmux-source-control__row-action" onClick={() => void mutate(() => row.change.staged ? client.unstageGitFiles(workspace.workspaceId, [row.change.path]) : client.stageGitFiles(workspace.workspaceId, [row.change.path]))}>{row.change.staged ? <IconClose size={10} /> : <IconPlus size={11} />}</button></div>; } return <div key={row.key} className="agentmux-source-control__virtual-row" data-index={item.index} ref={virtualizer.measureElement} style={{ transform: `translateY(${item.start}px)` }}>{content}</div>; })}</div></div></section>
+      <div className="agentmux-source-control__splitter" role="separator" aria-orientation="horizontal" aria-label={t("sourceControl.resizeFileList")} tabIndex={0} onPointerDown={(event) => { if (event.button !== 0) return; event.currentTarget.setPointerCapture(event.pointerId); updateRatio(event.clientY); }} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updateRatio(event.clientY); }} onKeyDown={(event) => { if (event.key === "ArrowUp") { setRatio((current) => Math.max(.2, current - .05)); event.preventDefault(); } if (event.key === "ArrowDown") { setRatio((current) => Math.min(.8, current + .05)); event.preventDefault(); } }} />
+      <section className="agentmux-source-control__diff"><div className="agentmux-source-control__diff-header"><span title={selection?.path}>{selection?.path ?? t("sourceControl.diff")}</span>{diff?.truncated ? <em>{t("sourceControl.truncated")}</em> : null}</div><div className="agentmux-source-control__diff-lines agentmux-scroll">{diff ? diffLines.map((line, index) => { const marked = line.anchor ? markers.get(`${line.anchor.side}:${line.anchor.line}`) : null; const selectedLine = reviewAnchor?.line === line.anchor?.line && reviewAnchor?.side === line.anchor?.side; return <button key={`${index}:${line.text}`} type="button" className="agentmux-source-control__diff-line" data-kind={line.kind} data-selected={selectedLine || undefined} disabled={!line.anchor} onClick={() => setReviewAnchor(line.anchor)}><span className="agentmux-source-control__diff-line-number">{line.anchor?.line ?? ""}</span><code>{line.text || " "}</code>{marked ? <span className="agentmux-source-control__thread-marker">1</span> : null}</button>; }) : <div className="agentmux-source-control__diff-empty">{selection ? t("common.loading") : t("sourceControl.selectFile")}</div>}</div>{reviewAnchor ? <div className="agentmux-source-control__review-composer"><small>Comment on {reviewAnchor.side} line {reviewAnchor.line}</small><textarea value={reviewBody} onChange={(event) => setReviewBody(event.currentTarget.value)} placeholder="Write review feedback" /><div><select value={delivery} onChange={(event) => setDelivery(event.currentTarget.value as "mailbox" | "terminal")}><option value="mailbox">Mailbox</option><option value="terminal">Terminal</option></select><select value={deliverySession} onChange={(event) => setDeliverySession(event.currentTarget.value)}><option value="">Do not deliver yet</option>{sessions.map((session) => <option key={session.sessionId} value={session.sessionId}>{session.backendKind} · {session.sessionId.slice(-8)}</option>)}</select><button type="button" disabled={!reviewBody.trim() || busy} onClick={() => void createReview()}>Add comment</button></div></div> : null}{threads.length ? <div className="agentmux-source-control__threads">{threads.slice(0, 4).map((thread) => <div key={thread.threadId}><span>{thread.anchor.side} {thread.anchor.line}</span><p>{thread.comments.at(-1)?.body}</p><button type="button" onClick={() => void runPanelAction(async () => { await client.updateGitReviewThread(thread.threadId, { resolved: !thread.resolved }); await loadThreads(selection?.path, summary?.repositoryId); })}>{thread.resolved ? "Reopen" : "Resolve"}</button><button type="button" onClick={() => void dialogs.confirm({ title: "Delete review thread?", description: "This removes stored review comments.", confirmLabel: "Delete", tone: "danger" }).then((confirmed) => { if (confirmed) void runPanelAction(async () => { await client.deleteGitReviewThread(thread.threadId); await loadThreads(selection?.path, summary?.repositoryId); }); })}>Delete</button></div>)}</div> : null}</section>
+    </div>}
+  </aside>;
 }

@@ -300,6 +300,128 @@ export interface GitCommitResult {
   summary: string;
 }
 
+export interface GitChangeSummary {
+  path: string;
+  originalPath?: string | null;
+  status: string;
+  staged: boolean;
+  unstaged: boolean;
+  untracked: boolean;
+  conflicted: boolean;
+  isBinary: boolean;
+  additions?: number | null;
+  deletions?: number | null;
+}
+
+export interface GitStatusSummary {
+  workspaceId: string;
+  repositoryId: string;
+  repositoryRoot: string;
+  branch?: string | null;
+  headOid?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  stagedCount: number;
+  unstagedCount: number;
+  untrackedCount: number;
+  conflictedCount: number;
+  generation: number;
+  refreshedAt: string;
+}
+
+export interface GitStatusPage {
+  workspaceId: string;
+  repositoryId: string;
+  generation: number;
+  changes: GitChangeSummary[];
+  nextCursor?: string | null;
+  totalCount?: number | null;
+}
+
+export interface GitPagedDiff extends GitDiff {
+  workspaceId: string;
+  repositoryId: string;
+  generation: number;
+  originalPath?: string | null;
+  isBinary: boolean;
+}
+
+export interface GitReviewLineAnchor {
+  path: string;
+  side: "left" | "right" | "context" | string;
+  line: number;
+  startLine?: number | null;
+  baseRevision?: string | null;
+  headRevision?: string | null;
+  hunkHeader?: string | null;
+  diffHash?: string | null;
+}
+
+export interface GitReviewComment {
+  commentId: string;
+  threadId: string;
+  body: string;
+  authorSessionId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitReviewThread {
+  threadId: string;
+  workspaceId: string;
+  repositoryId: string;
+  anchor: GitReviewLineAnchor;
+  resolved: boolean;
+  stale: boolean;
+  staleReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  comments: GitReviewComment[];
+}
+
+export interface GitReviewDelivery {
+  threadId: string;
+  target: "mailbox" | "terminal" | string;
+  targetSessionId?: string | null;
+  deliveredAt: string;
+}
+
+export interface AgentWorktreeOperation {
+  operationId: string;
+  worktreeId: string;
+  workspaceId: string;
+  branch: string;
+  path: string;
+  state: string;
+  surfaceId?: string | null;
+  paneId?: string | null;
+  sessionId?: string | null;
+  reused: boolean;
+  recovered: boolean;
+}
+
+export interface AgentWorktreeProgress {
+  operationId: string;
+  worktreeId?: string | null;
+  workspaceId: string;
+  state: string;
+  step: string;
+  message?: string | null;
+  completed: boolean;
+  rolledBack: boolean;
+}
+
+export interface DevelopmentServerCandidate {
+  candidateId: string;
+  workspaceId: string;
+  sessionId: string;
+  url: string;
+  source: string;
+  detectedAt: string;
+  dismissed?: boolean;
+}
+
 export type TerminalProfile = "wsl" | "powershell" | "cmd";
 
 export interface WorkspaceSummary {
@@ -961,17 +1083,115 @@ export interface ControlClient {
   sendTeamMessage(input: TeamMessageSendInput): Promise<TeamMessage>;
   markTeamMessageRead(messageId: string): Promise<void>;
   getGitStatus(workspaceId: string): Promise<GitStatus>;
+  getGitStatusSummary(
+    workspaceId: string,
+    repositoryId?: string | null,
+  ): Promise<GitStatusSummary>;
+  getGitStatusPage(
+    workspaceId: string,
+    options?: {
+      repositoryId?: string | null;
+      state?: "staged" | "unstaged" | "untracked" | "conflicted" | string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+    },
+  ): Promise<GitStatusPage>;
   getGitDiff(
     workspaceId: string,
     path: string,
     options?: { staged?: boolean; untracked?: boolean },
   ): Promise<GitDiff>;
+  getGitPagedDiff(
+    workspaceId: string,
+    path: string,
+    options?: {
+      repositoryId?: string | null;
+      stage?: "staged" | "working" | "untracked" | string | null;
+      contextLines?: number;
+      generation?: number | null;
+    },
+  ): Promise<GitPagedDiff>;
   stageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
   unstageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
+  discardGitFiles(workspaceId: string, paths: string[]): Promise<void>;
+  stageAllGitFiles(workspaceId: string): Promise<void>;
+  unstageAllGitFiles(workspaceId: string): Promise<void>;
   commitGitChanges(
     workspaceId: string,
     message: string,
   ): Promise<GitCommitResult>;
+  listGitReviewThreads(
+    workspaceId: string,
+    options?: {
+      repositoryId?: string | null;
+      path?: string | null;
+      includeResolved?: boolean;
+      includeStale?: boolean;
+      limit?: number;
+    },
+  ): Promise<GitReviewThread[]>;
+  createGitReviewThread(input: {
+    workspaceId: string;
+    repositoryId?: string | null;
+    anchor: GitReviewLineAnchor;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewThread>;
+  updateGitReviewThread(
+    threadId: string,
+    input: { resolved?: boolean; anchor?: GitReviewLineAnchor },
+  ): Promise<GitReviewThread>;
+  deleteGitReviewThread(threadId: string): Promise<void>;
+  listGitReviewComments(threadId: string, limit?: number): Promise<GitReviewComment[]>;
+  createGitReviewComment(input: {
+    threadId: string;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewComment>;
+  updateGitReviewComment(commentId: string, body: string): Promise<GitReviewComment>;
+  deleteGitReviewComment(commentId: string): Promise<void>;
+  deliverGitReviewThread(
+    threadId: string,
+    input: {
+      target: "mailbox" | "terminal";
+      targetSessionId?: string | null;
+      includeContext?: boolean;
+    },
+  ): Promise<GitReviewDelivery>;
+  createAgentWorktree(input: {
+    workspaceId: string;
+    branch: string;
+    destination: string;
+    baseRevision?: string | null;
+    createBranch?: boolean;
+    backend?: string | null;
+    backendProfile?: string | null;
+    command?: string[];
+    cwd?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation>;
+  listAgentWorktrees(
+    workspaceId?: string | null,
+    includeCompleted?: boolean,
+  ): Promise<AgentWorktreeOperation[]>;
+  recoverAgentWorktree(input: {
+    operationId?: string | null;
+    idempotencyKey?: string | null;
+  }): Promise<AgentWorktreeOperation>;
+  removeAgentWorktree(input: {
+    worktreeId: string;
+    force?: boolean;
+    idempotencyKey?: string | null;
+  }): Promise<AgentWorktreeOperation>;
+  listDevelopmentServerCandidates(
+    workspaceId?: string | null,
+  ): Promise<DevelopmentServerCandidate[]>;
+  dismissDevelopmentServerCandidate(candidateId: string): Promise<void>;
+  openDevelopmentServerCandidateInSplit(
+    candidateId: string,
+    options?: { paneId?: string | null },
+  ): Promise<{ surfaceId: string; url: string }>;
   getSidebarState(workspaceId?: string | null): Promise<SidebarState>;
 }
 
@@ -2473,6 +2693,54 @@ class TauriControlClient implements ControlClient {
     return mapGitStatus(result);
   }
 
+  async getGitStatusSummary(
+    workspaceId: string,
+    repositoryId?: string | null,
+  ): Promise<GitStatusSummary> {
+    const result = await this.call<GitStatusSummaryWire>("git.status_summary", {
+      workspace_id: workspaceId,
+      repository_id: repositoryId ?? null,
+    });
+    return mapGitStatusSummary(result);
+  }
+
+  async getGitStatusPage(
+    workspaceId: string,
+    options: {
+      repositoryId?: string | null;
+      state?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+    } = {},
+  ): Promise<GitStatusPage> {
+    const result = await this.call<GitStatusPageWire>("git.status_page", {
+      workspace_id: workspaceId,
+      repository_id: options.repositoryId ?? null,
+      state: options.state ?? null,
+      cursor: options.cursor ?? null,
+      limit: options.limit ?? null,
+      generation: options.generation ?? null,
+    });
+    return mapGitStatusPage(result);
+  }
+
+  async getGitPagedDiff(
+    workspaceId: string,
+    path: string,
+    options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {},
+  ): Promise<GitPagedDiff> {
+    const result = await this.call<GitPagedDiffWire>("git.diff", {
+      workspace_id: workspaceId,
+      repository_id: options.repositoryId ?? null,
+      path,
+      stage: options.stage ?? null,
+      context_lines: options.contextLines ?? null,
+      generation: options.generation ?? null,
+    });
+    return mapGitPagedDiff(result);
+  }
+
   async getGitDiff(
     workspaceId: string,
     path: string,
@@ -2504,6 +2772,18 @@ class TauriControlClient implements ControlClient {
     });
   }
 
+  async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> {
+    await this.call("git.discard", { workspace_id: workspaceId, paths });
+  }
+
+  async stageAllGitFiles(workspaceId: string): Promise<void> {
+    await this.call("git.stage_all", { workspace_id: workspaceId });
+  }
+
+  async unstageAllGitFiles(workspaceId: string): Promise<void> {
+    await this.call("git.unstage_all", { workspace_id: workspaceId });
+  }
+
   async commitGitChanges(
     workspaceId: string,
     message: string,
@@ -2524,6 +2804,26 @@ class TauriControlClient implements ControlClient {
     });
     return mapSidebarState(result);
   }
+
+  async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
+    const result = await this.call<GitReviewThreadListWire>("git.review_thread.list", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path: options.path ?? null, include_resolved: options.includeResolved ?? false, include_stale: options.includeStale ?? false, limit: options.limit ?? null });
+    return result.threads.map(mapGitReviewThread);
+  }
+  async createGitReviewThread(input: { workspaceId: string; repositoryId?: string | null; anchor: GitReviewLineAnchor; body: string; authorSessionId?: string | null }): Promise<GitReviewThread> { return mapGitReviewThread(await this.call<GitReviewThreadWire>("git.review_thread.create", { workspace_id: input.workspaceId, repository_id: input.repositoryId ?? null, anchor: toGitReviewAnchorWire(input.anchor), body: input.body, author_session_id: input.authorSessionId ?? null })); }
+  async updateGitReviewThread(threadId: string, input: { resolved?: boolean; anchor?: GitReviewLineAnchor }): Promise<GitReviewThread> { return mapGitReviewThread(await this.call<GitReviewThreadWire>("git.review_thread.update", { thread_id: threadId, resolved: input.resolved ?? null, anchor: input.anchor ? toGitReviewAnchorWire(input.anchor) : null })); }
+  async deleteGitReviewThread(threadId: string): Promise<void> { await this.call("git.review_thread.delete", { thread_id: threadId }); }
+  async listGitReviewComments(threadId: string, limit?: number): Promise<GitReviewComment[]> { const result = await this.call<GitReviewCommentListWire>("git.review_comment.list", { thread_id: threadId, limit: limit ?? null }); return result.comments.map(mapGitReviewComment); }
+  async createGitReviewComment(input: { threadId: string; body: string; authorSessionId?: string | null }): Promise<GitReviewComment> { return mapGitReviewComment(await this.call<GitReviewCommentWire>("git.review_comment.create", { thread_id: input.threadId, body: input.body, author_session_id: input.authorSessionId ?? null })); }
+  async updateGitReviewComment(commentId: string, body: string): Promise<GitReviewComment> { return mapGitReviewComment(await this.call<GitReviewCommentWire>("git.review_comment.update", { comment_id: commentId, body })); }
+  async deleteGitReviewComment(commentId: string): Promise<void> { await this.call("git.review_comment.delete", { comment_id: commentId }); }
+  async deliverGitReviewThread(threadId: string, input: { target: "mailbox" | "terminal"; targetSessionId?: string | null; includeContext?: boolean }): Promise<GitReviewDelivery> { return mapGitReviewDelivery(await this.call<GitReviewDeliveryWire>("git.review_thread.deliver", { thread_id: threadId, target: input.target, target_session_id: input.targetSessionId ?? null, include_context: input.includeContext ?? true })); }
+  async createAgentWorktree(input: { workspaceId: string; branch: string; destination: string; baseRevision?: string | null; createBranch?: boolean; backend?: string | null; backendProfile?: string | null; command?: string[]; cwd?: string | null; idempotencyKey: string }): Promise<AgentWorktreeOperation> { return mapAgentWorktreeOperation(await this.call<AgentWorktreeOperationWire>("agent.worktree.create", { workspace_id: input.workspaceId, branch: input.branch, destination: input.destination, base_revision: input.baseRevision ?? null, create_branch: input.createBranch ?? true, backend: input.backend ?? null, backend_profile: input.backendProfile ?? null, command: input.command ?? [], cwd: input.cwd ?? null, idempotency_key: input.idempotencyKey })); }
+  async listAgentWorktrees(workspaceId?: string | null, includeCompleted = true): Promise<AgentWorktreeOperation[]> { const result = await this.call<AgentWorktreeListWire>("agent.worktree.list", { workspace_id: workspaceId ?? null, include_completed: includeCompleted }); return result.worktrees.map(mapAgentWorktreeOperation); }
+  async recoverAgentWorktree(input: { operationId?: string | null; idempotencyKey?: string | null }): Promise<AgentWorktreeOperation> { return mapAgentWorktreeOperation(await this.call<AgentWorktreeOperationWire>("agent.worktree.recover", { operation_id: input.operationId ?? null, idempotency_key: input.idempotencyKey ?? null })); }
+  async removeAgentWorktree(input: { worktreeId: string; force?: boolean; idempotencyKey?: string | null }): Promise<AgentWorktreeOperation> { return mapAgentWorktreeOperation(await this.call<AgentWorktreeOperationWire>("agent.worktree.remove", { worktree_id: input.worktreeId, force: input.force ?? false, idempotency_key: input.idempotencyKey ?? null })); }
+  async listDevelopmentServerCandidates(workspaceId?: string | null): Promise<DevelopmentServerCandidate[]> { const result = await this.call<DevelopmentServerCandidateListWire>("dev_server.candidate.list", { workspace_id: workspaceId ?? null, include_dismissed: false, limit: 100 }); return result.candidates.map(mapDevelopmentServerCandidate); }
+  async dismissDevelopmentServerCandidate(candidateId: string): Promise<void> { await this.call("dev_server.candidate.dismiss", { candidate_id: candidateId }); }
+  async openDevelopmentServerCandidateInSplit(candidateId: string, options: { paneId?: string | null } = {}): Promise<{ surfaceId: string; url: string }> { const result = await this.call<DevelopmentServerCandidateOpenInSplitWire>("dev_server.candidate.open_in_split", { candidate_id: candidateId, pane_id: options.paneId ?? null }); return { surfaceId: result.surface_id, url: result.candidate.url }; }
 
   private async call<T = unknown>(method: string, params: unknown): Promise<T> {
     const token = await this.getControlToken();
@@ -2597,6 +2897,11 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly teamMessages: TeamMessage[] = [];
   private readonly sidebarStates = new Map<string, SidebarState>();
   private readonly gitStatuses = new Map<string, GitStatus>();
+  private readonly gitReviewThreads = new Map<string, GitReviewThread>();
+  private readonly agentWorktrees = new Map<string, AgentWorktreeOperation>();
+  private gitReviewCounter = 0;
+  private gitReviewCommentCounter = 0;
+  private agentWorktreeCounter = 0;
   private readonly terminalSurfaces: SurfaceSummary[] = [];
   private readonly sessions = new Map<string, TerminalSession>();
   private readonly outputs = new Map<string, string>();
@@ -4033,6 +4338,78 @@ class BrowserPreviewControlClient implements ControlClient {
     );
   }
 
+  async getGitStatusSummary(
+    workspaceId: string,
+    _repositoryId?: string | null,
+  ): Promise<GitStatusSummary> {
+    const status = await this.getGitStatus(workspaceId);
+    const files = status.files;
+    return {
+      workspaceId,
+      repositoryId: `preview_repo_${workspaceId}`,
+      repositoryRoot: status.repositoryRoot ?? "",
+      branch: status.branch ?? null,
+      headOid: status.head ?? null,
+      upstream: status.upstream ?? null,
+      ahead: status.ahead,
+      behind: status.behind,
+      stagedCount: files.filter((change) => change.staged).length,
+      unstagedCount: files.filter((change) => change.unstaged).length,
+      untrackedCount: files.filter((change) => change.untracked).length,
+      conflictedCount: files.filter((change) => change.conflict).length,
+      generation: Math.max(1, files.length + (status.head?.length ?? 0)),
+      refreshedAt: new Date().toISOString(),
+    };
+  }
+
+  async getGitStatusPage(
+    workspaceId: string,
+    options: {
+      repositoryId?: string | null;
+      state?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+    } = {},
+  ): Promise<GitStatusPage> {
+    const [status, summary] = await Promise.all([
+      this.getGitStatus(workspaceId),
+      this.getGitStatusSummary(workspaceId, options.repositoryId),
+    ]);
+    const filtered = status.files.filter((change) => {
+      switch (options.state) {
+        case "staged": return change.staged;
+        case "unstaged": return change.unstaged && !change.untracked;
+        case "untracked": return change.untracked;
+        case "conflicted": return change.conflict;
+        default: return true;
+      }
+    });
+    const offset = Math.max(0, Number.parseInt(options.cursor ?? "0", 10) || 0);
+    const limit = Math.max(1, Math.min(500, options.limit ?? 200));
+    const page = filtered.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    return {
+      workspaceId,
+      repositoryId: summary.repositoryId,
+      generation: summary.generation,
+      changes: page.map((change) => ({
+        path: change.path,
+        originalPath: change.originalPath ?? null,
+        status: change.staged ? change.indexStatus : change.worktreeStatus,
+        staged: change.staged,
+        unstaged: change.unstaged,
+        untracked: change.untracked,
+        conflicted: change.conflict,
+        isBinary: false,
+        additions: null,
+        deletions: null,
+      })),
+      nextCursor: nextOffset < filtered.length ? String(nextOffset) : null,
+      totalCount: filtered.length,
+    };
+  }
+
   async spawnWslTerminal(
     workspaceId: string,
     distribution: string | null,
@@ -4542,6 +4919,52 @@ class BrowserPreviewControlClient implements ControlClient {
       };
     }
     return this.readSidebarState(workspace.workspaceId);
+  }
+
+  async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {}): Promise<GitPagedDiff> {
+    const [diff, summary] = await Promise.all([this.getGitDiff(workspaceId, path, { staged: options.stage === "staged" }), this.getGitStatusSummary(workspaceId, options.repositoryId)]);
+    return { ...diff, workspaceId, repositoryId: summary.repositoryId, generation: summary.generation, originalPath: null, isBinary: false };
+  }
+
+  async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> {
+    const status = this.gitStatuses.get(workspaceId);
+    if (status) status.files = status.files.filter((change) => !paths.includes(change.path) && !paths.includes(change.originalPath ?? ""));
+  }
+  async stageAllGitFiles(workspaceId: string): Promise<void> { await this.stageGitFiles(workspaceId); }
+  async unstageAllGitFiles(workspaceId: string): Promise<void> { await this.unstageGitFiles(workspaceId); }
+
+  async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
+    return [...this.gitReviewThreads.values()].filter((thread) => thread.workspaceId === workspaceId).filter((thread) => !options.repositoryId || thread.repositoryId === options.repositoryId).filter((thread) => !options.path || thread.anchor.path === options.path).filter((thread) => options.includeResolved || !thread.resolved).filter((thread) => options.includeStale || !thread.stale).slice(0, options.limit ?? 500).map(cloneGitReviewThread);
+  }
+  async createGitReviewThread(input: { workspaceId: string; repositoryId?: string | null; anchor: GitReviewLineAnchor; body: string; authorSessionId?: string | null }): Promise<GitReviewThread> {
+    const now = new Date().toISOString(); const threadId = `review_preview_${++this.gitReviewCounter}`;
+    const comment: GitReviewComment = { commentId: `review_comment_preview_${++this.gitReviewCommentCounter}`, threadId, body: input.body.trim(), authorSessionId: input.authorSessionId ?? null, createdAt: now, updatedAt: now };
+    const thread: GitReviewThread = { threadId, workspaceId: input.workspaceId, repositoryId: input.repositoryId ?? `preview_repo_${input.workspaceId}`, anchor: { ...input.anchor }, resolved: false, stale: false, staleReason: null, createdAt: now, updatedAt: now, comments: [comment] };
+    this.gitReviewThreads.set(threadId, thread); return cloneGitReviewThread(thread);
+  }
+  async updateGitReviewThread(threadId: string, input: { resolved?: boolean; anchor?: GitReviewLineAnchor }): Promise<GitReviewThread> {
+    const thread = this.findGitReviewThread(threadId); if (input.resolved !== undefined) thread.resolved = input.resolved; if (input.anchor) thread.anchor = { ...input.anchor }; thread.updatedAt = new Date().toISOString(); return cloneGitReviewThread(thread);
+  }
+  async deleteGitReviewThread(threadId: string): Promise<void> { this.gitReviewThreads.delete(threadId); }
+  async listGitReviewComments(threadId: string, limit = 500): Promise<GitReviewComment[]> { return this.findGitReviewThread(threadId).comments.slice(0, limit).map(cloneGitReviewComment); }
+  async createGitReviewComment(input: { threadId: string; body: string; authorSessionId?: string | null }): Promise<GitReviewComment> {
+    const thread = this.findGitReviewThread(input.threadId); const now = new Date().toISOString(); const comment: GitReviewComment = { commentId: `review_comment_preview_${++this.gitReviewCommentCounter}`, threadId: thread.threadId, body: input.body.trim(), authorSessionId: input.authorSessionId ?? null, createdAt: now, updatedAt: now }; thread.comments.push(comment); thread.updatedAt = now; return cloneGitReviewComment(comment);
+  }
+  async updateGitReviewComment(commentId: string, body: string): Promise<GitReviewComment> { for (const thread of this.gitReviewThreads.values()) { const comment = thread.comments.find((candidate) => candidate.commentId === commentId); if (comment) { comment.body = body.trim(); comment.updatedAt = new Date().toISOString(); thread.updatedAt = comment.updatedAt; return cloneGitReviewComment(comment); } } throw new ControlClientError("Review comment was not found.", "not_found"); }
+  async deleteGitReviewComment(commentId: string): Promise<void> { for (const thread of this.gitReviewThreads.values()) { const index = thread.comments.findIndex((candidate) => candidate.commentId === commentId); if (index >= 0) { thread.comments.splice(index, 1); thread.updatedAt = new Date().toISOString(); return; } } }
+  async deliverGitReviewThread(threadId: string, input: { target: "mailbox" | "terminal"; targetSessionId?: string | null; includeContext?: boolean }): Promise<GitReviewDelivery> { const thread = this.findGitReviewThread(threadId); const body = thread.comments.map((comment) => comment.body).join("\n"); if (input.target === "terminal" && input.targetSessionId) await this.sendPaste(input.targetSessionId, body); else if (input.targetSessionId) await this.sendTeamMessage({ workspaceId: thread.workspaceId, toSessionId: input.targetSessionId, body, kind: "mailbox" }); return { threadId, target: input.target, targetSessionId: input.targetSessionId ?? null, deliveredAt: new Date().toISOString() }; }
+  async createAgentWorktree(input: { workspaceId: string; branch: string; destination: string; baseRevision?: string | null; createBranch?: boolean; backend?: string | null; backendProfile?: string | null; command?: string[]; cwd?: string | null; idempotencyKey: string }): Promise<AgentWorktreeOperation> { const existing = [...this.agentWorktrees.values()].find((operation) => operation.operationId === input.idempotencyKey); if (existing) return { ...existing, reused: true }; const worktreeId = `worktree_preview_${++this.agentWorktreeCounter}`; const operation: AgentWorktreeOperation = { operationId: input.idempotencyKey, worktreeId, workspaceId: input.workspaceId, branch: input.branch, path: input.destination, state: "completed", surfaceId: null, paneId: null, sessionId: null, reused: false, recovered: false }; this.agentWorktrees.set(worktreeId, operation); return { ...operation }; }
+  async listAgentWorktrees(workspaceId?: string | null, _includeCompleted = true): Promise<AgentWorktreeOperation[]> { return [...this.agentWorktrees.values()].filter((operation) => !workspaceId || operation.workspaceId === workspaceId).map((operation) => ({ ...operation })); }
+  async recoverAgentWorktree(input: { operationId?: string | null; idempotencyKey?: string | null }): Promise<AgentWorktreeOperation> { const operation = [...this.agentWorktrees.values()].find((candidate) => candidate.operationId === input.operationId || candidate.operationId === input.idempotencyKey); if (!operation) throw new ControlClientError("Worktree operation was not found.", "not_found"); return { ...operation, recovered: true }; }
+  async removeAgentWorktree(input: { worktreeId: string; force?: boolean; idempotencyKey?: string | null }): Promise<AgentWorktreeOperation> { const operation = this.agentWorktrees.get(input.worktreeId); if (!operation) throw new ControlClientError("Worktree operation was not found.", "not_found"); this.agentWorktrees.delete(input.worktreeId); return { ...operation, state: "removed" }; }
+  async listDevelopmentServerCandidates(_workspaceId?: string | null): Promise<DevelopmentServerCandidate[]> { return []; }
+  async dismissDevelopmentServerCandidate(_candidateId: string): Promise<void> {}
+  async openDevelopmentServerCandidateInSplit(_candidateId: string, _options: { paneId?: string | null } = {}): Promise<{ surfaceId: string; url: string }> { throw new ControlClientError("Development server candidates are unavailable in browser preview.", "unavailable"); }
+
+  private findGitReviewThread(threadId: string): GitReviewThread {
+    const thread = this.gitReviewThreads.get(threadId);
+    if (!thread) throw new ControlClientError("Review thread was not found.", "not_found");
+    return thread;
   }
 
   private findWorkspace(workspaceId: string): WorkspaceSummary {
@@ -6004,36 +6427,44 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return mapGitDiff(result);
   }
 
-  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
-    await this.serverControl("git.stage", {
-      workspace_id: workspaceId,
-      paths,
-    });
+  async getGitStatusSummary(workspaceId: string, repositoryId?: string | null): Promise<GitStatusSummary> {
+    return mapGitStatusSummary(await this.serverControl<GitStatusSummaryWire>("git.status_summary", { workspace_id: workspaceId, repository_id: repositoryId ?? null }));
   }
 
-  async unstageGitFiles(
-    workspaceId: string,
-    paths: string[] = [],
-  ): Promise<void> {
-    await this.serverControl("git.unstage", {
-      workspace_id: workspaceId,
-      paths,
-    });
+  async getGitStatusPage(workspaceId: string, options: { repositoryId?: string | null; state?: string | null; cursor?: string | null; limit?: number; generation?: number | null } = {}): Promise<GitStatusPage> {
+    return mapGitStatusPage(await this.serverControl<GitStatusPageWire>("git.status_page", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, state: options.state ?? null, cursor: options.cursor ?? null, limit: options.limit ?? null, generation: options.generation ?? null }));
   }
 
-  async commitGitChanges(
-    workspaceId: string,
-    message: string,
-  ): Promise<GitCommitResult> {
-    const result = await this.serverControl<GitCommitResultWire>("git.commit", {
-      workspace_id: workspaceId,
-      message,
-    });
-    return {
-      commit: result.commit,
-      summary: result.summary,
-    };
+  async getGitPagedDiff(workspaceId: string, path: string, options: { repositoryId?: string | null; stage?: string | null; contextLines?: number; generation?: number | null } = {}): Promise<GitPagedDiff> {
+    return mapGitPagedDiff(await this.serverControl<GitPagedDiffWire>("git.diff", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path, stage: options.stage ?? null, context_lines: options.contextLines ?? null, generation: options.generation ?? null }));
   }
+
+  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> { await this.serverControl("git.stage", { workspace_id: workspaceId, paths }); }
+  async unstageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> { await this.serverControl("git.unstage", { workspace_id: workspaceId, paths }); }
+  async discardGitFiles(workspaceId: string, paths: string[]): Promise<void> { await this.serverControl("git.discard", { workspace_id: workspaceId, paths }); }
+  async stageAllGitFiles(workspaceId: string): Promise<void> { await this.serverControl("git.stage_all", { workspace_id: workspaceId }); }
+  async unstageAllGitFiles(workspaceId: string): Promise<void> { await this.serverControl("git.unstage_all", { workspace_id: workspaceId }); }
+
+  async listGitReviewThreads(workspaceId: string, options: { repositoryId?: string | null; path?: string | null; includeResolved?: boolean; includeStale?: boolean; limit?: number } = {}): Promise<GitReviewThread[]> {
+    const result = await this.serverControl<GitReviewThreadListWire>("git.review_thread.list", { workspace_id: workspaceId, repository_id: options.repositoryId ?? null, path: options.path ?? null, include_resolved: options.includeResolved ?? false, include_stale: options.includeStale ?? false, limit: options.limit ?? null });
+    return result.threads.map(mapGitReviewThread);
+  }
+  async createGitReviewThread(input: { workspaceId: string; repositoryId?: string | null; anchor: GitReviewLineAnchor; body: string; authorSessionId?: string | null }): Promise<GitReviewThread> { return mapGitReviewThread(await this.serverControl<GitReviewThreadWire>("git.review_thread.create", { workspace_id: input.workspaceId, repository_id: input.repositoryId ?? null, anchor: toGitReviewAnchorWire(input.anchor), body: input.body, author_session_id: input.authorSessionId ?? null })); }
+  async updateGitReviewThread(threadId: string, input: { resolved?: boolean; anchor?: GitReviewLineAnchor }): Promise<GitReviewThread> { return mapGitReviewThread(await this.serverControl<GitReviewThreadWire>("git.review_thread.update", { thread_id: threadId, resolved: input.resolved ?? null, anchor: input.anchor ? toGitReviewAnchorWire(input.anchor) : null })); }
+  async deleteGitReviewThread(threadId: string): Promise<void> { await this.serverControl("git.review_thread.delete", { thread_id: threadId }); }
+  async listGitReviewComments(threadId: string, limit?: number): Promise<GitReviewComment[]> { const result = await this.serverControl<GitReviewCommentListWire>("git.review_comment.list", { thread_id: threadId, limit: limit ?? null }); return result.comments.map(mapGitReviewComment); }
+  async createGitReviewComment(input: { threadId: string; body: string; authorSessionId?: string | null }): Promise<GitReviewComment> { return mapGitReviewComment(await this.serverControl<GitReviewCommentWire>("git.review_comment.create", { thread_id: input.threadId, body: input.body, author_session_id: input.authorSessionId ?? null })); }
+  async updateGitReviewComment(commentId: string, body: string): Promise<GitReviewComment> { return mapGitReviewComment(await this.serverControl<GitReviewCommentWire>("git.review_comment.update", { comment_id: commentId, body })); }
+  async deleteGitReviewComment(commentId: string): Promise<void> { await this.serverControl("git.review_comment.delete", { comment_id: commentId }); }
+  async deliverGitReviewThread(threadId: string, input: { target: "mailbox" | "terminal"; targetSessionId?: string | null; includeContext?: boolean }): Promise<GitReviewDelivery> { return mapGitReviewDelivery(await this.serverControl<GitReviewDeliveryWire>("git.review_thread.deliver", { thread_id: threadId, target: input.target, target_session_id: input.targetSessionId ?? null, include_context: input.includeContext ?? true })); }
+  async createAgentWorktree(input: { workspaceId: string; branch: string; destination: string; baseRevision?: string | null; createBranch?: boolean; backend?: string | null; backendProfile?: string | null; command?: string[]; cwd?: string | null; idempotencyKey: string }): Promise<AgentWorktreeOperation> { return mapAgentWorktreeOperation(await this.serverControl<AgentWorktreeOperationWire>("agent.worktree.create", { workspace_id: input.workspaceId, branch: input.branch, destination: input.destination, base_revision: input.baseRevision ?? null, create_branch: input.createBranch ?? true, backend: input.backend ?? null, backend_profile: input.backendProfile ?? null, command: input.command ?? [], cwd: input.cwd ?? null, idempotency_key: input.idempotencyKey })); }
+  async listAgentWorktrees(workspaceId?: string | null, includeCompleted = true): Promise<AgentWorktreeOperation[]> { const result = await this.serverControl<AgentWorktreeListWire>("agent.worktree.list", { workspace_id: workspaceId ?? null, include_completed: includeCompleted }); return result.worktrees.map(mapAgentWorktreeOperation); }
+  async recoverAgentWorktree(input: { operationId?: string | null; idempotencyKey?: string | null }): Promise<AgentWorktreeOperation> { return mapAgentWorktreeOperation(await this.serverControl<AgentWorktreeOperationWire>("agent.worktree.recover", { operation_id: input.operationId ?? null, idempotency_key: input.idempotencyKey ?? null })); }
+  async removeAgentWorktree(input: { worktreeId: string; force?: boolean; idempotencyKey?: string | null }): Promise<AgentWorktreeOperation> { return mapAgentWorktreeOperation(await this.serverControl<AgentWorktreeOperationWire>("agent.worktree.remove", { worktree_id: input.worktreeId, force: input.force ?? false, idempotency_key: input.idempotencyKey ?? null })); }
+  async listDevelopmentServerCandidates(workspaceId?: string | null): Promise<DevelopmentServerCandidate[]> { const result = await this.serverControl<DevelopmentServerCandidateListWire>("dev_server.candidate.list", { workspace_id: workspaceId ?? null, include_dismissed: false, limit: 100 }); return result.candidates.map(mapDevelopmentServerCandidate); }
+  async dismissDevelopmentServerCandidate(candidateId: string): Promise<void> { await this.serverControl("dev_server.candidate.dismiss", { candidate_id: candidateId }); }
+  async openDevelopmentServerCandidateInSplit(candidateId: string, options: { paneId?: string | null } = {}): Promise<{ surfaceId: string; url: string }> { const result = await this.serverControl<DevelopmentServerCandidateOpenInSplitWire>("dev_server.candidate.open_in_split", { candidate_id: candidateId, pane_id: options.paneId ?? null }); return { surfaceId: result.surface_id, url: result.candidate.url }; }
+
 
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
     await this.hydrateServerState();
@@ -6631,6 +7062,142 @@ interface GitCommitResultWire {
   summary: string;
 }
 
+interface GitChangeSummaryWire {
+  path: string;
+  original_path?: string | null;
+  status: string;
+  staged?: boolean;
+  unstaged?: boolean;
+  untracked?: boolean;
+  conflicted?: boolean;
+  is_binary?: boolean;
+  additions?: number | null;
+  deletions?: number | null;
+}
+
+interface GitStatusSummaryWire {
+  workspace_id: string;
+  repository_id: string;
+  repository_root: string;
+  branch?: string | null;
+  head_oid?: string | null;
+  upstream?: string | null;
+  ahead?: number;
+  behind?: number;
+  staged_count?: number;
+  unstaged_count?: number;
+  untracked_count?: number;
+  conflicted_count?: number;
+  generation: number;
+  refreshed_at: string;
+}
+
+interface GitStatusPageWire {
+  workspace_id: string;
+  repository_id: string;
+  generation: number;
+  changes: GitChangeSummaryWire[];
+  next_cursor?: string | null;
+  total_count?: number | null;
+}
+
+interface GitPagedDiffWire {
+  workspace_id: string;
+  repository_id: string;
+  generation: number;
+  path: string;
+  original_path?: string | null;
+  diff?: string;
+  is_binary?: boolean;
+  truncated?: boolean;
+}
+
+interface GitReviewLineAnchorWire {
+  path: string;
+  side: string;
+  line: number;
+  start_line?: number | null;
+  base_revision?: string | null;
+  head_revision?: string | null;
+  hunk_header?: string | null;
+  diff_hash?: string | null;
+}
+
+interface GitReviewCommentWire {
+  comment_id: string;
+  thread_id: string;
+  body: string;
+  author_session_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface GitReviewThreadWire {
+  thread_id: string;
+  workspace_id: string;
+  repository_id: string;
+  anchor: GitReviewLineAnchorWire;
+  resolved?: boolean;
+  stale?: boolean;
+  stale_reason?: string | null;
+  created_at: string;
+  updated_at: string;
+  comments?: GitReviewCommentWire[];
+}
+
+interface GitReviewThreadListWire {
+  threads: GitReviewThreadWire[];
+}
+
+interface GitReviewCommentListWire {
+  comments: GitReviewCommentWire[];
+}
+
+interface GitReviewDeliveryWire {
+  thread_id: string;
+  target: string;
+  target_session_id?: string | null;
+  delivered_at: string;
+}
+
+interface AgentWorktreeOperationWire {
+  operation_id: string;
+  worktree_id: string;
+  workspace_id: string;
+  branch: string;
+  path: string;
+  state: string;
+  surface_id?: string | null;
+  pane_id?: string | null;
+  session_id?: string | null;
+  reused?: boolean;
+  recovered?: boolean;
+}
+
+interface AgentWorktreeListWire {
+  worktrees: AgentWorktreeOperationWire[];
+}
+
+interface DevelopmentServerCandidateWire {
+  candidate_id: string;
+  workspace_id: string;
+  session_id: string;
+  url: string;
+  source: string;
+  detected_at: string;
+  dismissed?: boolean;
+}
+
+interface DevelopmentServerCandidateListWire {
+  candidates: DevelopmentServerCandidateWire[];
+}
+
+interface DevelopmentServerCandidateOpenInSplitWire {
+  candidate: DevelopmentServerCandidateWire;
+  pane_id: string;
+  surface_id: string;
+}
+
 interface RecoveryDiagnosticsWire {
   workspace_count: number;
   pane_count: number;
@@ -7136,10 +7703,172 @@ function mapGitDiff(value: GitDiffWire): GitDiff {
   };
 }
 
+function mapGitChangeSummary(value: GitChangeSummaryWire): GitChangeSummary {
+  return {
+    path: value.path,
+    originalPath: value.original_path ?? null,
+    status: value.status,
+    staged: value.staged ?? false,
+    unstaged: value.unstaged ?? false,
+    untracked: value.untracked ?? false,
+    conflicted: value.conflicted ?? false,
+    isBinary: value.is_binary ?? false,
+    additions: value.additions ?? null,
+    deletions: value.deletions ?? null,
+  };
+}
+
+function mapGitStatusSummary(value: GitStatusSummaryWire): GitStatusSummary {
+  return {
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    repositoryRoot: value.repository_root,
+    branch: value.branch ?? null,
+    headOid: value.head_oid ?? null,
+    upstream: value.upstream ?? null,
+    ahead: value.ahead ?? 0,
+    behind: value.behind ?? 0,
+    stagedCount: value.staged_count ?? 0,
+    unstagedCount: value.unstaged_count ?? 0,
+    untrackedCount: value.untracked_count ?? 0,
+    conflictedCount: value.conflicted_count ?? 0,
+    generation: value.generation,
+    refreshedAt: value.refreshed_at,
+  };
+}
+
+function mapGitStatusPage(value: GitStatusPageWire): GitStatusPage {
+  return {
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    generation: value.generation,
+    changes: value.changes.map(mapGitChangeSummary),
+    nextCursor: value.next_cursor ?? null,
+    totalCount: value.total_count ?? null,
+  };
+}
+
+function mapGitPagedDiff(value: GitPagedDiffWire): GitPagedDiff {
+  return {
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    generation: value.generation,
+    path: value.path,
+    originalPath: value.original_path ?? null,
+    staged: false,
+    patch: value.diff ?? "",
+    isBinary: value.is_binary ?? false,
+    truncated: value.truncated ?? false,
+  };
+}
+
+function toGitReviewAnchorWire(value: GitReviewLineAnchor): GitReviewLineAnchorWire {
+  return {
+    path: value.path,
+    side: value.side,
+    line: value.line,
+    start_line: value.startLine ?? null,
+    base_revision: value.baseRevision ?? null,
+    head_revision: value.headRevision ?? null,
+    hunk_header: value.hunkHeader ?? null,
+    diff_hash: value.diffHash ?? null,
+  };
+}
+
+function mapGitReviewAnchor(value: GitReviewLineAnchorWire): GitReviewLineAnchor {
+  return {
+    path: value.path,
+    side: value.side,
+    line: value.line,
+    startLine: value.start_line ?? null,
+    baseRevision: value.base_revision ?? null,
+    headRevision: value.head_revision ?? null,
+    hunkHeader: value.hunk_header ?? null,
+    diffHash: value.diff_hash ?? null,
+  };
+}
+
+function mapGitReviewComment(value: GitReviewCommentWire): GitReviewComment {
+  return {
+    commentId: value.comment_id,
+    threadId: value.thread_id,
+    body: value.body,
+    authorSessionId: value.author_session_id ?? null,
+    createdAt: value.created_at,
+    updatedAt: value.updated_at,
+  };
+}
+
+function mapGitReviewThread(value: GitReviewThreadWire): GitReviewThread {
+  return {
+    threadId: value.thread_id,
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    anchor: mapGitReviewAnchor(value.anchor),
+    resolved: value.resolved ?? false,
+    stale: value.stale ?? false,
+    staleReason: value.stale_reason ?? null,
+    createdAt: value.created_at,
+    updatedAt: value.updated_at,
+    comments: (value.comments ?? []).map(mapGitReviewComment),
+  };
+}
+
+function mapGitReviewDelivery(value: GitReviewDeliveryWire): GitReviewDelivery {
+  return {
+    threadId: value.thread_id,
+    target: value.target,
+    targetSessionId: value.target_session_id ?? null,
+    deliveredAt: value.delivered_at,
+  };
+}
+
+function mapAgentWorktreeOperation(value: AgentWorktreeOperationWire): AgentWorktreeOperation {
+  return {
+    operationId: value.operation_id,
+    worktreeId: value.worktree_id,
+    workspaceId: value.workspace_id,
+    branch: value.branch,
+    path: value.path,
+    state: value.state,
+    surfaceId: value.surface_id ?? null,
+    paneId: value.pane_id ?? null,
+    sessionId: value.session_id ?? null,
+    reused: value.reused ?? false,
+    recovered: value.recovered ?? false,
+  };
+}
+
+export function mapDevelopmentServerCandidate(
+  value: DevelopmentServerCandidateWire,
+): DevelopmentServerCandidate {
+  return {
+    candidateId: value.candidate_id,
+    workspaceId: value.workspace_id,
+    sessionId: value.session_id,
+    url: value.url,
+    source: value.source,
+    detectedAt: value.detected_at,
+    dismissed: value.dismissed ?? false,
+  };
+}
+
 function cloneGitStatus(value: GitStatus): GitStatus {
   return {
     ...value,
     files: value.files.map((change) => ({ ...change })),
+  };
+}
+
+function cloneGitReviewComment(value: GitReviewComment): GitReviewComment {
+  return { ...value };
+}
+
+function cloneGitReviewThread(value: GitReviewThread): GitReviewThread {
+  return {
+    ...value,
+    anchor: { ...value.anchor },
+    comments: value.comments.map(cloneGitReviewComment),
   };
 }
 

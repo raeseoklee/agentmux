@@ -169,6 +169,14 @@ export type I18nKey =
   | "sourceControl.unstageAll"
   | "sourceControl.unstageFile"
   | "sourceControl.updating"
+  | "sourceControl.worktreeBase"
+  | "sourceControl.worktreeBranch"
+  | "sourceControl.worktreeCommand"
+  | "sourceControl.worktreeCreateConfirm"
+  | "sourceControl.worktreeCreateDescription"
+  | "sourceControl.worktreeCreateTitle"
+  | "sourceControl.worktreeDestination"
+  | "sourceControl.worktreeStarted"
   | "action.group.agent"
   | "action.group.terminal"
   | "action.group.workspace"
@@ -434,6 +442,14 @@ const en: Record<I18nKey, string> = {
   "sourceControl.unstageAll": "Unstage all",
   "sourceControl.unstageFile": "Unstage {path}",
   "sourceControl.updating": "Updating repository...",
+  "sourceControl.worktreeBase": "Base revision",
+  "sourceControl.worktreeBranch": "Branch",
+  "sourceControl.worktreeCommand": "Agent command",
+  "sourceControl.worktreeCreateConfirm": "Create worktree",
+  "sourceControl.worktreeCreateDescription": "Creates an AgentMux-owned worktree, workspace, and optional agent session as one recoverable operation.",
+  "sourceControl.worktreeCreateTitle": "Create isolated agent worktree",
+  "sourceControl.worktreeDestination": "Destination",
+  "sourceControl.worktreeStarted": "Worktree operation started",
   "statusbar.surfaceSummary": "{surfaces} surfaces · {terminals} terminals · {running} running",
   "action.group.agent": "Agent",
   "action.group.terminal": "Terminal",
@@ -778,6 +794,14 @@ const ko: Record<I18nKey, string> = {
   "sourceControl.unstageAll": "모두 스테이징 해제",
   "sourceControl.unstageFile": "{path} 스테이징 해제",
   "sourceControl.updating": "저장소 변경 적용 중...",
+  "sourceControl.worktreeBase": "기준 리비전",
+  "sourceControl.worktreeBranch": "브랜치",
+  "sourceControl.worktreeCommand": "에이전트 명령",
+  "sourceControl.worktreeCreateConfirm": "worktree 만들기",
+  "sourceControl.worktreeCreateDescription": "AgentMux 소유 worktree, 워크스페이스, 선택적 에이전트 세션을 하나의 복구 가능한 작업으로 만듭니다.",
+  "sourceControl.worktreeCreateTitle": "격리된 에이전트 worktree 만들기",
+  "sourceControl.worktreeDestination": "대상 경로",
+  "sourceControl.worktreeStarted": "worktree 작업 시작됨",
 };
 
 const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {
