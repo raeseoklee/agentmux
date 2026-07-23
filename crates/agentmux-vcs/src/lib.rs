@@ -1285,6 +1285,13 @@ fn validate_worktree_lookup_path(host: &GitHost, destination: &str) -> Result<()
 fn worktree_paths_equal(host: &GitHost, left: &str, right: &str) -> bool {
     match host {
         GitHost::Native => {
+            let left_path = Path::new(left);
+            let right_path = Path::new(right);
+            match same_file::is_same_file(left_path, right_path) {
+                Ok(equivalent) => return equivalent,
+                Err(_) if left_path.exists() || right_path.exists() => return false,
+                Err(_) => {}
+            }
             let normalize = |value: &str| {
                 canonicalize_native_path(Path::new(value))
                     .unwrap_or_else(|_| PathBuf::from(value))

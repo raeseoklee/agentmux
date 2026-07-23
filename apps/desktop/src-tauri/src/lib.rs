@@ -13215,6 +13215,11 @@ fn is_host_process_working_dir(path: &str) -> bool {
 }
 
 fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match same_file::is_same_file(left, right) {
+        Ok(equivalent) => return equivalent,
+        Err(_) if left.exists() || right.exists() => return false,
+        Err(_) => {}
+    }
     let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
     let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
     normalized_path_text(&left) == normalized_path_text(&right)

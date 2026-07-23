@@ -202,6 +202,7 @@ dependencies = [
  "getrandom 0.2.17",
  "image",
  "notify-rust",
+ "same-file",
  "serde",
  "serde_json",
  "tauri",
@@ -240,6 +241,7 @@ version = "0.1.21"
 name = "agentmux-vcs"
 version = "0.1.21"
 dependencies = [
+ "same-file",
  "serde",
  "tempfile",
 ]

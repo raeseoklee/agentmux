@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+same-file = "1"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
