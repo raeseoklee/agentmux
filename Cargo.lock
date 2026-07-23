@@ -195,6 +195,7 @@ dependencies = [
  "agentmux-core",
  "agentmux-ipc",
  "agentmux-store",
+ "agentmux-vcs",
  "arboard",
  "base64 0.22.1",
  "getrandom 0.2.17",

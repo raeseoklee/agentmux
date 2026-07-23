@@ -96,6 +96,8 @@ use base64::prelude::{Engine as _, BASE64_STANDARD};
 use tauri::ipc::Channel;
 use tauri::Emitter as _;
 
+mod five_track;
+
 pub const DESKTOP_CONTROL_TOKEN: &str = DEFAULT_LOCAL_CONTROL_TOKEN;
 const MAX_BROWSER_FAILURES: usize = 100;
 const MAX_CONTROL_AUDIT_RECORDS: usize = 1000;
@@ -400,6 +402,7 @@ pub struct DesktopControlState {
     // until SQLite accepts them so an exited session cannot remain persisted
     // as running after a transient store lock/write failure.
     pending_session_state_updates: Mutex<HashMap<String, (String, Option<i32>)>>,
+    five_track: five_track::FiveTrackState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -561,6 +564,7 @@ impl DesktopControlState {
             input_command_buffers: Mutex::new(HashMap::new()),
             pending_agent_launch_lines: Mutex::new(HashMap::new()),
             pending_session_state_updates: Mutex::new(HashMap::new()),
+            five_track: five_track::FiveTrackState::new(),
         };
         // Durable-session recovery is deliberately NOT run here: it probes
         // wsl.exe/tmux and can block for seconds. The desktop host runs it on a
@@ -594,6 +598,7 @@ impl DesktopControlState {
             input_command_buffers: Mutex::new(HashMap::new()),
             pending_agent_launch_lines: Mutex::new(HashMap::new()),
             pending_session_state_updates: Mutex::new(HashMap::new()),
+            five_track: five_track::FiveTrackState::new(),
         };
         Ok(state)
     }
@@ -638,6 +643,7 @@ impl DesktopControlState {
     /// Store the Tauri AppHandle so the background pump can emit UI events.
     /// Called once from `.setup()` in main.rs before any pump ticks fire.
     pub fn set_app_handle(&self, handle: tauri::AppHandle) {
+        self.five_track.start_repository_monitor(handle.clone());
         let _ = self.app_handle.set(handle);
     }
 
@@ -988,6 +994,8 @@ impl DesktopControlState {
             || !cwd_updates.is_empty()
             || !session_state_updates.is_empty()
             || !persisted_state_updates.is_empty();
+        self.process_five_track_output(&deltas, &session_state_updates);
+        self.reassert_verified_hook_states();
         // Persist live cwd updates (OSC 7) so the footer git status tracks the
         // directory the shell has cd'd into. Best-effort; skip on contention.
         if !cwd_updates.is_empty() {
@@ -2528,121 +2536,127 @@ impl DesktopControlState {
             return ResponseEnvelope::error(id, error);
         }
 
-        let response = match request.method.as_str() {
-            "system.ping" => self.handle_system_ping(&request),
-            "system.capabilities" => self.handle_system_capabilities(&request),
-            "system.identify" => self.handle_system_identify(&request),
-            "workspace.create" => self.handle_workspace_create(&request),
-            "workspace.list" => self.handle_workspace_list(&request),
-            "workspace.get" => self.handle_workspace_get(&request),
-            "workspace.rename" => self.handle_workspace_rename(&request),
-            "workspace.update" => self.handle_workspace_update(&request),
-            "workspace.close" => self.handle_workspace_close(&request),
-            "workspace_group.list" => self.handle_workspace_group_list(&request),
-            "workspace_group.create" => self.handle_workspace_group_create(&request),
-            "workspace_group.update" => self.handle_workspace_group_update(&request),
-            "workspace_group.delete" => self.handle_workspace_group_delete(&request),
-            "workspace_group.add_workspace" => self.handle_workspace_group_add_workspace(&request),
-            "workspace_group.remove_workspace" => {
-                self.handle_workspace_group_remove_workspace(&request)
+        let response = if five_track::is_five_track_method(&request.method) {
+            self.handle_five_track_request(&request)
+        } else {
+            match request.method.as_str() {
+                "system.ping" => self.handle_system_ping(&request),
+                "system.capabilities" => self.handle_system_capabilities(&request),
+                "system.identify" => self.handle_system_identify(&request),
+                "workspace.create" => self.handle_workspace_create(&request),
+                "workspace.list" => self.handle_workspace_list(&request),
+                "workspace.get" => self.handle_workspace_get(&request),
+                "workspace.rename" => self.handle_workspace_rename(&request),
+                "workspace.update" => self.handle_workspace_update(&request),
+                "workspace.close" => self.handle_workspace_close(&request),
+                "workspace_group.list" => self.handle_workspace_group_list(&request),
+                "workspace_group.create" => self.handle_workspace_group_create(&request),
+                "workspace_group.update" => self.handle_workspace_group_update(&request),
+                "workspace_group.delete" => self.handle_workspace_group_delete(&request),
+                "workspace_group.add_workspace" => {
+                    self.handle_workspace_group_add_workspace(&request)
+                }
+                "workspace_group.remove_workspace" => {
+                    self.handle_workspace_group_remove_workspace(&request)
+                }
+                "pane.split" => self.handle_pane_split(&request),
+                "pane.focus" => self.handle_pane_focus(&request),
+                "pane.close" => self.handle_pane_close(&request),
+                "pane.resize_layout" => self.handle_pane_resize_layout(&request),
+                "pane.mount_surface" => self.handle_pane_mount_surface(&request),
+                "pane.unmount_surface" => self.handle_pane_unmount_surface(&request),
+                "surface.create_browser" => self.handle_surface_create_browser(&request),
+                "surface.close" => self.handle_surface_close(&request),
+                "surface.move_workspace" => self.handle_surface_move_workspace(&request),
+                "browser.navigate" => self.handle_browser_navigate(&request),
+                "browser.reload" => self.handle_browser_reload(&request),
+                "browser.back" => self.handle_browser_back(&request),
+                "browser.forward" => self.handle_browser_forward(&request),
+                "browser.current_url" => self.handle_browser_current_url(&request),
+                "browser.screenshot" => self.handle_browser_screenshot(&request),
+                "browser.dom_snapshot" => self.handle_browser_dom_snapshot(&request),
+                "browser.frames" => self.handle_browser_frames(&request),
+                "browser.storage" => self.handle_browser_storage(&request),
+                "browser.cookies" => self.handle_browser_cookies(&request),
+                "browser.downloads" => self.handle_browser_downloads(&request),
+                "browser.history" => self.handle_browser_history(&request),
+                "browser.console" => self.handle_browser_console(&request),
+                "browser.dialogs" => self.handle_browser_dialogs(&request),
+                "browser.dialog.respond" => self.handle_browser_dialog_respond(&request),
+                "browser.dialog.cancel" => self.handle_browser_dialog_cancel(&request),
+                "browser.errors" => self.handle_browser_errors(&request),
+                "browser.click" => self.handle_browser_click(&request),
+                "browser.type" => self.handle_browser_type(&request),
+                "browser.fill" => self.handle_browser_fill(&request),
+                "browser.press" => self.handle_browser_press(&request),
+                "browser.select" => self.handle_browser_select(&request),
+                "browser.scroll" => self.handle_browser_scroll(&request),
+                "browser.hover" => self.handle_browser_hover(&request),
+                "browser.check" => self.handle_browser_check(&request),
+                "browser.get" => self.handle_browser_get(&request),
+                "browser.find" => self.handle_browser_find(&request),
+                "browser.highlight" => self.handle_browser_highlight(&request),
+                "browser.focus" => self.handle_browser_focus(&request),
+                "browser.zoom" => self.handle_browser_zoom(&request),
+                "browser.wait_for_selector" => self.handle_browser_wait_for_selector(&request),
+                "browser.evaluate" => self.handle_browser_evaluate(&request),
+                "agent.get_state" => self.handle_agent_get_state(&request),
+                "agent.list_attention" => self.handle_agent_list_attention(&request),
+                "agent.list" => self.handle_agent_list(&request),
+                "actions.list" => self.handle_actions_list(&request),
+                "notification.create" => self.handle_notification_create(&request),
+                "notification.list" => self.handle_notification_list(&request),
+                "notification.dismiss" => self.handle_notification_dismiss(&request),
+                "notification.clear" => self.handle_notification_clear(&request),
+                "team.task.list" => self.handle_team_task_list(&request),
+                "team.task.create" => self.handle_team_task_create(&request),
+                "team.task.claim" => self.handle_team_task_claim(&request),
+                "team.task.complete" => self.handle_team_task_complete(&request),
+                "team.task.block" => self.handle_team_task_block(&request),
+                "team.task.unblock" => self.handle_team_task_unblock(&request),
+                "team.task.set_dependency" => self.handle_team_task_set_dependency(&request),
+                "team.message.list" => self.handle_team_message_list(&request),
+                "team.message.send" => self.handle_team_message_send(&request),
+                "team.message.mark_read" => self.handle_team_message_mark_read(&request),
+                "sidebar.set_status" => self.handle_sidebar_set_status(&request),
+                "sidebar.clear_status" => self.handle_sidebar_clear_status(&request),
+                "sidebar.list_status" => self.handle_sidebar_list_status(&request),
+                "sidebar.set_progress" => self.handle_sidebar_set_progress(&request),
+                "sidebar.clear_progress" => self.handle_sidebar_clear_progress(&request),
+                "sidebar.log" => self.handle_sidebar_log(&request),
+                "sidebar.clear_log" => self.handle_sidebar_clear_log(&request),
+                "sidebar.list_log" => self.handle_sidebar_list_log(&request),
+                "sidebar.state" => self.handle_sidebar_state(&request),
+                "git.status" => self.handle_git_status(&request),
+                "git.diff" => self.handle_git_diff(&request),
+                "git.stage" => self.handle_git_stage(&request),
+                "git.unstage" => self.handle_git_unstage(&request),
+                "git.commit" => self.handle_git_commit(&request),
+                "profile.list" => self.handle_profile_list(&request),
+                "profile.create" => self.handle_profile_create(&request),
+                "profile.update" => self.handle_profile_update(&request),
+                "profile.delete" => self.handle_profile_delete(&request),
+                "config.get" => self.handle_config_get(&request),
+                "config.reload" => self.handle_config_reload(&request),
+                "config.update" => self.handle_config_update(&request),
+                "config.export" => self.handle_config_export(&request),
+                "config.import" => self.handle_config_import(&request),
+                "config.reset" => self.handle_config_reset(&request),
+                "config.migrate_project" => self.handle_config_migrate_project(&request),
+                "config.diagnostics" => self.handle_config_diagnostics(&request),
+                "dock.get" => self.handle_dock_get(&request),
+                "dock.trust" => self.handle_dock_trust(&request),
+                "diagnostics.browser" => self.handle_browser_diagnostics(&request),
+                "diagnostics.export" => self.handle_diagnostics_export(&request),
+                "diagnostics.control_audit" => self.handle_control_audit(&request),
+                "diagnostics.recovery" => self.handle_recovery_diagnostics(&request),
+                "diagnostics.wsl_distributions" => self.handle_wsl_distributions(&request),
+                "diagnostics.tmux" => self.handle_tmux_diagnostics(&request),
+                _ => Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::UnsupportedMethod,
+                    format!("Unsupported method '{}'.", request.method),
+                ))),
             }
-            "pane.split" => self.handle_pane_split(&request),
-            "pane.focus" => self.handle_pane_focus(&request),
-            "pane.close" => self.handle_pane_close(&request),
-            "pane.resize_layout" => self.handle_pane_resize_layout(&request),
-            "pane.mount_surface" => self.handle_pane_mount_surface(&request),
-            "pane.unmount_surface" => self.handle_pane_unmount_surface(&request),
-            "surface.create_browser" => self.handle_surface_create_browser(&request),
-            "surface.close" => self.handle_surface_close(&request),
-            "surface.move_workspace" => self.handle_surface_move_workspace(&request),
-            "browser.navigate" => self.handle_browser_navigate(&request),
-            "browser.reload" => self.handle_browser_reload(&request),
-            "browser.back" => self.handle_browser_back(&request),
-            "browser.forward" => self.handle_browser_forward(&request),
-            "browser.current_url" => self.handle_browser_current_url(&request),
-            "browser.screenshot" => self.handle_browser_screenshot(&request),
-            "browser.dom_snapshot" => self.handle_browser_dom_snapshot(&request),
-            "browser.frames" => self.handle_browser_frames(&request),
-            "browser.storage" => self.handle_browser_storage(&request),
-            "browser.cookies" => self.handle_browser_cookies(&request),
-            "browser.downloads" => self.handle_browser_downloads(&request),
-            "browser.history" => self.handle_browser_history(&request),
-            "browser.console" => self.handle_browser_console(&request),
-            "browser.dialogs" => self.handle_browser_dialogs(&request),
-            "browser.dialog.respond" => self.handle_browser_dialog_respond(&request),
-            "browser.dialog.cancel" => self.handle_browser_dialog_cancel(&request),
-            "browser.errors" => self.handle_browser_errors(&request),
-            "browser.click" => self.handle_browser_click(&request),
-            "browser.type" => self.handle_browser_type(&request),
-            "browser.fill" => self.handle_browser_fill(&request),
-            "browser.press" => self.handle_browser_press(&request),
-            "browser.select" => self.handle_browser_select(&request),
-            "browser.scroll" => self.handle_browser_scroll(&request),
-            "browser.hover" => self.handle_browser_hover(&request),
-            "browser.check" => self.handle_browser_check(&request),
-            "browser.get" => self.handle_browser_get(&request),
-            "browser.find" => self.handle_browser_find(&request),
-            "browser.highlight" => self.handle_browser_highlight(&request),
-            "browser.focus" => self.handle_browser_focus(&request),
-            "browser.zoom" => self.handle_browser_zoom(&request),
-            "browser.wait_for_selector" => self.handle_browser_wait_for_selector(&request),
-            "browser.evaluate" => self.handle_browser_evaluate(&request),
-            "agent.get_state" => self.handle_agent_get_state(&request),
-            "agent.list_attention" => self.handle_agent_list_attention(&request),
-            "agent.list" => self.handle_agent_list(&request),
-            "actions.list" => self.handle_actions_list(&request),
-            "notification.create" => self.handle_notification_create(&request),
-            "notification.list" => self.handle_notification_list(&request),
-            "notification.dismiss" => self.handle_notification_dismiss(&request),
-            "notification.clear" => self.handle_notification_clear(&request),
-            "team.task.list" => self.handle_team_task_list(&request),
-            "team.task.create" => self.handle_team_task_create(&request),
-            "team.task.claim" => self.handle_team_task_claim(&request),
-            "team.task.complete" => self.handle_team_task_complete(&request),
-            "team.task.block" => self.handle_team_task_block(&request),
-            "team.task.unblock" => self.handle_team_task_unblock(&request),
-            "team.task.set_dependency" => self.handle_team_task_set_dependency(&request),
-            "team.message.list" => self.handle_team_message_list(&request),
-            "team.message.send" => self.handle_team_message_send(&request),
-            "team.message.mark_read" => self.handle_team_message_mark_read(&request),
-            "sidebar.set_status" => self.handle_sidebar_set_status(&request),
-            "sidebar.clear_status" => self.handle_sidebar_clear_status(&request),
-            "sidebar.list_status" => self.handle_sidebar_list_status(&request),
-            "sidebar.set_progress" => self.handle_sidebar_set_progress(&request),
-            "sidebar.clear_progress" => self.handle_sidebar_clear_progress(&request),
-            "sidebar.log" => self.handle_sidebar_log(&request),
-            "sidebar.clear_log" => self.handle_sidebar_clear_log(&request),
-            "sidebar.list_log" => self.handle_sidebar_list_log(&request),
-            "sidebar.state" => self.handle_sidebar_state(&request),
-            "git.status" => self.handle_git_status(&request),
-            "git.diff" => self.handle_git_diff(&request),
-            "git.stage" => self.handle_git_stage(&request),
-            "git.unstage" => self.handle_git_unstage(&request),
-            "git.commit" => self.handle_git_commit(&request),
-            "profile.list" => self.handle_profile_list(&request),
-            "profile.create" => self.handle_profile_create(&request),
-            "profile.update" => self.handle_profile_update(&request),
-            "profile.delete" => self.handle_profile_delete(&request),
-            "config.get" => self.handle_config_get(&request),
-            "config.reload" => self.handle_config_reload(&request),
-            "config.update" => self.handle_config_update(&request),
-            "config.export" => self.handle_config_export(&request),
-            "config.import" => self.handle_config_import(&request),
-            "config.reset" => self.handle_config_reset(&request),
-            "config.migrate_project" => self.handle_config_migrate_project(&request),
-            "config.diagnostics" => self.handle_config_diagnostics(&request),
-            "dock.get" => self.handle_dock_get(&request),
-            "dock.trust" => self.handle_dock_trust(&request),
-            "diagnostics.browser" => self.handle_browser_diagnostics(&request),
-            "diagnostics.export" => self.handle_diagnostics_export(&request),
-            "diagnostics.control_audit" => self.handle_control_audit(&request),
-            "diagnostics.recovery" => self.handle_recovery_diagnostics(&request),
-            "diagnostics.wsl_distributions" => self.handle_wsl_distributions(&request),
-            "diagnostics.tmux" => self.handle_tmux_diagnostics(&request),
-            _ => Err(DesktopHostError::Control(ControlError::new(
-                ErrorCode::UnsupportedMethod,
-                format!("Unsupported method '{}'.", request.method),
-            ))),
         };
 
         match response {
@@ -7888,10 +7902,34 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "session.terminate",
         "session.read_recent",
         "git.status",
+        "git.status_summary",
+        "git.status_page",
         "git.diff",
         "git.stage",
         "git.unstage",
+        "git.stage_all",
+        "git.unstage_all",
+        "git.discard",
         "git.commit",
+        "agent.worktree.create",
+        "agent.worktree.list",
+        "agent.worktree.recover",
+        "agent.worktree.remove",
+        "git.review_thread.list",
+        "git.review_thread.create",
+        "git.review_thread.update",
+        "git.review_thread.delete",
+        "git.review_thread.mark_stale",
+        "git.review_thread.deliver",
+        "git.review_comment.list",
+        "git.review_comment.create",
+        "git.review_comment.update",
+        "git.review_comment.delete",
+        "agent.hook_state",
+        "dev_server.candidate_detected",
+        "dev_server.candidate.list",
+        "dev_server.candidate.dismiss",
+        "dev_server.candidate.open_in_split",
         "agent.set_state",
         "agent.team.reserve",
         "agent.team.settle",
@@ -7990,6 +8028,10 @@ fn managed_terminal_env(
             value: workspace_id.to_string(),
         },
         EnvVarParam {
+            key: "AGENTMUX_SESSION_ID".to_string(),
+            value: format!("surface:{surface_id}"),
+        },
+        EnvVarParam {
             key: "AGENTMUX_SURFACE_ID".to_string(),
             value: surface_id.to_string(),
         },
@@ -8059,6 +8101,7 @@ fn managed_wsl_env_value(extra_keys: &[String], integration_tmux: bool) -> Strin
         "AGENTMUX_CONTROL_PIPE",
         "AGENTMUX_CONTROL_TOKEN",
         "AGENTMUX_WORKSPACE_ID",
+        "AGENTMUX_SESSION_ID",
         "AGENTMUX_SURFACE_ID",
         "AGENTMUX_PANE_ID",
         "CMUX_SOCKET_PATH",
@@ -11130,6 +11173,9 @@ fn persisted_terminal_session(
 }
 
 fn is_desktop_store_method(method: &str) -> bool {
+    if five_track::is_five_track_method(method) {
+        return true;
+    }
     matches!(
         method,
         "system.ping"
@@ -11445,6 +11491,7 @@ fn persisted_launch_environment(env: &[EnvVarParam]) -> Vec<(String, String)> {
         "AGENTMUX_CONTROL_PIPE",
         "AGENTMUX_CONTROL_TOKEN",
         "AGENTMUX_WORKSPACE_ID",
+        "AGENTMUX_SESSION_ID",
         "AGENTMUX_SURFACE_ID",
         "AGENTMUX_PANE_ID",
         "CMUX_SOCKET_PATH",
@@ -13770,6 +13817,9 @@ fn default_command_for_backend(
 }
 
 fn is_mutating_control_method(method: &str) -> bool {
+    if five_track::is_mutating_five_track_method(method) {
+        return true;
+    }
     matches!(
         method,
         "workspace.create"
@@ -13899,6 +13949,7 @@ fn desktop_notification_type_enabled(notification: &NotificationSummaryResult) -
             | "agent.completed"
             | "agent.failed"
             | "browser.action_failed"
+            | "dev_server.detected"
             | "cli.notification"
     )
 }
