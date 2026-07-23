@@ -40,7 +40,7 @@ const WSL_LOGIN_SHELL_WITH_CWD_TRACKING = [
     '*/zsh) agentmux_orig_zdotdir="${ZDOTDIR:-$HOME}"',
     'agentmux_tmp="${XDG_RUNTIME_DIR:-/tmp}/agentmux-zdotdir-$$"',
     'mkdir -p "$agentmux_tmp"',
-    "printf '%s\\n' '[ -r \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zprofile\" ] && . \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zprofile\"' > \"$agentmux_tmp/.zprofile\"",
+    'printf \'%s\\n\' \'[ -r "${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zprofile" ] && . "${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zprofile"\' > "$agentmux_tmp/.zprofile"',
     "printf '%s\\n' '[ -r \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zshrc\" ] && . \"${AGENTMUX_ORIG_ZDOTDIR:-$HOME}/.zshrc\"' '_agentmux_emit_cwd(){ printf \"\\\\033]7;file://localhost%s\\\\007\" \"$PWD\"; }' 'autoload -Uz add-zsh-hook' 'add-zsh-hook precmd _agentmux_emit_cwd' '_agentmux_emit_cwd' \"trap 'rm -rf -- \\\"$agentmux_tmp\\\"' EXIT\" > \"$agentmux_tmp/.zshrc\"",
     'export AGENTMUX_ORIG_ZDOTDIR="$agentmux_orig_zdotdir"',
     'export ZDOTDIR="$agentmux_tmp"',
@@ -298,6 +298,201 @@ export interface GitDiff {
 export interface GitCommitResult {
   commit: string;
   summary: string;
+}
+
+export const SOURCE_CONTROL_METHODS = [
+  "git.status",
+  "git.status_summary",
+  "git.status_page",
+  "git.diff",
+  "git.stage",
+  "git.unstage",
+  "git.stage_all",
+  "git.unstage_all",
+  "git.discard",
+  "git.commit",
+  "agent.worktree.create",
+  "agent.worktree.list",
+  "agent.worktree.recover",
+  "agent.worktree.remove",
+  "git.review_thread.create",
+  "git.review_thread.list",
+  "git.review_thread.update",
+  "git.review_thread.delete",
+  "git.review_thread.mark_stale",
+  "git.review_thread.deliver",
+  "git.review_comment.list",
+  "git.review_comment.create",
+  "git.review_comment.update",
+  "git.review_comment.delete",
+] as const;
+
+export type SourceControlMethod = (typeof SOURCE_CONTROL_METHODS)[number];
+
+export interface GitMutationOptions {
+  repositoryId: string;
+  paneId?: string | null;
+  idempotencyKey: string;
+}
+
+export function createGitMutationParams(
+  workspaceId: string,
+  options: GitMutationOptions,
+  params: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    ...params,
+    workspace_id: workspaceId,
+    repository_id: options.repositoryId,
+    pane_id: options.paneId ?? null,
+    idempotency_key: options.idempotencyKey,
+  };
+}
+
+export function createSourceControlActionIdempotencyKey(input: {
+  method: SourceControlMethod;
+  workspaceId: string;
+  repositoryId?: string | null;
+  paneId?: string | null;
+  actionId: string;
+}): string {
+  const segment = (value?: string | null) =>
+    (value ?? "none")
+      .trim()
+      .replace(/[^A-Za-z0-9._-]+/g, "_")
+      .slice(0, 160) || "none";
+  return [
+    "ui-source-control",
+    segment(input.method),
+    segment(input.workspaceId),
+    segment(input.repositoryId),
+    segment(input.paneId),
+    segment(input.actionId),
+  ].join(":");
+}
+
+export interface GitChangeSummary {
+  path: string;
+  originalPath?: string | null;
+  status: string;
+  staged: boolean;
+  unstaged: boolean;
+  untracked: boolean;
+  conflicted: boolean;
+  isBinary: boolean;
+  additions?: number | null;
+  deletions?: number | null;
+}
+
+export interface GitStatusSummary {
+  workspaceId: string;
+  repositoryId: string;
+  repositoryRoot: string;
+  branch?: string | null;
+  headOid?: string | null;
+  upstream?: string | null;
+  ahead: number;
+  behind: number;
+  stagedCount: number;
+  unstagedCount: number;
+  untrackedCount: number;
+  conflictedCount: number;
+  generation: number;
+  refreshedAt: string;
+}
+
+export interface GitStatusPage {
+  workspaceId: string;
+  repositoryId: string;
+  generation: number;
+  summary?: GitStatusSummary | null;
+  changes: GitChangeSummary[];
+  nextCursor?: string | null;
+  totalCount?: number | null;
+}
+
+export interface GitPagedDiff extends GitDiff {
+  workspaceId: string;
+  repositoryId: string;
+  generation: number;
+  originalPath?: string | null;
+  isBinary: boolean;
+  diffHash: string;
+}
+
+export interface GitReviewLineAnchor {
+  path: string;
+  side: "left" | "right" | "context" | string;
+  line: number;
+  startLine?: number | null;
+  baseRevision?: string | null;
+  headRevision?: string | null;
+  hunkHeader?: string | null;
+  diffHash?: string | null;
+}
+
+export interface GitReviewComment {
+  commentId: string;
+  threadId: string;
+  body: string;
+  authorSessionId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GitReviewThread {
+  threadId: string;
+  workspaceId: string;
+  repositoryId: string;
+  anchor: GitReviewLineAnchor;
+  resolved: boolean;
+  stale: boolean;
+  staleReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  comments: GitReviewComment[];
+}
+
+export interface GitReviewDelivery {
+  threadId: string;
+  target: "mailbox" | "terminal" | string;
+  targetSessionId?: string | null;
+  deliveredAt: string;
+}
+
+export interface AgentWorktreeOperation {
+  operationId: string;
+  worktreeId: string;
+  workspaceId: string;
+  branch: string;
+  path: string;
+  state: string;
+  surfaceId?: string | null;
+  paneId?: string | null;
+  sessionId?: string | null;
+  reused: boolean;
+  recovered: boolean;
+}
+
+export interface AgentWorktreeProgress {
+  operationId: string;
+  worktreeId?: string | null;
+  workspaceId: string;
+  state: string;
+  step: string;
+  message?: string | null;
+  completed: boolean;
+  rolledBack: boolean;
+}
+
+export interface DevelopmentServerCandidate {
+  candidateId: string;
+  workspaceId: string;
+  sessionId: string;
+  url: string;
+  source: string;
+  detectedAt: string;
+  dismissed?: boolean;
 }
 
 export type TerminalProfile = "wsl" | "powershell" | "cmd";
@@ -652,6 +847,7 @@ export interface BrowserClickTarget {
 
 export interface ControlClient {
   readonly supportsSourceControl: boolean;
+  supportsSourceControlMethod(method: SourceControlMethod): boolean;
   listWorkspaces(): Promise<WorkspaceSummary[]>;
   createWorkspace(
     name: string,
@@ -825,7 +1021,10 @@ export interface ControlClient {
     script: string,
     options?: { frameId?: string | null },
   ): Promise<BrowserEvaluateResult>;
-  browserDialogs(surfaceId: string, limit?: number): Promise<BrowserDialogMessage[]>;
+  browserDialogs(
+    surfaceId: string,
+    limit?: number,
+  ): Promise<BrowserDialogMessage[]>;
   browserRespondDialog(
     surfaceId: string,
     dialogId: string,
@@ -945,7 +1144,9 @@ export interface ControlClient {
     severity?: string | null;
     includeDismissed?: boolean;
   }): Promise<NotificationSummary[]>;
-  createNotification(input: NotificationCreateInput): Promise<NotificationSummary>;
+  createNotification(
+    input: NotificationCreateInput,
+  ): Promise<NotificationSummary>;
   dismissNotification(notificationId: string): Promise<void>;
   listTeamTasks(workspaceId?: string | null): Promise<TeamTask[]>;
   createTeamTask(input: TeamTaskCreateInput): Promise<TeamTask>;
@@ -953,7 +1154,10 @@ export interface ControlClient {
   completeTeamTask(taskId: string): Promise<TeamTask>;
   blockTeamTask(taskId: string, reason?: string | null): Promise<TeamTask>;
   unblockTeamTask(taskId: string): Promise<TeamTask>;
-  setTeamTaskDependencies(taskId: string, dependsOn: string[]): Promise<TeamTask>;
+  setTeamTaskDependencies(
+    taskId: string,
+    dependsOn: string[],
+  ): Promise<TeamTask>;
   listTeamMessages(
     workspaceId?: string | null,
     includeRead?: boolean,
@@ -961,17 +1165,147 @@ export interface ControlClient {
   sendTeamMessage(input: TeamMessageSendInput): Promise<TeamMessage>;
   markTeamMessageRead(messageId: string): Promise<void>;
   getGitStatus(workspaceId: string): Promise<GitStatus>;
+  getGitStatusSummary(
+    workspaceId: string,
+    repositoryId?: string | null,
+    paneId?: string | null,
+  ): Promise<GitStatusSummary>;
+  getGitStatusPage(
+    workspaceId: string,
+    options?: {
+      repositoryId?: string | null;
+      state?:
+        "staged" | "unstaged" | "untracked" | "conflicted" | string | null;
+      query?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    },
+  ): Promise<GitStatusPage>;
   getGitDiff(
     workspaceId: string,
     path: string,
     options?: { staged?: boolean; untracked?: boolean },
   ): Promise<GitDiff>;
-  stageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
-  unstageGitFiles(workspaceId: string, paths?: string[]): Promise<void>;
+  getGitPagedDiff(
+    workspaceId: string,
+    path: string,
+    options?: {
+      repositoryId?: string | null;
+      stage?: "staged" | "working" | "untracked" | string | null;
+      contextLines?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    },
+  ): Promise<GitPagedDiff>;
+  stageGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void>;
+  unstageGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void>;
+  discardGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void>;
+  stageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void>;
+  unstageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void>;
   commitGitChanges(
     workspaceId: string,
     message: string,
+    options: GitMutationOptions,
   ): Promise<GitCommitResult>;
+  listGitReviewThreads(
+    workspaceId: string,
+    options?: {
+      paneId?: string | null;
+      repositoryId?: string | null;
+      path?: string | null;
+      includeResolved?: boolean;
+      includeStale?: boolean;
+      limit?: number;
+    },
+  ): Promise<GitReviewThread[]>;
+  createGitReviewThread(input: {
+    workspaceId: string;
+    paneId?: string | null;
+    repositoryId?: string | null;
+    anchor: GitReviewLineAnchor;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewThread>;
+  updateGitReviewThread(
+    threadId: string,
+    input: { resolved?: boolean; anchor?: GitReviewLineAnchor },
+  ): Promise<GitReviewThread>;
+  deleteGitReviewThread(threadId: string): Promise<void>;
+  listGitReviewComments(
+    threadId: string,
+    limit?: number,
+  ): Promise<GitReviewComment[]>;
+  createGitReviewComment(input: {
+    threadId: string;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewComment>;
+  updateGitReviewComment(
+    commentId: string,
+    body: string,
+  ): Promise<GitReviewComment>;
+  deleteGitReviewComment(commentId: string): Promise<void>;
+  deliverGitReviewThread(
+    threadId: string,
+    input: {
+      target: "mailbox" | "terminal";
+      targetSessionId?: string | null;
+      includeContext?: boolean;
+    },
+  ): Promise<GitReviewDelivery>;
+  createAgentWorktree(input: {
+    workspaceId: string;
+    branch: string;
+    destination: string;
+    baseRevision?: string | null;
+    createBranch?: boolean;
+    backend?: string | null;
+    backendProfile?: string | null;
+    command?: string[];
+    cwd?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation>;
+  listAgentWorktrees(
+    workspaceId?: string | null,
+    includeCompleted?: boolean,
+  ): Promise<AgentWorktreeOperation[]>;
+  recoverAgentWorktree(input: {
+    operationId?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation>;
+  removeAgentWorktree(input: {
+    worktreeId: string;
+    force?: boolean;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation>;
+  listDevelopmentServerCandidates(
+    workspaceId?: string | null,
+  ): Promise<DevelopmentServerCandidate[]>;
+  dismissDevelopmentServerCandidate(candidateId: string): Promise<void>;
+  openDevelopmentServerCandidateInSplit(
+    candidateId: string,
+    options?: { paneId?: string | null },
+  ): Promise<{ surfaceId: string; url: string }>;
   getSidebarState(workspaceId?: string | null): Promise<SidebarState>;
 }
 
@@ -1020,10 +1354,22 @@ function outputSubscriptionId(): string {
   return `out_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
 }
 
+export function buildServerWebSocketUrl(
+  baseUrl: string,
+  path: string,
+  ticket: string,
+): string {
+  const url = new URL(path, baseUrl);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("ticket", ticket);
+  return url.toString();
+}
+
 interface AgentmuxServerBootstrap {
   baseUrl?: string;
   mode?: string;
   token?: string | null;
+  capabilities?: ServerCapabilitiesWire;
   defaults?: {
     workspace_id?: string | null;
     backend?: string | null;
@@ -1046,6 +1392,7 @@ declare global {
     __AGENTMUX_PREVIEW__?: BrowserPreviewApi;
     __AGENTMUX_PREVIEW_READY__?: boolean;
     __AGENTMUX_PREVIEW_SEED_WORKSPACE__?: boolean;
+    __AGENTMUX_PREVIEW_SOURCE_CONTROL_METHODS__?: string[];
     __AGENTMUX_PREVIEW_WSL_DISTRIBUTIONS__?: WslDistribution[];
     __AGENTMUX_PREVIEW_TMUX_AVAILABLE__?: boolean;
   }
@@ -1069,6 +1416,10 @@ class TauriControlClient implements ControlClient {
   private controlToken?: Promise<string>;
 
   constructor(private readonly invoke: TauriCore["invoke"]) {}
+
+  supportsSourceControlMethod(_method: SourceControlMethod): boolean {
+    return true;
+  }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
     const result = await this.call<{ workspaces: WorkspaceSummaryWire[] }>(
@@ -1709,10 +2060,13 @@ class TauriControlClient implements ControlClient {
     surfaceId: string,
     limit = 25,
   ): Promise<BrowserDialogMessage[]> {
-    const result = await this.call<BrowserDialogsResultWire>("browser.dialogs", {
-      surface_id: surfaceId,
-      limit,
-    });
+    const result = await this.call<BrowserDialogsResultWire>(
+      "browser.dialogs",
+      {
+        surface_id: surfaceId,
+        limit,
+      },
+    );
     return result.messages.map(mapBrowserDialogMessage);
   }
 
@@ -2004,11 +2358,7 @@ class TauriControlClient implements ControlClient {
       // Launch the user's login shell (e.g. zsh) so their configured prompt and
       // theme (powerlevel10k, oh-my-zsh, ...) load, instead of forcing bash.
       // Falls back to $SHELL, then /bin/bash, when the passwd lookup is empty.
-      command: [
-        "sh",
-        "-c",
-        WSL_LOGIN_SHELL_WITH_CWD_TRACKING,
-      ],
+      command: ["sh", "-c", WSL_LOGIN_SHELL_WITH_CWD_TRACKING],
       cwd,
       columns: 120,
       rows: 30,
@@ -2042,11 +2392,7 @@ class TauriControlClient implements ControlClient {
       // "$(getent passwd "$(id -un)" …)" was fragile and the pane died on
       // launch (server "exited unexpectedly"). Splitting into separate
       // assignments keeps the login-shell detection but survives the re-quoting.
-      command: [
-        "sh",
-        "-c",
-        WSL_LOGIN_SHELL_WITH_CWD_TRACKING,
-      ],
+      command: ["sh", "-c", WSL_LOGIN_SHELL_WITH_CWD_TRACKING],
       cwd,
       columns: 120,
       rows: 30,
@@ -2355,14 +2701,17 @@ class TauriControlClient implements ControlClient {
   async createNotification(
     input: NotificationCreateInput,
   ): Promise<NotificationSummary> {
-    const result = await this.call<NotificationSummaryWire>("notification.create", {
-      title: input.title,
-      body: input.body ?? null,
-      subtitle: input.subtitle ?? null,
-      severity: input.severity ?? null,
-      workspace_id: input.workspaceId ?? null,
-      session_id: input.sessionId ?? null,
-    });
+    const result = await this.call<NotificationSummaryWire>(
+      "notification.create",
+      {
+        title: input.title,
+        body: input.body ?? null,
+        subtitle: input.subtitle ?? null,
+        severity: input.severity ?? null,
+        workspace_id: input.workspaceId ?? null,
+        session_id: input.sessionId ?? null,
+      },
+    );
     return mapNotification(result);
   }
 
@@ -2373,9 +2722,12 @@ class TauriControlClient implements ControlClient {
   }
 
   async listTeamTasks(workspaceId?: string | null): Promise<TeamTask[]> {
-    const result = await this.call<{ tasks: TeamTaskWire[] }>("team.task.list", {
-      workspace_id: workspaceId ?? null,
-    });
+    const result = await this.call<{ tasks: TeamTaskWire[] }>(
+      "team.task.list",
+      {
+        workspace_id: workspaceId ?? null,
+      },
+    );
     return result.tasks.map(mapTeamTask);
   }
 
@@ -2473,6 +2825,67 @@ class TauriControlClient implements ControlClient {
     return mapGitStatus(result);
   }
 
+  async getGitStatusSummary(
+    workspaceId: string,
+    repositoryId?: string | null,
+    paneId?: string | null,
+  ): Promise<GitStatusSummary> {
+    const result = await this.call<GitStatusSummaryWire>("git.status_summary", {
+      workspace_id: workspaceId,
+      repository_id: repositoryId ?? null,
+      pane_id: paneId ?? null,
+    });
+    return mapGitStatusSummary(result);
+  }
+
+  async getGitStatusPage(
+    workspaceId: string,
+    options: {
+      repositoryId?: string | null;
+      state?: string | null;
+      query?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    } = {},
+  ): Promise<GitStatusPage> {
+    const result = await this.call<GitStatusPageWire>("git.status_page", {
+      workspace_id: workspaceId,
+      repository_id: options.repositoryId ?? null,
+      state: options.state ?? null,
+      query: options.query ?? null,
+      cursor: options.cursor ?? null,
+      limit: options.limit ?? null,
+      generation: options.generation ?? null,
+      pane_id: options.paneId ?? null,
+    });
+    return mapGitStatusPage(result);
+  }
+
+  async getGitPagedDiff(
+    workspaceId: string,
+    path: string,
+    options: {
+      repositoryId?: string | null;
+      stage?: string | null;
+      contextLines?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    } = {},
+  ): Promise<GitPagedDiff> {
+    const result = await this.call<GitPagedDiffWire>("git.diff", {
+      workspace_id: workspaceId,
+      repository_id: options.repositoryId ?? null,
+      path,
+      stage: options.stage ?? null,
+      context_lines: options.contextLines ?? null,
+      generation: options.generation ?? null,
+      pane_id: options.paneId ?? null,
+    });
+    return mapGitPagedDiff(result);
+  }
+
   async getGitDiff(
     workspaceId: string,
     path: string,
@@ -2487,31 +2900,53 @@ class TauriControlClient implements ControlClient {
     return mapGitDiff(result);
   }
 
-  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
-    await this.call("git.stage", {
-      workspace_id: workspaceId,
-      paths,
-    });
+  async stageGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.call("git.stage", createGitMutationParams(workspaceId, options, { paths }));
   }
 
   async unstageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void> {
-    await this.call("git.unstage", {
-      workspace_id: workspaceId,
-      paths,
-    });
+    await this.call("git.unstage", createGitMutationParams(workspaceId, options, { paths }));
+  }
+
+  async discardGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.call("git.discard", createGitMutationParams(workspaceId, options, { paths }));
+  }
+
+  async stageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.call("git.stage_all", createGitMutationParams(workspaceId, options));
+  }
+
+  async unstageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.call("git.unstage_all", createGitMutationParams(workspaceId, options));
   }
 
   async commitGitChanges(
     workspaceId: string,
     message: string,
+    options: GitMutationOptions,
   ): Promise<GitCommitResult> {
-    const result = await this.call<GitCommitResultWire>("git.commit", {
-      workspace_id: workspaceId,
-      message,
-    });
+    const result = await this.call<GitCommitResultWire>(
+      "git.commit",
+      createGitMutationParams(workspaceId, options, { message, amend: false }),
+    );
     return {
       commit: result.commit,
       summary: result.summary,
@@ -2523,6 +2958,212 @@ class TauriControlClient implements ControlClient {
       workspace_id: workspaceId ?? null,
     });
     return mapSidebarState(result);
+  }
+
+  async listGitReviewThreads(
+    workspaceId: string,
+    options: {
+      paneId?: string | null;
+      repositoryId?: string | null;
+      path?: string | null;
+      includeResolved?: boolean;
+      includeStale?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<GitReviewThread[]> {
+    const result = await this.call<GitReviewThreadListWire>(
+      "git.review_thread.list",
+      {
+        workspace_id: workspaceId,
+        pane_id: options.paneId ?? null,
+        repository_id: options.repositoryId ?? null,
+        path: options.path ?? null,
+        include_resolved: options.includeResolved ?? false,
+        include_stale: options.includeStale ?? false,
+        limit: options.limit ?? null,
+      },
+    );
+    return result.threads.map(mapGitReviewThread);
+  }
+  async createGitReviewThread(input: {
+    workspaceId: string;
+    paneId?: string | null;
+    repositoryId?: string | null;
+    anchor: GitReviewLineAnchor;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewThread> {
+    return mapGitReviewThread(
+      await this.call<GitReviewThreadWire>("git.review_thread.create", {
+        workspace_id: input.workspaceId,
+        pane_id: input.paneId ?? null,
+        repository_id: input.repositoryId ?? null,
+        anchor: toGitReviewAnchorWire(input.anchor),
+        body: input.body,
+        author_session_id: input.authorSessionId ?? null,
+      }),
+    );
+  }
+  async updateGitReviewThread(
+    threadId: string,
+    input: { resolved?: boolean; anchor?: GitReviewLineAnchor },
+  ): Promise<GitReviewThread> {
+    return mapGitReviewThread(
+      await this.call<GitReviewThreadWire>("git.review_thread.update", {
+        thread_id: threadId,
+        resolved: input.resolved ?? null,
+        anchor: input.anchor ? toGitReviewAnchorWire(input.anchor) : null,
+      }),
+    );
+  }
+  async deleteGitReviewThread(threadId: string): Promise<void> {
+    await this.call("git.review_thread.delete", { thread_id: threadId });
+  }
+  async listGitReviewComments(
+    threadId: string,
+    limit?: number,
+  ): Promise<GitReviewComment[]> {
+    const result = await this.call<GitReviewCommentListWire>(
+      "git.review_comment.list",
+      { thread_id: threadId, limit: limit ?? null },
+    );
+    return result.comments.map(mapGitReviewComment);
+  }
+  async createGitReviewComment(input: {
+    threadId: string;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewComment> {
+    return mapGitReviewComment(
+      await this.call<GitReviewCommentWire>("git.review_comment.create", {
+        thread_id: input.threadId,
+        body: input.body,
+        author_session_id: input.authorSessionId ?? null,
+      }),
+    );
+  }
+  async updateGitReviewComment(
+    commentId: string,
+    body: string,
+  ): Promise<GitReviewComment> {
+    return mapGitReviewComment(
+      await this.call<GitReviewCommentWire>("git.review_comment.update", {
+        comment_id: commentId,
+        body,
+      }),
+    );
+  }
+  async deleteGitReviewComment(commentId: string): Promise<void> {
+    await this.call("git.review_comment.delete", { comment_id: commentId });
+  }
+  async deliverGitReviewThread(
+    threadId: string,
+    input: {
+      target: "mailbox" | "terminal";
+      targetSessionId?: string | null;
+      includeContext?: boolean;
+    },
+  ): Promise<GitReviewDelivery> {
+    return mapGitReviewDelivery(
+      await this.call<GitReviewDeliveryWire>("git.review_thread.deliver", {
+        thread_id: threadId,
+        target: input.target,
+        target_session_id: input.targetSessionId ?? null,
+        include_context: input.includeContext ?? true,
+      }),
+    );
+  }
+  async createAgentWorktree(input: {
+    workspaceId: string;
+    branch: string;
+    destination: string;
+    baseRevision?: string | null;
+    createBranch?: boolean;
+    backend?: string | null;
+    backendProfile?: string | null;
+    command?: string[];
+    cwd?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    return mapAgentWorktreeOperation(
+      await this.call<AgentWorktreeOperationWire>("agent.worktree.create", {
+        workspace_id: input.workspaceId,
+        branch: input.branch,
+        destination: input.destination,
+        base_revision: input.baseRevision ?? null,
+        create_branch: input.createBranch ?? true,
+        backend: input.backend ?? null,
+        backend_profile: input.backendProfile ?? null,
+        command: input.command ?? [],
+        cwd: input.cwd ?? null,
+        idempotency_key: input.idempotencyKey,
+      }),
+    );
+  }
+  async listAgentWorktrees(
+    workspaceId?: string | null,
+    includeCompleted = true,
+  ): Promise<AgentWorktreeOperation[]> {
+    const result = await this.call<AgentWorktreeListWire>(
+      "agent.worktree.list",
+      {
+        workspace_id: workspaceId ?? null,
+        include_completed: includeCompleted,
+      },
+    );
+    return result.worktrees.map(mapAgentWorktreeOperation);
+  }
+  async recoverAgentWorktree(input: {
+    operationId?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    return mapAgentWorktreeOperation(
+      await this.call<AgentWorktreeOperationWire>("agent.worktree.recover", {
+        operation_id: input.operationId ?? null,
+        idempotency_key: input.idempotencyKey,
+      }),
+    );
+  }
+  async removeAgentWorktree(input: {
+    worktreeId: string;
+    force?: boolean;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    return mapAgentWorktreeOperation(
+      await this.call<AgentWorktreeOperationWire>("agent.worktree.remove", {
+        worktree_id: input.worktreeId,
+        force: input.force ?? false,
+        idempotency_key: input.idempotencyKey,
+      }),
+    );
+  }
+  async listDevelopmentServerCandidates(
+    workspaceId?: string | null,
+  ): Promise<DevelopmentServerCandidate[]> {
+    const result = await this.call<DevelopmentServerCandidateListWire>(
+      "dev_server.candidate.list",
+      {
+        workspace_id: workspaceId ?? null,
+        include_dismissed: false,
+        limit: 100,
+      },
+    );
+    return result.candidates.map(mapDevelopmentServerCandidate);
+  }
+  async dismissDevelopmentServerCandidate(candidateId: string): Promise<void> {
+    await this.call("dev_server.candidate.dismiss", {
+      candidate_id: candidateId,
+    });
+  }
+  async openDevelopmentServerCandidateInSplit(
+    candidateId: string,
+    options: { paneId?: string | null } = {},
+  ): Promise<{ surfaceId: string; url: string }> {
+    const result = await this.call<DevelopmentServerCandidateOpenInSplitWire>(
+      "dev_server.candidate.open_in_split",
+      { candidate_id: candidateId, pane_id: options.paneId ?? null },
+    );
+    return { surfaceId: result.surface_id, url: result.candidate.url };
   }
 
   private async call<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -2576,7 +3217,10 @@ interface ControlResponse {
 }
 
 class BrowserPreviewControlClient implements ControlClient {
-  readonly supportsSourceControl: boolean = true;
+  private readonly sourceControlMethods = new Set<string>(
+    window.__AGENTMUX_PREVIEW_SOURCE_CONTROL_METHODS__ ??
+      SOURCE_CONTROL_METHODS,
+  );
   private readonly configStorageKey = "agentmux.preview.config.v1";
   private readonly projectConfigStoragePrefix =
     "agentmux.preview.project.config.v1.";
@@ -2597,6 +3241,30 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly teamMessages: TeamMessage[] = [];
   private readonly sidebarStates = new Map<string, SidebarState>();
   private readonly gitStatuses = new Map<string, GitStatus>();
+  private readonly gitReviewThreads = new Map<string, GitReviewThread>();
+  private heldGitReviewCreate: {
+    wait: Promise<void>;
+    release: () => void;
+  } | null = null;
+  private heldGitReviewList: {
+    wait: Promise<void>;
+    release: () => void;
+    reject: (reason: Error) => void;
+  } | null = null;
+  private gitReviewListRequestCount = 0;
+  private heldGitWorktreeList: {
+    wait: Promise<void>;
+    release: () => void;
+  } | null = null;
+  private activeGitWorktreeList: {
+    wait: Promise<void>;
+    release: () => void;
+  } | null = null;
+  private gitWorktreeListRequestCount = 0;
+  private readonly agentWorktrees = new Map<string, AgentWorktreeOperation>();
+  private gitReviewCounter = 0;
+  private gitReviewCommentCounter = 0;
+  private agentWorktreeCounter = 0;
   private readonly terminalSurfaces: SurfaceSummary[] = [];
   private readonly sessions = new Map<string, TerminalSession>();
   private readonly outputs = new Map<string, string>();
@@ -2604,6 +3272,11 @@ class BrowserPreviewControlClient implements ControlClient {
     string,
     Array<{ columns: number; rows: number }>
   >();
+  private readonly gitRequestLog: Array<{
+    operation: string;
+    paneId: string | null;
+    query: string | null;
+  }> = [];
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
   private readonly browserActionLog: string[] = [];
@@ -2656,7 +3329,10 @@ class BrowserPreviewControlClient implements ControlClient {
     ];
     const previewApi: BrowserPreviewApi = {
       syntheticAgentState: (detail) => this.applySyntheticAgentState(detail),
-      sidebarState: (detail) => this.applySyntheticSidebarState(detail),
+      sidebarState: (detail) => {
+        this.applySyntheticSidebarState(detail);
+        window.dispatchEvent(new Event("agentmux:synthetic-sidebar-state"));
+      },
       teamTask: (detail) => this.applySyntheticTeamTask(detail),
       teamMessage: (detail) => this.applySyntheticTeamMessage(detail),
       browserUrl: (surfaceId?: string) => {
@@ -2675,6 +3351,21 @@ class BrowserPreviewControlClient implements ControlClient {
         const id = sessionId ?? this.lastSessionId;
         return id ? [...(this.terminalResizeLog.get(id) ?? [])] : [];
       },
+      gitRequests: () => [...this.gitRequestLog],
+      setGitStatusFileCount: (count) =>
+        this.setPreviewGitStatusFileCount(count),
+      holdGitReviewCreate: () => this.holdGitReviewCreate(),
+      releaseGitReviewCreate: () => this.releaseGitReviewCreate(),
+      holdGitReviewList: () => this.holdGitReviewList(),
+      releaseGitReviewList: () => this.releaseGitReviewList(),
+      failGitReviewList: () => this.failGitReviewList(),
+      gitReviewListRequests: () => this.gitReviewListRequestCount,
+      holdGitWorktreeList: () => this.holdGitWorktreeList(),
+      releaseGitWorktreeList: () => this.releaseGitWorktreeList(),
+      gitWorktreeListRequests: () => this.gitWorktreeListRequestCount,
+      seedGitWorktree: (workspaceId, branch) =>
+        this.seedGitWorktree(workspaceId, branch),
+      clearGitWorktrees: (workspaceId) => this.clearGitWorktrees(workspaceId),
     };
     window.__AGENTMUX_PREVIEW__ = previewApi;
     if (window.__AGENTMUX_PREVIEW_SEED_WORKSPACE__ === true) {
@@ -2692,6 +3383,14 @@ class BrowserPreviewControlClient implements ControlClient {
         (event as CustomEvent<SyntheticAgentStateDetail>).detail,
       );
     });
+  }
+
+  get supportsSourceControl(): boolean {
+    return this.supportsSourceControlMethod("git.status_page");
+  }
+
+  supportsSourceControlMethod(method: SourceControlMethod): boolean {
+    return this.sourceControlMethods.has(method);
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -3338,8 +4037,12 @@ class BrowserPreviewControlClient implements ControlClient {
     }
 
     const surface =
-      this.terminalSurfaces.find((candidate) => candidate.surfaceId === surfaceId) ??
-      this.browserSurfaces.find((candidate) => candidate.surfaceId === surfaceId);
+      this.terminalSurfaces.find(
+        (candidate) => candidate.surfaceId === surfaceId,
+      ) ??
+      this.browserSurfaces.find(
+        (candidate) => candidate.surfaceId === surfaceId,
+      );
     if (!surface) {
       throw new Error(`Surface '${surfaceId}' was not found.`);
     }
@@ -3348,7 +4051,8 @@ class BrowserPreviewControlClient implements ControlClient {
       const session = this.sessions.get(surface.sessionId);
       if (session) {
         this.agentStates.get(surface.sessionId) &&
-          (this.agentStates.get(surface.sessionId)!.workspaceId = targetWorkspaceId);
+          (this.agentStates.get(surface.sessionId)!.workspaceId =
+            targetWorkspaceId);
       }
     }
 
@@ -4033,6 +4737,109 @@ class BrowserPreviewControlClient implements ControlClient {
     );
   }
 
+  async getGitStatusSummary(
+    workspaceId: string,
+    _repositoryId?: string | null,
+    _paneId?: string | null,
+  ): Promise<GitStatusSummary> {
+    this.gitRequestLog.push({
+      operation: "summary",
+      paneId: _paneId ?? null,
+      query: null,
+    });
+    const status = await this.getGitStatus(workspaceId);
+    const files = status.files;
+    return {
+      workspaceId,
+      repositoryId: `preview_repo_${workspaceId}`,
+      repositoryRoot: status.repositoryRoot ?? "",
+      branch: status.branch ?? null,
+      headOid: status.head ?? null,
+      upstream: status.upstream ?? null,
+      ahead: status.ahead,
+      behind: status.behind,
+      stagedCount: files.filter((change) => change.staged).length,
+      unstagedCount: files.filter((change) => change.unstaged).length,
+      untrackedCount: files.filter((change) => change.untracked).length,
+      conflictedCount: files.filter((change) => change.conflict).length,
+      generation: Math.max(1, files.length + (status.head?.length ?? 0)),
+      refreshedAt: new Date().toISOString(),
+    };
+  }
+
+  async getGitStatusPage(
+    workspaceId: string,
+    options: {
+      repositoryId?: string | null;
+      state?: string | null;
+      query?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    } = {},
+  ): Promise<GitStatusPage> {
+    this.gitRequestLog.push({
+      operation: "page",
+      paneId: options.paneId ?? null,
+      query: options.query?.trim() || null,
+    });
+    const [status, summary] = await Promise.all([
+      this.getGitStatus(workspaceId),
+      this.getGitStatusSummary(
+        workspaceId,
+        options.repositoryId,
+        options.paneId,
+      ),
+    ]);
+    const filtered = status.files.filter((change) => {
+      switch (options.state) {
+        case "staged":
+          return change.staged;
+        case "unstaged":
+          return change.unstaged && !change.untracked;
+        case "untracked":
+          return change.untracked;
+        case "conflicted":
+          return change.conflict;
+        default:
+          return true;
+      }
+    });
+    const query = options.query?.trim().toLocaleLowerCase() ?? "";
+    const queried = query
+      ? filtered.filter((change) =>
+          `${change.path} ${change.originalPath ?? ""}`
+            .toLocaleLowerCase()
+            .includes(query),
+        )
+      : filtered;
+    const offset = Math.max(0, Number.parseInt(options.cursor ?? "0", 10) || 0);
+    const limit = Math.max(1, Math.min(500, options.limit ?? 200));
+    const page = queried.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    return {
+      workspaceId,
+      repositoryId: summary.repositoryId,
+      generation: summary.generation,
+      summary,
+      changes: page.map((change) => ({
+        path: change.path,
+        originalPath: change.originalPath ?? null,
+        status: change.staged ? change.indexStatus : change.worktreeStatus,
+        staged: change.staged,
+        unstaged: change.unstaged,
+        untracked: change.untracked,
+        conflicted: change.conflict,
+        isBinary: false,
+        additions: null,
+        deletions: null,
+      })),
+      nextCursor: nextOffset < queried.length ? String(nextOffset) : null,
+      totalCount: queried.length,
+    };
+  }
+
   async spawnWslTerminal(
     workspaceId: string,
     distribution: string | null,
@@ -4066,7 +4873,11 @@ class BrowserPreviewControlClient implements ControlClient {
       "wsl-tmux-control",
       "wsl-tmux-control",
       [
-        "\r\n$ wsl " + (distribution ?? "default") + " " + (cwd ?? "~") + "  (durable · tmux)",
+        "\r\n$ wsl " +
+          (distribution ?? "default") +
+          " " +
+          (cwd ?? "~") +
+          "  (durable · tmux)",
         "\r\nagentmux durable WSL desktop preview",
         "\r\n",
       ].join(""),
@@ -4417,6 +5228,128 @@ class BrowserPreviewControlClient implements ControlClient {
     }
   }
 
+  private setPreviewGitStatusFileCount(count: number): void {
+    const workspaceId = this.workspaces[0]?.workspaceId;
+    if (!workspaceId) return;
+    const status = this.gitStatuses.get(workspaceId);
+    if (!status) return;
+    const normalized = Math.max(0, Math.min(20_000, Math.floor(count)));
+    status.files = Array.from({ length: normalized }, (_, index) => {
+      const remainder = index % 5;
+      return {
+        path: `generated/${remainder === 1 ? "staged" : remainder === 2 ? "untracked" : "working"}/file-${index.toString().padStart(5, "0")}.ts`,
+        originalPath:
+          remainder === 4
+            ? `generated/renamed/from-${index.toString().padStart(5, "0")}.ts`
+            : null,
+        indexStatus:
+          remainder === 1 || remainder === 4
+            ? "M"
+            : remainder === 2
+              ? "?"
+              : ".",
+        worktreeStatus:
+          remainder === 0 || remainder === 3 || remainder === 4
+            ? "M"
+            : remainder === 2
+              ? "?"
+              : ".",
+        staged: remainder === 1 || remainder === 4,
+        unstaged:
+          remainder === 0 ||
+          remainder === 2 ||
+          remainder === 3 ||
+          remainder === 4,
+        untracked: remainder === 2,
+        conflict: false,
+      };
+    });
+  }
+
+  private holdGitReviewCreate(): void {
+    if (this.heldGitReviewCreate) return;
+    let release: () => void = () => {};
+    const wait = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    this.heldGitReviewCreate = { wait, release };
+  }
+
+  private releaseGitReviewCreate(): void {
+    const held = this.heldGitReviewCreate;
+    this.heldGitReviewCreate = null;
+    held?.release();
+  }
+
+  private holdGitReviewList(): void {
+    if (this.heldGitReviewList) return;
+    let release: () => void = () => {};
+    let reject: (reason: Error) => void = () => {};
+    const wait = new Promise<void>((resolve, rejectWait) => {
+      release = () => resolve();
+      reject = rejectWait;
+    });
+    this.heldGitReviewList = { wait, release, reject };
+  }
+
+  private releaseGitReviewList(): void {
+    const held = this.heldGitReviewList;
+    this.heldGitReviewList = null;
+    held?.release();
+  }
+
+  private failGitReviewList(): void {
+    const held = this.heldGitReviewList;
+    this.heldGitReviewList = null;
+    held?.reject(
+      new ControlClientError(
+        "Synthetic stale review-list failure.",
+        "backend_degraded",
+      ),
+    );
+  }
+
+  private holdGitWorktreeList(): void {
+    if (this.heldGitWorktreeList) return;
+    let release: () => void = () => {};
+    const wait = new Promise<void>((resolve) => {
+      release = () => resolve();
+    });
+    this.heldGitWorktreeList = { wait, release };
+  }
+
+  private releaseGitWorktreeList(): void {
+    const held = this.heldGitWorktreeList ?? this.activeGitWorktreeList;
+    this.heldGitWorktreeList = null;
+    this.activeGitWorktreeList = null;
+    held?.release();
+  }
+
+  private seedGitWorktree(workspaceId: string, branch: string): void {
+    const worktreeId = `worktree_preview_${++this.agentWorktreeCounter}`;
+    this.agentWorktrees.set(worktreeId, {
+      operationId: `worktree_seed_${this.agentWorktreeCounter}`,
+      worktreeId,
+      workspaceId,
+      branch,
+      path: `D:\\Workspace\\${branch.replace(/[^A-Za-z0-9_-]+/g, "-")}`,
+      state: "completed",
+      surfaceId: null,
+      paneId: null,
+      sessionId: null,
+      reused: false,
+      recovered: false,
+    });
+  }
+
+  private clearGitWorktrees(workspaceId?: string): void {
+    for (const [worktreeId, operation] of this.agentWorktrees) {
+      if (!workspaceId || operation.workspaceId === workspaceId) {
+        this.agentWorktrees.delete(worktreeId);
+      }
+    }
+  }
+
   async getGitStatus(workspaceId: string): Promise<GitStatus> {
     const workspace = this.findWorkspace(workspaceId);
     return cloneGitStatus(
@@ -4460,7 +5393,11 @@ class BrowserPreviewControlClient implements ControlClient {
     };
   }
 
-  async stageGitFiles(workspaceId: string, paths: string[] = []): Promise<void> {
+  async stageGitFiles(
+    workspaceId: string,
+    paths: string[],
+    _options: GitMutationOptions,
+  ): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status) return;
     const selected = new Set(paths);
@@ -4487,7 +5424,8 @@ class BrowserPreviewControlClient implements ControlClient {
 
   async unstageGitFiles(
     workspaceId: string,
-    paths: string[] = [],
+    paths: string[],
+    _options: GitMutationOptions,
   ): Promise<void> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status) return;
@@ -4501,7 +5439,8 @@ class BrowserPreviewControlClient implements ControlClient {
       ) {
         continue;
       }
-      change.worktreeStatus = change.indexStatus === "A" ? "?" : change.indexStatus;
+      change.worktreeStatus =
+        change.indexStatus === "A" ? "?" : change.indexStatus;
       change.indexStatus = change.indexStatus === "A" ? "?" : ".";
       change.staged = false;
       change.unstaged = true;
@@ -4512,6 +5451,7 @@ class BrowserPreviewControlClient implements ControlClient {
   async commitGitChanges(
     workspaceId: string,
     message: string,
+    _options: GitMutationOptions,
   ): Promise<GitCommitResult> {
     const status = this.gitStatuses.get(workspaceId);
     if (!status || !status.files.some((change) => change.staged)) {
@@ -4542,6 +5482,337 @@ class BrowserPreviewControlClient implements ControlClient {
       };
     }
     return this.readSidebarState(workspace.workspaceId);
+  }
+
+  async getGitPagedDiff(
+    workspaceId: string,
+    path: string,
+    options: {
+      repositoryId?: string | null;
+      stage?: string | null;
+      contextLines?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    } = {},
+  ): Promise<GitPagedDiff> {
+    const [diff, summary] = await Promise.all([
+      this.getGitDiff(workspaceId, path, {
+        staged: options.stage === "staged",
+      }),
+      this.getGitStatusSummary(
+        workspaceId,
+        options.repositoryId,
+        options.paneId,
+      ),
+    ]);
+    return {
+      ...diff,
+      workspaceId,
+      repositoryId: summary.repositoryId,
+      generation: summary.generation,
+      originalPath: null,
+      isBinary: false,
+      diffHash: `${summary.generation}:${diff.patch.length}`,
+    };
+  }
+
+  async discardGitFiles(
+    workspaceId: string,
+    paths: string[],
+    _options: GitMutationOptions,
+  ): Promise<void> {
+    const status = this.gitStatuses.get(workspaceId);
+    if (status)
+      status.files = status.files.filter(
+        (change) =>
+          !paths.includes(change.path) &&
+          !paths.includes(change.originalPath ?? ""),
+      );
+  }
+  async stageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.stageGitFiles(workspaceId, [], options);
+  }
+  async unstageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.unstageGitFiles(workspaceId, [], options);
+  }
+
+  async listGitReviewThreads(
+    workspaceId: string,
+    options: {
+      repositoryId?: string | null;
+      path?: string | null;
+      includeResolved?: boolean;
+      includeStale?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<GitReviewThread[]> {
+    this.gitReviewListRequestCount += 1;
+    const held = this.heldGitReviewList;
+    if (held) {
+      this.heldGitReviewList = null;
+      await held.wait;
+    }
+    return [...this.gitReviewThreads.values()]
+      .filter((thread) => thread.workspaceId === workspaceId)
+      .filter(
+        (thread) =>
+          !options.repositoryId || thread.repositoryId === options.repositoryId,
+      )
+      .filter((thread) => !options.path || thread.anchor.path === options.path)
+      .filter((thread) => options.includeResolved || !thread.resolved)
+      .filter((thread) => options.includeStale || !thread.stale)
+      .slice(0, options.limit ?? 500)
+      .map(cloneGitReviewThread);
+  }
+  async createGitReviewThread(input: {
+    workspaceId: string;
+    paneId?: string | null;
+    repositoryId?: string | null;
+    anchor: GitReviewLineAnchor;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewThread> {
+    const held = this.heldGitReviewCreate;
+    if (held) {
+      this.heldGitReviewCreate = null;
+      await held.wait;
+    }
+    const now = new Date().toISOString();
+    const threadId = `review_preview_${++this.gitReviewCounter}`;
+    const comment: GitReviewComment = {
+      commentId: `review_comment_preview_${++this.gitReviewCommentCounter}`,
+      threadId,
+      body: input.body.trim(),
+      authorSessionId: input.authorSessionId ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const thread: GitReviewThread = {
+      threadId,
+      workspaceId: input.workspaceId,
+      repositoryId: input.repositoryId ?? `preview_repo_${input.workspaceId}`,
+      anchor: { ...input.anchor },
+      resolved: false,
+      stale: false,
+      staleReason: null,
+      createdAt: now,
+      updatedAt: now,
+      comments: [comment],
+    };
+    this.gitReviewThreads.set(threadId, thread);
+    return cloneGitReviewThread(thread);
+  }
+  async updateGitReviewThread(
+    threadId: string,
+    input: { resolved?: boolean; anchor?: GitReviewLineAnchor },
+  ): Promise<GitReviewThread> {
+    const thread = this.findGitReviewThread(threadId);
+    if (input.resolved !== undefined) thread.resolved = input.resolved;
+    if (input.anchor) thread.anchor = { ...input.anchor };
+    thread.updatedAt = new Date().toISOString();
+    return cloneGitReviewThread(thread);
+  }
+  async deleteGitReviewThread(threadId: string): Promise<void> {
+    this.gitReviewThreads.delete(threadId);
+  }
+  async listGitReviewComments(
+    threadId: string,
+    limit = 500,
+  ): Promise<GitReviewComment[]> {
+    return this.findGitReviewThread(threadId)
+      .comments.slice(0, limit)
+      .map(cloneGitReviewComment);
+  }
+  async createGitReviewComment(input: {
+    threadId: string;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewComment> {
+    const thread = this.findGitReviewThread(input.threadId);
+    const now = new Date().toISOString();
+    const comment: GitReviewComment = {
+      commentId: `review_comment_preview_${++this.gitReviewCommentCounter}`,
+      threadId: thread.threadId,
+      body: input.body.trim(),
+      authorSessionId: input.authorSessionId ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    thread.comments.push(comment);
+    thread.updatedAt = now;
+    return cloneGitReviewComment(comment);
+  }
+  async updateGitReviewComment(
+    commentId: string,
+    body: string,
+  ): Promise<GitReviewComment> {
+    for (const thread of this.gitReviewThreads.values()) {
+      const comment = thread.comments.find(
+        (candidate) => candidate.commentId === commentId,
+      );
+      if (comment) {
+        comment.body = body.trim();
+        comment.updatedAt = new Date().toISOString();
+        thread.updatedAt = comment.updatedAt;
+        return cloneGitReviewComment(comment);
+      }
+    }
+    throw new ControlClientError("Review comment was not found.", "not_found");
+  }
+  async deleteGitReviewComment(commentId: string): Promise<void> {
+    for (const thread of this.gitReviewThreads.values()) {
+      const index = thread.comments.findIndex(
+        (candidate) => candidate.commentId === commentId,
+      );
+      if (index >= 0) {
+        thread.comments.splice(index, 1);
+        thread.updatedAt = new Date().toISOString();
+        return;
+      }
+    }
+  }
+  async deliverGitReviewThread(
+    threadId: string,
+    input: {
+      target: "mailbox" | "terminal";
+      targetSessionId?: string | null;
+      includeContext?: boolean;
+    },
+  ): Promise<GitReviewDelivery> {
+    const thread = this.findGitReviewThread(threadId);
+    const body = thread.comments.map((comment) => comment.body).join("\n");
+    if (input.target === "terminal" && input.targetSessionId)
+      await this.sendPaste(input.targetSessionId, body);
+    else if (input.targetSessionId)
+      await this.sendTeamMessage({
+        workspaceId: thread.workspaceId,
+        toSessionId: input.targetSessionId,
+        body,
+        kind: "mailbox",
+      });
+    return {
+      threadId,
+      target: input.target,
+      targetSessionId: input.targetSessionId ?? null,
+      deliveredAt: new Date().toISOString(),
+    };
+  }
+  async createAgentWorktree(input: {
+    workspaceId: string;
+    branch: string;
+    destination: string;
+    baseRevision?: string | null;
+    createBranch?: boolean;
+    backend?: string | null;
+    backendProfile?: string | null;
+    command?: string[];
+    cwd?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    const existing = [...this.agentWorktrees.values()].find(
+      (operation) => operation.operationId === input.idempotencyKey,
+    );
+    if (existing) return { ...existing, reused: true };
+    const worktreeId = `worktree_preview_${++this.agentWorktreeCounter}`;
+    const operation: AgentWorktreeOperation = {
+      operationId: input.idempotencyKey,
+      worktreeId,
+      workspaceId: input.workspaceId,
+      branch: input.branch,
+      path: input.destination,
+      state: "completed",
+      surfaceId: null,
+      paneId: null,
+      sessionId: null,
+      reused: false,
+      recovered: false,
+    };
+    this.agentWorktrees.set(worktreeId, operation);
+    return { ...operation };
+  }
+  async listAgentWorktrees(
+    workspaceId?: string | null,
+    _includeCompleted = true,
+  ): Promise<AgentWorktreeOperation[]> {
+    this.gitWorktreeListRequestCount += 1;
+    const worktrees = [...this.agentWorktrees.values()]
+      .filter(
+        (operation) => !workspaceId || operation.workspaceId === workspaceId,
+      )
+      .map((operation) => ({ ...operation }));
+    const held = this.heldGitWorktreeList;
+    if (held) {
+      this.heldGitWorktreeList = null;
+      this.activeGitWorktreeList = held;
+      try {
+        await held.wait;
+      } finally {
+        if (this.activeGitWorktreeList === held) {
+          this.activeGitWorktreeList = null;
+        }
+      }
+    }
+    return worktrees;
+  }
+  async recoverAgentWorktree(input: {
+    operationId?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    const operation = [...this.agentWorktrees.values()].find(
+      (candidate) =>
+        candidate.operationId === input.operationId ||
+        candidate.operationId === input.idempotencyKey,
+    );
+    if (!operation)
+      throw new ControlClientError(
+        "Worktree operation was not found.",
+        "not_found",
+      );
+    return { ...operation, recovered: true };
+  }
+  async removeAgentWorktree(input: {
+    worktreeId: string;
+    force?: boolean;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    const operation = this.agentWorktrees.get(input.worktreeId);
+    if (!operation)
+      throw new ControlClientError(
+        "Worktree operation was not found.",
+        "not_found",
+      );
+    this.agentWorktrees.delete(input.worktreeId);
+    return { ...operation, state: "removed" };
+  }
+  async listDevelopmentServerCandidates(
+    _workspaceId?: string | null,
+  ): Promise<DevelopmentServerCandidate[]> {
+    return [];
+  }
+  async dismissDevelopmentServerCandidate(
+    _candidateId: string,
+  ): Promise<void> {}
+  async openDevelopmentServerCandidateInSplit(
+    _candidateId: string,
+    _options: { paneId?: string | null } = {},
+  ): Promise<{ surfaceId: string; url: string }> {
+    throw new ControlClientError(
+      "Development server candidates are unavailable in browser preview.",
+      "unavailable",
+    );
+  }
+
+  private findGitReviewThread(threadId: string): GitReviewThread {
+    const thread = this.gitReviewThreads.get(threadId);
+    if (!thread)
+      throw new ControlClientError("Review thread was not found.", "not_found");
+    return thread;
   }
 
   private findWorkspace(workspaceId: string): WorkspaceSummary {
@@ -4874,10 +6145,7 @@ class BrowserPreviewControlClient implements ControlClient {
   private previewDockPath(
     workspaceId: string | null | undefined,
     source:
-      | "project_agentmux"
-      | "project_cmux"
-      | "global_agentmux"
-      | "global_cmux",
+      "project_agentmux" | "project_cmux" | "global_agentmux" | "global_cmux",
   ): string {
     if (source === "global_agentmux") {
       return "localStorage://agentmux.preview.dock.v1";
@@ -5179,8 +6447,8 @@ class BrowserPreviewControlClient implements ControlClient {
       assignedSessionId: detail.assignedSessionId ?? null,
       blockedReason:
         status === "blocked"
-          ? detail.blockedReason ?? "waiting_on_dependency"
-          : detail.blockedReason ?? null,
+          ? (detail.blockedReason ?? "waiting_on_dependency")
+          : (detail.blockedReason ?? null),
       createdAt: detail.createdAt ?? now,
       updatedAt: detail.updatedAt ?? now,
       completedAt: detail.completedAt ?? (status === "completed" ? now : null),
@@ -5188,7 +6456,9 @@ class BrowserPreviewControlClient implements ControlClient {
     });
   }
 
-  private applySyntheticTeamMessage(detail: SyntheticTeamMessageDetail = {}): void {
+  private applySyntheticTeamMessage(
+    detail: SyntheticTeamMessageDetail = {},
+  ): void {
     const workspace = detail.workspaceId
       ? this.findWorkspace(detail.workspaceId)
       : this.workspaces[0];
@@ -5197,7 +6467,8 @@ class BrowserPreviewControlClient implements ControlClient {
     }
     const now = new Date().toISOString();
     const message: TeamMessage = {
-      messageId: detail.messageId ?? `message_preview_${++this.teamMessageCounter}`,
+      messageId:
+        detail.messageId ?? `message_preview_${++this.teamMessageCounter}`,
       workspaceId: workspace.workspaceId,
       threadId: detail.threadId ?? null,
       fromSessionId: detail.fromSessionId ?? null,
@@ -5340,8 +6611,14 @@ interface ServerApiEnvelope<T> {
   error?: string;
 }
 
+interface ServerCapabilitiesWire {
+  source_control?: boolean;
+  control_methods?: string[];
+}
+
 interface ServerStateResult {
   mode: string;
+  capabilities?: ServerCapabilitiesWire;
   control_pipe?: string | null;
   default_workspace_id?: string | null;
   workspaces: WorkspaceSummaryWire[];
@@ -5349,11 +6626,18 @@ interface ServerStateResult {
   defaults: NonNullable<AgentmuxServerBootstrap["defaults"]>;
 }
 
+interface ServerWebSocketTicketResult {
+  ticket: string;
+  expires_in_ms: number;
+}
+
 class ServerControlClient extends BrowserPreviewControlClient {
-  override readonly supportsSourceControl = false;
+  private serverControlMethods = new Set<string>();
   private readonly serverBaseUrl: string;
   private readonly serverToken: string | null;
-  private readonly serverDefaults: NonNullable<AgentmuxServerBootstrap["defaults"]>;
+  private readonly serverDefaults: NonNullable<
+    AgentmuxServerBootstrap["defaults"]
+  >;
   private readonly serverWorkspaces = new Map<string, WorkspaceSummary>();
   private readonly serverPanes = new Map<string, PaneSummary[]>();
   private readonly serverSurfaces = new Map<string, SurfaceSummary[]>();
@@ -5367,6 +6651,18 @@ class ServerControlClient extends BrowserPreviewControlClient {
     this.serverBaseUrl = (bootstrap.baseUrl ?? "").replace(/\/+$/, "");
     this.serverToken = bootstrap.token?.trim() || null;
     this.serverDefaults = bootstrap.defaults ?? {};
+    this.setServerCapabilities(
+      bootstrap.capabilities,
+      bootstrap.mode,
+    );
+  }
+
+  override get supportsSourceControl(): boolean {
+    return this.supportsSourceControlMethod("git.status_page");
+  }
+
+  override supportsSourceControlMethod(method: SourceControlMethod): boolean {
+    return this.serverControlMethods.has(method);
   }
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
@@ -5403,14 +6699,15 @@ class ServerControlClient extends BrowserPreviewControlClient {
   async getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
     await this.hydrateServerState();
     const workspace = this.findServerWorkspace(workspaceId);
-    const sessionsResult = await this.serverApi<{ sessions: SessionSummaryWire[] }>(
-      `/api/sessions?workspace=${encodeURIComponent(workspaceId)}`,
-    );
+    const sessionsResult = await this.serverApi<{
+      sessions: SessionSummaryWire[];
+    }>(`/api/sessions?workspace=${encodeURIComponent(workspaceId)}`);
     const sessions = sessionsResult.sessions.map(mapSession);
     const surfaces = this.syncServerSessions(workspaceId, sessions);
     return {
       workspace: { ...workspace },
-      panes: this.serverPanes.get(workspaceId)?.map((pane) => ({ ...pane })) ?? [],
+      panes:
+        this.serverPanes.get(workspaceId)?.map((pane) => ({ ...pane })) ?? [],
       surfaces: surfaces.map((surface) => ({ ...surface })),
       sessions: sessions.map((session) => ({ ...session })),
     };
@@ -5451,7 +6748,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
       return false;
     }
     const detail = await this.getWorkspace(workspaceId);
-    const sessionSurfaces = detail.surfaces.filter((surface) => surface.sessionId);
+    const sessionSurfaces = detail.surfaces.filter(
+      (surface) => surface.sessionId,
+    );
     if (closePolicy === "fail_if_running" && sessionSurfaces.length > 0) {
       throw new ControlClientError(
         "Workspace has running sessions.",
@@ -5462,7 +6761,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
       await Promise.all(
         sessionSurfaces.map((surface) =>
           surface.sessionId
-            ? this.terminateServerSession(surface.sessionId).catch(() => undefined)
+            ? this.terminateServerSession(surface.sessionId).catch(
+                () => undefined,
+              )
             : Promise.resolve(),
         ),
       );
@@ -5547,7 +6848,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     }
     const parent = panes.find((pane) => pane.paneId === target.parentPaneId);
     const sibling = panes.find(
-      (pane) => pane.parentPaneId === target.parentPaneId && pane.paneId !== paneId,
+      (pane) =>
+        pane.parentPaneId === target.parentPaneId && pane.paneId !== paneId,
     );
     const closedSurfaceId = target.mountedSurfaceId ?? null;
     this.serverPanes.set(
@@ -5702,7 +7004,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return this.spawnServerTerminal({
       workspaceId,
       backend: "wsl-direct",
-      backendProfile: distribution ?? this.serverDefaults.backend_profile ?? null,
+      backendProfile:
+        distribution ?? this.serverDefaults.backend_profile ?? null,
       command: ["bash", "-l"],
       cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
@@ -5720,7 +7023,13 @@ class ServerControlClient extends BrowserPreviewControlClient {
   ): Promise<TerminalSession> {
     // Server mode doesn't model durability separately yet — fall back to a
     // regular WSL terminal so the call still resolves.
-    return this.spawnWslTerminal(workspaceId, distribution, cwd, placement, paneId);
+    return this.spawnWslTerminal(
+      workspaceId,
+      distribution,
+      cwd,
+      placement,
+      paneId,
+    );
   }
 
   async spawnDockTerminal(
@@ -5733,7 +7042,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return this.spawnServerTerminal({
       workspaceId,
       backend: "wsl-direct",
-      backendProfile: distribution ?? this.serverDefaults.backend_profile ?? null,
+      backendProfile:
+        distribution ?? this.serverDefaults.backend_profile ?? null,
       command: ["bash", "-lc", control.command],
       cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
@@ -5773,7 +7083,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return this.spawnServerTerminal({
       workspaceId,
       backend: "wsl-tmux-control",
-      backendProfile: distribution ?? this.serverDefaults.backend_profile ?? null,
+      backendProfile:
+        distribution ?? this.serverDefaults.backend_profile ?? null,
       command,
       cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
@@ -5817,48 +7128,20 @@ class ServerControlClient extends BrowserPreviewControlClient {
     sessionId: string,
     onFrame: (fromOffset: number, bytes: Uint8Array) => void,
   ): Promise<() => void> {
-    const socket = new WebSocket(
-      this.serverWebSocketUrl(`/api/session/${encodeURIComponent(sessionId)}/stream`),
-    );
-    let opened = false;
-    socket.onmessage = (event) => {
-      if (typeof event.data !== "string") {
-        return;
-      }
-      let frame: {
-        type?: string;
-        from_offset?: number;
-        bytes_base64?: string;
-      };
+    let socket: WebSocket | null = null;
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 2 && socket === null; attempt += 1) {
       try {
-        frame = JSON.parse(event.data) as typeof frame;
-      } catch {
-        return;
+        socket = await this.openServerOutputSocket(sessionId, onFrame);
+      } catch (error) {
+        lastError = error;
       }
-      if (
-        (frame.type === "output" || frame.type === "reset") &&
-        typeof frame.from_offset === "number"
-      ) {
-        onFrame(frame.from_offset, base64ToBytes(frame.bytes_base64 ?? ""));
-      }
-    };
-    await new Promise<void>((resolve, reject) => {
-      socket.onopen = () => {
-        opened = true;
-        this.serverOutputSockets.set(sessionId, socket);
-        resolve();
-      };
-      socket.onerror = () => reject(new Error("Server output WebSocket failed."));
-      socket.onclose = () => {
-        const current = this.serverOutputSockets.get(sessionId);
-        if (current === socket) {
-          this.serverOutputSockets.delete(sessionId);
-        }
-        if (!opened) {
-          reject(new Error("Server output WebSocket closed before opening."));
-        }
-      };
-    });
+    }
+    if (!socket) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("Server output WebSocket failed.");
+    }
     return () => {
       const current = this.serverOutputSockets.get(sessionId);
       if (current === socket) {
@@ -5884,7 +7167,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
   async getSession(sessionId: string): Promise<TerminalSession> {
     for (const workspace of await this.listWorkspaces()) {
       const detail = await this.getWorkspace(workspace.workspaceId);
-      const session = detail.sessions.find((candidate) => candidate.sessionId === sessionId);
+      const session = detail.sessions.find(
+        (candidate) => candidate.sessionId === sessionId,
+      );
       if (session) {
         return session;
       }
@@ -5910,10 +7195,13 @@ class ServerControlClient extends BrowserPreviewControlClient {
     if (this.sendServerSocketMessage(sessionId, { type: "paste", text })) {
       return;
     }
-    await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/paste`, {
-      method: "POST",
-      body: JSON.stringify({ text, bracketed: true }),
-    });
+    await this.serverApi(
+      `/api/session/${encodeURIComponent(sessionId)}/paste`,
+      {
+        method: "POST",
+        body: JSON.stringify({ text, bracketed: true }),
+      },
+    );
   }
 
   async sendKey(sessionId: string, key: string): Promise<void> {
@@ -5931,13 +7219,18 @@ class ServerControlClient extends BrowserPreviewControlClient {
     columns: number,
     rows: number,
   ): Promise<void> {
-    if (this.sendServerSocketMessage(sessionId, { type: "resize", columns, rows })) {
+    if (
+      this.sendServerSocketMessage(sessionId, { type: "resize", columns, rows })
+    ) {
       return;
     }
-    await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/resize`, {
-      method: "POST",
-      body: JSON.stringify({ columns, rows }),
-    });
+    await this.serverApi(
+      `/api/session/${encodeURIComponent(sessionId)}/resize`,
+      {
+        method: "POST",
+        body: JSON.stringify({ columns, rows }),
+      },
+    );
   }
 
   async recoveryDiagnostics(): Promise<RecoveryDiagnostics> {
@@ -5957,7 +7250,10 @@ class ServerControlClient extends BrowserPreviewControlClient {
     );
     return {
       workspaceCount: workspaces.length,
-      paneCount: details.reduce((count, detail) => count + detail.panes.length, 0),
+      paneCount: details.reduce(
+        (count, detail) => count + detail.panes.length,
+        0,
+      ),
       surfaceCount: details.reduce(
         (count, detail) => count + detail.surfaces.length,
         0,
@@ -5968,63 +7264,401 @@ class ServerControlClient extends BrowserPreviewControlClient {
   }
 
   async listWslDistributions(): Promise<WslDistribution[]> {
-    const result = await this.serverApi<{ distributions: WslDistributionWire[] }>(
-      "/api/wsl/distributions",
-    );
+    const result = await this.serverApi<{
+      distributions: WslDistributionWire[];
+    }>("/api/wsl/distributions");
     return result.distributions.map(mapWslDistribution);
   }
 
   async checkTmux(distribution?: string | null): Promise<TmuxDiagnostics> {
-    const result = await this.serverApi<TmuxDiagnosticsWire>("/api/tmux/check", {
-      method: "POST",
-      body: JSON.stringify({ distribution: distribution ?? null }),
-    });
+    const result = await this.serverApi<TmuxDiagnosticsWire>(
+      "/api/tmux/check",
+      {
+        method: "POST",
+        body: JSON.stringify({ distribution: distribution ?? null }),
+      },
+    );
     return mapTmuxDiagnostics(result);
   }
 
-  async getGitStatus(_workspaceId: string): Promise<GitStatus> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
-    );
+  async getGitStatus(workspaceId: string): Promise<GitStatus> {
+    const result = await this.serverControl<GitStatusWire>("git.status", {
+      workspace_id: workspaceId,
+    });
+    return mapGitStatus(result);
   }
 
   async getGitDiff(
-    _workspaceId: string,
-    _path: string,
-    _options: { staged?: boolean; untracked?: boolean } = {},
+    workspaceId: string,
+    path: string,
+    options: { staged?: boolean; untracked?: boolean } = {},
   ): Promise<GitDiff> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
+    const result = await this.serverControl<GitDiffWire>("git.diff", {
+      workspace_id: workspaceId,
+      path,
+      staged: options.staged ?? false,
+      untracked: options.untracked ?? false,
+    });
+    return mapGitDiff(result);
+  }
+
+  async getGitStatusSummary(
+    workspaceId: string,
+    repositoryId?: string | null,
+    paneId?: string | null,
+  ): Promise<GitStatusSummary> {
+    return mapGitStatusSummary(
+      await this.serverControl<GitStatusSummaryWire>("git.status_summary", {
+        workspace_id: workspaceId,
+        repository_id: repositoryId ?? null,
+        pane_id: paneId ?? null,
+      }),
     );
   }
 
-  async stageGitFiles(_workspaceId: string, _paths: string[] = []): Promise<void> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
+  async getGitStatusPage(
+    workspaceId: string,
+    options: {
+      repositoryId?: string | null;
+      state?: string | null;
+      query?: string | null;
+      cursor?: string | null;
+      limit?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    } = {},
+  ): Promise<GitStatusPage> {
+    return mapGitStatusPage(
+      await this.serverControl<GitStatusPageWire>("git.status_page", {
+        workspace_id: workspaceId,
+        repository_id: options.repositoryId ?? null,
+        state: options.state ?? null,
+        query: options.query ?? null,
+        cursor: options.cursor ?? null,
+        limit: options.limit ?? null,
+        generation: options.generation ?? null,
+        pane_id: options.paneId ?? null,
+      }),
     );
   }
 
-  async unstageGitFiles(
-    _workspaceId: string,
-    _paths: string[] = [],
+  async getGitPagedDiff(
+    workspaceId: string,
+    path: string,
+    options: {
+      repositoryId?: string | null;
+      stage?: string | null;
+      contextLines?: number;
+      generation?: number | null;
+      paneId?: string | null;
+    } = {},
+  ): Promise<GitPagedDiff> {
+    return mapGitPagedDiff(
+      await this.serverControl<GitPagedDiffWire>("git.diff", {
+        workspace_id: workspaceId,
+        repository_id: options.repositoryId ?? null,
+        path,
+        stage: options.stage ?? null,
+        context_lines: options.contextLines ?? null,
+        generation: options.generation ?? null,
+        pane_id: options.paneId ?? null,
+      }),
+    );
+  }
+
+  async stageGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
   ): Promise<void> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
+    await this.serverControl(
+      "git.stage",
+      createGitMutationParams(workspaceId, options, { paths }),
+    );
+  }
+  async unstageGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.serverControl(
+      "git.unstage",
+      createGitMutationParams(workspaceId, options, { paths }),
+    );
+  }
+  async discardGitFiles(
+    workspaceId: string,
+    paths: string[],
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.serverControl(
+      "git.discard",
+      createGitMutationParams(workspaceId, options, { paths }),
+    );
+  }
+  async stageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.serverControl(
+      "git.stage_all",
+      createGitMutationParams(workspaceId, options),
+    );
+  }
+  async unstageAllGitFiles(
+    workspaceId: string,
+    options: GitMutationOptions,
+  ): Promise<void> {
+    await this.serverControl(
+      "git.unstage_all",
+      createGitMutationParams(workspaceId, options),
     );
   }
 
   async commitGitChanges(
-    _workspaceId: string,
-    _message: string,
+    workspaceId: string,
+    message: string,
+    options: GitMutationOptions,
   ): Promise<GitCommitResult> {
-    throw new ControlClientError(
-      "Source control is not available through the server transport yet.",
-      "unsupported_method",
+    const result = await this.serverControl<
+      GitCommitResultWire | GitMutationResultWire
+    >(
+      "git.commit",
+      createGitMutationParams(workspaceId, options, { message, amend: false }),
     );
+    return mapServerGitCommitResult(result, message);
+  }
+
+  async listGitReviewThreads(
+    workspaceId: string,
+    options: {
+      paneId?: string | null;
+      repositoryId?: string | null;
+      path?: string | null;
+      includeResolved?: boolean;
+      includeStale?: boolean;
+      limit?: number;
+    } = {},
+  ): Promise<GitReviewThread[]> {
+    const result = await this.serverControl<GitReviewThreadListWire>(
+      "git.review_thread.list",
+      {
+        workspace_id: workspaceId,
+        pane_id: options.paneId ?? null,
+        repository_id: options.repositoryId ?? null,
+        path: options.path ?? null,
+        include_resolved: options.includeResolved ?? false,
+        include_stale: options.includeStale ?? false,
+        limit: options.limit ?? null,
+      },
+    );
+    return result.threads.map(mapGitReviewThread);
+  }
+  async createGitReviewThread(input: {
+    workspaceId: string;
+    paneId?: string | null;
+    repositoryId?: string | null;
+    anchor: GitReviewLineAnchor;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewThread> {
+    return mapGitReviewThread(
+      await this.serverControl<GitReviewThreadWire>(
+        "git.review_thread.create",
+        {
+          workspace_id: input.workspaceId,
+          pane_id: input.paneId ?? null,
+          repository_id: input.repositoryId ?? null,
+          anchor: toGitReviewAnchorWire(input.anchor),
+          body: input.body,
+          author_session_id: input.authorSessionId ?? null,
+        },
+      ),
+    );
+  }
+  async updateGitReviewThread(
+    threadId: string,
+    input: { resolved?: boolean; anchor?: GitReviewLineAnchor },
+  ): Promise<GitReviewThread> {
+    return mapGitReviewThread(
+      await this.serverControl<GitReviewThreadWire>(
+        "git.review_thread.update",
+        {
+          thread_id: threadId,
+          resolved: input.resolved ?? null,
+          anchor: input.anchor ? toGitReviewAnchorWire(input.anchor) : null,
+        },
+      ),
+    );
+  }
+  async deleteGitReviewThread(threadId: string): Promise<void> {
+    await this.serverControl("git.review_thread.delete", {
+      thread_id: threadId,
+    });
+  }
+  async listGitReviewComments(
+    threadId: string,
+    limit?: number,
+  ): Promise<GitReviewComment[]> {
+    const result = await this.serverControl<GitReviewCommentListWire>(
+      "git.review_comment.list",
+      { thread_id: threadId, limit: limit ?? null },
+    );
+    return result.comments.map(mapGitReviewComment);
+  }
+  async createGitReviewComment(input: {
+    threadId: string;
+    body: string;
+    authorSessionId?: string | null;
+  }): Promise<GitReviewComment> {
+    return mapGitReviewComment(
+      await this.serverControl<GitReviewCommentWire>(
+        "git.review_comment.create",
+        {
+          thread_id: input.threadId,
+          body: input.body,
+          author_session_id: input.authorSessionId ?? null,
+        },
+      ),
+    );
+  }
+  async updateGitReviewComment(
+    commentId: string,
+    body: string,
+  ): Promise<GitReviewComment> {
+    return mapGitReviewComment(
+      await this.serverControl<GitReviewCommentWire>(
+        "git.review_comment.update",
+        { comment_id: commentId, body },
+      ),
+    );
+  }
+  async deleteGitReviewComment(commentId: string): Promise<void> {
+    await this.serverControl("git.review_comment.delete", {
+      comment_id: commentId,
+    });
+  }
+  async deliverGitReviewThread(
+    threadId: string,
+    input: {
+      target: "mailbox" | "terminal";
+      targetSessionId?: string | null;
+      includeContext?: boolean;
+    },
+  ): Promise<GitReviewDelivery> {
+    return mapGitReviewDelivery(
+      await this.serverControl<GitReviewDeliveryWire>(
+        "git.review_thread.deliver",
+        {
+          thread_id: threadId,
+          target: input.target,
+          target_session_id: input.targetSessionId ?? null,
+          include_context: input.includeContext ?? true,
+        },
+      ),
+    );
+  }
+  async createAgentWorktree(input: {
+    workspaceId: string;
+    branch: string;
+    destination: string;
+    baseRevision?: string | null;
+    createBranch?: boolean;
+    backend?: string | null;
+    backendProfile?: string | null;
+    command?: string[];
+    cwd?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    return mapAgentWorktreeOperation(
+      await this.serverControl<AgentWorktreeOperationWire>(
+        "agent.worktree.create",
+        {
+          workspace_id: input.workspaceId,
+          branch: input.branch,
+          destination: input.destination,
+          base_revision: input.baseRevision ?? null,
+          create_branch: input.createBranch ?? true,
+          backend: input.backend ?? null,
+          backend_profile: input.backendProfile ?? null,
+          command: input.command ?? [],
+          cwd: input.cwd ?? null,
+          idempotency_key: input.idempotencyKey,
+        },
+      ),
+    );
+  }
+  async listAgentWorktrees(
+    workspaceId?: string | null,
+    includeCompleted = true,
+  ): Promise<AgentWorktreeOperation[]> {
+    const result = await this.serverControl<AgentWorktreeListWire>(
+      "agent.worktree.list",
+      {
+        workspace_id: workspaceId ?? null,
+        include_completed: includeCompleted,
+      },
+    );
+    return result.worktrees.map(mapAgentWorktreeOperation);
+  }
+  async recoverAgentWorktree(input: {
+    operationId?: string | null;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    return mapAgentWorktreeOperation(
+      await this.serverControl<AgentWorktreeOperationWire>(
+        "agent.worktree.recover",
+        {
+          operation_id: input.operationId ?? null,
+          idempotency_key: input.idempotencyKey,
+        },
+      ),
+    );
+  }
+  async removeAgentWorktree(input: {
+    worktreeId: string;
+    force?: boolean;
+    idempotencyKey: string;
+  }): Promise<AgentWorktreeOperation> {
+    return mapAgentWorktreeOperation(
+      await this.serverControl<AgentWorktreeOperationWire>(
+        "agent.worktree.remove",
+        {
+          worktree_id: input.worktreeId,
+          force: input.force ?? false,
+          idempotency_key: input.idempotencyKey,
+        },
+      ),
+    );
+  }
+  async listDevelopmentServerCandidates(
+    workspaceId?: string | null,
+  ): Promise<DevelopmentServerCandidate[]> {
+    const result = await this.serverControl<DevelopmentServerCandidateListWire>(
+      "dev_server.candidate.list",
+      {
+        workspace_id: workspaceId ?? null,
+        include_dismissed: false,
+        limit: 100,
+      },
+    );
+    return result.candidates.map(mapDevelopmentServerCandidate);
+  }
+  async dismissDevelopmentServerCandidate(candidateId: string): Promise<void> {
+    await this.serverControl("dev_server.candidate.dismiss", {
+      candidate_id: candidateId,
+    });
+  }
+  async openDevelopmentServerCandidateInSplit(
+    candidateId: string,
+    options: { paneId?: string | null } = {},
+  ): Promise<{ surfaceId: string; url: string }> {
+    const result =
+      await this.serverControl<DevelopmentServerCandidateOpenInSplitWire>(
+        "dev_server.candidate.open_in_split",
+        { candidate_id: candidateId, pane_id: options.paneId ?? null },
+      );
+    return { surfaceId: result.surface_id, url: result.candidate.url };
   }
 
   async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
@@ -6046,10 +7680,21 @@ class ServerControlClient extends BrowserPreviewControlClient {
 
   private async hydrateServerState(): Promise<ServerStateResult> {
     const state = await this.serverApi<ServerStateResult>("/api/state");
+    this.setServerCapabilities(
+      state.capabilities,
+      state.mode,
+    );
     for (const wire of state.workspaces ?? []) {
       this.ensureServerWorkspace(mapWorkspace(wire));
     }
     return state;
+  }
+
+  private setServerCapabilities(
+    capabilities: ServerCapabilitiesWire | undefined,
+    mode?: string,
+  ): void {
+    this.serverControlMethods = serverSourceControlMethods(capabilities, mode);
   }
 
   private ensureServerWorkspace(workspace: WorkspaceSummary): WorkspaceSummary {
@@ -6063,7 +7708,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
         }
       : workspace;
     next.defaultWslDistribution =
-      next.defaultWslDistribution ?? this.serverDefaults.backend_profile ?? null;
+      next.defaultWslDistribution ??
+      this.serverDefaults.backend_profile ??
+      null;
     this.serverWorkspaces.set(next.workspaceId, next);
     this.ensureServerPaneRoot(next);
     return next;
@@ -6073,7 +7720,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     if (this.serverPanes.has(workspace.workspaceId)) {
       return;
     }
-    const rootPaneId = workspace.rootPaneId || `pane_server_${workspace.workspaceId}`;
+    const rootPaneId =
+      workspace.rootPaneId || `pane_server_${workspace.workspaceId}`;
     workspace.rootPaneId = rootPaneId;
     workspace.activePaneId = workspace.activePaneId || rootPaneId;
     this.serverPanes.set(workspace.workspaceId, [
@@ -6110,7 +7758,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
       (surface) => !surface.sessionId || sessionIds.has(surface.sessionId),
     );
     for (const session of sessions) {
-      if (!surfaces.some((surface) => surface.sessionId === session.sessionId)) {
+      if (
+        !surfaces.some((surface) => surface.sessionId === session.sessionId)
+      ) {
         surfaces.push(this.createServerSurface(workspaceId, session));
       }
     }
@@ -6118,10 +7768,16 @@ class ServerControlClient extends BrowserPreviewControlClient {
     this.clearMissingServerSurfaceMounts(workspaceId);
     if (
       surfaces.length > 0 &&
-      !(this.serverPanes.get(workspaceId) ?? []).some((pane) => pane.mountedSurfaceId)
+      !(this.serverPanes.get(workspaceId) ?? []).some(
+        (pane) => pane.mountedSurfaceId,
+      )
     ) {
       const workspace = this.findServerWorkspace(workspaceId);
-      this.mountServerSurface(workspaceId, surfaces[0].surfaceId, workspace.activePaneId);
+      this.mountServerSurface(
+        workspaceId,
+        surfaces[0].surfaceId,
+        workspace.activePaneId,
+      );
     }
     return surfaces;
   }
@@ -6187,7 +7843,11 @@ class ServerControlClient extends BrowserPreviewControlClient {
       if (options.placement === "new_tab") {
         this.createServerTabPane(options.workspaceId, surface.surfaceId);
       } else {
-        this.mountServerSurface(options.workspaceId, surface.surfaceId, options.paneId);
+        this.mountServerSurface(
+          options.workspaceId,
+          surface.surfaceId,
+          options.paneId,
+        );
       }
     }
     return session;
@@ -6219,8 +7879,9 @@ class ServerControlClient extends BrowserPreviewControlClient {
     const workspace = this.findServerWorkspace(workspaceId);
     const panes = this.serverPanes.get(workspaceId) ?? [];
     const target =
-      panes.find((pane) => pane.paneId === (paneId ?? workspace.activePaneId)) ??
-      panes.find((pane) => pane.kind === "leaf");
+      panes.find(
+        (pane) => pane.paneId === (paneId ?? workspace.activePaneId),
+      ) ?? panes.find((pane) => pane.kind === "leaf");
     if (!target) {
       return;
     }
@@ -6232,7 +7893,8 @@ class ServerControlClient extends BrowserPreviewControlClient {
     target.mountedSurfaceId = surfaceId;
     workspace.activePaneId = target.paneId;
     workspace.rootPaneId =
-      this.findServerRootPaneId(workspaceId, target.paneId) ?? workspace.rootPaneId;
+      this.findServerRootPaneId(workspaceId, target.paneId) ??
+      workspace.rootPaneId;
   }
 
   private async removeServerSurface(
@@ -6241,9 +7903,13 @@ class ServerControlClient extends BrowserPreviewControlClient {
     terminate: boolean,
   ): Promise<void> {
     const surfaces = this.serverSurfaces.get(workspaceId) ?? [];
-    const surface = surfaces.find((candidate) => candidate.surfaceId === surfaceId);
+    const surface = surfaces.find(
+      (candidate) => candidate.surfaceId === surfaceId,
+    );
     if (terminate && surface?.sessionId) {
-      await this.terminateServerSession(surface.sessionId).catch(() => undefined);
+      await this.terminateServerSession(surface.sessionId).catch(
+        () => undefined,
+      );
     }
     this.serverSurfaces.set(
       workspaceId,
@@ -6257,16 +7923,21 @@ class ServerControlClient extends BrowserPreviewControlClient {
   }
 
   private async terminateServerSession(sessionId: string): Promise<void> {
-    await this.serverApi(`/api/session/${encodeURIComponent(sessionId)}/terminate`, {
-      method: "POST",
-      body: "{}",
-    });
+    await this.serverApi(
+      `/api/session/${encodeURIComponent(sessionId)}/terminate`,
+      {
+        method: "POST",
+        body: "{}",
+      },
+    );
     this.serverSessions.delete(sessionId);
   }
 
   private clearMissingServerSurfaceMounts(workspaceId: string): void {
     const surfaceIds = new Set(
-      (this.serverSurfaces.get(workspaceId) ?? []).map((surface) => surface.surfaceId),
+      (this.serverSurfaces.get(workspaceId) ?? []).map(
+        (surface) => surface.surfaceId,
+      ),
     );
     for (const pane of this.serverPanes.get(workspaceId) ?? []) {
       if (pane.mountedSurfaceId && !surfaceIds.has(pane.mountedSurfaceId)) {
@@ -6275,7 +7946,10 @@ class ServerControlClient extends BrowserPreviewControlClient {
     }
   }
 
-  private findServerRootPaneId(workspaceId: string, paneId: string): string | null {
+  private findServerRootPaneId(
+    workspaceId: string,
+    paneId: string,
+  ): string | null {
     const panes = this.serverPanes.get(workspaceId) ?? [];
     let pane = panes.find((candidate) => candidate.paneId === paneId);
     let guard = 0;
@@ -6315,16 +7989,93 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return data.result as T;
   }
 
-  private serverWebSocketUrl(path: string): string {
+  private async serverControl<T = unknown>(
+    method: string,
+    params: unknown,
+  ): Promise<T> {
+    if (
+      SOURCE_CONTROL_METHODS.includes(method as SourceControlMethod) &&
+      !this.supportsSourceControlMethod(method as SourceControlMethod)
+    ) {
+      throw new ControlClientError(
+        `Server does not advertise '${method}'.`,
+        "unsupported_method",
+      );
+    }
+    return this.serverApi<T>("/api/control", {
+      method: "POST",
+      body: JSON.stringify({ method, params }),
+    });
+  }
+
+  private async openServerOutputSocket(
+    sessionId: string,
+    onFrame: (fromOffset: number, bytes: Uint8Array) => void,
+  ): Promise<WebSocket> {
+    const ticket = await this.serverApi<ServerWebSocketTicketResult>(
+      "/api/ws-ticket",
+      {
+        method: "POST",
+        body: JSON.stringify({ session_id: sessionId }),
+      },
+    );
+    if (!ticket.ticket || ticket.expires_in_ms <= 0) {
+      throw new Error("Server returned an invalid WebSocket ticket.");
+    }
+    const socket = new WebSocket(
+      this.serverWebSocketUrl(
+        `/api/session/${encodeURIComponent(sessionId)}/stream`,
+        ticket.ticket,
+      ),
+    );
+    let opened = false;
+    socket.onmessage = (event) => {
+      if (typeof event.data !== "string") {
+        return;
+      }
+      let frame: {
+        type?: string;
+        from_offset?: number;
+        bytes_base64?: string;
+      };
+      try {
+        frame = JSON.parse(event.data) as typeof frame;
+      } catch {
+        return;
+      }
+      if (
+        (frame.type === "output" || frame.type === "reset") &&
+        typeof frame.from_offset === "number"
+      ) {
+        onFrame(frame.from_offset, base64ToBytes(frame.bytes_base64 ?? ""));
+      }
+    };
+    await new Promise<void>((resolve, reject) => {
+      socket.onopen = () => {
+        opened = true;
+        this.serverOutputSockets.set(sessionId, socket);
+        resolve();
+      };
+      socket.onerror = () =>
+        reject(new Error("Server output WebSocket failed."));
+      socket.onclose = () => {
+        const current = this.serverOutputSockets.get(sessionId);
+        if (current === socket) {
+          this.serverOutputSockets.delete(sessionId);
+        }
+        if (!opened) {
+          reject(new Error("Server output WebSocket closed before opening."));
+        }
+      };
+    });
+    return socket;
+  }
+
+  private serverWebSocketUrl(path: string, ticket: string): string {
     const base =
       this.serverBaseUrl ||
       `${window.location.protocol}//${window.location.host}`;
-    const url = new URL(path, base);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    if (this.serverToken) {
-      url.searchParams.set("token", this.serverToken);
-    }
-    return url.toString();
+    return buildServerWebSocketUrl(base, path, ticket);
   }
 
   private sendServerSocketMessage(
@@ -6396,6 +8147,96 @@ interface BrowserPreviewApi {
   browserDialog(detail?: SyntheticBrowserDialogDetail): string | null;
   terminalOutput(sessionId?: string): string | null;
   terminalResizes(sessionId?: string): Array<{ columns: number; rows: number }>;
+  gitRequests(): Array<{
+    operation: string;
+    paneId: string | null;
+    query: string | null;
+  }>;
+  setGitStatusFileCount(count: number): void;
+  holdGitReviewCreate(): void;
+  releaseGitReviewCreate(): void;
+  holdGitReviewList(): void;
+  releaseGitReviewList(): void;
+  failGitReviewList(): void;
+  gitReviewListRequests(): number;
+  holdGitWorktreeList(): void;
+  releaseGitWorktreeList(): void;
+  gitWorktreeListRequests(): number;
+  seedGitWorktree(workspaceId: string, branch: string): void;
+  clearGitWorktrees(workspaceId?: string): void;
+}
+
+const LEGACY_DESKTOP_SOURCE_CONTROL_METHODS: readonly SourceControlMethod[] =
+  SOURCE_CONTROL_METHODS;
+const LEGACY_LOCAL_SOURCE_CONTROL_METHODS: readonly SourceControlMethod[] = [
+  "git.status",
+  "git.status_summary",
+  "git.status_page",
+  "git.diff",
+  "git.stage",
+  "git.unstage",
+  "git.stage_all",
+  "git.unstage_all",
+  "git.commit",
+];
+
+export function serverSourceControlMethods(
+  capabilities: ServerCapabilitiesWire | undefined,
+  mode?: string,
+): Set<string> {
+  if (Array.isArray(capabilities?.control_methods)) {
+    return new Set(
+      capabilities.control_methods.filter(
+        (method): method is string => typeof method === "string" && method.length > 0,
+      ),
+    );
+  }
+  if (capabilities?.source_control === false) {
+    return new Set();
+  }
+  if (mode === "desktop-bridge") {
+    return new Set(LEGACY_DESKTOP_SOURCE_CONTROL_METHODS);
+  }
+  if (capabilities?.source_control) {
+    return new Set(LEGACY_LOCAL_SOURCE_CONTROL_METHODS);
+  }
+  return new Set();
+}
+
+export function serverSupportsSourceControlMethod(
+  capabilities: ServerCapabilitiesWire | undefined,
+  method: SourceControlMethod,
+  mode?: string,
+): boolean {
+  return serverSourceControlMethods(capabilities, mode).has(method);
+}
+
+export function serverSupportsSourceControl(
+  capabilities: ServerCapabilitiesWire | undefined,
+  mode?: string,
+): boolean {
+  return serverSupportsSourceControlMethod(
+    capabilities,
+    "git.status_page",
+    mode,
+  );
+}
+
+export function mapServerGitCommitResult(
+  result: GitCommitResultWire | GitMutationResultWire,
+  message: string,
+): GitCommitResult {
+  const commit = "commit" in result ? result.commit : result.commit_oid;
+  if (!commit) {
+    throw new ControlClientError(
+      "The server did not return the created commit.",
+      "backend_degraded",
+    );
+  }
+  return {
+    commit,
+    summary: "summary" in result ? result.summary : message.trim(),
+  };
 }
 
 interface WorkspaceSummaryWire {
@@ -6614,6 +8455,148 @@ interface GitDiffWire {
 interface GitCommitResultWire {
   commit: string;
   summary: string;
+}
+
+interface GitMutationResultWire {
+  commit_oid?: string | null;
+}
+
+interface GitChangeSummaryWire {
+  path: string;
+  original_path?: string | null;
+  status: string;
+  staged?: boolean;
+  unstaged?: boolean;
+  untracked?: boolean;
+  conflicted?: boolean;
+  is_binary?: boolean;
+  additions?: number | null;
+  deletions?: number | null;
+}
+
+interface GitStatusSummaryWire {
+  workspace_id: string;
+  repository_id: string;
+  repository_root: string;
+  branch?: string | null;
+  head_oid?: string | null;
+  upstream?: string | null;
+  ahead?: number;
+  behind?: number;
+  staged_count?: number;
+  unstaged_count?: number;
+  untracked_count?: number;
+  conflicted_count?: number;
+  generation: number;
+  refreshed_at: string;
+}
+
+interface GitStatusPageWire {
+  workspace_id: string;
+  repository_id: string;
+  generation: number;
+  summary?: GitStatusSummaryWire | null;
+  changes: GitChangeSummaryWire[];
+  next_cursor?: string | null;
+  total_count?: number | null;
+}
+
+interface GitPagedDiffWire {
+  workspace_id: string;
+  repository_id: string;
+  generation: number;
+  path: string;
+  original_path?: string | null;
+  diff?: string;
+  is_binary?: boolean;
+  truncated?: boolean;
+  diff_hash?: string;
+}
+
+interface GitReviewLineAnchorWire {
+  path: string;
+  side: string;
+  line: number;
+  start_line?: number | null;
+  base_revision?: string | null;
+  head_revision?: string | null;
+  hunk_header?: string | null;
+  diff_hash?: string | null;
+}
+
+interface GitReviewCommentWire {
+  comment_id: string;
+  thread_id: string;
+  body: string;
+  author_session_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface GitReviewThreadWire {
+  thread_id: string;
+  workspace_id: string;
+  repository_id: string;
+  anchor: GitReviewLineAnchorWire;
+  resolved?: boolean;
+  stale?: boolean;
+  stale_reason?: string | null;
+  created_at: string;
+  updated_at: string;
+  comments?: GitReviewCommentWire[];
+}
+
+interface GitReviewThreadListWire {
+  threads: GitReviewThreadWire[];
+}
+
+interface GitReviewCommentListWire {
+  comments: GitReviewCommentWire[];
+}
+
+interface GitReviewDeliveryWire {
+  thread_id: string;
+  target: string;
+  target_session_id?: string | null;
+  delivered_at: string;
+}
+
+interface AgentWorktreeOperationWire {
+  operation_id: string;
+  worktree_id: string;
+  workspace_id: string;
+  branch: string;
+  path: string;
+  state: string;
+  surface_id?: string | null;
+  pane_id?: string | null;
+  session_id?: string | null;
+  reused?: boolean;
+  recovered?: boolean;
+}
+
+interface AgentWorktreeListWire {
+  worktrees: AgentWorktreeOperationWire[];
+}
+
+interface DevelopmentServerCandidateWire {
+  candidate_id: string;
+  workspace_id: string;
+  session_id: string;
+  url: string;
+  source: string;
+  detected_at: string;
+  dismissed?: boolean;
+}
+
+interface DevelopmentServerCandidateListWire {
+  candidates: DevelopmentServerCandidateWire[];
+}
+
+interface DevelopmentServerCandidateOpenInSplitWire {
+  candidate: DevelopmentServerCandidateWire;
+  pane_id: string;
+  surface_id: string;
 }
 
 interface RecoveryDiagnosticsWire {
@@ -6847,7 +8830,9 @@ function mapWorkspace(value: WorkspaceSummaryWire): WorkspaceSummary {
     icon: value.icon,
     color: value.color,
     defaultWslDistribution: value.default_wsl_distribution,
-    defaultTerminalProfile: normalizeTerminalProfile(value.default_terminal_profile),
+    defaultTerminalProfile: normalizeTerminalProfile(
+      value.default_terminal_profile,
+    ),
     defaultAgentCommand: value.default_agent_command,
   };
 }
@@ -6954,7 +8939,9 @@ function mapAgentState(value: AgentStateWire): AgentState {
   };
 }
 
-function mapAgentTelemetry(value?: AgentTelemetryWire | null): AgentTelemetry | null {
+function mapAgentTelemetry(
+  value?: AgentTelemetryWire | null,
+): AgentTelemetry | null {
   if (!value) {
     return null;
   }
@@ -7121,10 +9108,180 @@ function mapGitDiff(value: GitDiffWire): GitDiff {
   };
 }
 
+function mapGitChangeSummary(value: GitChangeSummaryWire): GitChangeSummary {
+  return {
+    path: value.path,
+    originalPath: value.original_path ?? null,
+    status: value.status,
+    staged: value.staged ?? false,
+    unstaged: value.unstaged ?? false,
+    untracked: value.untracked ?? false,
+    conflicted: value.conflicted ?? false,
+    isBinary: value.is_binary ?? false,
+    additions: value.additions ?? null,
+    deletions: value.deletions ?? null,
+  };
+}
+
+function mapGitStatusSummary(value: GitStatusSummaryWire): GitStatusSummary {
+  return {
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    repositoryRoot: value.repository_root,
+    branch: value.branch ?? null,
+    headOid: value.head_oid ?? null,
+    upstream: value.upstream ?? null,
+    ahead: value.ahead ?? 0,
+    behind: value.behind ?? 0,
+    stagedCount: value.staged_count ?? 0,
+    unstagedCount: value.unstaged_count ?? 0,
+    untrackedCount: value.untracked_count ?? 0,
+    conflictedCount: value.conflicted_count ?? 0,
+    generation: value.generation,
+    refreshedAt: value.refreshed_at,
+  };
+}
+
+function mapGitStatusPage(value: GitStatusPageWire): GitStatusPage {
+  return {
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    generation: value.generation,
+    summary: value.summary ? mapGitStatusSummary(value.summary) : null,
+    changes: value.changes.map(mapGitChangeSummary),
+    nextCursor: value.next_cursor ?? null,
+    totalCount: value.total_count ?? null,
+  };
+}
+
+function mapGitPagedDiff(value: GitPagedDiffWire): GitPagedDiff {
+  return {
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    generation: value.generation,
+    path: value.path,
+    originalPath: value.original_path ?? null,
+    staged: false,
+    patch: value.diff ?? "",
+    isBinary: value.is_binary ?? false,
+    truncated: value.truncated ?? false,
+    diffHash: value.diff_hash ?? "",
+  };
+}
+
+function toGitReviewAnchorWire(
+  value: GitReviewLineAnchor,
+): GitReviewLineAnchorWire {
+  return {
+    path: value.path,
+    side: value.side,
+    line: value.line,
+    start_line: value.startLine ?? null,
+    base_revision: value.baseRevision ?? null,
+    head_revision: value.headRevision ?? null,
+    hunk_header: value.hunkHeader ?? null,
+    diff_hash: value.diffHash ?? null,
+  };
+}
+
+function mapGitReviewAnchor(
+  value: GitReviewLineAnchorWire,
+): GitReviewLineAnchor {
+  return {
+    path: value.path,
+    side: value.side,
+    line: value.line,
+    startLine: value.start_line ?? null,
+    baseRevision: value.base_revision ?? null,
+    headRevision: value.head_revision ?? null,
+    hunkHeader: value.hunk_header ?? null,
+    diffHash: value.diff_hash ?? null,
+  };
+}
+
+function mapGitReviewComment(value: GitReviewCommentWire): GitReviewComment {
+  return {
+    commentId: value.comment_id,
+    threadId: value.thread_id,
+    body: value.body,
+    authorSessionId: value.author_session_id ?? null,
+    createdAt: value.created_at,
+    updatedAt: value.updated_at,
+  };
+}
+
+function mapGitReviewThread(value: GitReviewThreadWire): GitReviewThread {
+  return {
+    threadId: value.thread_id,
+    workspaceId: value.workspace_id,
+    repositoryId: value.repository_id,
+    anchor: mapGitReviewAnchor(value.anchor),
+    resolved: value.resolved ?? false,
+    stale: value.stale ?? false,
+    staleReason: value.stale_reason ?? null,
+    createdAt: value.created_at,
+    updatedAt: value.updated_at,
+    comments: (value.comments ?? []).map(mapGitReviewComment),
+  };
+}
+
+function mapGitReviewDelivery(value: GitReviewDeliveryWire): GitReviewDelivery {
+  return {
+    threadId: value.thread_id,
+    target: value.target,
+    targetSessionId: value.target_session_id ?? null,
+    deliveredAt: value.delivered_at,
+  };
+}
+
+function mapAgentWorktreeOperation(
+  value: AgentWorktreeOperationWire,
+): AgentWorktreeOperation {
+  return {
+    operationId: value.operation_id,
+    worktreeId: value.worktree_id,
+    workspaceId: value.workspace_id,
+    branch: value.branch,
+    path: value.path,
+    state: value.state,
+    surfaceId: value.surface_id ?? null,
+    paneId: value.pane_id ?? null,
+    sessionId: value.session_id ?? null,
+    reused: value.reused ?? false,
+    recovered: value.recovered ?? false,
+  };
+}
+
+export function mapDevelopmentServerCandidate(
+  value: DevelopmentServerCandidateWire,
+): DevelopmentServerCandidate {
+  return {
+    candidateId: value.candidate_id,
+    workspaceId: value.workspace_id,
+    sessionId: value.session_id,
+    url: value.url,
+    source: value.source,
+    detectedAt: value.detected_at,
+    dismissed: value.dismissed ?? false,
+  };
+}
+
 function cloneGitStatus(value: GitStatus): GitStatus {
   return {
     ...value,
     files: value.files.map((change) => ({ ...change })),
+  };
+}
+
+function cloneGitReviewComment(value: GitReviewComment): GitReviewComment {
+  return { ...value };
+}
+
+function cloneGitReviewThread(value: GitReviewThread): GitReviewThread {
+  return {
+    ...value,
+    anchor: { ...value.anchor },
+    comments: value.comments.map(cloneGitReviewComment),
   };
 }
 
@@ -7248,8 +9405,7 @@ function appConfigExportSnapshot(
       surface_tab_actions: config.ui.surfaceTabActions ?? null,
       text_box_max_lines: config.ui.textBoxMaxLines ?? null,
       terminal_inner_margin: config.ui.terminalInnerMargin ?? null,
-      terminal_gpu_acceleration:
-        config.ui.terminalGpuAcceleration ?? "auto",
+      terminal_gpu_acceleration: config.ui.terminalGpuAcceleration ?? "auto",
       terminal_start_directory: config.ui.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config.ui.terminalStartCustomCwd ?? null,
       terminal_split_behavior: config.ui.terminalSplitBehavior ?? null,
@@ -7296,8 +9452,7 @@ function previewProjectConfigExportSnapshot(
       surface_tab_actions: config?.ui?.surfaceTabActions ?? null,
       text_box_max_lines: config?.ui?.textBoxMaxLines ?? null,
       terminal_inner_margin: config?.ui?.terminalInnerMargin ?? null,
-      terminal_gpu_acceleration:
-        config?.ui?.terminalGpuAcceleration ?? null,
+      terminal_gpu_acceleration: config?.ui?.terminalGpuAcceleration ?? null,
       terminal_start_directory: config?.ui?.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config?.ui?.terminalStartCustomCwd ?? null,
       terminal_split_behavior: config?.ui?.terminalSplitBehavior ?? null,
@@ -8178,17 +10333,17 @@ function sanitizeTerminalInnerMargin(value: unknown): number | null {
 function normalizeTerminalStartDirectory(
   value: unknown,
 ): TerminalStartDirectory {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  const normalized =
+    typeof value === "string" ? value.trim().toLowerCase() : "";
   if (normalized === "workspace" || normalized === "custom") {
     return normalized;
   }
   return "home";
 }
 
-function normalizeTerminalSplitBehavior(
-  value: unknown,
-): TerminalSplitBehavior {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+function normalizeTerminalSplitBehavior(value: unknown): TerminalSplitBehavior {
+  const normalized =
+    typeof value === "string" ? value.trim().toLowerCase() : "";
   return normalized === "empty" ? "empty" : "clone_current";
 }
 
@@ -8200,11 +10355,7 @@ function normalizeTerminalGpuAcceleration(
   }
   const normalized =
     typeof value === "string" ? value.trim().toLowerCase() : "";
-  if (
-    normalized === "auto" ||
-    normalized === "on" ||
-    normalized === "off"
-  ) {
+  if (normalized === "auto" || normalized === "on" || normalized === "off") {
     return normalized;
   }
   throw new Error(

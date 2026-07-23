@@ -86,6 +86,7 @@ const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
 // user compares adjacent tabs, while still releasing inactive contexts.
 const WEBGL_DISABLE_DEBOUNCE_MS = 1500;
 const TERMINAL_RESIZE_SETTLE_MS = 160;
+const TERMINAL_LAYOUT_SETTLE_MS = 90;
 const TERMINAL_LINE_HEIGHT = 1.0;
 const PREVIEW_CACHE_ENABLED_KEY = "agentmux.terminal.previewCache";
 const PREVIEW_CACHE_PREFIX = "agentmux.terminal.preview.v1.";
@@ -319,6 +320,12 @@ function writeTerminalPreviewCache(sessionId: string, bytes: Uint8Array): void {
 interface LiveTerminalProps {
   client: ControlClient;
   sessionId: string;
+  /**
+   * The terminal is laid out in the current tab and can consume geometry
+   * changes. This intentionally differs from `active`, which represents
+   * keyboard focus and the sole WebGL-eligible pane.
+   */
+  visible: boolean;
   active: boolean;
   terminalGpuAcceleration: TerminalGpuAccelerationMode;
   agentKind?: "claude" | "codex" | null;
@@ -469,6 +476,7 @@ export function TerminalRestorePreview({
 export function LiveTerminal({
   client,
   sessionId,
+  visible,
   active,
   terminalGpuAcceleration,
   agentKind,
@@ -482,6 +490,7 @@ export function LiveTerminal({
 }: LiveTerminalProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<XtermTerminalRenderer | null>(null);
+  const visibleRef = useRef(visible);
   const activeRef = useRef(active);
   const agentKindRef = useRef(agentKind ?? null);
   const onOpenLinkRef = useRef(onOpenLink);
@@ -490,6 +499,8 @@ export function LiveTerminal({
   const inputLineRef = useRef("");
   const bootingRef = useRef(true);
   const pollNowRef = useRef<(() => void) | null>(null);
+  const synchronizeLayoutRef = useRef<(() => void) | null>(null);
+  const checkpointViewStateRef = useRef<(() => void) | null>(null);
   const webglDisableTimerRef = useRef<number | null>(null);
   const [rendererEpoch, setRendererEpoch] = useState(0);
   const margin = Math.min(32, Math.max(0, Math.round(innerMargin)));
@@ -585,6 +596,7 @@ export function LiveTerminal({
     void initialStateReady.then(() => {
       if (alive) {
         restoredViewReady = true;
+        renderer.restoreViewportY(restoredViewState?.viewportY);
       }
     });
     let renderedOutputOffset = restoredViewState?.outputOffset ?? null;
@@ -608,9 +620,11 @@ export function LiveTerminal({
       terminalViewStateCache.write(sessionId, {
         serialized,
         outputOffset: renderedOutputOffset,
+        viewportY: renderer.viewportY() ?? undefined,
         updatedAt: Date.now(),
       });
     };
+    checkpointViewStateRef.current = () => checkpointRendererViewState();
     const scheduleViewCheckpoint = () => {
       if (viewCheckpointTimer !== null) {
         window.clearTimeout(viewCheckpointTimer);
@@ -723,33 +737,50 @@ export function LiveTerminal({
       resizeCoordinator.request(size, immediate);
     };
     const unsubscribeResize = renderer.onResize((columns, rows) => {
-      if (!alive) {
+      if (!alive || !visibleRef.current) {
         return;
       }
       resizeCoordinator.request({ columns, rows });
     });
-    reportRendererSize(true);
+    if (visibleRef.current) {
+      reportRendererSize(true);
+    }
     const resizeRetryTimers = [120, 400].map((delay) =>
       window.setTimeout(() => {
-        if (!alive) {
+        if (!alive || !visibleRef.current) {
           return;
         }
-        renderer.fit();
-        reportRendererSize(false);
+        renderer.refreshDisplayMetrics();
+        reportRendererSize(true);
       }, delay)
     );
     let fitFrame: number | null = null;
+    let layoutSettleTimer: number | null = null;
     let displayMetricsFrame: number | null = null;
-    const requestFit = () => {
-      if (fitFrame !== null) {
+    const synchronizeLayout = () => {
+      if (!alive || !visibleRef.current) {
         return;
       }
-      fitFrame = window.requestAnimationFrame(() => {
-        fitFrame = null;
-        renderer.fit();
-        reportRendererSize(false);
-      });
+      if (layoutSettleTimer !== null) {
+        window.clearTimeout(layoutSettleTimer);
+      }
+      layoutSettleTimer = window.setTimeout(() => {
+        layoutSettleTimer = null;
+        if (fitFrame !== null) {
+          window.cancelAnimationFrame(fitFrame);
+        }
+        fitFrame = window.requestAnimationFrame(() => {
+          fitFrame = null;
+          if (!alive || !visibleRef.current) {
+            return;
+          }
+          renderer.refreshDisplayMetrics();
+          reportRendererSize(true);
+        });
+      }, TERMINAL_LAYOUT_SETTLE_MS);
     };
+    synchronizeLayoutRef.current = synchronizeLayout;
+    const requestFit = () => synchronizeLayout();
     const requestDisplayMetricsRefresh = () => {
       if (displayMetricsFrame !== null) {
         return;
@@ -759,8 +790,11 @@ export function LiveTerminal({
         if (!alive) {
           return;
         }
+        if (!visibleRef.current) {
+          return;
+        }
         renderer.refreshDisplayMetrics?.();
-        reportRendererSize(false);
+        reportRendererSize(true);
       });
     };
     const resizeObserver = new ResizeObserver(requestFit);
@@ -805,6 +839,12 @@ export function LiveTerminal({
       }
       window.clearTimeout(bootingBackstop);
       resizeCoordinator.dispose();
+      if (synchronizeLayoutRef.current === synchronizeLayout) {
+        synchronizeLayoutRef.current = null;
+      }
+      if (layoutSettleTimer !== null) {
+        window.clearTimeout(layoutSettleTimer);
+      }
       if (fitFrame !== null) {
         window.cancelAnimationFrame(fitFrame);
       }
@@ -826,6 +866,9 @@ export function LiveTerminal({
       // Keep the last parsed checkpoint when an output burst is still queued;
       // replacing it with a partial framebuffer would create an offset gap.
       checkpointRendererViewState(true);
+      if (checkpointViewStateRef.current) {
+        checkpointViewStateRef.current = null;
+      }
       discardTerminalOutput(renderer);
       renderer.dispose();
       flushPreviewCache();
@@ -1472,14 +1515,34 @@ export function LiveTerminal({
   }, [agentKind]);
 
   useEffect(() => {
+    visibleRef.current = visible;
+    if (visible) {
+      // Every pane visible in the active tab owns a live terminal grid. A
+      // focused-only policy leaves sibling WSL/tmux PTYs at stale dimensions
+      // when docked UI or the window changes size.
+      synchronizeLayoutRef.current?.();
+      pollNowRef.current?.();
+    } else {
+      // A warm-retained background tab stays mounted for instant switching but
+      // must not react to its off-screen layout box.
+      checkpointViewStateRef.current?.();
+    }
+  }, [visible]);
+
+  useEffect(() => {
     activeRef.current = active;
     const renderer = rendererRef.current;
     if (renderer) {
       setTerminalOutputForeground(renderer, active);
     }
     if (active) {
+      synchronizeLayoutRef.current?.();
       renderer?.focus();
       pollNowRef.current?.();
+    } else {
+      // Capture before this tree becomes eligible for cold parking. Cleanup
+      // retains the last complete checkpoint if xterm is still parsing.
+      checkpointViewStateRef.current?.();
     }
   }, [active]);
 

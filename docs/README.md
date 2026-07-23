@@ -4,6 +4,8 @@ The default documentation language is English.
 
 - [English documentation](./en/README.md)
 - [Korean documentation](./ko/README.md)
+- [Advanced agent workflows](./en/user/advanced-agent-workflows.md)
+- [고급 에이전트 워크플로](./ko/user/advanced-agent-workflows.md)
 - [Release policy](./release-policy.md)
 - [Release evidence](./release-evidence/0.1.3.md)
 

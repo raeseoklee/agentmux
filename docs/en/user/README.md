@@ -9,8 +9,9 @@ Recommended reading order:
 2. [User manual](./manual.md)
 3. [CLI guide](./cli.md)
 4. [MCP control plane](./mcp.md)
-5. [Known limitations](./known-limitations.md)
-6. [Troubleshooting](./troubleshooting.md)
+5. [Advanced agent workflows](./advanced-agent-workflows.md)
+6. [Known limitations](./known-limitations.md)
+7. [Troubleshooting](./troubleshooting.md)
 
 For release verification and operations, see
 [the operations runbook](../operations/release-runbook.md).

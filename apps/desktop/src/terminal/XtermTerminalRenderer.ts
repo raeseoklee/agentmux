@@ -746,6 +746,33 @@ export class XtermTerminalRenderer implements TerminalRenderer {
     return this.serializeAddon.serialize(options);
   }
 
+  /** Return the absolute normal-buffer viewport position for cold parking. */
+  viewportY(): number | null {
+    const terminal = this.terminal;
+    if (!terminal || terminal.buffer.active.type !== "normal") {
+      return null;
+    }
+    return terminal.buffer.active.viewportY;
+  }
+
+  /** Restore a saved viewport after serialized scrollback has been replayed. */
+  restoreViewportY(viewportY: number | null | undefined): void {
+    const terminal = this.terminal;
+    const normalizedViewportY =
+      typeof viewportY === "number" && Number.isSafeInteger(viewportY)
+        ? viewportY
+        : null;
+    if (
+      !terminal ||
+      terminal.buffer.active.type !== "normal" ||
+      normalizedViewportY === null ||
+      normalizedViewportY < 0
+    ) {
+      return;
+    }
+    terminal.scrollToLine(Math.min(normalizedViewportY, terminal.buffer.active.baseY));
+  }
+
   reset(): void {
     this.terminal?.reset();
   }

@@ -62,8 +62,8 @@ function updateWorkspaceCargoVersion(version) {
 function refreshCargoLock() {
   const result = spawnSync(
     "cargo",
-    ["metadata", "--format-version", "1", "--no-deps"],
-    { cwd: root, encoding: "utf8" },
+    ["metadata", "--format-version", "1"],
+    { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
   );
   if (result.error) {
     throw new Error(`Failed to run cargo metadata: ${result.error.message}`);

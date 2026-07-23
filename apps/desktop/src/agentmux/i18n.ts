@@ -169,6 +169,48 @@ export type I18nKey =
   | "sourceControl.unstageAll"
   | "sourceControl.unstageFile"
   | "sourceControl.updating"
+  | "sourceControl.worktreeBase"
+  | "sourceControl.worktreeBranch"
+  | "sourceControl.worktreeCommand"
+  | "sourceControl.worktreeCreateConfirm"
+  | "sourceControl.worktreeCreateDescription"
+  | "sourceControl.worktreeCreateTitle"
+  | "sourceControl.worktreeDestination"
+  | "sourceControl.worktreeList"
+  | "sourceControl.worktreeRecover"
+  | "sourceControl.worktreeRemove"
+  | "sourceControl.worktreeRemoveDescription"
+  | "sourceControl.worktreeRemoveTitle"
+  | "sourceControl.worktreeStarted"
+  | "sourceControl.worktreeStateCompleted"
+  | "sourceControl.worktreeStateFailed"
+  | "sourceControl.worktreeStatePrepared"
+  | "sourceControl.worktreeStateRemoved"
+  | "sourceControl.worktreeStateRolledBack"
+  | "sourceControl.worktreeStateRollingBack"
+  | "sourceControl.worktreeStateSessionCreated"
+  | "sourceControl.worktreeStateUnknown"
+  | "sourceControl.worktreeStateWorkspaceCreated"
+  | "sourceControl.worktreeStateWorktreeCreated"
+  | "sourceControl.reviewAdd"
+  | "sourceControl.reviewCommentOn"
+  | "sourceControl.reviewDelete"
+  | "sourceControl.reviewDeleteDescription"
+  | "sourceControl.reviewDeleteTitle"
+  | "sourceControl.reviewDoNotDeliver"
+  | "sourceControl.reviewMailbox"
+  | "sourceControl.reviewPlaceholder"
+  | "sourceControl.reviewReopen"
+  | "sourceControl.reviewResolve"
+  | "sourceControl.reviewSideContext"
+  | "sourceControl.reviewSideLeft"
+  | "sourceControl.reviewSideRight"
+  | "sourceControl.reviewSideUnknown"
+  | "sourceControl.reviewTerminal"
+  | "devServer.detectedTitle"
+  | "devServer.detectedDescription"
+  | "devServer.openInSplit"
+  | "devServer.openFailed"
   | "action.group.agent"
   | "action.group.terminal"
   | "action.group.workspace"
@@ -434,6 +476,48 @@ const en: Record<I18nKey, string> = {
   "sourceControl.unstageAll": "Unstage all",
   "sourceControl.unstageFile": "Unstage {path}",
   "sourceControl.updating": "Updating repository...",
+  "sourceControl.worktreeBase": "Base revision",
+  "sourceControl.worktreeBranch": "Branch",
+  "sourceControl.worktreeCommand": "Agent command",
+  "sourceControl.worktreeCreateConfirm": "Create worktree",
+  "sourceControl.worktreeCreateDescription": "Creates an AgentMux-owned worktree, workspace, and optional agent session as one recoverable operation.",
+  "sourceControl.worktreeCreateTitle": "Create isolated agent worktree",
+  "sourceControl.worktreeDestination": "Destination",
+  "sourceControl.worktreeList": "Agent worktrees",
+  "sourceControl.worktreeRecover": "Recover operation",
+  "sourceControl.worktreeRemove": "Remove",
+  "sourceControl.worktreeRemoveDescription": "Only AgentMux-owned worktree resources will be removed.",
+  "sourceControl.worktreeRemoveTitle": "Remove isolated worktree?",
+  "sourceControl.worktreeStarted": "Worktree operation started",
+  "sourceControl.worktreeStateCompleted": "Completed",
+  "sourceControl.worktreeStateFailed": "Failed",
+  "sourceControl.worktreeStatePrepared": "Preparing",
+  "sourceControl.worktreeStateRemoved": "Removed",
+  "sourceControl.worktreeStateRolledBack": "Rolled back",
+  "sourceControl.worktreeStateRollingBack": "Rolling back",
+  "sourceControl.worktreeStateSessionCreated": "Session created",
+  "sourceControl.worktreeStateUnknown": "Unknown status",
+  "sourceControl.worktreeStateWorkspaceCreated": "Workspace created",
+  "sourceControl.worktreeStateWorktreeCreated": "Worktree created",
+  "sourceControl.reviewAdd": "Add comment",
+  "sourceControl.reviewCommentOn": "Comment on {side} line {line}",
+  "sourceControl.reviewDelete": "Delete",
+  "sourceControl.reviewDeleteDescription": "This removes stored review comments.",
+  "sourceControl.reviewDeleteTitle": "Delete review thread?",
+  "sourceControl.reviewDoNotDeliver": "Do not deliver yet",
+  "sourceControl.reviewMailbox": "Mailbox",
+  "sourceControl.reviewPlaceholder": "Write review feedback",
+  "sourceControl.reviewReopen": "Reopen",
+  "sourceControl.reviewResolve": "Resolve",
+  "sourceControl.reviewSideContext": "context",
+  "sourceControl.reviewSideLeft": "left",
+  "sourceControl.reviewSideRight": "right",
+  "sourceControl.reviewSideUnknown": "unknown side",
+  "sourceControl.reviewTerminal": "Terminal",
+  "devServer.detectedTitle": "Development server detected",
+  "devServer.detectedDescription": "{url} is ready to open beside the terminal.",
+  "devServer.openInSplit": "Open in split",
+  "devServer.openFailed": "Could not open the development server",
   "statusbar.surfaceSummary": "{surfaces} surfaces · {terminals} terminals · {running} running",
   "action.group.agent": "Agent",
   "action.group.terminal": "Terminal",
@@ -778,6 +862,48 @@ const ko: Record<I18nKey, string> = {
   "sourceControl.unstageAll": "모두 스테이징 해제",
   "sourceControl.unstageFile": "{path} 스테이징 해제",
   "sourceControl.updating": "저장소 변경 적용 중...",
+  "sourceControl.worktreeBase": "기준 리비전",
+  "sourceControl.worktreeBranch": "브랜치",
+  "sourceControl.worktreeCommand": "에이전트 명령",
+  "sourceControl.worktreeCreateConfirm": "worktree 만들기",
+  "sourceControl.worktreeCreateDescription": "AgentMux 소유 worktree, 워크스페이스, 선택적 에이전트 세션을 하나의 복구 가능한 작업으로 만듭니다.",
+  "sourceControl.worktreeCreateTitle": "격리된 에이전트 worktree 만들기",
+  "sourceControl.worktreeDestination": "대상 경로",
+  "sourceControl.worktreeList": "에이전트 worktree",
+  "sourceControl.worktreeRecover": "작업 복구",
+  "sourceControl.worktreeRemove": "제거",
+  "sourceControl.worktreeRemoveDescription": "AgentMux가 소유한 worktree 리소스만 제거됩니다.",
+  "sourceControl.worktreeRemoveTitle": "격리된 worktree를 제거할까요?",
+  "sourceControl.worktreeStarted": "worktree 작업 시작됨",
+  "sourceControl.worktreeStateCompleted": "완료됨",
+  "sourceControl.worktreeStateFailed": "실패함",
+  "sourceControl.worktreeStatePrepared": "준비 중",
+  "sourceControl.worktreeStateRemoved": "제거됨",
+  "sourceControl.worktreeStateRolledBack": "되돌림 완료",
+  "sourceControl.worktreeStateRollingBack": "되돌리는 중",
+  "sourceControl.worktreeStateSessionCreated": "세션 생성됨",
+  "sourceControl.worktreeStateUnknown": "알 수 없는 상태",
+  "sourceControl.worktreeStateWorkspaceCreated": "워크스페이스 생성됨",
+  "sourceControl.worktreeStateWorktreeCreated": "worktree 생성됨",
+  "sourceControl.reviewAdd": "코멘트 추가",
+  "sourceControl.reviewCommentOn": "{side} {line}번 줄에 코멘트",
+  "sourceControl.reviewDelete": "삭제",
+  "sourceControl.reviewDeleteDescription": "저장된 리뷰 코멘트를 제거합니다.",
+  "sourceControl.reviewDeleteTitle": "리뷰 thread를 삭제할까요?",
+  "sourceControl.reviewDoNotDeliver": "아직 전달하지 않음",
+  "sourceControl.reviewMailbox": "메일박스",
+  "sourceControl.reviewPlaceholder": "리뷰 피드백 작성",
+  "sourceControl.reviewReopen": "다시 열기",
+  "sourceControl.reviewResolve": "해결",
+  "sourceControl.reviewSideContext": "문맥",
+  "sourceControl.reviewSideLeft": "왼쪽",
+  "sourceControl.reviewSideRight": "오른쪽",
+  "sourceControl.reviewSideUnknown": "알 수 없는 쪽",
+  "sourceControl.reviewTerminal": "터미널",
+  "devServer.detectedTitle": "개발 서버 감지됨",
+  "devServer.detectedDescription": "{url}을(를) 터미널 옆에서 열 수 있습니다.",
+  "devServer.openInSplit": "분할로 열기",
+  "devServer.openFailed": "개발 서버를 열지 못했습니다",
 };
 
 const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {

@@ -1,3 +1,14 @@
+pub mod agent_hooks;
+pub mod development_server;
+
+pub use agent_hooks::{
+    AgentHookNormalizer, AgentHookNormalizerConfig, AgentHookProvider, AgentHookSource,
+    AgentHookState, AgentHookValidationError, NormalizedAgentHookEvent,
+};
+pub use development_server::{
+    DevelopmentServerUrlCandidate, PtyStreamMetadata, PtyUrlDetector, PtyUrlDetectorConfig,
+};
+
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;

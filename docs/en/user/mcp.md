@@ -26,9 +26,9 @@ Always start with the narrowest profile that can complete the workflow.
 
 | Profile | Capabilities | Recommended use |
 | --- | --- | --- |
-| `read` | Lists workspaces, sessions, agent attention, pane workers, integration readiness, team messages and tasks; reads terminal output, browser snapshots, events, context, and diagnostics. | Monitoring, status collection, and first-time client setup. |
-| `standard` | Includes `read`, then adds pane focus, terminal open/split/input, pane-worker start/send, browser open/navigation/click/fill, team messaging/task updates, and agent-state updates. This is a trusted write and command-execution profile: terminal tools can run arbitrary commands and browser tools can mutate external systems. | Trusted interactive agent workflows that require command execution or writes. |
-| `full` | Includes `standard`, then adds adaptive-team worker release, pane-worker stop, integration shim setup, workspace/pane/surface close, session termination, config updates, browser JavaScript evaluation, action execution, and notification clearing. | Trusted operator automation that genuinely needs destructive or high-impact actions. |
+| `read` | Lists workspaces, sessions, agent attention, pane workers, integration readiness, worktree operations, Git status/diffs/reviews, development-server candidates, team messages, and tasks; reads terminal output, browser snapshots, events, context, and diagnostics. | Monitoring, status collection, review, and first-time client setup. |
+| `standard` | Includes `read`, then adds pane focus, terminal open/split/input, pane-worker start/send, worktree create/recovery, caller-scoped Git stage/unstage/non-amend commit, caller-owned review authoring/delivery/comment deletion, development-server split opening, browser operations, team messaging/task updates, and agent-state updates. This is a trusted write and command-execution profile. | Trusted interactive agent workflows that require command execution or writes constrained to the caller's immutable pane and repository context. |
+| `full` | Includes `standard`, then adds worker release, worktree removal, repository-wide Git stage/unstage, discard, administrative commit authority, review-thread deletion, integration setup, workspace/pane/surface close, session termination, config updates, browser JavaScript evaluation, action execution, and notification clearing. | Trusted operator automation that genuinely needs destructive, cross-context, or high-impact actions. |
 
 `standard` is not a safe or non-destructive profile. Grant it only to a client
 that may execute commands and change terminal, browser, and shared coordination
@@ -45,6 +45,28 @@ so it does not appear in desktop control-plane audit records. It writes shims to
 the integration directory selected by `AGENTMUX_CMUXTERM_HOME`, the compatible
 `CMUXTERM_HOME`, or the default user directory. With `add_to_user_path: true`,
 it also modifies the Windows user `PATH`.
+
+## Git, Worktree, Review, and Development-Server Tools
+
+The five-track workflow adds the following MCP surfaces. Read tools are safe for
+monitoring, but every write remains subject to the selected profile and the
+desktop control-plane audit log.
+
+| Workflow | `read` | `standard` | `full` |
+| --- | --- | --- | --- |
+| Git | `git_status_summary`, `git_status_page`, `git_diff` | `git_stage`, `git_unstage`, and non-amend `git_commit`, all constrained to the caller's immutable pane and repository context | `git_stage_all`, `git_unstage_all`, `git_discard`, amend and cross-context commit authority |
+| Agent worktrees | `agent_worktree_list` | `agent_worktree_create`, `agent_worktree_recover` | `agent_worktree_remove` |
+| Diff review | `git_review_thread_list`, `git_review_comment_list` | Create/update caller-owned threads and comments; mark owned threads stale; deliver owned threads to allowed targets; delete owned comments | Delete threads and administer reviews outside the caller-owned context |
+| Development servers | `development_server_candidate_list` | Dismiss a candidate or open it in a browser split | - |
+
+Worktree creation is a recoverable saga: Git worktree creation, AgentMux
+workspace creation, terminal startup, and agent launch are compensated in
+reverse order when a later step fails. Review delivery is explicit because it
+writes to an agent mailbox or terminal. The `standard` profile may deliver only
+caller-owned reviews to targets allowed by its immutable pane context; `full`
+retains administrative cross-context authority. See
+[Advanced agent workflows](./advanced-agent-workflows.md) for examples and
+recovery guidance.
 
 ## Agent Pane Workers and tmux Integrations
 

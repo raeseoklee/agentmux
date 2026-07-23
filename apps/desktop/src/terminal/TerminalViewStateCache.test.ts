@@ -7,14 +7,34 @@ describe("TerminalViewStateCache", () => {
     expect(cache.write("session-1", {
       serialized: "\u001b[31mhistory\u001b[0m",
       outputOffset: 42,
+      viewportY: 18,
       updatedAt: 100,
     })).toBe(true);
 
     expect(cache.read("session-1")).toEqual({
       serialized: "\u001b[31mhistory\u001b[0m",
       outputOffset: 42,
+      viewportY: 18,
       updatedAt: 100,
     });
+  });
+
+  it("rejects invalid viewport positions without discarding the prior snapshot", () => {
+    const cache = new TerminalViewStateCache();
+    cache.write("session-1", {
+      serialized: "history",
+      outputOffset: 4,
+      viewportY: 3,
+      updatedAt: 1,
+    });
+
+    expect(cache.write("session-1", {
+      serialized: "new history",
+      outputOffset: 5,
+      viewportY: -1,
+      updatedAt: 2,
+    })).toBe(false);
+    expect(cache.read("session-1")?.viewportY).toBe(3);
   });
 
   it("retains live sessions until lifecycle cleanup removes them", () => {

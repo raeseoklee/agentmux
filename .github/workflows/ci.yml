@@ -64,6 +64,46 @@ jobs:
       - run: npm run tauri:build -- --debug --no-bundle --ci
         working-directory: apps/desktop
 
+  desktop-ui:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: apps/desktop
+      - name: Install Playwright Chromium
+        run: npm exec -- playwright install chromium
+        working-directory: apps/desktop
+      - name: Run complete desktop Playwright UI suite
+        run: npm run test:ui
+        working-directory: apps/desktop
+
+  desktop-performance-gates:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-performance-gates
+          cache-on-failure: true
+      - name: Prepare desktop sidecars
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tools/prepare-desktop-bundle-binaries.ps1 -BuildProfile Debug
+      - name: Prepare desktop resource stub
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/desktop/dist | Out-Null
+          Set-Content -Path apps/desktop/dist/index.html -Value '<!doctype html><html><body>ci</body></html>' -Encoding UTF8
+      - name: Run performance gates
+        run: npm run perf:gates:ci
+
   docs-check:
     runs-on: windows-latest
     steps:

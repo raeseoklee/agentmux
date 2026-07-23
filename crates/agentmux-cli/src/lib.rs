@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -18,24 +18,32 @@ use agentmux_backend_wsl::{
 use agentmux_core::{RuntimeControlPlane, TerminalRuntime};
 use agentmux_ipc::{
     default_control_token_path, read_control_token, AckResult, ActionListParams, ActionListResult,
-    ActionRunParams, ActionRunResult, AgentAttentionListResult, AgentListAttentionParams,
-    AgentSetStateParams, AgentStateResult, AgentTeamRecoverParams, AgentTeamRecoverResult,
-    AgentTeamReserveParams, AgentTeamReserveResult, AgentTeamSettleParams, AgentTelemetry,
-    AppConfigDiagnosticsParams, AppConfigDiagnosticsResult, AppConfigGetParams,
-    AppConfigMigrateProjectParams, AppConfigMigrateProjectResult, AppConfigResult,
-    BrowserActionResult, BrowserCheckParams, BrowserClickParams, BrowserConsoleParams,
-    BrowserConsoleResult, BrowserCookiesResult, BrowserDiagnosticsParams, BrowserDiagnosticsResult,
-    BrowserDialogsParams, BrowserDialogsResult, BrowserDomSnapshotParams, BrowserDomSnapshotResult,
-    BrowserDownloadsParams, BrowserDownloadsResult, BrowserErrorsParams, BrowserErrorsResult,
-    BrowserEvaluateParams, BrowserEvaluateResult, BrowserFillParams, BrowserFindParams,
-    BrowserFindResult, BrowserFocusParams, BrowserFramesResult, BrowserGetParams, BrowserGetResult,
-    BrowserHighlightParams, BrowserHistoryResult, BrowserHoverParams, BrowserNavigateParams,
-    BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams, BrowserScreenshotResult,
-    BrowserScrollParams, BrowserSelectParams, BrowserStorageResult, BrowserSurfaceParams,
-    BrowserTypeParams, BrowserWaitForSelectorParams, BrowserWaitForSelectorResult,
-    BrowserZoomParams, ControlCaller, ControlError, DiagnosticsExportResult, EnvVarParam,
-    ErrorCode, EventFrame, EventPollParams, EventPollResult, EventSubscribeParams,
-    EventSubscribeResult, NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
+    ActionRunParams, ActionRunResult, AgentAttentionListResult, AgentHookStateParams,
+    AgentListAttentionParams, AgentSetStateParams, AgentStateResult, AgentTeamRecoverParams,
+    AgentTeamRecoverResult, AgentTeamReserveParams, AgentTeamReserveResult, AgentTeamSettleParams,
+    AgentTelemetry, AgentWorktreeCreateParams, AgentWorktreeListParams, AgentWorktreeRecoverParams,
+    AgentWorktreeRemoveParams, AppConfigDiagnosticsParams, AppConfigDiagnosticsResult,
+    AppConfigGetParams, AppConfigMigrateProjectParams, AppConfigMigrateProjectResult,
+    AppConfigResult, BrowserActionResult, BrowserCheckParams, BrowserClickParams,
+    BrowserConsoleParams, BrowserConsoleResult, BrowserCookiesResult, BrowserDiagnosticsParams,
+    BrowserDiagnosticsResult, BrowserDialogsParams, BrowserDialogsResult, BrowserDomSnapshotParams,
+    BrowserDomSnapshotResult, BrowserDownloadsParams, BrowserDownloadsResult, BrowserErrorsParams,
+    BrowserErrorsResult, BrowserEvaluateParams, BrowserEvaluateResult, BrowserFillParams,
+    BrowserFindParams, BrowserFindResult, BrowserFocusParams, BrowserFramesResult,
+    BrowserGetParams, BrowserGetResult, BrowserHighlightParams, BrowserHistoryResult,
+    BrowserHoverParams, BrowserNavigateParams, BrowserNavigationResult, BrowserPressParams,
+    BrowserScreenshotParams, BrowserScreenshotResult, BrowserScrollParams, BrowserSelectParams,
+    BrowserStorageResult, BrowserSurfaceParams, BrowserTypeParams, BrowserWaitForSelectorParams,
+    BrowserWaitForSelectorResult, BrowserZoomParams, ControlCaller, ControlError,
+    DevelopmentServerCandidateDismissParams, DevelopmentServerCandidateListParams,
+    DevelopmentServerCandidateOpenInSplitParams, DiagnosticsExportResult, EnvVarParam, ErrorCode,
+    EventFrame, EventPollParams, EventPollResult, EventSubscribeParams, EventSubscribeResult,
+    GitAllMutationParams, GitCommitParams, GitDiffParams, GitPathMutationParams,
+    GitRepositoryParams, GitReviewCommentCreateParams, GitReviewCommentIdParams,
+    GitReviewCommentListParams, GitReviewCommentUpdateParams, GitReviewLineAnchor,
+    GitReviewThreadCreateParams, GitReviewThreadDeliverParams, GitReviewThreadIdParams,
+    GitReviewThreadListParams, GitReviewThreadMarkStaleParams, GitReviewThreadUpdateParams,
+    GitStatusPageParams, NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
     NotificationCreateParams, NotificationDismissParams, NotificationListParams,
     NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
     PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, ProfileListResult,
@@ -55,11 +63,18 @@ use agentmux_ipc::{
     WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
     DEFAULT_CONTROL_PIPE_NAME,
 };
-use tungstenite::{accept_hdr, Error as WsError, Message as WsMessage};
+use tungstenite::handshake::server::ErrorResponse as WsErrorResponse;
+use tungstenite::http::StatusCode as WsStatusCode;
+use tungstenite::protocol::WebSocketConfig;
+use tungstenite::{accept_hdr_with_config, Error as WsError, Message as WsMessage};
 
+mod agent_hooks;
 mod mcp;
 mod mcp_config;
 mod mcp_http;
+mod server_local_git;
+
+use server_local_git::ServerLocalGit;
 
 const AGENTMUX_CONFIG_SCHEMA_JSON: &str =
     include_str!("../../../docs/en/schemas/agentmux.config.schema.json");
@@ -76,8 +91,10 @@ pub const COMMAND_FAMILIES: &[&str] = &[
     "notification",
     "events",
     "browser",
+    "git",
     "mcp",
     "agent",
+    "dev-server",
     "actions",
     "diagnostics",
     "session",
@@ -124,8 +141,10 @@ const PUBLIC_COMMAND_FAMILIES: &[&str] = &[
     "notification",
     "events",
     "browser",
+    "git",
     "mcp",
     "agent",
+    "dev-server",
     "actions",
     "diagnostics",
     "session",
@@ -163,6 +182,8 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} session terminate <id> --mode soft --yes\n",
             "Try: {program_name} agent list --workspace <id> --json\n",
             "Try: {program_name} agent set-state <session-id> waiting_for_input --reason \"needs input\"\n",
+            "Try: {program_name} agent hooks preview --provider all\n",
+            "Try: {program_name} agent hooks install --provider all --yes\n",
             "Try: {program_name} integrations install-shims --user-path\n",
             "Try: {program_name} integrations doctor claude-teams --distribution Ubuntu --json\n",
             "Try: {program_name} integrations launch claude-teams\n",
@@ -176,6 +197,11 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} browser zoom <surface-id> 125\n",
             "Try: {program_name} browser wait-for-selector <surface-id> #ready --timeout-ms 5000\n",
             "Try: {program_name} browser evaluate <surface-id> [--frame <frame-id>] -- document.title\n",
+            "Try: {program_name} git status --workspace <id> --json\n",
+            "Try: {program_name} git page --workspace <id> --limit 200 --json\n",
+            "Try: {program_name} agent worktree create --workspace <id> --branch agent/fix --destination D:\\work\\agent-fix --idempotency-key <key> -- cmd.exe /d /q\n",
+            "Try: {program_name} agent hook-state --workspace <id> --session <id> --sequence 1 --state running --source claude_hook --observed-at 2026-07-23T00:00:00Z --json\n",
+            "Try: {program_name} dev-server candidate list --workspace <id> --json\n",
             "Try: {program_name} mcp serve --profile read\n",
             "Try: {program_name} mcp doctor --json\n",
             "Try: {program_name} ssh deploy@host.example:22 --workspace <id>\n",
@@ -294,6 +320,16 @@ where
             let options = parse_agent_set_state_options(rest)?;
             run_agent_set_state(options, &mut output)
         }
+        [family, command, rest @ ..] if family == "agent" && command == "hook-state" => {
+            let (invoke, params) = parse_agent_hook_state_options(rest)?;
+            run_control_command("agent.hook_state", &params, invoke, &mut output)
+        }
+        [family, command, rest @ ..] if family == "agent" && command == "hooks" => {
+            agent_hooks::run_command(rest, &mut output)
+        }
+        [family, command, rest @ ..] if family == "agent" && command == "worktree" => {
+            run_agent_worktree_command(rest, &mut output)
+        }
         [family, command, rest @ ..] if family == "agent" && command == "get-state" => {
             let options = parse_agent_get_state_options(rest)?;
             run_agent_get_state(options, &mut output)
@@ -357,6 +393,14 @@ where
         [family, command, rest @ ..] if family == "actions" && command == "run" => {
             let options = parse_action_run_options(rest)?;
             run_actions_run(options, &mut output)
+        }
+        [family, command, rest @ ..] if family == "git" => {
+            run_git_command(command, rest, &mut output)
+        }
+        [family, command, action, rest @ ..]
+            if family == "dev-server" && command == "candidate" =>
+        {
+            run_dev_server_candidate_command(action, rest, &mut output)
         }
         [family, command, rest @ ..] if family == "browser" => {
             run_browser_command(command, rest, &mut output)
@@ -955,6 +999,18 @@ struct ServerTmuxCheckRequest {
     distribution: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ServerWebSocketTicketRequest {
+    session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ServerControlRequest {
+    method: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AgentSetStateOptions {
     invoke: ControlInvokeOptions,
@@ -1330,6 +1386,1591 @@ fn parse_no_params_control_options(
         )));
     }
     Ok(invoke)
+}
+
+// Five-track commands intentionally remain a thin, validated facade over the
+// authenticated desktop control plane. The CLI never shells out to Git.
+fn parse_agent_hook_state_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, AgentHookStateParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut session_id = None;
+    let mut sequence = None;
+    let mut state = None;
+    let mut reason = None;
+    let mut source = None;
+    let mut observed_at = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--session" | "--session-id" => {
+                session_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--sequence" => {
+                sequence = Some(parse_u64_option(
+                    option_value(args, index, "--sequence")?,
+                    "--sequence",
+                )?);
+                index += 2;
+            }
+            "--state" => {
+                state = Some(option_value(args, index, "--state")?.to_string());
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(option_value(args, index, "--reason")?.to_string());
+                index += 2;
+            }
+            "--source" => {
+                source = Some(option_value(args, index, "--source")?.to_string());
+                index += 2;
+            }
+            "--observed-at" => {
+                observed_at = Some(option_value(args, index, "--observed-at")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown agent hook-state option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "agent hook-state does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    let state = required_cli_value(state, "agent hook-state requires --state.")?;
+    validate_agent_hook_state(&state)?;
+    let source = required_cli_value(source, "agent hook-state requires --source.")?;
+    validate_agent_hook_source(&source)?;
+    Ok((
+        invoke,
+        AgentHookStateParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "agent hook-state requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            session_id: required_cli_value(session_id, "agent hook-state requires --session.")?,
+            sequence: sequence.ok_or_else(|| {
+                CliError::InvalidArgs("agent hook-state requires --sequence.".to_string())
+            })?,
+            state,
+            reason,
+            source,
+            observed_at: required_cli_value(
+                observed_at,
+                "agent hook-state requires --observed-at.",
+            )?,
+            telemetry: None,
+        },
+    ))
+}
+
+fn run_git_command<W>(command: &str, args: &[String], output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    match command {
+        "status" => { let (invoke, params) = parse_git_repository_options(args, "git status")?; run_control_command("git.status_summary", &params, invoke, output) }
+        "page" => { let (invoke, params) = parse_git_page_options(args)?; run_control_command("git.status_page", &params, invoke, output) }
+        "diff" => { let (invoke, params) = parse_git_diff_options(args)?; run_control_command("git.diff", &params, invoke, output) }
+        "stage" | "unstage" | "discard" => {
+            let (invoke, params, confirmed) = parse_git_path_mutation_options(args, command)?;
+            if command == "discard" { require_confirmation(confirmed, "git discard requires --yes because it permanently discards local changes.")?; }
+            run_control_command(&format!("git.{command}"), &params, invoke, output)
+        }
+        "stage-all" | "unstage-all" => {
+            let (invoke, params) = parse_git_all_mutation_options(args, command)?;
+            let method = if command == "stage-all" { "git.stage_all" } else { "git.unstage_all" };
+            run_control_command(method, &params, invoke, output)
+        }
+        "commit" => { let (invoke, params) = parse_git_commit_options(args)?; run_control_command("git.commit", &params, invoke, output) }
+        "review" => run_git_review_command(args, output),
+        other => Err(CliError::InvalidArgs(format!("unknown git command '{other}'. Expected status, page, diff, stage, unstage, stage-all, unstage-all, discard, commit, or review."))),
+    }
+}
+
+fn run_agent_worktree_command<W>(args: &[String], output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let (command, rest) = args.split_first().ok_or_else(|| {
+        CliError::InvalidArgs(
+            "agent worktree requires create, list, recover, or remove.".to_string(),
+        )
+    })?;
+    match command.as_str() {
+        "create" => {
+            let (invoke, params) = parse_worktree_create_options(rest)?;
+            run_control_command("agent.worktree.create", &params, invoke, output)
+        }
+        "list" => {
+            let (invoke, params) = parse_worktree_list_options(rest)?;
+            run_control_command("agent.worktree.list", &params, invoke, output)
+        }
+        "recover" => {
+            let (invoke, params) = parse_worktree_recover_options(rest)?;
+            run_control_command("agent.worktree.recover", &params, invoke, output)
+        }
+        "remove" => {
+            let (invoke, params, confirmed) = parse_worktree_remove_options(rest)?;
+            require_confirmation(confirmed, "agent worktree remove requires --yes because it removes an AgentMux-managed worktree.")?;
+            run_control_command("agent.worktree.remove", &params, invoke, output)
+        }
+        other => Err(CliError::InvalidArgs(format!(
+            "unknown agent worktree command '{other}'."
+        ))),
+    }
+}
+
+fn run_dev_server_candidate_command<W>(
+    action: &str,
+    args: &[String],
+    output: &mut W,
+) -> Result<(), CliError>
+where
+    W: Write,
+{
+    match action {
+        "list" => {
+            let (invoke, params) = parse_dev_server_candidate_list_options(args)?;
+            run_control_command("dev_server.candidate.list", &params, invoke, output)
+        }
+        "dismiss" => {
+            let (invoke, params) = parse_dev_server_candidate_dismiss_options(args)?;
+            run_control_command("dev_server.candidate.dismiss", &params, invoke, output)
+        }
+        "open" => {
+            let (invoke, params) = parse_dev_server_candidate_open_options(args)?;
+            run_control_command(
+                "dev_server.candidate.open_in_split",
+                &params,
+                invoke,
+                output,
+            )
+        }
+        other => Err(CliError::InvalidArgs(format!(
+            "unknown dev-server candidate action '{other}'. Expected list, dismiss, or open."
+        ))),
+    }
+}
+
+fn parse_git_repository_options(
+    args: &[String],
+    command_name: &str,
+) -> Result<(ControlInvokeOptions, GitRepositoryParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown {command_name} option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "{command_name} does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitRepositoryParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                &format!("{command_name} requires --workspace or AGENTMUX_WORKSPACE_ID."),
+            )?,
+            pane_id,
+            repository_id,
+        },
+    ))
+}
+
+fn parse_git_page_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitStatusPageParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut state = None;
+    let mut query = None;
+    let mut cursor = None;
+    let mut limit = None;
+    let mut generation = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--state" => {
+                state = Some(option_value(args, index, "--state")?.to_string());
+                index += 2;
+            }
+            "--query" => {
+                query = Some(option_value(args, index, "--query")?.to_string());
+                index += 2;
+            }
+            "--cursor" => {
+                cursor = Some(option_value(args, index, "--cursor")?.to_string());
+                index += 2;
+            }
+            "--limit" => {
+                limit = Some(parse_usize_option(
+                    option_value(args, index, "--limit")?,
+                    "--limit",
+                )?);
+                index += 2;
+            }
+            "--generation" => {
+                generation = Some(parse_u64_option(
+                    option_value(args, index, "--generation")?,
+                    "--generation",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git page option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "git page does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitStatusPageParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "git page requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            pane_id,
+            repository_id,
+            state,
+            query,
+            cursor,
+            limit,
+            generation,
+        },
+    ))
+}
+
+fn parse_git_diff_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitDiffParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut path = None;
+    let mut stage = None;
+    let mut context_lines = None;
+    let mut generation = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--stage" => {
+                stage = Some(option_value(args, index, "--stage")?.to_string());
+                index += 2;
+            }
+            "--context" | "--context-lines" => {
+                context_lines = Some(parse_u16_option(
+                    option_value(args, index, args[index].as_str())?,
+                    args[index].as_str(),
+                )?);
+                index += 2;
+            }
+            "--generation" => {
+                generation = Some(parse_u64_option(
+                    option_value(args, index, "--generation")?,
+                    "--generation",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git diff option '{value}'."
+                )))
+            }
+            value => {
+                if path.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git diff accepts exactly one path.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitDiffParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "git diff requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            pane_id,
+            repository_id,
+            path: required_cli_value(path, "git diff requires a path.")?,
+            stage,
+            context_lines,
+            generation,
+        },
+    ))
+}
+
+fn parse_git_path_mutation_options(
+    args: &[String],
+    command: &str,
+) -> Result<(ControlInvokeOptions, GitPathMutationParams, bool), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut paths = Vec::new();
+    let mut idempotency_key = None;
+    let mut confirmed = false;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(option_value(args, index, "--idempotency-key")?.to_string());
+                index += 2;
+            }
+            "--yes" | "--confirm" => {
+                confirmed = true;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git {command} option '{value}'."
+                )))
+            }
+            value => {
+                paths.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Err(CliError::InvalidArgs(format!(
+            "git {command} requires at least one path."
+        )));
+    }
+    Ok((
+        invoke,
+        GitPathMutationParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                &format!("git {command} requires --workspace or AGENTMUX_WORKSPACE_ID."),
+            )?,
+            pane_id,
+            repository_id,
+            paths,
+            idempotency_key,
+        },
+        confirmed,
+    ))
+}
+
+fn parse_git_all_mutation_options(
+    args: &[String],
+    command: &str,
+) -> Result<(ControlInvokeOptions, GitAllMutationParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut idempotency_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(option_value(args, index, "--idempotency-key")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git {command} option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "git {command} does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitAllMutationParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                &format!("git {command} requires --workspace or AGENTMUX_WORKSPACE_ID."),
+            )?,
+            pane_id,
+            repository_id,
+            idempotency_key,
+        },
+    ))
+}
+
+fn parse_git_commit_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitCommitParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut message = None;
+    let mut amend = false;
+    let mut idempotency_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--message" | "-m" => {
+                message = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--amend" => {
+                amend = true;
+                index += 1;
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(option_value(args, index, "--idempotency-key")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git commit option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "git commit does not accept argument '{value}'; use --message."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitCommitParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "git commit requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            pane_id,
+            repository_id,
+            message: required_cli_value(message, "git commit requires --message.")?,
+            amend,
+            idempotency_key,
+        },
+    ))
+}
+
+fn parse_worktree_create_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, AgentWorktreeCreateParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut branch = None;
+    let mut destination = None;
+    let mut base_revision = None;
+    let mut create_branch = false;
+    let mut backend = None;
+    let mut backend_profile = None;
+    let mut cwd = None;
+    let mut idempotency_key = None;
+    let mut command = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--" {
+            command.extend_from_slice(&args[index + 1..]);
+            break;
+        }
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace"=>{workspace_id=Some(option_value(args,index,"--workspace")?.to_string());index+=2;}
+            "--branch"=>{branch=Some(option_value(args,index,"--branch")?.to_string());index+=2;}
+            "--destination"=>{destination=Some(option_value(args,index,"--destination")?.to_string());index+=2;}
+            "--base"|"--base-revision"=>{base_revision=Some(option_value(args,index,args[index].as_str())?.to_string());index+=2;}
+            "--create-branch"=>{create_branch=true;index+=1;}
+            "--backend"=>{backend=Some(option_value(args,index,"--backend")?.to_string());index+=2;}
+            "--backend-profile"|"--distribution"=>{backend_profile=Some(option_value(args,index,args[index].as_str())?.to_string());index+=2;}
+            "--cwd"=>{cwd=Some(option_value(args,index,"--cwd")?.to_string());index+=2;}
+            "--idempotency-key"=>{idempotency_key=Some(option_value(args,index,"--idempotency-key")?.to_string());index+=2;}
+            value if value.starts_with("--")=>return Err(CliError::InvalidArgs(format!("unknown agent worktree create option '{value}'."))),
+            value=>return Err(CliError::InvalidArgs(format!("agent worktree create does not accept argument '{value}'; use -- before the command argv."))),
+        }
+    }
+    Ok((
+        invoke,
+        AgentWorktreeCreateParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "agent worktree create requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            branch: required_cli_value(branch, "agent worktree create requires --branch.")?,
+            destination: required_cli_value(
+                destination,
+                "agent worktree create requires --destination.",
+            )?,
+            base_revision,
+            create_branch,
+            backend,
+            backend_profile,
+            command,
+            cwd,
+            idempotency_key: required_cli_value(
+                idempotency_key,
+                "agent worktree create requires --idempotency-key for safe retries.",
+            )?,
+        },
+    ))
+}
+
+fn parse_worktree_list_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, AgentWorktreeListParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut include_completed = false;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--include-completed" => {
+                include_completed = true;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown agent worktree list option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "agent worktree list does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        AgentWorktreeListParams {
+            workspace_id,
+            include_completed,
+        },
+    ))
+}
+
+fn parse_worktree_recover_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, AgentWorktreeRecoverParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut operation_id = None;
+    let mut idempotency_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--operation" | "--operation-id" => {
+                operation_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(option_value(args, index, "--idempotency-key")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown agent worktree recover option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "agent worktree recover does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    if operation_id.is_none() && idempotency_key.is_none() {
+        return Err(CliError::InvalidArgs(
+            "agent worktree recover requires --operation-id or --idempotency-key.".to_string(),
+        ));
+    }
+    Ok((
+        invoke,
+        AgentWorktreeRecoverParams {
+            operation_id,
+            idempotency_key,
+        },
+    ))
+}
+
+fn parse_worktree_remove_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, AgentWorktreeRemoveParams, bool), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut worktree_id = None;
+    let mut force = false;
+    let mut idempotency_key = None;
+    let mut confirmed = false;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--force" => {
+                force = true;
+                index += 1;
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(option_value(args, index, "--idempotency-key")?.to_string());
+                index += 2;
+            }
+            "--yes" | "--confirm" => {
+                confirmed = true;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown agent worktree remove option '{value}'."
+                )))
+            }
+            value => {
+                if worktree_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "agent worktree remove accepts exactly one worktree id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        AgentWorktreeRemoveParams {
+            worktree_id: required_cli_value(
+                worktree_id,
+                "agent worktree remove requires a worktree id.",
+            )?,
+            force,
+            idempotency_key,
+        },
+        confirmed,
+    ))
+}
+
+fn run_git_review_command<W>(args: &[String], output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let (kind, rest) = args.split_first().ok_or_else(|| {
+        CliError::InvalidArgs("git review requires thread or comment.".to_string())
+    })?;
+    let (action, rest) = rest
+        .split_first()
+        .ok_or_else(|| CliError::InvalidArgs(format!("git review {kind} requires an action.")))?;
+    match (kind.as_str(),action.as_str()) {
+        ("thread","list")=>{let(i,p)=parse_review_thread_list_options(rest)?;run_control_command("git.review_thread.list",&p,i,output)}
+        ("thread","create")=>{let(i,p)=parse_review_thread_create_options(rest)?;run_control_command("git.review_thread.create",&p,i,output)}
+        ("thread","update")=>{let(i,p)=parse_review_thread_update_options(rest,false)?;run_control_command("git.review_thread.update",&p,i,output)}
+        ("thread","resolve")=>{let(i,p)=parse_review_thread_update_options(rest,true)?;run_control_command("git.review_thread.update",&p,i,output)}
+        ("thread","delete")=>{let(i,p)=parse_review_thread_id_options(rest,"git review thread delete")?;run_control_command("git.review_thread.delete",&p,i,output)}
+        ("thread","stale")=>{let(i,p)=parse_review_thread_stale_options(rest)?;run_control_command("git.review_thread.mark_stale",&p,i,output)}
+        ("thread","deliver")=>{let(i,p)=parse_review_thread_deliver_options(rest)?;run_control_command("git.review_thread.deliver",&p,i,output)}
+        ("comment","list")=>{let(i,p)=parse_review_comment_list_options(rest)?;run_control_command("git.review_comment.list",&p,i,output)}
+        ("comment","create")=>{let(i,p)=parse_review_comment_create_options(rest)?;run_control_command("git.review_comment.create",&p,i,output)}
+        ("comment","update")=>{let(i,p)=parse_review_comment_update_options(rest)?;run_control_command("git.review_comment.update",&p,i,output)}
+        ("comment","delete")=>{let(i,p)=parse_review_comment_id_options(rest,"git review comment delete")?;run_control_command("git.review_comment.delete",&p,i,output)}
+        _=>Err(CliError::InvalidArgs("unknown git review command. Use thread list|create|update|resolve|delete|stale|deliver or comment list|create|update|delete.".to_string())),
+    }
+}
+
+fn parse_review_thread_list_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewThreadListParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut path = None;
+    let mut include_resolved = false;
+    let mut include_stale = false;
+    let mut limit = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--path" => {
+                path = Some(option_value(args, index, "--path")?.to_string());
+                index += 2;
+            }
+            "--include-resolved" => {
+                include_resolved = true;
+                index += 1;
+            }
+            "--include-stale" => {
+                include_stale = true;
+                index += 1;
+            }
+            "--limit" => {
+                limit = Some(parse_usize_option(
+                    option_value(args, index, "--limit")?,
+                    "--limit",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review thread list option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "git review thread list does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitReviewThreadListParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "git review thread list requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            pane_id,
+            repository_id,
+            path,
+            include_resolved,
+            include_stale,
+            limit,
+        },
+    ))
+}
+
+fn parse_review_thread_create_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewThreadCreateParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
+    let mut repository_id = None;
+    let mut path = None;
+    let mut side = None;
+    let mut line = None;
+    let mut start_line = None;
+    let mut base_revision = None;
+    let mut head_revision = None;
+    let mut hunk_header = None;
+    let mut diff_hash = None;
+    let mut body = None;
+    let mut author_session_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--repository" | "--repository-id" => {
+                repository_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--path" => {
+                path = Some(option_value(args, index, "--path")?.to_string());
+                index += 2;
+            }
+            "--side" => {
+                side = Some(option_value(args, index, "--side")?.to_string());
+                index += 2;
+            }
+            "--line" => {
+                line = Some(parse_u32_option(
+                    option_value(args, index, "--line")?,
+                    "--line",
+                )?);
+                index += 2;
+            }
+            "--start-line" => {
+                start_line = Some(parse_u32_option(
+                    option_value(args, index, "--start-line")?,
+                    "--start-line",
+                )?);
+                index += 2;
+            }
+            "--base-revision" => {
+                base_revision = Some(option_value(args, index, "--base-revision")?.to_string());
+                index += 2;
+            }
+            "--head-revision" => {
+                head_revision = Some(option_value(args, index, "--head-revision")?.to_string());
+                index += 2;
+            }
+            "--hunk-header" => {
+                hunk_header = Some(option_value(args, index, "--hunk-header")?.to_string());
+                index += 2;
+            }
+            "--diff-hash" => {
+                diff_hash = Some(option_value(args, index, "--diff-hash")?.to_string());
+                index += 2;
+            }
+            "--body" => {
+                body = Some(option_value(args, index, "--body")?.to_string());
+                index += 2;
+            }
+            "--author-session" => {
+                author_session_id =
+                    Some(option_value(args, index, "--author-session")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review thread create option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "git review thread create does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    let side = required_cli_value(
+        side,
+        "git review thread create requires --side (left or right).",
+    )?;
+    if !matches!(side.as_str(), "left" | "right") {
+        return Err(CliError::InvalidArgs(
+            "--side must be left or right.".to_string(),
+        ));
+    }
+    Ok((
+        invoke,
+        GitReviewThreadCreateParams {
+            workspace_id: required_cli_value(
+                workspace_id,
+                "git review thread create requires --workspace or AGENTMUX_WORKSPACE_ID.",
+            )?,
+            pane_id,
+            repository_id,
+            anchor: GitReviewLineAnchor {
+                path: required_cli_value(path, "git review thread create requires --path.")?,
+                side,
+                line: line.ok_or_else(|| {
+                    CliError::InvalidArgs("git review thread create requires --line.".to_string())
+                })?,
+                start_line,
+                base_revision,
+                head_revision,
+                hunk_header,
+                diff_hash,
+            },
+            body: required_cli_value(body, "git review thread create requires --body.")?,
+            author_session_id,
+        },
+    ))
+}
+
+fn parse_review_thread_update_options(
+    args: &[String],
+    resolve: bool,
+) -> Result<(ControlInvokeOptions, GitReviewThreadUpdateParams), CliError> {
+    let (mut invoke, mut thread_id, mut resolved, mut index) =
+        (ControlInvokeOptions::from_env(), None, None, 0);
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--resolved" => {
+                resolved = Some(parse_bool_option(
+                    option_value(args, index, "--resolved")?,
+                    "--resolved",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review thread update option '{value}'."
+                )))
+            }
+            value => {
+                if thread_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git review thread update accepts exactly one thread id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    if resolve {
+        resolved = Some(true);
+    }
+    if resolved.is_none() {
+        return Err(CliError::InvalidArgs(
+            "git review thread update requires --resolved true|false.".to_string(),
+        ));
+    }
+    Ok((
+        invoke,
+        GitReviewThreadUpdateParams {
+            thread_id: required_cli_value(
+                thread_id,
+                "git review thread update requires a thread id.",
+            )?,
+            resolved,
+            anchor: None,
+        },
+    ))
+}
+
+fn parse_review_thread_id_options(
+    args: &[String],
+    command: &str,
+) -> Result<(ControlInvokeOptions, GitReviewThreadIdParams), CliError> {
+    let (invoke, id) = parse_single_control_id(args, command, "thread id")?;
+    Ok((invoke, GitReviewThreadIdParams { thread_id: id }))
+}
+fn parse_review_thread_stale_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewThreadMarkStaleParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut thread_id = None;
+    let mut stale = None;
+    let mut reason = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--stale" => {
+                stale = Some(parse_bool_option(
+                    option_value(args, index, "--stale")?,
+                    "--stale",
+                )?);
+                index += 2;
+            }
+            "--reason" => {
+                reason = Some(option_value(args, index, "--reason")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review thread stale option '{value}'."
+                )))
+            }
+            value => {
+                if thread_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git review thread stale accepts exactly one thread id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitReviewThreadMarkStaleParams {
+            thread_id: required_cli_value(
+                thread_id,
+                "git review thread stale requires a thread id.",
+            )?,
+            stale: stale.ok_or_else(|| {
+                CliError::InvalidArgs(
+                    "git review thread stale requires --stale true|false.".to_string(),
+                )
+            })?,
+            reason,
+        },
+    ))
+}
+fn parse_review_thread_deliver_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewThreadDeliverParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut thread_id = None;
+    let mut target = None;
+    let mut target_session_id = None;
+    let mut include_context = false;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--target" => {
+                target = Some(option_value(args, index, "--target")?.to_string());
+                index += 2;
+            }
+            "--session" | "--target-session" => {
+                target_session_id =
+                    Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--include-context" => {
+                include_context = true;
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review thread deliver option '{value}'."
+                )))
+            }
+            value => {
+                if thread_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git review thread deliver accepts exactly one thread id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    let target = required_cli_value(
+        target,
+        "git review thread deliver requires --target (mailbox or terminal).",
+    )?;
+    if !matches!(target.as_str(), "mailbox" | "terminal") {
+        return Err(CliError::InvalidArgs(
+            "--target must be mailbox or terminal.".to_string(),
+        ));
+    }
+    Ok((
+        invoke,
+        GitReviewThreadDeliverParams {
+            thread_id: required_cli_value(
+                thread_id,
+                "git review thread deliver requires a thread id.",
+            )?,
+            target,
+            target_session_id,
+            include_context,
+        },
+    ))
+}
+fn parse_review_comment_list_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewCommentListParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut thread_id = None;
+    let mut limit = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--limit" => {
+                limit = Some(parse_usize_option(
+                    option_value(args, index, "--limit")?,
+                    "--limit",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review comment list option '{value}'."
+                )))
+            }
+            value => {
+                if thread_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git review comment list accepts exactly one thread id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitReviewCommentListParams {
+            thread_id: required_cli_value(
+                thread_id,
+                "git review comment list requires a thread id.",
+            )?,
+            limit,
+        },
+    ))
+}
+fn parse_review_comment_create_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewCommentCreateParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut thread_id = None;
+    let mut body = None;
+    let mut author_session_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--body" => {
+                body = Some(option_value(args, index, "--body")?.to_string());
+                index += 2;
+            }
+            "--author-session" => {
+                author_session_id =
+                    Some(option_value(args, index, "--author-session")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review comment create option '{value}'."
+                )))
+            }
+            value => {
+                if thread_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git review comment create accepts exactly one thread id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitReviewCommentCreateParams {
+            thread_id: required_cli_value(
+                thread_id,
+                "git review comment create requires a thread id.",
+            )?,
+            body: required_cli_value(body, "git review comment create requires --body.")?,
+            author_session_id,
+        },
+    ))
+}
+fn parse_review_comment_update_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, GitReviewCommentUpdateParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut comment_id = None;
+    let mut body = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--body" => {
+                body = Some(option_value(args, index, "--body")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown git review comment update option '{value}'."
+                )))
+            }
+            value => {
+                if comment_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "git review comment update accepts exactly one comment id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        GitReviewCommentUpdateParams {
+            comment_id: required_cli_value(
+                comment_id,
+                "git review comment update requires a comment id.",
+            )?,
+            body: required_cli_value(body, "git review comment update requires --body.")?,
+        },
+    ))
+}
+fn parse_review_comment_id_options(
+    args: &[String],
+    command: &str,
+) -> Result<(ControlInvokeOptions, GitReviewCommentIdParams), CliError> {
+    let (invoke, id) = parse_single_control_id(args, command, "comment id")?;
+    Ok((invoke, GitReviewCommentIdParams { comment_id: id }))
+}
+
+fn parse_dev_server_candidate_list_options(
+    args: &[String],
+) -> Result<(ControlInvokeOptions, DevelopmentServerCandidateListParams), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut session_id = None;
+    let mut include_dismissed = false;
+    let mut limit = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--session" => {
+                session_id = Some(option_value(args, index, "--session")?.to_string());
+                index += 2;
+            }
+            "--include-dismissed" => {
+                include_dismissed = true;
+                index += 1;
+            }
+            "--limit" => {
+                limit = Some(parse_usize_option(
+                    option_value(args, index, "--limit")?,
+                    "--limit",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown dev-server candidate list option '{value}'."
+                )))
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "dev-server candidate list does not accept argument '{value}'."
+                )))
+            }
+        }
+    }
+    Ok((
+        invoke,
+        DevelopmentServerCandidateListParams {
+            workspace_id,
+            session_id,
+            include_dismissed,
+            limit,
+        },
+    ))
+}
+fn parse_dev_server_candidate_dismiss_options(
+    args: &[String],
+) -> Result<
+    (
+        ControlInvokeOptions,
+        DevelopmentServerCandidateDismissParams,
+    ),
+    CliError,
+> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut candidate_id = None;
+    let mut reason = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--reason" => {
+                reason = Some(option_value(args, index, "--reason")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown dev-server candidate dismiss option '{value}'."
+                )))
+            }
+            value => {
+                if candidate_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "dev-server candidate dismiss accepts exactly one candidate id."
+                            .to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok((
+        invoke,
+        DevelopmentServerCandidateDismissParams {
+            candidate_id: required_cli_value(
+                candidate_id,
+                "dev-server candidate dismiss requires a candidate id.",
+            )?,
+            reason,
+        },
+    ))
+}
+fn parse_dev_server_candidate_open_options(
+    args: &[String],
+) -> Result<
+    (
+        ControlInvokeOptions,
+        DevelopmentServerCandidateOpenInSplitParams,
+    ),
+    CliError,
+> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut candidate_id = None;
+    let mut pane_id = None;
+    let mut axis = None;
+    let mut ratio = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--pane" | "--pane-id" => {
+                pane_id = Some(option_value(args, index, args[index].as_str())?.to_string());
+                index += 2;
+            }
+            "--axis" => {
+                axis = Some(option_value(args, index, "--axis")?.to_string());
+                index += 2;
+            }
+            "--ratio" => {
+                ratio = Some(parse_f64_option(
+                    option_value(args, index, "--ratio")?,
+                    "--ratio",
+                )?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown dev-server candidate open option '{value}'."
+                )))
+            }
+            value => {
+                if candidate_id.replace(value.to_string()).is_some() {
+                    return Err(CliError::InvalidArgs(
+                        "dev-server candidate open accepts exactly one candidate id.".to_string(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    if let Some(axis) = axis.as_deref() {
+        if !matches!(axis, "horizontal" | "vertical") {
+            return Err(CliError::InvalidArgs(
+                "--axis must be horizontal or vertical.".to_string(),
+            ));
+        }
+    }
+    Ok((
+        invoke,
+        DevelopmentServerCandidateOpenInSplitParams {
+            candidate_id: required_cli_value(
+                candidate_id,
+                "dev-server candidate open requires a candidate id.",
+            )?,
+            pane_id,
+            axis,
+            ratio,
+        },
+    ))
+}
+
+fn parse_single_control_id(
+    args: &[String],
+    command: &str,
+    id_name: &str,
+) -> Result<(ControlInvokeOptions, String), CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut id = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        let value = args[index].as_str();
+        if value.starts_with("--") {
+            return Err(CliError::InvalidArgs(format!(
+                "unknown {command} option '{value}'."
+            )));
+        }
+        if id.replace(value.to_string()).is_some() {
+            return Err(CliError::InvalidArgs(format!(
+                "{command} accepts exactly one {id_name}."
+            )));
+        }
+        index += 1;
+    }
+    Ok((
+        invoke,
+        required_cli_value(id, &format!("{command} requires a {id_name}."))?,
+    ))
+}
+fn required_cli_value(value: Option<String>, message: &str) -> Result<String, CliError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| CliError::InvalidArgs(message.to_string()))
+}
+fn parse_u32_option(value: &str, option: &str) -> Result<u32, CliError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| CliError::InvalidArgs(format!("{option} requires a positive integer.")))
+}
+fn validate_agent_hook_state(value: &str) -> Result<(), CliError> {
+    if matches!(
+        value,
+        "started" | "running" | "waiting_for_input" | "completed" | "failed" | "exited"
+    ) {
+        Ok(())
+    } else {
+        Err(CliError::InvalidArgs(format!("--state must be started, running, waiting_for_input, completed, failed, or exited; got '{value}'.")))
+    }
+}
+fn validate_agent_hook_source(value: &str) -> Result<(), CliError> {
+    if matches!(value, "claude_hook" | "codex_hook" | "verified_hook") {
+        Ok(())
+    } else {
+        Err(CliError::InvalidArgs(format!(
+            "--source must be claude_hook, codex_hook, or verified_hook; got '{value}'."
+        )))
+    }
 }
 
 fn parse_config_get_options(
@@ -5170,6 +6811,14 @@ fn generate_server_auth_token() -> String {
     format!("srv_{nanos:x}_{pid:x}_{stack_marker:x}")
 }
 
+fn generate_websocket_ticket() -> String {
+    let mut bytes = [0_u8; 32];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        return format!("wst_{}", bytes_to_hex(&bytes));
+    }
+    generate_server_auth_token().replacen("srv_", "wst_", 1)
+}
+
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -5766,7 +7415,10 @@ fn parse_identify_options(args: &[String]) -> Result<IdentifyOptions, CliError> 
     }
     Ok(IdentifyOptions {
         invoke,
-        params: SystemIdentifyParams { workspace_id },
+        params: SystemIdentifyParams {
+            workspace_id,
+            ..SystemIdentifyParams::default()
+        },
     })
 }
 
@@ -6509,10 +8161,83 @@ where
 
 const SERVER_LOCAL_TOKEN: &str = "server-local-token";
 const SERVER_LOCAL_WORKSPACE_ID: &str = "ws_server";
+const SERVER_MUTATION_RATE_LIMIT: usize = 1_200;
+const SERVER_MUTATION_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SERVER_WEBSOCKET_TICKET_TTL: Duration = Duration::from_secs(20);
+const SERVER_WEBSOCKET_MAX_TICKETS: usize = 2_048;
+const SERVER_WEBSOCKET_RATE_WINDOW: Duration = Duration::from_secs(60);
+const SERVER_WEBSOCKET_RATE_FRAMES: usize = 6_000;
+const SERVER_WEBSOCKET_RATE_BYTES: usize = 16 * 1024 * 1024;
+const SERVER_WEBSOCKET_MAX_MESSAGE_BYTES: usize = 1024 * 1024 + 4096;
+const SERVER_WEBSOCKET_MAX_INPUT_BYTES: usize = 64 * 1024;
+const SERVER_WEBSOCKET_MAX_PASTE_BYTES: usize = 1024 * 1024;
+const SERVER_WEBSOCKET_MAX_KEY_BYTES: usize = 64;
+const SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION: u16 = 2_000;
+const SERVER_WEBSOCKET_MAX_PRESSURE_BYTES: u64 = 1024 * 1024 * 1024;
+const SERVER_WEBSOCKET_MAX_BACKPRESSURE_EVENTS: u64 = 10_000_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServerRequestAccess {
+    Public,
+    Read,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerRateWindow {
+    started_at: Instant,
+    request_count: usize,
+}
+
+#[derive(Debug)]
+struct ServerWebSocketTicket {
+    session_id: String,
+    client_ip: Option<IpAddr>,
+    origin: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerWebSocketRateWindow {
+    started_at: Instant,
+    frame_count: usize,
+    byte_count: usize,
+}
+
+impl ServerWebSocketRateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            frame_count: 0,
+            byte_count: 0,
+        }
+    }
+
+    fn allow(&mut self, frame_bytes: usize, now: Instant) -> bool {
+        if now.saturating_duration_since(self.started_at) >= SERVER_WEBSOCKET_RATE_WINDOW {
+            *self = Self::new(now);
+        }
+        let Some(next_bytes) = self.byte_count.checked_add(frame_bytes) else {
+            return false;
+        };
+        if self.frame_count >= SERVER_WEBSOCKET_RATE_FRAMES
+            || next_bytes > SERVER_WEBSOCKET_RATE_BYTES
+        {
+            return false;
+        }
+        self.frame_count += 1;
+        self.byte_count = next_bytes;
+        true
+    }
+}
 
 struct ServerState {
     options: ServerOptions,
     local_control: Option<LocalServerControl>,
+    local_git: Option<ServerLocalGit>,
+    mutation_rate_limits: HashMap<IpAddr, ServerRateWindow>,
+    websocket_tickets: HashMap<String, ServerWebSocketTicket>,
+    websocket_rate_limits: HashMap<IpAddr, ServerWebSocketRateWindow>,
 }
 
 impl ServerState {
@@ -6521,9 +8246,25 @@ impl ServerState {
             ServerMode::Local => Some(LocalServerControl::new(&options)),
             ServerMode::DesktopBridge => None,
         };
+        let local_git = match options.mode {
+            ServerMode::Local => ServerLocalGit::probe(
+                options
+                    .workspace_id
+                    .as_deref()
+                    .unwrap_or(SERVER_LOCAL_WORKSPACE_ID),
+                options.backend.as_deref(),
+                options.backend_profile.as_deref(),
+                options.cwd.as_deref(),
+            ),
+            ServerMode::DesktopBridge => None,
+        };
         Self {
             options,
             local_control,
+            local_git,
+            mutation_rate_limits: HashMap::new(),
+            websocket_tickets: HashMap::new(),
+            websocket_rate_limits: HashMap::new(),
         }
     }
 
@@ -6549,12 +8290,132 @@ impl ServerState {
                     &params_json,
                     SERVER_LOCAL_TOKEN,
                 );
+                if ServerLocalGit::supports_method(method) {
+                    let git = self.local_git.as_mut().ok_or_else(|| {
+                        CliError::Control(
+                            "Git is not available for the configured local server directory."
+                                .to_string(),
+                        )
+                    })?;
+                    return Ok(git.handle_request(request));
+                }
                 let control = self.local_control.as_mut().ok_or_else(|| {
                     CliError::Control("local server runtime is not initialized.".to_string())
                 })?;
                 Ok(control.handle_request(request))
             }
         }
+    }
+
+    fn source_control_available(&self) -> bool {
+        self.options.mode == ServerMode::DesktopBridge || self.local_git.is_some()
+    }
+
+    fn control_methods(&self) -> Vec<&'static str> {
+        match self.options.mode {
+            ServerMode::DesktopBridge => server_desktop_control_methods().to_vec(),
+            ServerMode::Local if self.local_git.is_some() => ServerLocalGit::methods().to_vec(),
+            ServerMode::Local => Vec::new(),
+        }
+    }
+
+    fn allow_mutation(&mut self, client_ip: Option<IpAddr>, now: Instant) -> bool {
+        let Some(client_ip) = client_ip else {
+            return true;
+        };
+        self.mutation_rate_limits.retain(|_, window| {
+            now.saturating_duration_since(window.started_at) < SERVER_MUTATION_RATE_WINDOW
+        });
+        let window = self
+            .mutation_rate_limits
+            .entry(client_ip)
+            .or_insert(ServerRateWindow {
+                started_at: now,
+                request_count: 0,
+            });
+        if now.saturating_duration_since(window.started_at) >= SERVER_MUTATION_RATE_WINDOW {
+            *window = ServerRateWindow {
+                started_at: now,
+                request_count: 0,
+            };
+        }
+        if window.request_count >= SERVER_MUTATION_RATE_LIMIT {
+            return false;
+        }
+        window.request_count += 1;
+        true
+    }
+
+    fn issue_websocket_ticket(
+        &mut self,
+        session_id: &str,
+        client_ip: Option<IpAddr>,
+        origin: &str,
+        now: Instant,
+    ) -> Result<String, CliError> {
+        self.websocket_tickets
+            .retain(|_, ticket| ticket.expires_at > now);
+        if self.websocket_tickets.len() >= SERVER_WEBSOCKET_MAX_TICKETS {
+            return Err(CliError::Control(
+                "Too many pending WebSocket tickets.".to_string(),
+            ));
+        }
+        for _ in 0..4 {
+            let ticket = generate_websocket_ticket();
+            if self.websocket_tickets.contains_key(&ticket) {
+                continue;
+            }
+            self.websocket_tickets.insert(
+                ticket.clone(),
+                ServerWebSocketTicket {
+                    session_id: session_id.to_string(),
+                    client_ip,
+                    origin: origin.to_string(),
+                    expires_at: now + SERVER_WEBSOCKET_TICKET_TTL,
+                },
+            );
+            return Ok(ticket);
+        }
+        Err(CliError::Control(
+            "Failed to allocate a unique WebSocket ticket.".to_string(),
+        ))
+    }
+
+    fn consume_websocket_ticket(
+        &mut self,
+        ticket: &str,
+        session_id: &str,
+        client_ip: Option<IpAddr>,
+        origin: &str,
+        now: Instant,
+    ) -> bool {
+        self.websocket_tickets
+            .retain(|_, ticket| ticket.expires_at > now);
+        let Some(ticket) = self.websocket_tickets.remove(ticket) else {
+            return false;
+        };
+        ticket.expires_at > now
+            && ticket.session_id == session_id
+            && ticket.client_ip == client_ip
+            && constant_time_eq(&ticket.origin, origin)
+    }
+
+    fn allow_websocket_frame(
+        &mut self,
+        client_ip: Option<IpAddr>,
+        frame_bytes: usize,
+        now: Instant,
+    ) -> bool {
+        let Some(client_ip) = client_ip else {
+            return true;
+        };
+        self.websocket_rate_limits.retain(|_, window| {
+            now.saturating_duration_since(window.started_at) < SERVER_WEBSOCKET_RATE_WINDOW
+        });
+        self.websocket_rate_limits
+            .entry(client_ip)
+            .or_insert_with(|| ServerWebSocketRateWindow::new(now))
+            .allow(frame_bytes, now)
     }
 }
 
@@ -6975,6 +8836,10 @@ fn server_startup_payload(
         "backend": state.options.backend.clone(),
         "backend_profile": state.options.backend_profile.clone(),
         "allow_remote": state.options.allow_remote,
+        "capabilities": {
+            "source_control": state.source_control_available(),
+            "control_methods": state.control_methods(),
+        },
         "auth": {
             "token_source": "generated_ephemeral",
             "token_disclosure": "pass --show-auth-token to include auth_token",
@@ -7010,18 +8875,21 @@ fn handle_server_stream(
     mut stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
 ) -> Result<(), CliError> {
+    let client_ip = stream.peer_addr().ok().map(|address| address.ip());
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     if is_websocket_upgrade(&stream)? {
-        return handle_server_websocket(stream, state);
+        return handle_server_websocket(stream, state, client_ip);
     }
 
-    let request = match read_http_request(&mut stream).and_then(|raw| parse_http_request(&raw)) {
+    let mut request = match read_http_request(&mut stream).and_then(|raw| parse_http_request(&raw))
+    {
         Ok(request) => request,
         Err(error) => {
             let response = api_error_response(400, &format!("Bad request: {error}"));
             return write_http_response(&mut stream, &response);
         }
     };
+    request.client_ip = client_ip;
     let response = match state.lock() {
         Ok(mut state) => route_server_request(&request, &mut state),
         Err(_) => api_error_response(503, "Server state is unavailable."),
@@ -7041,6 +8909,72 @@ fn is_websocket_upgrade(stream: &TcpStream) -> Result<bool, CliError> {
         && head.contains("\r\nsec-websocket-key:"))
 }
 
+#[derive(Debug)]
+struct AuthorizedServerWebSocket {
+    session_id: String,
+    query: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServerWebSocketHandshakeRejection {
+    status: WsStatusCode,
+    message: &'static str,
+}
+
+fn authorize_server_websocket_target(
+    target: &str,
+    host: Option<&str>,
+    origin: Option<&str>,
+    client_ip: Option<IpAddr>,
+    state: &mut ServerState,
+    now: Instant,
+) -> Result<AuthorizedServerWebSocket, ServerWebSocketHandshakeRejection> {
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path.to_string(), Some(query.to_string())),
+        None => (target.to_string(), None),
+    };
+    if query_param(query.as_deref(), "token").is_some() {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::UNAUTHORIZED,
+            message: "Reusable query credentials are not accepted.",
+        });
+    }
+    let Some(session_id) = session_id_from_path(&path, "/stream") else {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::NOT_FOUND,
+            message: "WebSocket terminal session was not found.",
+        });
+    };
+    let Some(origin) = normalized_allowed_server_origin(origin, host, &state.options) else {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::FORBIDDEN,
+            message: "WebSocket origin is not allowed.",
+        });
+    };
+    let Some(ticket) = query_param(query.as_deref(), "ticket") else {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::UNAUTHORIZED,
+            message: "A short-lived WebSocket ticket is required.",
+        });
+    };
+    if !state.consume_websocket_ticket(&ticket, &session_id, client_ip, &origin, now) {
+        return Err(ServerWebSocketHandshakeRejection {
+            status: WsStatusCode::UNAUTHORIZED,
+            message: "The WebSocket ticket is invalid, expired, or already used.",
+        });
+    }
+    Ok(AuthorizedServerWebSocket { session_id, query })
+}
+
+fn websocket_handshake_error(rejection: ServerWebSocketHandshakeRejection) -> WsErrorResponse {
+    tungstenite::http::Response::builder()
+        .status(rejection.status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .body(Some(rejection.message.to_string()))
+        .unwrap_or_else(|_| tungstenite::http::Response::new(None))
+}
+
 // The accept_hdr handshake callback must return tungstenite's
 // Result<Response, ErrorResponse>; that Err variant (an http::Response) is
 // large and imposed by the upstream API, so the large-Err lint can't be
@@ -7049,19 +8983,65 @@ fn is_websocket_upgrade(stream: &TcpStream) -> Result<bool, CliError> {
 fn handle_server_websocket(
     stream: TcpStream,
     state: Arc<Mutex<ServerState>>,
+    client_ip: Option<IpAddr>,
 ) -> Result<(), CliError> {
-    let target = Arc::new(Mutex::new(None::<String>));
-    let captured_target = Arc::clone(&target);
-    let mut socket = accept_hdr(
+    let authorized = Arc::new(Mutex::new(None::<AuthorizedServerWebSocket>));
+    let captured_authorized = Arc::clone(&authorized);
+    let handshake_state = Arc::clone(&state);
+    let websocket_config = WebSocketConfig {
+        max_message_size: Some(SERVER_WEBSOCKET_MAX_MESSAGE_BYTES),
+        max_frame_size: Some(SERVER_WEBSOCKET_MAX_MESSAGE_BYTES),
+        ..WebSocketConfig::default()
+    };
+    let mut socket = match accept_hdr_with_config(
         stream,
         move |request: &tungstenite::handshake::server::Request, response| {
-            if let Ok(mut target) = captured_target.lock() {
-                *target = Some(request.uri().to_string());
-            }
+            let host = request
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok());
+            let origin = request
+                .headers()
+                .get("origin")
+                .and_then(|value| value.to_str().ok());
+            let authorization = handshake_state
+                .lock()
+                .map_err(|_| {
+                    websocket_handshake_error(ServerWebSocketHandshakeRejection {
+                        status: WsStatusCode::SERVICE_UNAVAILABLE,
+                        message: "Server state is unavailable.",
+                    })
+                })
+                .and_then(|mut state| {
+                    authorize_server_websocket_target(
+                        &request.uri().to_string(),
+                        host,
+                        origin,
+                        client_ip,
+                        &mut state,
+                        Instant::now(),
+                    )
+                    .map_err(websocket_handshake_error)
+                })?;
+            let mut captured = captured_authorized.lock().map_err(|_| {
+                websocket_handshake_error(ServerWebSocketHandshakeRejection {
+                    status: WsStatusCode::SERVICE_UNAVAILABLE,
+                    message: "WebSocket authorization state is unavailable.",
+                })
+            })?;
+            *captured = Some(authorization);
             Ok(response)
         },
-    )
-    .map_err(|error| CliError::Control(format!("websocket handshake error: {error}")))?;
+        Some(websocket_config),
+    ) {
+        Ok(socket) => socket,
+        Err(tungstenite::HandshakeError::Failure(WsError::Http(_))) => return Ok(()),
+        Err(error) => {
+            return Err(CliError::Control(format!(
+                "websocket handshake error: {error}"
+            )))
+        }
+    };
 
     let _ = socket
         .get_mut()
@@ -7070,40 +9050,44 @@ fn handle_server_websocket(
         .get_mut()
         .set_write_timeout(Some(Duration::from_secs(5)));
 
-    let target = target
+    let authorized = authorized
         .lock()
         .ok()
-        .and_then(|target| target.clone())
-        .unwrap_or_else(|| "/".to_string());
-    let (path, query) = match target.split_once('?') {
-        Some((path, query)) => (path.to_string(), Some(query.to_string())),
-        None => (target, None),
-    };
-    let authorized = {
-        let state = state
-            .lock()
-            .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?;
-        query_param(query.as_deref(), "token")
-            .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token))
-    };
-    if !authorized {
-        let _ = socket.close(None);
-        return Ok(());
-    }
-    let Some(session_id) = session_id_from_path(&path, "/stream") else {
-        let _ = socket.close(None);
-        return Ok(());
-    };
-    let mut offset = initial_websocket_output_offset(&session_id, query.as_deref(), &state)?;
+        .and_then(|mut authorized| authorized.take())
+        .ok_or_else(|| {
+            CliError::Control("WebSocket authorization was not captured.".to_string())
+        })?;
+    let session_id = authorized.session_id;
+    let mut offset =
+        initial_websocket_output_offset(&session_id, authorized.query.as_deref(), &state)?;
+    let mut connection_rate = ServerWebSocketRateWindow::new(Instant::now());
 
     loop {
         match socket.read() {
-            Ok(WsMessage::Text(text)) => {
-                handle_server_websocket_message(&session_id, &text, &state)?;
+            Ok(message) => {
+                if !allow_server_websocket_inbound_frame(
+                    &state,
+                    client_ip,
+                    &mut connection_rate,
+                    &message,
+                    Instant::now(),
+                )? {
+                    let _ = socket.close(None);
+                    return Ok(());
+                }
+
+                match message {
+                    WsMessage::Text(text) => {
+                        if handle_server_websocket_message(&session_id, &text, &state).is_err() {
+                            let _ = socket.close(None);
+                            return Ok(());
+                        }
+                    }
+                    WsMessage::Binary(_) | WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                    WsMessage::Close(_) => break,
+                    WsMessage::Frame(_) => {}
+                }
             }
-            Ok(WsMessage::Binary(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
-            Ok(WsMessage::Close(_)) => break,
-            Ok(WsMessage::Frame(_)) => {}
             Err(WsError::Io(error))
                 if matches!(
                     error.kind(),
@@ -7119,6 +9103,23 @@ fn handle_server_websocket(
     }
 
     Ok(())
+}
+
+fn allow_server_websocket_inbound_frame(
+    state: &Arc<Mutex<ServerState>>,
+    client_ip: Option<IpAddr>,
+    connection_rate: &mut ServerWebSocketRateWindow,
+    message: &WsMessage,
+    now: Instant,
+) -> Result<bool, CliError> {
+    let frame_bytes = message.len();
+    let within_message_limit = frame_bytes <= SERVER_WEBSOCKET_MAX_MESSAGE_BYTES;
+    let connection_allowed = connection_rate.allow(frame_bytes, now);
+    let client_allowed = state
+        .lock()
+        .map_err(|_| CliError::Control("Server state is unavailable.".to_string()))?
+        .allow_websocket_frame(client_ip, frame_bytes, now);
+    Ok(within_message_limit && connection_allowed && client_allowed)
 }
 
 fn websocket_error(error: WsError) -> CliError {
@@ -7195,6 +9196,11 @@ fn handle_server_websocket_message(
     text: &str,
     state: &Arc<Mutex<ServerState>>,
 ) -> Result<(), CliError> {
+    if text.len() > SERVER_WEBSOCKET_MAX_MESSAGE_BYTES {
+        return Err(CliError::InvalidArgs(
+            "websocket message exceeds the configured size limit.".to_string(),
+        ));
+    }
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|error| CliError::InvalidArgs(format!("invalid websocket message: {error}")))?;
     let Some(message_type) = value.get("type").and_then(|value| value.as_str()) else {
@@ -7205,6 +9211,11 @@ fn handle_server_websocket_message(
             let Some(text) = value.get("text").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
+            if text.len() > SERVER_WEBSOCKET_MAX_INPUT_BYTES {
+                return Err(CliError::InvalidArgs(
+                    "websocket input exceeds 64 KiB.".to_string(),
+                ));
+            }
             (
                 "session.send_text",
                 serde_json::to_value(SessionSendTextParams {
@@ -7218,6 +9229,11 @@ fn handle_server_websocket_message(
             let Some(text) = value.get("text").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
+            if text.len() > SERVER_WEBSOCKET_MAX_PASTE_BYTES {
+                return Err(CliError::InvalidArgs(
+                    "websocket paste exceeds 1 MiB.".to_string(),
+                ));
+            }
             (
                 "session.send_paste",
                 serde_json::to_value(SessionSendPasteParams {
@@ -7235,6 +9251,11 @@ fn handle_server_websocket_message(
             let Some(key) = value.get("key").and_then(|value| value.as_str()) else {
                 return Ok(());
             };
+            if key.is_empty() || key.len() > SERVER_WEBSOCKET_MAX_KEY_BYTES {
+                return Err(CliError::InvalidArgs(
+                    "websocket key is empty or exceeds 64 bytes.".to_string(),
+                ));
+            }
             (
                 "session.send_key",
                 serde_json::to_value(SessionSendKeyParams {
@@ -7255,6 +9276,15 @@ fn handle_server_websocket_message(
                 .and_then(|value| value.as_u64())
                 .and_then(|value| u16::try_from(value).ok())
                 .unwrap_or(30);
+            if columns == 0
+                || rows == 0
+                || columns > SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION
+                || rows > SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION
+            {
+                return Err(CliError::InvalidArgs(
+                    "websocket terminal dimensions are outside the supported range.".to_string(),
+                ));
+            }
             (
                 "session.resize",
                 serde_json::to_value(SessionResizeParams {
@@ -7273,33 +9303,46 @@ fn handle_server_websocket_message(
             })
             .map_err(|error| CliError::Control(error.to_string()))?,
         ),
-        "pressure" => (
-            "session.report_output_pressure",
-            serde_json::to_value(SessionOutputPressureParams {
-                session_id: session_id.to_string(),
-                queued_bytes: value
-                    .get("queuedBytes")
-                    .or_else(|| value.get("queued_bytes"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                max_queued_bytes: value
-                    .get("maxQueuedBytes")
-                    .or_else(|| value.get("max_queued_bytes"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                backpressure_events: value
-                    .get("backpressureEvents")
-                    .or_else(|| value.get("backpressure_events"))
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(0),
-                write_in_flight: value
-                    .get("writeInFlight")
-                    .or_else(|| value.get("write_in_flight"))
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false),
-            })
-            .map_err(|error| CliError::Control(error.to_string()))?,
-        ),
+        "pressure" => {
+            let queued_bytes = value
+                .get("queuedBytes")
+                .or_else(|| value.get("queued_bytes"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let max_queued_bytes = value
+                .get("maxQueuedBytes")
+                .or_else(|| value.get("max_queued_bytes"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let backpressure_events = value
+                .get("backpressureEvents")
+                .or_else(|| value.get("backpressure_events"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            if queued_bytes > SERVER_WEBSOCKET_MAX_PRESSURE_BYTES
+                || max_queued_bytes > SERVER_WEBSOCKET_MAX_PRESSURE_BYTES
+                || backpressure_events > SERVER_WEBSOCKET_MAX_BACKPRESSURE_EVENTS
+            {
+                return Err(CliError::InvalidArgs(
+                    "websocket pressure report exceeds the supported range.".to_string(),
+                ));
+            }
+            (
+                "session.report_output_pressure",
+                serde_json::to_value(SessionOutputPressureParams {
+                    session_id: session_id.to_string(),
+                    queued_bytes,
+                    max_queued_bytes,
+                    backpressure_events,
+                    write_in_flight: value
+                        .get("writeInFlight")
+                        .or_else(|| value.get("write_in_flight"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                })
+                .map_err(|error| CliError::Control(error.to_string()))?,
+            )
+        }
         _ => return Ok(()),
     };
     let mut state = state
@@ -7317,6 +9360,7 @@ struct HttpRequest {
     query: Option<String>,
     headers: HashMap<String, String>,
     body: String,
+    client_ip: Option<IpAddr>,
 }
 
 #[derive(Debug)]
@@ -7411,20 +9455,35 @@ fn parse_http_request(raw: &str) -> Result<HttpRequest, CliError> {
         query,
         headers,
         body: body.to_string(),
+        client_ip: None,
     })
 }
 
 fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpResponse {
-    if server_request_requires_auth(request) && !server_request_authorized(request, state) {
+    let access = server_request_access(request, state.options.mode);
+    if access != ServerRequestAccess::Public && !server_request_authorized(request, state, access) {
         return api_error_response(401, "Unauthorized.");
     }
+    if access == ServerRequestAccess::Mutation {
+        if !server_mutation_content_type_allowed(request) {
+            return api_error_response(415, "Mutation requests require application/json.");
+        }
+        if !server_mutation_origin_allowed(request, &state.options) {
+            return api_error_response(403, "Mutation origin is not allowed.");
+        }
+        if !state.allow_mutation(request.client_ip, Instant::now()) {
+            return api_error_response(429, "Mutation rate limit exceeded.");
+        }
+    }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => server_desktop_index_response(&state.options),
+        ("GET", "/") | ("GET", "/index.html") => server_desktop_index_response(state),
         ("GET", "/api/state") => server_state_response(state),
         ("GET", "/api/sessions") => server_sessions_response(request, state),
         ("GET", "/api/wsl/distributions") => server_wsl_distributions_response(),
+        ("POST", "/api/ws-ticket") => server_websocket_ticket_response(request, state),
         ("POST", "/api/tmux/check") => server_tmux_check_response(request),
         ("POST", "/api/spawn") => server_spawn_response(request, state),
+        ("POST", "/api/control") => server_control_response(request, state),
         ("OPTIONS", _) => empty_response(204),
         _ => {
             if request.method == "GET" {
@@ -7462,17 +9521,202 @@ fn route_server_request(request: &HttpRequest, state: &mut ServerState) -> HttpR
     }
 }
 
+fn run_control_command<T, W>(
+    method: &str,
+    params: &T,
+    invoke: ControlInvokeOptions,
+    output: &mut W,
+) -> Result<(), CliError>
+where
+    T: serde::Serialize,
+    W: Write,
+{
+    let response = invoke_control(method, params, &invoke)?;
+    if invoke.json {
+        return write_json_response(&response, output);
+    }
+    let result: serde_json::Value = response_result(&response)?;
+    write_json_value(&result, output)
+}
+
+fn server_control_response(request: &HttpRequest, state: &mut ServerState) -> HttpResponse {
+    let parsed = match parse_json_body::<ServerControlRequest>(&request.body) {
+        Ok(value) => value,
+        Err(error) => return api_error_response(400, &error.to_string()),
+    };
+    let method = parsed.method.trim();
+    let capability_available = state.options.mode != ServerMode::Local || state.local_git.is_some();
+    if method.len() > 128
+        || !capability_available
+        || !server_control_method_allowed(method, state.options.mode)
+    {
+        return api_error_response(403, "Control method is not available through server mode.");
+    }
+    match state
+        .invoke(method, &parsed.params)
+        .and_then(|response| response_result::<serde_json::Value>(&response))
+    {
+        Ok(result) => api_json_response(200, result),
+        Err(error) => api_error_response(503, &server_control_error_message(error, &state.options)),
+    }
+}
+
+fn server_control_method_allowed(method: &str, mode: ServerMode) -> bool {
+    match mode {
+        ServerMode::DesktopBridge => server_desktop_control_methods().contains(&method),
+        ServerMode::Local => ServerLocalGit::supports_method(method),
+    }
+}
+
+fn server_desktop_control_methods() -> &'static [&'static str] {
+    &[
+        "git.status",
+        "git.status_summary",
+        "git.status_page",
+        "git.diff",
+        "git.stage",
+        "git.unstage",
+        "git.stage_all",
+        "git.unstage_all",
+        "git.discard",
+        "git.commit",
+        "agent.worktree.create",
+        "agent.worktree.list",
+        "agent.worktree.recover",
+        "agent.worktree.remove",
+        "git.review_thread.create",
+        "git.review_thread.list",
+        "git.review_thread.update",
+        "git.review_thread.delete",
+        "git.review_thread.mark_stale",
+        "git.review_thread.deliver",
+        "git.review_comment.list",
+        "git.review_comment.create",
+        "git.review_comment.update",
+        "git.review_comment.delete",
+        "agent.hook_state",
+        "dev_server.candidate.list",
+        "dev_server.candidate.dismiss",
+        "dev_server.candidate.open_in_split",
+    ]
+}
+
 fn server_request_requires_auth(request: &HttpRequest) -> bool {
     request.path.starts_with("/api/")
 }
 
-fn server_request_authorized(request: &HttpRequest, state: &ServerState) -> bool {
-    request
+fn server_request_access(request: &HttpRequest, mode: ServerMode) -> ServerRequestAccess {
+    if !server_request_requires_auth(request) || request.method == "OPTIONS" {
+        return ServerRequestAccess::Public;
+    }
+    if request.method == "GET" {
+        return ServerRequestAccess::Read;
+    }
+    if request.method == "POST" && request.path == "/api/control" {
+        let method = serde_json::from_str::<ServerControlRequest>(&request.body)
+            .ok()
+            .map(|request| request.method);
+        if method
+            .as_deref()
+            .is_some_and(|method| server_control_method_is_read(method, mode))
+        {
+            return ServerRequestAccess::Read;
+        }
+    }
+    ServerRequestAccess::Mutation
+}
+
+fn server_control_method_is_read(method: &str, mode: ServerMode) -> bool {
+    match mode {
+        ServerMode::Local => ServerLocalGit::is_read_method(method),
+        ServerMode::DesktopBridge => matches!(
+            method,
+            "git.status"
+                | "git.status_summary"
+                | "git.status_page"
+                | "git.diff"
+                | "agent.worktree.list"
+                | "git.review_thread.list"
+                | "git.review_comment.list"
+                | "dev_server.candidate.list"
+        ),
+    }
+}
+
+fn server_request_authorized(
+    request: &HttpRequest,
+    state: &ServerState,
+    access: ServerRequestAccess,
+) -> bool {
+    let header_authorized = request
         .headers
         .get("x-agentmux-server-token")
         .is_some_and(|token| constant_time_eq(token, &state.options.auth_token))
-        || query_param(request.query.as_deref(), "token")
-            .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token))
+        || request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+            .map(|(_, token)| token)
+            .is_some_and(|token| constant_time_eq(token.trim(), &state.options.auth_token));
+    header_authorized
+        || (access == ServerRequestAccess::Read
+            && query_param(request.query.as_deref(), "token")
+                .is_some_and(|token| constant_time_eq(&token, &state.options.auth_token)))
+}
+
+fn server_mutation_content_type_allowed(request: &HttpRequest) -> bool {
+    request
+        .headers
+        .get("content-type")
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn server_mutation_origin_allowed(request: &HttpRequest, options: &ServerOptions) -> bool {
+    let Some(origin) = request.headers.get("origin") else {
+        return true;
+    };
+    normalized_allowed_server_origin(
+        Some(origin),
+        request.headers.get("host").map(String::as_str),
+        options,
+    )
+    .is_some()
+}
+
+fn normalized_allowed_server_origin(
+    origin: Option<&str>,
+    host: Option<&str>,
+    _options: &ServerOptions,
+) -> Option<String> {
+    let origin = origin?.trim().trim_end_matches('/').to_ascii_lowercase();
+    let host = host?.trim().to_ascii_lowercase();
+    if origin == format!("http://{host}") || origin == format!("https://{host}") {
+        return Some(origin);
+    }
+
+    // Tauri's WebView has a fixed application origin. It is only trusted when
+    // the actual HTTP target is loopback, so a remote AgentMux server cannot be
+    // mutated by a desktop WebView merely by presenting the Tauri origin.
+    if matches!(
+        origin.as_str(),
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    ) && server_host_header_is_loopback(&host)
+    {
+        return Some(origin);
+    }
+    None
+}
+
+fn server_host_header_is_loopback(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let hostname = if let Some(rest) = host.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host).unwrap_or(rest)
+    } else {
+        host.split_once(':').map(|(host, _)| host).unwrap_or(&host)
+    };
+    matches!(hostname, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -7547,6 +9791,10 @@ fn load_server_state(state: &mut ServerState) -> Result<serde_json::Value, CliEr
 
     Ok(serde_json::json!({
         "mode": state.options.mode.as_str(),
+        "capabilities": {
+            "source_control": state.source_control_available(),
+            "control_methods": state.control_methods(),
+        },
         "control_pipe": if state.options.mode == ServerMode::DesktopBridge {
             Some(state.options.invoke.pipe_name.clone())
         } else {
@@ -7589,6 +9837,37 @@ fn server_wsl_distributions_response() -> HttpResponse {
             }),
         ),
         Err(diagnostic) => api_error_response(503, &diagnostic.message),
+    }
+}
+
+fn server_websocket_ticket_response(
+    request: &HttpRequest,
+    state: &mut ServerState,
+) -> HttpResponse {
+    let parsed = match parse_json_body::<ServerWebSocketTicketRequest>(&request.body) {
+        Ok(value) => value,
+        Err(error) => return api_error_response(400, &error.to_string()),
+    };
+    let session_id = parsed.session_id.trim();
+    if session_id.is_empty() || session_id.len() > 256 {
+        return api_error_response(400, "A valid terminal session ID is required.");
+    }
+    let Some(origin) = normalized_allowed_server_origin(
+        request.headers.get("origin").map(String::as_str),
+        request.headers.get("host").map(String::as_str),
+        &state.options,
+    ) else {
+        return api_error_response(403, "WebSocket ticket origin is not allowed.");
+    };
+    match state.issue_websocket_ticket(session_id, request.client_ip, &origin, Instant::now()) {
+        Ok(ticket) => api_json_response(
+            200,
+            serde_json::json!({
+                "ticket": ticket,
+                "expires_in_ms": SERVER_WEBSOCKET_TICKET_TTL.as_millis(),
+            }),
+        ),
+        Err(error) => api_error_response(503, &error.to_string()),
     }
 }
 
@@ -8077,12 +10356,12 @@ fn bytes_response(status_code: u16, content_type: &'static str, body: Vec<u8>) -
     }
 }
 
-fn server_desktop_index_response(options: &ServerOptions) -> HttpResponse {
+fn server_desktop_index_response(state: &ServerState) -> HttpResponse {
     let Some(index_path) = desktop_ui_file_path("index.html") else {
         return html_response(503, missing_desktop_ui_html());
     };
     match fs::read_to_string(&index_path) {
-        Ok(html) => html_response(200, inject_server_bootstrap(html, options)),
+        Ok(html) => html_response(200, inject_server_bootstrap(html, state)),
         Err(error) => html_response(
             503,
             format!(
@@ -8165,11 +10444,16 @@ fn push_unique_path(candidates: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-fn inject_server_bootstrap(mut html: String, options: &ServerOptions) -> String {
+fn inject_server_bootstrap(mut html: String, state: &ServerState) -> String {
+    let options = &state.options;
     let bootstrap = serde_json::to_string(&serde_json::json!({
         "baseUrl": "",
         "mode": options.mode.as_str(),
         "token": options.auth_token.clone(),
+        "capabilities": {
+            "source_control": state.source_control_available(),
+            "control_methods": state.control_methods(),
+        },
         "defaults": server_defaults_json(options),
     }))
     .unwrap_or_else(|_| "{}".to_string());
@@ -8222,7 +10506,10 @@ fn http_reason(status_code: u16) -> &'static str {
         304 => "Not Modified",
         401 => "Unauthorized",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "OK",
     }
@@ -9001,6 +11288,7 @@ where
 {
     let params = SystemIdentifyParams {
         workspace_id: options.workspace_id,
+        ..SystemIdentifyParams::default()
     };
     let response = invoke_control("system.identify", &params, &options.invoke)?;
     if options.invoke.json {
@@ -12372,7 +14660,10 @@ fn identify_context(
 ) -> Result<SystemIdentifyResult, CliError> {
     let response = invoke_control(
         "system.identify",
-        &SystemIdentifyParams { workspace_id },
+        &SystemIdentifyParams {
+            workspace_id,
+            ..SystemIdentifyParams::default()
+        },
         invoke,
     )?;
     response_result(&response)
@@ -15676,6 +17967,75 @@ mod tests {
     }
 
     #[test]
+    fn git_parsers_forward_selected_pane_to_every_operation() {
+        let repository_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane".to_string(),
+            "pane_1".to_string(),
+        ];
+        let (_, repository) = parse_git_repository_options(&repository_args, "git status").unwrap();
+        assert_eq!(repository.pane_id.as_deref(), Some("pane_1"));
+
+        let mut page_args = repository_args.clone();
+        page_args.extend(["--limit".to_string(), "25".to_string()]);
+        let (_, page) = parse_git_page_options(&page_args).unwrap();
+        assert_eq!(page.pane_id.as_deref(), Some("pane_1"));
+
+        let mut diff_args = repository_args.clone();
+        diff_args.push("src/lib.rs".to_string());
+        let (_, diff) = parse_git_diff_options(&diff_args).unwrap();
+        assert_eq!(diff.pane_id.as_deref(), Some("pane_1"));
+
+        let mut path_args = repository_args.clone();
+        path_args.extend(["--yes".to_string(), "src/lib.rs".to_string()]);
+        let (_, mutation, confirmed) =
+            parse_git_path_mutation_options(&path_args, "stage").unwrap();
+        assert!(confirmed);
+        assert_eq!(mutation.pane_id.as_deref(), Some("pane_1"));
+
+        let (_, all) = parse_git_all_mutation_options(&repository_args, "stage-all").unwrap();
+        assert_eq!(all.pane_id.as_deref(), Some("pane_1"));
+
+        let commit_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane-id".to_string(),
+            "pane_1".to_string(),
+            "--message".to_string(),
+            "test".to_string(),
+        ];
+        let (_, commit) = parse_git_commit_options(&commit_args).unwrap();
+        assert_eq!(commit.pane_id.as_deref(), Some("pane_1"));
+
+        let review_list_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane".to_string(),
+            "pane_1".to_string(),
+        ];
+        let (_, review_list) = parse_review_thread_list_options(&review_list_args).unwrap();
+        assert_eq!(review_list.pane_id.as_deref(), Some("pane_1"));
+
+        let review_create_args = vec![
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane-id".to_string(),
+            "pane_1".to_string(),
+            "--path".to_string(),
+            "src/lib.rs".to_string(),
+            "--side".to_string(),
+            "right".to_string(),
+            "--line".to_string(),
+            "42".to_string(),
+            "--body".to_string(),
+            "review".to_string(),
+        ];
+        let (_, review_create) = parse_review_thread_create_options(&review_create_args).unwrap();
+        assert_eq!(review_create.pane_id.as_deref(), Some("pane_1"));
+    }
+
+    #[test]
     fn server_help_documents_mcp_http_without_starting_a_listener() {
         let mut output = Vec::new();
         run_cli(["server", "--help"], &mut output).unwrap();
@@ -15894,9 +18254,14 @@ mod tests {
             query: None,
             headers: HashMap::new(),
             body: String::new(),
+            client_ip: None,
         };
         assert!(server_request_requires_auth(&unauthenticated));
-        assert!(!server_request_authorized(&unauthenticated, &state));
+        assert!(!server_request_authorized(
+            &unauthenticated,
+            &state,
+            ServerRequestAccess::Read
+        ));
 
         let mut headers = HashMap::new();
         headers.insert(
@@ -15907,7 +18272,11 @@ mod tests {
             headers,
             ..unauthenticated
         };
-        assert!(server_request_authorized(&header_authenticated, &state));
+        assert!(server_request_authorized(
+            &header_authenticated,
+            &state,
+            ServerRequestAccess::Read
+        ));
 
         let query_authenticated = HttpRequest {
             method: "GET".to_string(),
@@ -15915,9 +18284,19 @@ mod tests {
             query: Some(format!("token={}", state.options.auth_token)),
             headers: HashMap::new(),
             body: String::new(),
+            client_ip: None,
         };
         assert!(server_request_requires_auth(&query_authenticated));
-        assert!(server_request_authorized(&query_authenticated, &state));
+        assert!(server_request_authorized(
+            &query_authenticated,
+            &state,
+            ServerRequestAccess::Read
+        ));
+        assert!(!server_request_authorized(
+            &query_authenticated,
+            &state,
+            ServerRequestAccess::Mutation
+        ));
 
         let public_asset = HttpRequest {
             method: "GET".to_string(),
@@ -15925,8 +18304,521 @@ mod tests {
             query: None,
             headers: HashMap::new(),
             body: String::new(),
+            client_ip: None,
         };
         assert!(!server_request_requires_auth(&public_asset));
+    }
+
+    #[test]
+    fn server_mutations_require_header_auth_json_and_same_origin() {
+        let options = parse_server_options(&[
+            "--desktop-control".to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let body = serde_json::json!({
+            "method": "git.stage",
+            "params": { "workspace_id": "ws_1", "paths": ["src/lib.rs"] }
+        })
+        .to_string();
+
+        let query_only = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: Some(format!("token={token}")),
+            headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            body: body.clone(),
+            client_ip: None,
+        };
+        assert_eq!(
+            route_server_request(&query_only, &mut state).status_code,
+            401
+        );
+
+        let header = HashMap::from([("authorization".to_string(), format!("Bearer {token}"))]);
+        let missing_content_type = HttpRequest {
+            headers: header.clone(),
+            query: None,
+            ..query_only
+        };
+        assert_eq!(
+            route_server_request(&missing_content_type, &mut state).status_code,
+            415
+        );
+
+        let mut wrong_origin_headers = header.clone();
+        wrong_origin_headers.insert("content-type".to_string(), "application/json".to_string());
+        wrong_origin_headers.insert("host".to_string(), "127.0.0.1:8765".to_string());
+        wrong_origin_headers.insert("origin".to_string(), "https://attacker.example".to_string());
+        let wrong_origin = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: None,
+            headers: wrong_origin_headers,
+            body: body.clone(),
+            client_ip: None,
+        };
+        assert_eq!(
+            route_server_request(&wrong_origin, &mut state).status_code,
+            403
+        );
+
+        let mut same_origin_headers = header;
+        same_origin_headers.insert("content-type".to_string(), "application/json".to_string());
+        same_origin_headers.insert("host".to_string(), "127.0.0.1:8765".to_string());
+        same_origin_headers.insert("origin".to_string(), "http://127.0.0.1:8765".to_string());
+        let same_origin = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: None,
+            headers: same_origin_headers,
+            body,
+            client_ip: None,
+        };
+        assert!(server_request_authorized(
+            &same_origin,
+            &state,
+            ServerRequestAccess::Mutation
+        ));
+        assert!(server_mutation_content_type_allowed(&same_origin));
+        assert!(server_mutation_origin_allowed(&same_origin, &state.options));
+    }
+
+    #[test]
+    fn server_read_control_keeps_query_token_compatibility() {
+        let options = parse_server_options(&[
+            "--desktop-control".to_string(),
+            "--port".to_string(),
+            "0".to_string(),
+        ])
+        .unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/control".to_string(),
+            query: Some(format!("token={token}")),
+            headers: HashMap::new(),
+            body: serde_json::json!({
+                "method": "git.status_page",
+                "params": { "workspace_id": "ws_1", "limit": 25 }
+            })
+            .to_string(),
+            client_ip: None,
+        };
+        assert_eq!(
+            server_request_access(&request, ServerMode::DesktopBridge),
+            ServerRequestAccess::Read
+        );
+        assert_ne!(route_server_request(&request, &mut state).status_code, 401);
+    }
+
+    #[test]
+    fn server_control_access_classification_is_exact() {
+        let desktop_reads = [
+            "git.status",
+            "git.status_summary",
+            "git.status_page",
+            "git.diff",
+            "agent.worktree.list",
+            "git.review_thread.list",
+            "git.review_comment.list",
+            "dev_server.candidate.list",
+        ];
+        for method in server_desktop_control_methods() {
+            assert_eq!(
+                server_control_method_is_read(method, ServerMode::DesktopBridge),
+                desktop_reads.contains(method),
+                "desktop method {method} was classified incorrectly"
+            );
+        }
+        for method in ServerLocalGit::methods() {
+            assert_eq!(
+                server_control_method_is_read(method, ServerMode::Local),
+                ServerLocalGit::is_read_method(method),
+                "local method {method} was classified incorrectly"
+            );
+        }
+        assert!(!server_control_method_is_read(
+            "workspace.close",
+            ServerMode::DesktopBridge
+        ));
+        assert!(!server_control_method_is_read(
+            "workspace.close",
+            ServerMode::Local
+        ));
+    }
+
+    #[test]
+    fn server_mutation_rate_limit_is_per_client_and_resets() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let first: IpAddr = "127.0.0.1".parse().unwrap();
+        let second: IpAddr = "127.0.0.2".parse().unwrap();
+        let started = Instant::now();
+        for _ in 0..SERVER_MUTATION_RATE_LIMIT {
+            assert!(state.allow_mutation(Some(first), started));
+        }
+        assert!(!state.allow_mutation(Some(first), started));
+        assert!(state.allow_mutation(Some(second), started));
+        assert!(state.allow_mutation(
+            Some(first),
+            started + SERVER_MUTATION_RATE_WINDOW + Duration::from_millis(1)
+        ));
+    }
+
+    fn issue_test_websocket_ticket(
+        state: &mut ServerState,
+        session_id: &str,
+        client_ip: IpAddr,
+        origin: &str,
+        now: Instant,
+    ) -> String {
+        state
+            .issue_websocket_ticket(session_id, Some(client_ip), origin, now)
+            .unwrap()
+    }
+
+    #[test]
+    fn server_websocket_rejects_reusable_query_token() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let rejection = authorize_server_websocket_target(
+            &format!("/api/session/sess_1/stream?token={token}"),
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            Instant::now(),
+        )
+        .unwrap_err();
+
+        assert_eq!(rejection.status, WsStatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn server_websocket_rejects_cross_origin_without_consuming_ticket() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let ticket = issue_test_websocket_ticket(
+            &mut state,
+            "sess_1",
+            client_ip,
+            "http://127.0.0.1:8765",
+            now,
+        );
+        let target = format!("/api/session/sess_1/stream?ticket={ticket}");
+        let rejection = authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("https://attacker.example"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(rejection.status, WsStatusCode::FORBIDDEN);
+
+        assert!(authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn server_websocket_ticket_is_session_bound_short_lived_and_single_use() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let ticket = issue_test_websocket_ticket(
+            &mut state,
+            "sess_1",
+            client_ip,
+            "http://127.0.0.1:8765",
+            now,
+        );
+        let target = format!("/api/session/sess_1/stream?ticket={ticket}");
+        let authorized = authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .unwrap();
+        assert_eq!(authorized.session_id, "sess_1");
+
+        let replay = authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(replay.status, WsStatusCode::UNAUTHORIZED);
+
+        let expired = issue_test_websocket_ticket(
+            &mut state,
+            "sess_2",
+            client_ip,
+            "http://127.0.0.1:8765",
+            now,
+        );
+        let expired_target = format!("/api/session/sess_2/stream?ticket={expired}");
+        assert!(authorize_server_websocket_target(
+            &expired_target,
+            Some("127.0.0.1:8765"),
+            Some("http://127.0.0.1:8765"),
+            Some(client_ip),
+            &mut state,
+            now + SERVER_WEBSOCKET_TICKET_TTL + Duration::from_millis(1),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn server_websocket_ticket_endpoint_and_tauri_loopback_origin_succeed() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let token = options.auth_token.clone();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/ws-ticket".to_string(),
+            query: None,
+            headers: HashMap::from([
+                ("authorization".to_string(), format!("Bearer {token}")),
+                ("content-type".to_string(), "application/json".to_string()),
+                ("host".to_string(), "127.0.0.1:8765".to_string()),
+                ("origin".to_string(), "http://tauri.localhost".to_string()),
+            ]),
+            body: serde_json::json!({ "session_id": "sess_1" }).to_string(),
+            client_ip: Some(client_ip),
+        };
+        let response = route_server_request(&request, &mut state);
+        assert_eq!(response.status_code, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let ticket = payload["result"]["ticket"].as_str().unwrap();
+        assert!(ticket.starts_with("wst_"));
+        assert!(!ticket.contains(&state.options.auth_token));
+
+        let target = format!("/api/session/sess_1/stream?ticket={ticket}");
+        assert!(authorize_server_websocket_target(
+            &target,
+            Some("127.0.0.1:8765"),
+            Some("http://tauri.localhost"),
+            Some(client_ip),
+            &mut state,
+            Instant::now(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn server_websocket_frame_rate_is_bounded_per_connection_and_client() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut state = ServerState::new(options);
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut connection = ServerWebSocketRateWindow::new(now);
+
+        for _ in 0..SERVER_WEBSOCKET_RATE_FRAMES {
+            assert!(connection.allow(1, now));
+            assert!(state.allow_websocket_frame(Some(client_ip), 1, now));
+        }
+        assert!(!connection.allow(1, now));
+        assert!(!state.allow_websocket_frame(Some(client_ip), 1, now));
+
+        let reset_at = now + SERVER_WEBSOCKET_RATE_WINDOW + Duration::from_millis(1);
+        assert!(connection.allow(1, reset_at));
+        assert!(state.allow_websocket_frame(Some(client_ip), 1, reset_at));
+
+        let mut byte_limited = ServerWebSocketRateWindow::new(now);
+        assert!(!byte_limited.allow(SERVER_WEBSOCKET_RATE_BYTES + 1, now));
+    }
+
+    #[test]
+    fn server_websocket_binary_frames_share_connection_and_client_budgets() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new(options)));
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut connection = ServerWebSocketRateWindow::new(now);
+
+        for _ in 0..SERVER_WEBSOCKET_RATE_FRAMES {
+            assert!(allow_server_websocket_inbound_frame(
+                &state,
+                Some(client_ip),
+                &mut connection,
+                &WsMessage::Binary(vec![0x42]),
+                now,
+            )
+            .unwrap());
+        }
+        assert!(!allow_server_websocket_inbound_frame(
+            &state,
+            Some(client_ip),
+            &mut connection,
+            &WsMessage::Binary(vec![0x42]),
+            now,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn server_websocket_rejects_oversized_binary_and_allows_normal_control_frames() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new(options)));
+        let client_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let now = Instant::now();
+        let mut connection = ServerWebSocketRateWindow::new(now);
+
+        assert!(!allow_server_websocket_inbound_frame(
+            &state,
+            Some(client_ip),
+            &mut connection,
+            &WsMessage::Binary(vec![0; SERVER_WEBSOCKET_MAX_MESSAGE_BYTES + 1]),
+            now,
+        )
+        .unwrap());
+        assert_eq!(connection.frame_count, 1);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .websocket_rate_limits
+                .get(&client_ip)
+                .unwrap()
+                .frame_count,
+            1
+        );
+
+        for control in [
+            WsMessage::Ping(vec![1, 2, 3]),
+            WsMessage::Pong(vec![4, 5, 6]),
+            WsMessage::Close(None),
+        ] {
+            assert!(allow_server_websocket_inbound_frame(
+                &state,
+                Some(client_ip),
+                &mut connection,
+                &control,
+                now,
+            )
+            .unwrap());
+        }
+        assert_eq!(connection.frame_count, 4);
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .websocket_rate_limits
+                .get(&client_ip)
+                .unwrap()
+                .frame_count,
+            4
+        );
+    }
+
+    #[test]
+    fn server_websocket_rejects_oversized_mutation_payloads_before_dispatch() {
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = Arc::new(Mutex::new(ServerState::new(options)));
+        let oversized_input = serde_json::json!({
+            "type": "input",
+            "text": "x".repeat(SERVER_WEBSOCKET_MAX_INPUT_BYTES + 1),
+        })
+        .to_string();
+        let oversized_paste = serde_json::json!({
+            "type": "paste",
+            "text": "x".repeat(SERVER_WEBSOCKET_MAX_PASTE_BYTES + 1),
+        })
+        .to_string();
+        let oversized_key = serde_json::json!({
+            "type": "key",
+            "key": "x".repeat(SERVER_WEBSOCKET_MAX_KEY_BYTES + 1),
+        })
+        .to_string();
+        let oversized_resize = serde_json::json!({
+            "type": "resize",
+            "columns": u64::from(SERVER_WEBSOCKET_MAX_TERMINAL_DIMENSION) + 1,
+            "rows": 30,
+        })
+        .to_string();
+
+        for payload in [
+            oversized_input,
+            oversized_paste,
+            oversized_key,
+            oversized_resize,
+        ] {
+            assert!(handle_server_websocket_message("sess_1", &payload, &state).is_err());
+        }
+    }
+
+    #[test]
+    fn server_control_bridge_is_allowlisted_and_desktop_only() {
+        assert!(server_control_method_allowed(
+            "git.status",
+            ServerMode::DesktopBridge
+        ));
+        assert!(server_control_method_allowed(
+            "agent.worktree.create",
+            ServerMode::DesktopBridge
+        ));
+        assert!(!server_control_method_allowed(
+            "session.send_text",
+            ServerMode::DesktopBridge
+        ));
+        assert!(server_control_method_allowed(
+            "git.status_page",
+            ServerMode::Local
+        ));
+        assert!(server_control_method_allowed(
+            "git.status",
+            ServerMode::Local
+        ));
+
+        let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "x-agentmux-server-token".to_string(),
+            options.auth_token.clone(),
+        );
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let mut state = ServerState::new(options);
+        let response = route_server_request(
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/control".to_string(),
+                query: None,
+                headers,
+                body: serde_json::json!({
+                    "method": "session.send_text",
+                    "params": { "session_id": "sess_1", "text": "blocked" }
+                })
+                .to_string(),
+                client_ip: None,
+            },
+            &mut state,
+        );
+        assert_eq!(response.status_code, 403);
     }
 
     #[test]
@@ -15948,14 +18840,39 @@ mod tests {
     #[test]
     fn server_desktop_bootstrap_embeds_auth_token() {
         let options = parse_server_options(&["--port".to_string(), "0".to_string()]).unwrap();
+        let state = ServerState::new(options);
         let html = inject_server_bootstrap(
             "<!doctype html><html><head></head><body></body></html>".to_string(),
-            &options,
+            &state,
         );
 
         assert!(html.contains("window.__AGENTMUX_SERVER__"));
         assert!(html.contains("\"token\""));
-        assert!(html.contains(&options.auth_token));
+        assert!(html.contains(&state.options.auth_token));
+    }
+
+    #[test]
+    fn local_server_source_control_capability_requires_a_successful_probe() {
+        let cwd = std::env::temp_dir().join(format!(
+            "agentmux-server-non-repository-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&cwd).unwrap();
+        let options = parse_server_options(&[
+            "--port".to_string(),
+            "0".to_string(),
+            "--cwd".to_string(),
+            cwd.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        let state = ServerState::new(options);
+        assert!(!state.source_control_available());
+        assert!(state.control_methods().is_empty());
+        fs::remove_dir_all(cwd).unwrap();
     }
 
     #[test]

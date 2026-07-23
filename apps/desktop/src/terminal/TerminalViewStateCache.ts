@@ -1,6 +1,8 @@
 export interface TerminalViewState {
   serialized: string;
   outputOffset: number;
+  /** Absolute xterm viewport position, retained across cold parking. */
+  viewportY?: number;
   updatedAt: number;
 }
 
@@ -24,7 +26,9 @@ export class TerminalViewStateCache {
       !sessionId ||
       !state.serialized ||
       !Number.isSafeInteger(state.outputOffset) ||
-      state.outputOffset < 0
+      state.outputOffset < 0 ||
+      (state.viewportY !== undefined &&
+        (!Number.isSafeInteger(state.viewportY) || state.viewportY < 0))
     ) {
       return false;
     }

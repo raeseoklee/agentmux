@@ -86,6 +86,10 @@ import type {
 } from "../terminal/TerminalWebglPolicy";
 import { terminalViewStateCache } from "../terminal/TerminalViewStateCache";
 import {
+  decideTerminalWarmRetain,
+  type TerminalWarmRetainTab,
+} from "../terminal/TerminalWarmRetainPolicy";
+import {
   ACCENTS,
   buildRootVars,
   THEMES,
@@ -1507,6 +1511,7 @@ interface PaneViewProps {
   pane: PaneSummary;
   surface: SurfaceSummary | undefined;
   session: TerminalSession | undefined;
+  visible: boolean;
   active: boolean;
   isBrowser: boolean;
   agentState: AgentState | null;
@@ -1561,6 +1566,7 @@ const PaneView = memo(function PaneView({
   pane,
   surface,
   session,
+  visible,
   active,
   isBrowser,
   agentState,
@@ -1891,6 +1897,7 @@ const PaneView = memo(function PaneView({
               key={session.sessionId}
               client={client}
               sessionId={session.sessionId}
+              visible={visible}
               active={active}
               agentKind={terminalAgentKind(session, telemetry)}
               innerMargin={terminalInnerMargin}
@@ -2042,6 +2049,7 @@ export function AgentmuxTerminalApp() {
   const updateNotificationSessionRef = useRef(
     createUpdateNotificationSession(),
   );
+  const announcedDevServerCandidatesRef = useRef<Set<string>>(new Set());
 
   const [theme, setTheme] = useState<ThemeName>("dark");
   const [language, setLanguage] = useState<AppLocaleLanguage>("en");
@@ -2341,6 +2349,50 @@ export function AgentmuxTerminalApp() {
 
   const T = THEMES[theme];
   const t = useMemo(() => createTranslator(language), [language]);
+  useEffect(() => {
+    const eventApi = (
+      window as Window & {
+        __TAURI__?: {
+          event?: {
+            listen?: (
+              event: string,
+              handler: (event: { payload?: unknown }) => void,
+            ) => Promise<() => void>;
+          };
+        };
+      }
+    ).__TAURI__?.event;
+    if (!eventApi?.listen) return;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void eventApi.listen("dev_server.candidate_detected", (event) => {
+      const payload = event.payload as { candidate_id?: unknown; url?: unknown } | undefined;
+      const candidateId = typeof payload?.candidate_id === "string" ? payload.candidate_id : "";
+      const url = typeof payload?.url === "string" ? payload.url : "";
+      if (!candidateId || !url || announcedDevServerCandidatesRef.current.has(candidateId)) return;
+      announcedDevServerCandidatesRef.current.add(candidateId);
+      dialogs.toast({
+        title: t("devServer.detectedTitle"),
+        description: t("devServer.detectedDescription", { url }),
+        actionLabel: t("devServer.openInSplit"),
+        durationMs: 15_000,
+        testId: "dev-server-detected-toast",
+        onAction: () => {
+          void client.openDevelopmentServerCandidateInSplit(candidateId).catch((cause) => {
+            dialogs.toast({
+              title: t("devServer.openFailed"),
+              description: cause instanceof Error ? cause.message : String(cause),
+              tone: "danger",
+            });
+          });
+        },
+      });
+    }).then((stopListening) => {
+      if (disposed) stopListening(); else unlisten = stopListening;
+    }).catch(() => undefined);
+    return () => { disposed = true; unlisten?.(); };
+  }, [client, dialogs, t]);
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
@@ -3308,6 +3360,91 @@ export function AgentmuxTerminalApp() {
     }
     return ordered;
   }, [panes, rootPaneForPane, rootPaneId, tabSurfaces]);
+
+  const activeTabRootRef = useRef<string | null>(null);
+  const [lastActiveTabRootId, setLastActiveTabRootId] = useState<string | null>(
+    null,
+  );
+  const [tabWarmActivity, setTabWarmActivity] = useState<
+    Map<string, { lastActiveAt: number; hiddenSince: number | null }>
+  >(() => new Map());
+  const [warmRetainNow, setWarmRetainNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const now = Date.now();
+    const previousActiveRoot = activeTabRootRef.current;
+    const activeRootChanged = previousActiveRoot !== rootPaneId;
+    if (rootPaneId && previousActiveRoot && activeRootChanged) {
+      setLastActiveTabRootId(previousActiveRoot);
+    }
+    activeTabRootRef.current = rootPaneId;
+
+    setTabWarmActivity((previous) => {
+      const next = new Map<
+        string,
+        { lastActiveAt: number; hiddenSince: number | null }
+      >();
+      let changed = previous.size !== tabRootPaneIds.length;
+      for (const tabId of tabRootPaneIds) {
+        const existing = previous.get(tabId);
+        if (tabId === rootPaneId) {
+          if (!existing || existing.hiddenSince !== null) {
+            next.set(tabId, { lastActiveAt: now, hiddenSince: null });
+            changed = true;
+          } else {
+            next.set(tabId, existing);
+          }
+          continue;
+        }
+        if (!existing) {
+          next.set(tabId, { lastActiveAt: now, hiddenSince: now });
+          changed = true;
+        } else if (existing.hiddenSince === null) {
+          next.set(tabId, { ...existing, hiddenSince: now });
+          changed = true;
+        } else {
+          next.set(tabId, existing);
+        }
+      }
+      return changed ? next : previous;
+    });
+    if (activeRootChanged) {
+      setWarmRetainNow(now);
+    }
+  }, [rootPaneId, tabRootPaneIds]);
+
+  const terminalWarmRetainTabs = useMemo<TerminalWarmRetainTab[]>(() => {
+    return tabRootPaneIds.map((tabId) => {
+      const activity = tabWarmActivity.get(tabId);
+      return {
+        tabId,
+        active: tabId === rootPaneId,
+        lastActive: tabId === lastActiveTabRootId,
+        lastActiveAt: activity?.lastActiveAt ?? null,
+        hiddenSince:
+          tabId === rootPaneId ? null : (activity?.hiddenSince ?? warmRetainNow),
+      };
+    });
+  }, [
+    lastActiveTabRootId,
+    rootPaneId,
+    tabRootPaneIds,
+    tabWarmActivity,
+    warmRetainNow,
+  ]);
+  const terminalWarmRetainDecision = useMemo(
+    () => decideTerminalWarmRetain(terminalWarmRetainTabs, warmRetainNow),
+    [terminalWarmRetainTabs, warmRetainNow],
+  );
+  useEffect(() => {
+    const nextTransitionAt = terminalWarmRetainDecision.nextTransitionAt;
+    if (!nextTransitionAt) return;
+    const timer = window.setTimeout(
+      () => setWarmRetainNow(Date.now()),
+      Math.max(0, nextTransitionAt - Date.now()) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [terminalWarmRetainDecision.nextTransitionAt]);
 
   const activeWorkspace = workspaces.find(
     (ws) => ws.workspaceId === activeWorkspaceId,
@@ -6906,6 +7043,14 @@ export function AgentmuxTerminalApp() {
       ? sessionById.get(surface.sessionId)
       : undefined;
     const active = pane.paneId === activePaneId;
+    const zoomedPane = zoomedPaneId ? paneById.get(zoomedPaneId) : undefined;
+    const activeTabZoomedPaneId =
+      zoomedPane && rootPaneId && rootPaneForPane(zoomedPane).paneId === rootPaneId
+        ? zoomedPaneId
+        : null;
+    const visible =
+      rootPaneForPane(pane).paneId === rootPaneId &&
+      (!activeTabZoomedPaneId || pane.paneId === activeTabZoomedPaneId);
     const attentionState = session
       ? attentionBySession.get(session.sessionId)
       : undefined;
@@ -6936,6 +7081,7 @@ export function AgentmuxTerminalApp() {
         pane={pane}
         surface={surface}
         session={session}
+        visible={visible}
         active={active}
         isBrowser={isBrowser}
         agentState={agentState}
@@ -8969,7 +9115,11 @@ export function AgentmuxTerminalApp() {
                   제어 플레인에 연결 중…
                 </div>
               ) : rootPaneId ? (
-                tabRootPaneIds.map((tabRootPaneId) => {
+                tabRootPaneIds
+                  .filter((tabRootPaneId) =>
+                    terminalWarmRetainDecision.warmTabIds.has(tabRootPaneId),
+                  )
+                  .map((tabRootPaneId) => {
                   const tabActive = tabRootPaneId === rootPaneId;
                   return (
                     <div
@@ -8978,6 +9128,7 @@ export function AgentmuxTerminalApp() {
                       data-agentmux-pane-tree={tabRootPaneId}
                       data-agentmux-tab-pane-tree={tabRootPaneId}
                       data-agentmux-tab-active={tabActive ? "true" : "false"}
+                      data-agentmux-tab-warm="true"
                       data-agentmux-zoomed-pane={
                         tabActive && zoomedPaneId && paneById.get(zoomedPaneId)
                           ? zoomedPaneId
@@ -9036,6 +9187,9 @@ export function AgentmuxTerminalApp() {
             <SourceControlPanel
               client={client}
               workspace={activeWorkspace}
+              activePaneId={activePaneId ?? null}
+              activeSessionId={activeTerminalSession?.sessionId ?? null}
+              activeCwd={sidebarState?.cwd ?? null}
               onClose={closeOverlay}
               onRepositoryChanged={ctl.refreshSidebar}
               t={t}
@@ -11016,6 +11170,7 @@ function DockPanel({
                   <LiveTerminal
                     client={client}
                     sessionId={session.sessionId}
+                    visible
                     active={activeSessionId === session.sessionId}
                     innerMargin={terminalInnerMargin}
                     terminalGpuAcceleration={terminalGpuAcceleration}

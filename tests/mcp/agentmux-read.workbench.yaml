@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 15
+        equals: 22
       - kind: contains
         path: $.tools[*].name
         value: agentmux_context
@@ -32,12 +32,51 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: agent_team_list
+      - kind: contains
+        path: $.tools[*].name
+        value: git_status_page
+      - kind: contains
+        path: $.tools[*].name
+        value: development_server_candidate_list
   - id: read-profile-denies-standard-call
     description: Dispatch rejects a standard tool even when a client calls it directly
     act:
       method: tools/call
       tool: terminal_open
       args: {}
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'standard' MCP profile
+  - id: read-profile-denies-git-mutation
+    description: Read profile cannot dispatch caller-scoped Git mutations
+    act:
+      method: tools/call
+      tool: git_stage
+      args: {}
+    assert:
+      - kind: status
+        equals: success
+      - kind: protocolError
+        equals: false
+      - kind: executionError
+        equals: true
+      - kind: contains
+        path: $.structuredContent.error.message
+        value: requires the 'standard' MCP profile
+  - id: read-profile-denies-review-comment-delete
+    description: Read profile cannot delete review comments
+    act:
+      method: tools/call
+      tool: git_review_comment_delete
+      args:
+        comment_id: comment-example
     assert:
       - kind: status
         equals: success
