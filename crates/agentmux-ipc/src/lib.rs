@@ -2752,6 +2752,8 @@ pub struct GitReviewThreadResult {
     pub thread_id: String,
     pub workspace_id: String,
     pub repository_id: String,
+    #[serde(default)]
+    pub author_session_id: Option<String>,
     pub anchor: GitReviewLineAnchor,
     #[serde(default)]
     pub resolved: bool,
@@ -4521,6 +4523,7 @@ mod tests {
             thread_id: "thread_1".to_string(),
             workspace_id: "ws_1".to_string(),
             repository_id: "repo_1".to_string(),
+            author_session_id: Some("ses_1".to_string()),
             anchor: create.anchor,
             resolved: false,
             stale: false,
@@ -4534,6 +4537,14 @@ mod tests {
                 .unwrap(),
             thread
         );
+
+        let mut legacy_thread = serde_json::to_value(&thread).unwrap();
+        legacy_thread
+            .as_object_mut()
+            .expect("serialized review thread object")
+            .remove("author_session_id");
+        let legacy_thread: GitReviewThreadResult = serde_json::from_value(legacy_thread).unwrap();
+        assert_eq!(legacy_thread.author_session_id, None);
     }
 
     #[test]

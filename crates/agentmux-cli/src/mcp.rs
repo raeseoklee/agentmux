@@ -913,7 +913,13 @@ impl AgentMuxMcpServer {
                 "the review thread is outside the caller's active workspace or repository",
             ));
         }
-        if review_thread_owner_session_id(thread) != Some(scope.session_id.as_str()) {
+        let Some(owner_session_id) = review_thread_owner_session_id(thread) else {
+            return Err(standard_scope_denied_result(
+                tool_name,
+                "the review thread has no durable owner identity",
+            ));
+        };
+        if owner_session_id != scope.session_id {
             return Err(standard_scope_denied_result(
                 tool_name,
                 "the review thread was not created by the caller's active agent session",
@@ -944,7 +950,13 @@ impl AgentMuxMcpServer {
             else {
                 continue;
             };
-            if review_thread_owner_session_id(thread) != Some(scope.session_id.as_str()) {
+            let Some(owner_session_id) = review_thread_owner_session_id(thread) else {
+                return Err(standard_scope_denied_result(
+                    tool_name,
+                    "the review thread has no durable owner identity",
+                ));
+            };
+            if owner_session_id != scope.session_id {
                 return Err(standard_scope_denied_result(
                     tool_name,
                     "the review comment belongs to a thread not owned by the caller's active agent session",
@@ -2229,6 +2241,14 @@ impl AgentMuxMcpServer {
         };
         if let Err(error) = request.validate() {
             return invalid_ipc_params_result(METHOD_GIT_REVIEW_THREAD_DELETE, error);
+        }
+        if self.profile == McpProfile::Standard {
+            if let Err(result) = self
+                .authorize_standard_review_thread("git_review_thread_delete", &request.thread_id)
+                .await
+            {
+                return result;
+            }
         }
         self.call(METHOD_GIT_REVIEW_THREAD_DELETE, json!(request))
             .await
@@ -5563,12 +5583,7 @@ fn review_thread_matches_scope(thread: &Value, scope: &StandardCallerScope) -> b
 }
 
 fn review_thread_owner_session_id(thread: &Value) -> Option<&str> {
-    thread
-        .get("comments")
-        .and_then(Value::as_array)
-        .and_then(|comments| comments.first())
-        .and_then(|comment| comment.get("author_session_id"))
-        .and_then(Value::as_str)
+    thread.get("author_session_id").and_then(Value::as_str)
 }
 
 fn invalid_ipc_params_result(method: &str, error: agentmux_ipc::ControlError) -> CallToolResult {
@@ -7191,6 +7206,7 @@ mod tests {
                 "thread_id": "review-owned",
                 "workspace_id": "workspace-1",
                 "repository_id": "repo-1",
+                "author_session_id": "session-agent",
                 "comments": [
                     {
                         "comment_id": "comment-root",
@@ -7904,6 +7920,10 @@ mod tests {
                     METHOD_GIT_REVIEW_COMMENT_DELETE,
                     json!({"comment_id": "comment-owned"}),
                 ),
+                (
+                    METHOD_GIT_REVIEW_THREAD_DELETE,
+                    json!({"thread_id": "review-owned"}),
+                ),
             ],
         );
 
@@ -7939,8 +7959,20 @@ mod tests {
                 comment_id: "comment-owned".to_string(),
             }))
             .await;
+        let delete_thread = server
+            .git_review_thread_delete(Parameters(GitReviewThreadIdToolParams {
+                thread_id: "review-owned".to_string(),
+            }))
+            .await;
 
-        for result in [update, stale, create, update_comment, delete_comment] {
+        for result in [
+            update,
+            stale,
+            create,
+            update_comment,
+            delete_comment,
+            delete_thread,
+        ] {
             assert_eq!(result.is_error, Some(false));
         }
         let calls = transport.calls.lock().expect("fake calls lock");
@@ -7952,6 +7984,211 @@ mod tests {
         assert!(calls
             .iter()
             .any(|(method, _)| method == METHOD_GIT_REVIEW_COMMENT_DELETE));
+        assert!(calls
+            .iter()
+            .any(|(method, _)| method == METHOD_GIT_REVIEW_THREAD_DELETE));
+    }
+
+    #[tokio::test]
+    async fn standard_review_thread_owner_survives_deleted_or_reordered_comments() {
+        for (thread_id, threads) in [
+            (
+                "review-comments-deleted",
+                json!({
+                    "threads": [{
+                        "thread_id": "review-comments-deleted",
+                        "workspace_id": "workspace-1",
+                        "repository_id": "repo-1",
+                        "author_session_id": "session-agent",
+                        "comments": [],
+                    }],
+                }),
+            ),
+            (
+                "review-comments-reordered",
+                json!({
+                    "threads": [{
+                        "thread_id": "review-comments-reordered",
+                        "workspace_id": "workspace-1",
+                        "repository_id": "repo-1",
+                        "author_session_id": "session-agent",
+                        "comments": [
+                            {
+                                "comment_id": "comment-peer",
+                                "author_session_id": "session-peer",
+                            },
+                            {
+                                "comment_id": "comment-owner",
+                                "author_session_id": "session-agent",
+                            }
+                        ],
+                    }],
+                }),
+            ),
+        ] {
+            let (server, transport) = test_server_for_profile(
+                McpProfile::Standard,
+                [
+                    ("system.identify", standard_caller_context()),
+                    (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                    (METHOD_GIT_REVIEW_THREAD_LIST, threads),
+                    (
+                        METHOD_GIT_REVIEW_THREAD_UPDATE,
+                        json!({"thread_id": thread_id}),
+                    ),
+                ],
+            );
+            let result = server
+                .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                    thread_id: thread_id.to_string(),
+                    resolved: Some(true),
+                    anchor: None,
+                }))
+                .await;
+            assert_eq!(result.is_error, Some(false));
+
+            let calls = transport.calls.lock().expect("fake calls lock");
+            assert_eq!(calls.len(), 4);
+            assert_eq!(calls[1].1["pane_id"], "pane-1");
+            assert_eq!(calls[2].1["workspace_id"], "workspace-1");
+            assert_eq!(calls[2].1["pane_id"], "pane-1");
+            assert_eq!(calls[2].1["repository_id"], "repo-1");
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_review_thread_owner_cannot_transfer_when_comments_are_reordered() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (
+                    METHOD_GIT_REVIEW_THREAD_LIST,
+                    json!({
+                        "threads": [{
+                            "thread_id": "review-peer",
+                            "workspace_id": "workspace-1",
+                            "repository_id": "repo-1",
+                            "author_session_id": "session-peer",
+                            "comments": [
+                                {
+                                    "comment_id": "comment-agent",
+                                    "author_session_id": "session-agent",
+                                },
+                                {
+                                    "comment_id": "comment-peer",
+                                    "author_session_id": "session-peer",
+                                }
+                            ],
+                        }],
+                    }),
+                ),
+            ],
+        );
+        let result = server
+            .git_review_thread_update(Parameters(GitReviewThreadUpdateToolParams {
+                thread_id: "review-peer".to_string(),
+                resolved: Some(true),
+                anchor: None,
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.as_ref().is_some_and(|value| value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("not created by the caller"))));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn standard_review_mutations_deny_threads_without_durable_owner() {
+        let missing_owner_threads = || {
+            json!({
+                "threads": [{
+                    "thread_id": "review-legacy",
+                    "workspace_id": "workspace-1",
+                    "repository_id": "repo-1",
+                    "comments": [{
+                        "comment_id": "comment-legacy",
+                        "author_session_id": "session-agent",
+                    }],
+                }],
+            })
+        };
+
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (METHOD_GIT_REVIEW_THREAD_LIST, missing_owner_threads()),
+            ],
+        );
+        let thread_delete = server
+            .git_review_thread_delete(Parameters(GitReviewThreadIdToolParams {
+                thread_id: "review-legacy".to_string(),
+            }))
+            .await;
+        assert_eq!(thread_delete.is_error, Some(true));
+        assert!(thread_delete
+            .structured_content
+            .as_ref()
+            .is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("no durable owner identity"))));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
+
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (METHOD_GIT_REVIEW_THREAD_LIST, missing_owner_threads()),
+            ],
+        );
+        let comment_update = server
+            .git_review_comment_update(Parameters(GitReviewCommentUpdateToolParams {
+                comment_id: "comment-legacy".to_string(),
+                body: "Denied legacy update".to_string(),
+            }))
+            .await;
+        assert_eq!(comment_update.is_error, Some(true));
+        assert!(comment_update
+            .structured_content
+            .as_ref()
+            .is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("no durable owner identity"))));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
+
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("system.identify", standard_caller_context()),
+                (METHOD_GIT_STATUS_SUMMARY, standard_active_repository()),
+                (METHOD_GIT_REVIEW_THREAD_LIST, missing_owner_threads()),
+            ],
+        );
+        let delivery = server
+            .git_review_thread_deliver(Parameters(GitReviewThreadDeliverToolParams {
+                thread_id: "review-legacy".to_string(),
+                target: "mailbox".to_string(),
+                target_session_id: Some("session-worker".to_string()),
+                include_context: false,
+            }))
+            .await;
+        assert_eq!(delivery.is_error, Some(true));
+        assert!(delivery
+            .structured_content
+            .as_ref()
+            .is_some_and(|value| value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("no durable owner identity"))));
+        assert_eq!(transport.calls.lock().expect("fake calls lock").len(), 3);
     }
 
     #[tokio::test]
@@ -7961,6 +8198,7 @@ mod tests {
                 "thread_id": "review-foreign-repo",
                 "workspace_id": "workspace-1",
                 "repository_id": "repo-foreign",
+                "author_session_id": "session-agent",
                 "comments": [{
                     "comment_id": "comment-foreign-repo",
                     "author_session_id": "session-agent"
@@ -7972,6 +8210,7 @@ mod tests {
                 "thread_id": "review-peer",
                 "workspace_id": "workspace-1",
                 "repository_id": "repo-1",
+                "author_session_id": "session-peer",
                 "comments": [{
                     "comment_id": "comment-peer-root",
                     "author_session_id": "session-peer"
@@ -8172,6 +8411,7 @@ mod tests {
                             "thread_id": "review-1",
                             "workspace_id": "workspace-1",
                             "repository_id": "repo-1",
+                            "author_session_id": "session-agent",
                             "comments": [{"author_session_id": "session-agent"}],
                         }],
                     })),
@@ -8237,6 +8477,7 @@ mod tests {
                             "thread_id": "review-1",
                             "workspace_id": "workspace-1",
                             "repository_id": "repo-1",
+                            "author_session_id": "session-other",
                             "comments": [{"author_session_id": "session-other"}],
                         }],
                     })),
@@ -8290,6 +8531,7 @@ mod tests {
                             "thread_id": "review-1",
                             "workspace_id": "workspace-1",
                             "repository_id": "repo-1",
+                            "author_session_id": "session-agent",
                             "comments": [{"author_session_id": "session-agent"}],
                         }],
                     })),
