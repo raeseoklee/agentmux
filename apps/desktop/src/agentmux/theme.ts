@@ -89,6 +89,72 @@ export const ACCENTS: Accent[] = [
   { key: "violet", label: "Iris", hex: "#8B5CF6", hover: "#7C3AED", soft: "rgba(139,92,246,0.16)" }
 ];
 
+const CUSTOM_ACCENT_PREFIX = "custom:";
+const HEX_COLOR_PATTERN = /^#([0-9a-f]{6})$/i;
+
+export function normalizeAccentHex(value: string): string | null {
+  const trimmed = value.trim();
+  const short = /^#([0-9a-f]{3})$/i.exec(trimmed);
+  if (short) {
+    return `#${[...short[1]].map((digit) => `${digit}${digit}`).join("")}`.toUpperCase();
+  }
+  return HEX_COLOR_PATTERN.test(trimmed) ? trimmed.toUpperCase() : null;
+}
+
+export function customAccentKey(value: string): string | null {
+  const hex = normalizeAccentHex(value);
+  return hex ? `${CUSTOM_ACCENT_PREFIX}${hex}` : null;
+}
+
+export function customAccentHex(key: string): string | null {
+  if (!key.startsWith(CUSTOM_ACCENT_PREFIX)) {
+    return null;
+  }
+  return normalizeAccentHex(key.slice(CUSTOM_ACCENT_PREFIX.length));
+}
+
+function relativeLuminance(hex: string): number {
+  const normalized = normalizeAccentHex(hex) ?? "#3B82F6";
+  const channels = [1, 3, 5].map((offset) => {
+    const channel = Number.parseInt(normalized.slice(offset, offset + 2), 16) / 255;
+    return channel <= 0.04045
+      ? channel / 12.92
+      : ((channel + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+}
+
+export function accentForeground(hex: string): "#0A0A0B" | "#FFFFFF" {
+  const luminance = relativeLuminance(hex);
+  const contrastWithDark = (luminance + 0.05) / 0.05;
+  const contrastWithLight = 1.05 / (luminance + 0.05);
+  return contrastWithDark >= contrastWithLight ? "#0A0A0B" : "#FFFFFF";
+}
+
+export function resolveAccent(key: string): Accent {
+  const preset = ACCENTS.find((candidate) => candidate.key === key);
+  if (preset) {
+    return preset;
+  }
+  const hex = customAccentHex(key);
+  if (!hex) {
+    return ACCENTS[0];
+  }
+  const channels = [1, 3, 5].map((offset) =>
+    Number.parseInt(hex.slice(offset, offset + 2), 16),
+  );
+  const hover = `#${channels
+    .map((channel) => Math.max(0, Math.round(channel * 0.84)).toString(16).padStart(2, "0"))
+    .join("")}`.toUpperCase();
+  return {
+    key: `${CUSTOM_ACCENT_PREFIX}${hex}`,
+    label: "Custom",
+    hex,
+    hover,
+    soft: `rgba(${channels.join(",")},0.16)`,
+  };
+}
+
 // Build the CSS custom-property map applied to the prototype root element so
 // every nested inline style can reference var(--accent), var(--fg1), etc.
 export function buildRootVars(theme: ThemeTokens, accent: Accent, fontSize: number): CSSProperties {
@@ -108,6 +174,7 @@ export function buildRootVars(theme: ThemeTokens, accent: Accent, fontSize: numb
     "--info": theme.info,
     "--term": theme.term,
     "--accent": accent.hex,
+    "--accent-fg": accentForeground(accent.hex),
     "--accent-hover": accent.hover,
     "--accent-soft": accent.soft,
     "--term-fs": `${fontSize}px`

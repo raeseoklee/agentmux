@@ -172,7 +172,7 @@ test("TS-14: broadcast toggle via palette shows BCAST badge on panes", async ({
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
-  await page.keyboard.type("브로드캐스트");
+  await page.keyboard.type("broadcast");
   await expect(page.locator(".agentmux-palette-item").first()).toBeVisible();
   await page.keyboard.press("Enter");
 
@@ -185,7 +185,7 @@ test("TS-14: broadcast toggle via palette shows BCAST badge on panes", async ({
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
-  await page.keyboard.type("브로드캐스트");
+  await page.keyboard.type("broadcast");
   await expect(page.locator(".agentmux-palette-item").first()).toBeVisible();
   await page.keyboard.press("Enter");
 
@@ -210,8 +210,10 @@ test("palette glue: terminal.clearBuffer and terminal.selectAll appear in palett
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
-  await page.keyboard.type("버퍼 지우기");
-  const clearItem = page.locator(".agentmux-palette-item").filter({ hasText: "터미널 버퍼 지우기" });
+  await page.keyboard.type("buffer");
+  const clearItem = page
+    .locator(".agentmux-palette-item")
+    .filter({ hasText: "Clear terminal buffer" });
   await expect(clearItem).toBeVisible();
 
   // Execute — should not crash (palette closes).
@@ -224,8 +226,10 @@ test("palette glue: terminal.clearBuffer and terminal.selectAll appear in palett
   await page.keyboard.press("P");
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
-  await page.keyboard.type("전체 선택");
-  const selectAllItem = page.locator(".agentmux-palette-item").filter({ hasText: "터미널 전체 선택" });
+  await page.keyboard.type("select all");
+  const selectAllItem = page
+    .locator(".agentmux-palette-item")
+    .filter({ hasText: "Select all terminal content" });
   await expect(selectAllItem).toBeVisible();
 
   // Execute — should not crash.

@@ -10,11 +10,16 @@ GitHub Actions with checksums and GitHub Artifact Attestations.
 Run these checks on the release branch before tagging:
 
 ```powershell
+npm run check
+npm run desktop:gates
 npm run version:check
-npm --prefix apps/desktop run build
-npm run docs:check
-npm run repo:hygiene
 ```
+
+Apply [Release quality gates](./release-quality-gates.md) to every user-visible
+change in the release. Browser Preview evidence alone is insufficient for a
+workflow that crosses Tauri IPC, WebView2, PTY, filesystem, updater, or another
+Windows integration. Perform and record an isolated real-Tauri smoke for each
+affected production boundary before tagging.
 
 For a full local installer smoke, build the NSIS installer and verify the output
 before tagging.

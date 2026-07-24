@@ -92,6 +92,10 @@ import {
 import {
   ACCENTS,
   buildRootVars,
+  customAccentHex,
+  customAccentKey,
+  normalizeAccentHex,
+  resolveAccent,
   THEMES,
   type ThemeName,
   type ThemeTokens,
@@ -106,6 +110,7 @@ import {
   IconDuplicate,
   IconFolder,
   IconGear,
+  IconGlobe,
   IconGrid,
   IconMoon,
   IconPlus,
@@ -960,8 +965,8 @@ function surfaceTabActionIcon(actionId: string): ReactNode {
 // component state. Hoisting them to module scope keeps their references stable
 // across renders, so style props no longer churn every poll tick.
 const ICON_BTN_STYLE: CSSProperties = {
-  width: 30,
-  height: 30,
+  width: 32,
+  height: 32,
   borderRadius: 7,
   border: 0,
   background: "transparent",
@@ -1761,7 +1766,7 @@ const PaneView = memo(function PaneView({
             title="페인 확대 중 — Ctrl+Shift+Z로 복원"
             style={{
               font: `700 9px/1 ${FONT_SANS}`,
-              color: "#fff",
+              color: "var(--accent-fg)",
               background: "var(--accent)",
               borderRadius: 4,
               padding: "3px 6px",
@@ -1916,7 +1921,7 @@ const PaneView = memo(function PaneView({
               onExitIntent={() => onTerminalExitIntent(session.sessionId)}
             />
           ) : isBrowser && surface ? (
-            <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} />
+            <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} t={t} />
           ) : (restoringAgent || restoringTerminal) && session ? (
             <TerminalRestorePreview
               sessionId={session.sessionId}
@@ -1951,7 +1956,7 @@ const PaneView = memo(function PaneView({
                   alignItems: "center",
                   gap: 7,
                   background: "var(--accent)",
-                  color: "#fff",
+                  color: "var(--accent-fg)",
                   border: 0,
                   borderRadius: 8,
                   padding: "8px 14px",
@@ -2218,11 +2223,7 @@ export function AgentmuxTerminalApp() {
 
   const applyConfig = useCallback((config: AppConfig) => {
     setTheme(config.appearance.theme);
-    setAccentKey(
-      ACCENTS.some((candidate) => candidate.key === config.appearance.accentKey)
-        ? config.appearance.accentKey
-        : "blue",
-    );
+    setAccentKey(resolveAccent(config.appearance.accentKey).key);
     setFontSize(Math.min(16, Math.max(11, config.appearance.fontSize)));
     setLanguage(config.locale.language);
     setUpdatesConfig(config.updates ?? DEFAULT_UPDATES_CONFIG);
@@ -2314,8 +2315,12 @@ export function AgentmuxTerminalApp() {
         },
         activeWorkspaceId,
       )
-      .catch(() => undefined);
-  }, [accentKey, activeWorkspaceId, client, configLoaded, fontSize, theme]);
+      .catch(() =>
+        setConfigReloadMessage(
+          createTranslator(language)("config.saveAppearanceFailed"),
+        ),
+      );
+  }, [accentKey, activeWorkspaceId, client, configLoaded, fontSize, language, theme]);
 
   useEffect(() => {
     if (!configLoaded) {
@@ -2396,7 +2401,7 @@ export function AgentmuxTerminalApp() {
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
-  const accent = ACCENTS.find((a) => a.key === accentKey) ?? ACCENTS[0];
+  const accent = resolveAccent(accentKey);
   const isDark = theme === "dark";
   useEffect(() => {
     // Native select popups are rendered by WebView2 outside the element box.
@@ -3360,7 +3365,6 @@ export function AgentmuxTerminalApp() {
     }
     return ordered;
   }, [panes, rootPaneForPane, rootPaneId, tabSurfaces]);
-
   const activeTabRootRef = useRef<string | null>(null);
   const [lastActiveTabRootId, setLastActiveTabRootId] = useState<string | null>(
     null,
@@ -6045,28 +6049,28 @@ export function AgentmuxTerminalApp() {
       workspaces.map<ActionDescriptor>((ws) => ({
         id: `workspace.select.${ws.workspaceId}`,
         group: "workspace",
-        title: `Switch to ${ws.name}`,
+        title: t("action.workspace.switch", { name: ws.name }),
         keywords: [ws.projectRoot ?? "", ws.name],
         run: () => {
           void ctl.selectWorkspace(ws.workspaceId);
           closeOverlay();
         },
       })),
-    [closeOverlay, ctl.selectWorkspace, workspaces],
+    [closeOverlay, ctl.selectWorkspace, t, workspaces],
   );
   const wslActionDescriptors = useMemo<ActionDescriptor[]>(
     () =>
       wslDistributions.map<ActionDescriptor>((distribution) => ({
         id: `wsl.open.${distribution.name}`,
         group: "remote",
-        title: `WSL shell: ${distribution.name}`,
+        title: t("action.terminal.wslShell", { name: distribution.name }),
         keywords: [distribution.name, distribution.isDefault ? "default" : ""],
         run: () => {
           void ctl.spawnWslTerminal(distribution.name);
           closeOverlay();
         },
       })),
-    [closeOverlay, ctl.spawnWslTerminal, wslDistributions],
+    [closeOverlay, ctl.spawnWslTerminal, t, wslDistributions],
   );
   const selectSurfaceTab = useCallback(
     (surfaceId: string) => {
@@ -6115,7 +6119,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "agent.launchClaude",
         group: "agent",
-        title: "Run Claude Code (durable tmux)",
+        title: t("action.agent.launchClaude"),
         keywords: ["claude", "tmux"],
         run: () => {
           void ctl.spawnAgent(["claude"]);
@@ -6125,7 +6129,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "agent.launchCodex",
         group: "agent",
-        title: "Run Codex (durable tmux)",
+        title: t("action.agent.launchCodex"),
         keywords: ["codex", "tmux", "no-alt-screen"],
         run: () => {
           void ctl.spawnAgent(["codex", "--no-alt-screen"]);
@@ -6135,14 +6139,14 @@ export function AgentmuxTerminalApp() {
       {
         id: "agent.launchCustom",
         group: "agent",
-        title: "Run custom agent...",
+        title: t("action.agent.launchCustom"),
         keywords: ["custom", "tmux"],
         run: promptCustomAgent,
       },
       {
         id: "agent.jumpNextAttention",
         group: "agent",
-        title: "Jump to next waiting agent",
+        title: t("action.agent.jumpNextAttention"),
         keywords: ["attention", "waiting", "agent", "jump"],
         disabled: attentionPaneQueue.length === 0,
         run: () => {
@@ -6152,7 +6156,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.newWsl",
         group: "terminal",
-        title: "New terminal",
+        title: t("action.terminal.new"),
         keywords: ["terminal", "wsl", "powershell", "cmd", "shell"],
         run: () => {
           void addTerminal();
@@ -6162,7 +6166,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.openInActivePane",
         group: "terminal",
-        title: "Open terminal in current pane",
+        title: t("action.terminal.openInActivePane"),
         keywords: ["terminal", "wsl", "powershell", "cmd", "pane"],
         disabled: activePaneId === null,
         run: () => {
@@ -6175,7 +6179,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.textBox",
         group: "terminal",
-        title: "TextBox",
+        title: t("action.terminal.textBox"),
         keywords: ["prompt", "composer", "send"],
         disabled: !activeTerminalSession,
         run: openTextBoxComposer,
@@ -6183,7 +6187,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.splitRight",
         group: "terminal",
-        title: "세로 분할",
+        title: t("action.pane.splitRight"),
         keywords: ["split", "right"],
         disabled: activePaneId === null,
         run: () => {
@@ -6196,7 +6200,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.splitDown",
         group: "terminal",
-        title: "가로 분할",
+        title: t("action.pane.splitDown"),
         keywords: ["split", "down"],
         disabled: activePaneId === null,
         run: () => {
@@ -6209,7 +6213,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "browser.openNewTab",
         group: "terminal",
-        title: "브라우저 새 탭 열기",
+        title: t("action.browser.openNewTab"),
         keywords: ["browser", "surface", "tab"],
         run: () => {
           void ctl.createBrowserSurface("new_tab");
@@ -6219,7 +6223,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "browser.openActivePane",
         group: "terminal",
-        title: "현재 페인에 브라우저 열기",
+        title: t("action.browser.openActivePane"),
         keywords: ["browser", "surface", "pane"],
         disabled: activePaneId === null,
         run: () => {
@@ -6240,7 +6244,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "browser.openContextLink",
         group: "terminal",
-        title: "Open context link",
+        title: t("action.browser.openContextLink"),
         keywords: ["browser", "url", "link", "context", "docs", "pr"],
         run: () => {
           void openContextLink();
@@ -6249,7 +6253,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "surface.nextTab",
         group: "view",
-        title: "다음 탭",
+        title: t("action.surface.nextTab"),
         keywords: ["tab", "next", "surface", "cycle"],
         run: () => {
           if (!activeWorkspaceId) return;
@@ -6270,7 +6274,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "surface.prevTab",
         group: "view",
-        title: "이전 탭",
+        title: t("action.surface.prevTab"),
         keywords: ["tab", "prev", "previous", "surface", "cycle"],
         run: () => {
           if (!activeWorkspaceId) return;
@@ -6292,7 +6296,7 @@ export function AgentmuxTerminalApp() {
       ...(([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n) => ({
         id: `surface.jumpTab${n}`,
         group: "view" as const,
-        title: `${n}번 탭으로 이동`,
+        title: t("action.surface.jumpTab", { number: n }),
         keywords: ["tab", "jump", String(n)],
         run: () => {
           if (!activeWorkspaceId) return;
@@ -6305,7 +6309,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "surface.closeTab",
         group: "view",
-        title: "현재 탭 닫기",
+        title: t("action.surface.closeTab"),
         keywords: ["tab", "close"],
         disabled: activePaneId === null,
         run: () => { void closeCurrentTab(); },
@@ -6314,21 +6318,21 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.fontSizeUp",
         group: "terminal",
-        title: "글꼴 크기 키우기",
+        title: t("action.terminal.fontSizeUp"),
         keywords: ["font", "size", "zoom", "larger"],
         run: () => { adjustFontSize(FONT_SIZE_STEP); },
       },
       {
         id: "terminal.fontSizeDown",
         group: "terminal",
-        title: "글꼴 크기 줄이기",
+        title: t("action.terminal.fontSizeDown"),
         keywords: ["font", "size", "zoom", "smaller"],
         run: () => { adjustFontSize(-FONT_SIZE_STEP); },
       },
       {
         id: "terminal.fontSizeReset",
         group: "terminal",
-        title: "글꼴 크기 초기화",
+        title: t("action.terminal.fontSizeReset"),
         keywords: ["font", "size", "reset", "default"],
         run: resetFontSize,
       },
@@ -6336,7 +6340,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.focusLeft",
         group: "terminal",
-        title: "왼쪽 페인 포커스",
+        title: t("action.pane.focusLeft"),
         keywords: ["pane", "focus", "left"],
         disabled: activePaneId === null,
         run: () => { focusPaneInDirection("left"); },
@@ -6344,7 +6348,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.focusRight",
         group: "terminal",
-        title: "오른쪽 페인 포커스",
+        title: t("action.pane.focusRight"),
         keywords: ["pane", "focus", "right"],
         disabled: activePaneId === null,
         run: () => { focusPaneInDirection("right"); },
@@ -6352,7 +6356,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.focusUp",
         group: "terminal",
-        title: "위쪽 페인 포커스",
+        title: t("action.pane.focusUp"),
         keywords: ["pane", "focus", "up"],
         disabled: activePaneId === null,
         run: () => { focusPaneInDirection("up"); },
@@ -6360,7 +6364,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.focusDown",
         group: "terminal",
-        title: "아래쪽 페인 포커스",
+        title: t("action.pane.focusDown"),
         keywords: ["pane", "focus", "down"],
         disabled: activePaneId === null,
         run: () => { focusPaneInDirection("down"); },
@@ -6369,7 +6373,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.growLeft",
         group: "terminal",
-        title: "왼쪽으로 페인 크기 조절",
+        title: t("action.pane.growLeft"),
         keywords: ["pane", "resize", "grow", "left"],
         disabled: activePaneId === null,
         run: () => { resizePaneInDirection("left"); },
@@ -6377,7 +6381,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.growRight",
         group: "terminal",
-        title: "오른쪽으로 페인 크기 조절",
+        title: t("action.pane.growRight"),
         keywords: ["pane", "resize", "grow", "right"],
         disabled: activePaneId === null,
         run: () => { resizePaneInDirection("right"); },
@@ -6385,7 +6389,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.growUp",
         group: "terminal",
-        title: "위쪽으로 페인 크기 조절",
+        title: t("action.pane.growUp"),
         keywords: ["pane", "resize", "grow", "up"],
         disabled: activePaneId === null,
         run: () => { resizePaneInDirection("up"); },
@@ -6393,7 +6397,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.growDown",
         group: "terminal",
-        title: "아래쪽으로 페인 크기 조절",
+        title: t("action.pane.growDown"),
         keywords: ["pane", "resize", "grow", "down"],
         disabled: activePaneId === null,
         run: () => { resizePaneInDirection("down"); },
@@ -6411,7 +6415,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "app.fullscreen",
         group: "view",
-        title: "전체 화면 전환",
+        title: t("action.app.fullscreen"),
         keywords: ["fullscreen", "f11"],
         run: () => { toggleFullscreenWindow(); },
       },
@@ -6419,7 +6423,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "workspace.next",
         group: "workspace",
-        title: "다음 워크스페이스",
+        title: t("action.workspace.next"),
         keywords: ["workspace", "next", "cycle"],
         disabled: sidebarWorkspaceOrder.length < 2,
         run: () => {
@@ -6434,7 +6438,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "workspace.prev",
         group: "workspace",
-        title: "이전 워크스페이스",
+        title: t("action.workspace.prev"),
         keywords: ["workspace", "prev", "previous", "cycle"],
         disabled: sidebarWorkspaceOrder.length < 2,
         run: () => {
@@ -6450,7 +6454,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.zoomToggle",
         group: "terminal",
-        title: "페인 확대/복원",
+        title: t("action.pane.zoomToggle"),
         keywords: ["pane", "zoom", "maximize", "restore"],
         disabled: activePaneId === null || orderedLeafPaneIds.length < 2,
         run: () => {
@@ -6462,7 +6466,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "pane.broadcastToggle",
         group: "terminal",
-        title: "전체 페인 입력 브로드캐스트",
+        title: t("action.pane.broadcastToggle"),
         keywords: ["broadcast", "sync", "pane", "input", "all"],
         disabled: orderedLeafPaneIds.length < 2,
         run: () => {
@@ -6477,7 +6481,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.clearBuffer",
         group: "terminal",
-        title: "터미널 버퍼 지우기",
+        title: t("action.terminal.clearBuffer"),
         keywords: ["clear", "buffer", "terminal"],
         disabled: !activeTerminalSession,
         run: () => {
@@ -6490,7 +6494,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "terminal.selectAll",
         group: "terminal",
-        title: "터미널 전체 선택",
+        title: t("action.terminal.selectAll"),
         keywords: ["select", "all", "terminal"],
         disabled: !activeTerminalSession,
         run: () => {
@@ -6532,7 +6536,7 @@ export function AgentmuxTerminalApp() {
       {
         id: "app.setup",
         group: "remote",
-        title: "Windows setup",
+        title: t("action.app.setup"),
         keywords: ["setup", "wsl", "tmux", "cmux", "first run"],
         run: () => setOverlay("setup"),
       },
@@ -7157,77 +7161,49 @@ export function AgentmuxTerminalApp() {
         >
           <Hov
             tag="button"
+            className="agentmux-sidebar-toggle"
             ariaLabel={t("app.sidebar.toggle")}
             title={`${t("app.sidebar.toggle")} (⌘B)`}
             style={{
               ...iconBtn,
               marginRight: 6,
-              color: sidebarCollapsed ? "var(--accent)" : "var(--fg2)",
+              color: isDark ? "#A3A3A3" : "#5F5F5F",
             }}
             hover={iconBtnHover}
             onClick={() => setSidebarCollapsed((c) => !c)}
           >
-            <IconSidebar />
+            <IconSidebar size={17} />
           </Hov>
-          {/* Non-interactive breadcrumb cluster — pointer-events:none lets
-             clicks fall through to the parent drag region so the titlebar
-             center drags the window. */}
-          <div
+          <span
             data-tauri-drag-region
+            className="agentmux-titlebar-brand"
             style={{
               display: "flex",
               alignItems: "center",
+              height: 16,
+              font: `700 13px/16px ${FONT_SANS}`,
+              letterSpacing: 0,
+              color: "var(--fg1)",
               pointerEvents: "none",
             }}
           >
-            <span
-              style={{
-                font: `700 13px/1 ${FONT_MONO}`,
-                letterSpacing: "-0.02em",
-                color: "var(--fg1)",
-              }}
-            >
-              AgentMux
-            </span>
-            <span style={{ color: "var(--fg4)", fontSize: 12, margin: "0 8px" }}>
-              ›
-            </span>
-            <span style={{ color: "var(--fg3)", display: "flex" }}>
-              <IconFolder />
-            </span>
-            <span
-              style={{
-                font: `600 12.5px/1 ${FONT_SANS}`,
-                color: "var(--fg2)",
-                marginLeft: 7,
-              }}
-            >
-              {activeWorkspace?.name ?? "—"}
-            </span>
-          </div>
+            AgentMux
+          </span>
           <div data-tauri-drag-region style={{ flex: 1, height: "100%" }} />
           <Hov
             tag="button"
             className="agentmux-theme-toggle"
+            ariaLabel={isDark ? t("appearance.light") : t("appearance.dark")}
+            title={isDark ? t("appearance.light") : t("appearance.dark")}
             style={{
-              height: 30,
-              borderRadius: 7,
-              border: 0,
-              background: "transparent",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              gap: 6,
-              padding: "0 9px",
-              color: "var(--fg2)",
-              font: `600 11px/1 ${FONT_SANS}`,
+              ...iconBtn,
               marginRight: 2,
+              color: isDark ? "#A3A3A3" : "#5F5F5F",
             }}
             hover={iconBtnHover}
             onClick={() => setTheme(isDark ? "light" : "dark")}
           >
-            {isDark ? <IconMoon /> : <IconSun />}
-            {isDark ? t("appearance.dark") : t("appearance.light")}
+            {isDark ? <IconMoon size={16} /> : <IconSun size={16} />}
           </Hov>
           {activeRootIsSplit ? (
             <Hov
@@ -7249,7 +7225,7 @@ export function AgentmuxTerminalApp() {
             hover={iconBtnHover}
             onClick={() => setOverlay("search")}
           >
-            <IconSearch />
+            <IconSearch size={16} />
           </Hov>
           <Hov
             tag="button"
@@ -7262,7 +7238,7 @@ export function AgentmuxTerminalApp() {
               setQuery("");
             }}
           >
-            <IconGrid />
+            <IconGrid size={16} />
           </Hov>
           <Hov
             tag="button"
@@ -7276,7 +7252,7 @@ export function AgentmuxTerminalApp() {
               setOverlay("settings");
             }}
           >
-            <IconGear />
+            <IconGear size={16} />
           </Hov>
           {/* window controls — frameless caption (decorations:false), flush to
               the top-right corner */}
@@ -8658,6 +8634,7 @@ export function AgentmuxTerminalApp() {
                     }}
                   >
                     <span
+                      data-agentmux-tab-icon={surface.surfaceType === "browser" ? "browser" : "terminal"}
                       style={{
                         color: "var(--fg4)",
                         display: "flex",
@@ -8665,7 +8642,7 @@ export function AgentmuxTerminalApp() {
                       }}
                     >
                       {surface.surfaceType === "browser" ? (
-                        <IconGrid size={12} />
+                        <IconGlobe size={13} />
                       ) : (
                         <IconShellArrow />
                       )}
@@ -9084,7 +9061,7 @@ export function AgentmuxTerminalApp() {
                   style={{
                     flex: "none",
                     background: "var(--accent)",
-                    color: "#fff",
+                    color: "var(--accent-fg)",
                     border: 0,
                     borderRadius: 7,
                     padding: "5px 10px",
@@ -9151,7 +9128,7 @@ export function AgentmuxTerminalApp() {
                     font: `500 13px/1 ${FONT_SANS}`,
                   }}
                 >
-                  표시할 페인이 없습니다.
+                  {t("pane.none")}
                 </div>
               )}
             </div>
@@ -9764,7 +9741,7 @@ const notificationSecondaryButtonStyle: CSSProperties = {
 
 const notificationPrimaryButtonStyle: CSSProperties = {
   background: "var(--accent)",
-  color: "#fff",
+  color: "var(--accent-fg)",
   border: 0,
   borderRadius: 7,
   padding: "6px 10px",
@@ -9900,7 +9877,7 @@ function TextBoxComposer({
             border: 0,
             borderRadius: 7,
             background: sendDisabled ? "var(--s3)" : "var(--accent)",
-            color: sendDisabled ? "var(--fg4)" : "#fff",
+            color: sendDisabled ? "var(--fg4)" : "var(--accent-fg)",
             cursor: sendDisabled ? "default" : "pointer",
             font: `700 12px/1 ${FONT_SANS}`,
           }}
@@ -10927,7 +10904,7 @@ function DockPanel({
               border: 0,
               borderRadius: 6,
               background: "var(--accent)",
-              color: "#fff",
+              color: "var(--accent-fg)",
               padding: "5px 8px",
               cursor: "pointer",
               font: `800 10px/1 ${FONT_SANS}`,
@@ -11031,7 +11008,7 @@ function DockPanel({
                     border: "1px solid var(--border)",
                     borderRadius: 6,
                     background: locked ? "var(--s2)" : "var(--accent)",
-                    color: locked ? "var(--fg4)" : "#fff",
+                    color: locked ? "var(--fg4)" : "var(--accent-fg)",
                     cursor: locked ? "not-allowed" : "pointer",
                   }}
                 >
@@ -12035,7 +12012,7 @@ function SetupModal(props: SetupModalProps) {
             style={{
               width: "100%",
               background: activeWorkspace ? "var(--accent)" : "var(--s2)",
-              color: activeWorkspace ? "#fff" : "var(--fg4)",
+              color: activeWorkspace ? "var(--accent-fg)" : "var(--fg4)",
               border: 0,
               borderRadius: 8,
               padding: "9px 12px",
@@ -12216,7 +12193,7 @@ function SetupModal(props: SetupModalProps) {
                     background: selectedDistribution
                       ? "var(--accent)"
                       : "var(--s2)",
-                    color: selectedDistribution ? "#fff" : "var(--fg4)",
+                    color: selectedDistribution ? "var(--accent-fg)" : "var(--fg4)",
                     border: 0,
                     borderRadius: 8,
                     padding: "8px 12px",
@@ -12419,12 +12396,29 @@ function SettingsModal(props: SettingsModalProps) {
   const [workspaceDraftBaseline, setWorkspaceDraftBaseline] =
     useState<WorkspaceUpdateInput>(() => workspaceSettingsDraft(activeWorkspace));
   const [workspaceSaveInFlight, setWorkspaceSaveInFlight] = useState(false);
+  const configuredCustomAccent = customAccentHex(accentKey);
+  const [customAccentDraft, setCustomAccentDraft] = useState(
+    () => configuredCustomAccent ?? ACCENTS[0].hex,
+  );
   const workspaceSaveInFlightRef = useRef(false);
   const workspaceDraftTargetIdRef = useRef(
     activeWorkspace?.workspaceId ?? null,
   );
   const selectedWorkspaceIdRef = useRef(selectedWorkspaceId);
   selectedWorkspaceIdRef.current = selectedWorkspaceId;
+
+  useEffect(() => {
+    if (configuredCustomAccent) {
+      setCustomAccentDraft(configuredCustomAccent);
+    }
+  }, [configuredCustomAccent]);
+
+  const applyCustomAccent = (value: string) => {
+    const key = customAccentKey(value);
+    if (key) {
+      setAccentKey(key);
+    }
+  };
 
   useEffect(() => {
     const targetWorkspaceId = activeWorkspace?.workspaceId ?? null;
@@ -13002,9 +12996,17 @@ function SettingsModal(props: SettingsModalProps) {
               >
                 {t("settings.accentColor")}
               </div>
-              <div style={{ display: "flex", gap: 10, marginBottom: 24 }}>
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 10,
+                  marginBottom: 24,
+                }}
+              >
                 {ACCENTS.map((a) => (
-                  <div
+                  <button
+                    type="button"
                     key={a.key}
                     onClick={() => setAccentKey(a.key)}
                     style={{
@@ -13015,6 +13017,8 @@ function SettingsModal(props: SettingsModalProps) {
                       borderRadius: 8,
                       padding: "8px 12px",
                       cursor: "pointer",
+                      background: "transparent",
+                      color: "var(--fg1)",
                     }}
                   >
                     <span
@@ -13033,8 +13037,82 @@ function SettingsModal(props: SettingsModalProps) {
                     >
                       {a.label}
                     </span>
-                  </div>
+                  </button>
                 ))}
+                <label
+                  className="agentmux-custom-accent"
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    border: `1px solid ${configuredCustomAccent ? "var(--accent)" : "var(--border)"}`,
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    cursor: "pointer",
+                  }}
+                  onClick={() => applyCustomAccent(customAccentDraft)}
+                >
+                  <input
+                    className="agentmux-custom-accent-color"
+                    aria-label={t("settings.accentHex")}
+                    type="color"
+                    value={
+                      normalizeAccentHex(customAccentDraft) ??
+                      configuredCustomAccent ??
+                      ACCENTS[0].hex
+                    }
+                    onChange={(event) => {
+                      const value = event.currentTarget.value.toUpperCase();
+                      setCustomAccentDraft(value);
+                      applyCustomAccent(value);
+                    }}
+                    style={{
+                      width: 26,
+                      height: 26,
+                      border: 0,
+                      padding: 0,
+                      background: "transparent",
+                      cursor: "pointer",
+                    }}
+                  />
+                  <span
+                    style={{
+                      font: `500 12px/1 ${FONT_SANS}`,
+                      color: "var(--fg1)",
+                    }}
+                  >
+                    {t("settings.accentCustom")}
+                  </span>
+                  <input
+                    className="agentmux-custom-accent-hex"
+                    aria-label={t("settings.accentHex")}
+                    value={customAccentDraft}
+                    maxLength={7}
+                    spellCheck={false}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value.toUpperCase();
+                      setCustomAccentDraft(value);
+                      applyCustomAccent(value);
+                    }}
+                    onBlur={() => {
+                      setCustomAccentDraft(
+                        normalizeAccentHex(customAccentDraft) ??
+                          configuredCustomAccent ??
+                          ACCENTS[0].hex,
+                      );
+                    }}
+                    style={{
+                      width: 78,
+                      border: 0,
+                      borderLeft: "1px solid var(--border)",
+                      padding: "2px 0 2px 8px",
+                      background: "transparent",
+                      color: "var(--fg2)",
+                      font: `500 11px/1 ${FONT_MONO}`,
+                      outline: 0,
+                    }}
+                  />
+                </label>
               </div>
               <div
                 style={{
@@ -13175,6 +13253,20 @@ function SettingsModal(props: SettingsModalProps) {
                     {t("settings.terminalGpuAcceleration.off")}
                   </option>
                 </select>
+              </div>
+            </>
+          ) : null}
+
+          {settingsTab === "general" ? (
+            <>
+              <div
+                style={{
+                  font: `700 18px/1 ${FONT_SANS}`,
+                  color: "var(--fg1)",
+                  marginBottom: 20,
+                }}
+              >
+                {t("settings.general")}
               </div>
               <div
                 style={{
@@ -13636,7 +13728,7 @@ function SettingsModal(props: SettingsModalProps) {
                     disabled={workspaceSaveInFlight}
                     style={{
                       background: "var(--accent)",
-                      color: "#fff",
+                      color: "var(--accent-fg)",
                       border: 0,
                       borderRadius: 8,
                       padding: "9px 14px",
@@ -13687,7 +13779,7 @@ function SettingsModal(props: SettingsModalProps) {
                     alignItems: "center",
                     gap: 6,
                     background: "var(--accent)",
-                    color: "#fff",
+                    color: "var(--accent-fg)",
                     border: 0,
                     borderRadius: 8,
                     padding: "8px 13px",
@@ -14050,7 +14142,7 @@ function SettingsModal(props: SettingsModalProps) {
                     style={{
                       flex: "none",
                       background: "var(--accent)",
-                      color: "#fff",
+                      color: "var(--accent-fg)",
                       border: 0,
                       borderRadius: 8,
                       padding: "8px 13px",
@@ -14111,15 +14203,6 @@ function SettingsModal(props: SettingsModalProps) {
 
           {settingsTab === "general" ? (
             <>
-              <div
-                style={{
-                  font: `700 18px/1 ${FONT_SANS}`,
-                  color: "var(--fg1)",
-                  marginBottom: 20,
-                }}
-              >
-                {t("settings.general")}
-              </div>
               <div
                 data-agentmux-app-version
                 style={{
@@ -14319,7 +14402,7 @@ function SettingsModal(props: SettingsModalProps) {
                         disabled={updateBusy}
                         style={{
                           background: "var(--accent)",
-                          color: "#fff",
+                          color: "var(--accent-fg)",
                           border: 0,
                           borderRadius: 8,
                           padding: "8px 13px",
@@ -14510,7 +14593,7 @@ function SettingsModal(props: SettingsModalProps) {
                       onClick={onReloadConfig}
                       style={{
                         background: "var(--accent)",
-                        color: "#fff",
+                        color: "var(--accent-fg)",
                         border: 0,
                         borderRadius: 8,
                         padding: "8px 13px",

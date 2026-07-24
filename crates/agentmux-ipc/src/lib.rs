@@ -1433,6 +1433,7 @@ pub struct BrowserScreenshotResult {
     pub format: String,
     pub image_handle: String,
     pub byte_count: usize,
+    pub data_base64: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2050,7 +2051,7 @@ impl GitStatusPageParams {
             MAX_IDEMPOTENCY_KEY_BYTES,
         )?;
         validate_optional("state", self.state.as_deref(), 64)?;
-        validate_optional("query", self.query.as_deref(), 512)?;
+        validate_optional_filter("query", self.query.as_deref(), 512)?;
         validate_optional("cursor", self.cursor.as_deref(), 1024)?;
         if let Some(limit) = self.limit {
             validate_range("limit", limit, 1, MAX_GIT_STATUS_PAGE_SIZE)?;
@@ -3008,6 +3009,17 @@ fn validate_optional(
 ) -> Result<(), ControlError> {
     if let Some(value) = value {
         validate_required(name, value, max_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_filter(
+    name: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), ControlError> {
+    if value.is_some_and(|value| value.len() > max_bytes) {
+        return Err(invalid_request(format!("{name} exceeds {max_bytes} bytes")));
     }
     Ok(())
 }
@@ -4409,6 +4421,24 @@ mod tests {
         .unwrap();
         page.validate().unwrap();
         assert_eq!(serde_json::to_value(&page).unwrap()["limit"], 100);
+
+        let unfiltered_page: GitStatusPageParams =
+            serde_json::from_str(r#"{"workspace_id":"ws_1","query":""}"#).unwrap();
+        unfiltered_page.validate().unwrap();
+
+        let max_filter: GitStatusPageParams = serde_json::from_value(serde_json::json!({
+            "workspace_id": "ws_1",
+            "query": "a".repeat(512),
+        }))
+        .unwrap();
+        max_filter.validate().unwrap();
+
+        let oversized_filter: GitStatusPageParams = serde_json::from_value(serde_json::json!({
+            "workspace_id": "ws_1",
+            "query": "a".repeat(513),
+        }))
+        .unwrap();
+        assert!(oversized_filter.validate().is_err());
 
         let diff: GitDiffParams = serde_json::from_str(
             r#"{"workspace_id":"ws_1","path":"src/main.rs","stage":"working_tree","context_lines":12}"#,

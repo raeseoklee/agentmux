@@ -12,7 +12,7 @@
 .agentmux-source-control__diff-line[data-kind="add"] { color: var(--green, #3fb950); background-color: color-mix(in srgb, var(--green, #3fb950) 8%, transparent); }
 .agentmux-source-control__diff-line[data-kind="remove"] { color: var(--red, #f85149); background-color: color-mix(in srgb, var(--red, #f85149) 8%, transparent); }
 .agentmux-source-control__diff-line[data-kind="hunk"] { color: var(--accent); }
-.agentmux-source-control__thread-marker { width: 16px; height: 16px; align-self: center; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fff; font: 700 9px/1 var(--font-sans, sans-serif); }
+.agentmux-source-control__thread-marker { width: 16px; height: 16px; align-self: center; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: var(--accent-fg); font: 700 9px/1 var(--font-sans, sans-serif); }
 .agentmux-source-control__diff-empty { padding: 16px 13px; color: var(--fg3); font-size: 12px; }
 .agentmux-source-control__review-composer { display: grid; gap: 6px; padding: 8px 11px; border-top: 1px solid var(--border); background: var(--surface); }
 .agentmux-source-control__review-composer small { color: var(--fg3); font: 10.5px/1.2 var(--font-mono, monospace); }
@@ -20,7 +20,7 @@
 .agentmux-source-control__review-composer textarea { min-height: 54px; resize: vertical; padding: 6px 7px; }
 .agentmux-source-control__review-composer > div { display: grid; grid-template-columns: 92px minmax(0, 1fr) auto; gap: 6px; }
 .agentmux-source-control__review-composer button, .agentmux-source-control__threads button { border: 0; border-radius: 3px; padding: 5px 7px; background: var(--s2); color: var(--fg2); font-size: 10px; cursor: pointer; }
-.agentmux-source-control__review-composer button { background: var(--accent); color: #fff; }
+.agentmux-source-control__review-composer button { background: var(--accent); color: var(--accent-fg); }
 .agentmux-source-control__threads { border-top: 1px solid var(--border); max-height: 118px; overflow: auto; }
 .agentmux-source-control__threads > div { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 6px; align-items: center; padding: 6px 11px; border-bottom: 1px solid var(--border); color: var(--fg2); font-size: 10.5px; }
 .agentmux-source-control__threads p { overflow: hidden; margin: 0; text-overflow: ellipsis; white-space: nowrap; }

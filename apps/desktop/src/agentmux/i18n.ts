@@ -2,6 +2,43 @@ import type { AppLocaleLanguage } from "../control/ControlClient";
 
 export type I18nKey =
   | "app.sidebar.toggle"
+  | "action.browser.openActivePane"
+  | "action.browser.openContextLink"
+  | "action.browser.openNewTab"
+  | "action.agent.jumpNextAttention"
+  | "action.agent.launchClaude"
+  | "action.agent.launchCodex"
+  | "action.agent.launchCustom"
+  | "action.app.fullscreen"
+  | "action.app.setup"
+  | "action.pane.broadcastToggle"
+  | "action.pane.focusDown"
+  | "action.pane.focusLeft"
+  | "action.pane.focusRight"
+  | "action.pane.focusUp"
+  | "action.pane.growDown"
+  | "action.pane.growLeft"
+  | "action.pane.growRight"
+  | "action.pane.growUp"
+  | "action.pane.splitDown"
+  | "action.pane.splitRight"
+  | "action.pane.zoomToggle"
+  | "action.surface.closeTab"
+  | "action.surface.jumpTab"
+  | "action.surface.nextTab"
+  | "action.surface.prevTab"
+  | "action.terminal.clearBuffer"
+  | "action.terminal.fontSizeDown"
+  | "action.terminal.fontSizeReset"
+  | "action.terminal.fontSizeUp"
+  | "action.terminal.new"
+  | "action.terminal.openInActivePane"
+  | "action.terminal.selectAll"
+  | "action.terminal.textBox"
+  | "action.terminal.wslShell"
+  | "action.workspace.next"
+  | "action.workspace.prev"
+  | "action.workspace.switch"
   | "app.search.activeWindow"
   | "app.search.placeholder"
   | "app.commandPalette.open"
@@ -45,6 +82,24 @@ export type I18nKey =
   | "browser.dialog.promptLabel"
   | "browser.dialog.promptTitle"
   | "browser.dialog.submit"
+  | "browser.surface.address"
+  | "browser.surface.back"
+  | "browser.surface.clickFailed"
+  | "browser.surface.connecting"
+  | "browser.surface.connectionError"
+  | "browser.surface.enterAddress"
+  | "browser.surface.forward"
+  | "browser.surface.go"
+  | "browser.surface.inputFailed"
+  | "browser.surface.loading"
+  | "browser.surface.navigationFailed"
+  | "browser.surface.newTab"
+  | "browser.surface.noReadableText"
+  | "browser.surface.pageReady"
+  | "browser.surface.previewTruncated"
+  | "browser.surface.reload"
+  | "browser.surface.renderFailed"
+  | "browser.surface.scrollFailed"
   | "config.configuration"
   | "config.export"
   | "config.exportProject"
@@ -58,6 +113,7 @@ export type I18nKey =
   | "config.resetGlobalConfirm"
   | "config.resetProject"
   | "config.resetProjectConfirm"
+  | "config.saveAppearanceFailed"
   | "config.scopeGlobal"
   | "config.scopeProject"
   | "dialog.dismissToast"
@@ -78,6 +134,7 @@ export type I18nKey =
   | "notifications.summary"
   | "notifications.title"
   | "pane.empty"
+  | "pane.none"
   | "pane.invalidLayout"
   | "pane.restoring"
   | "settings.appearance"
@@ -96,6 +153,8 @@ export type I18nKey =
   | "settings.tabs.workspace"
   | "settings.theme"
   | "settings.accentColor"
+  | "settings.accentCustom"
+  | "settings.accentHex"
   | "settings.uiFontSize"
   | "settings.terminalInnerMargin"
   | "settings.terminalGpuAcceleration"
@@ -307,6 +366,43 @@ export const SUPPORTED_LANGUAGES: Array<{
 
 const en: Record<I18nKey, string> = {
   "app.sidebar.toggle": "Toggle sidebar",
+  "action.browser.openActivePane": "Open browser in current pane",
+  "action.browser.openContextLink": "Open context link",
+  "action.browser.openNewTab": "Open new browser tab",
+  "action.agent.jumpNextAttention": "Jump to next waiting agent",
+  "action.agent.launchClaude": "Run Claude Code (durable tmux)",
+  "action.agent.launchCodex": "Run Codex (durable tmux)",
+  "action.agent.launchCustom": "Run custom agent...",
+  "action.app.fullscreen": "Toggle fullscreen",
+  "action.app.setup": "Windows setup",
+  "action.pane.broadcastToggle": "Broadcast input to all panes",
+  "action.pane.focusDown": "Focus pane below",
+  "action.pane.focusLeft": "Focus pane left",
+  "action.pane.focusRight": "Focus pane right",
+  "action.pane.focusUp": "Focus pane above",
+  "action.pane.growDown": "Resize pane downward",
+  "action.pane.growLeft": "Resize pane left",
+  "action.pane.growRight": "Resize pane right",
+  "action.pane.growUp": "Resize pane upward",
+  "action.pane.splitDown": "Split down",
+  "action.pane.splitRight": "Split right",
+  "action.pane.zoomToggle": "Toggle pane zoom",
+  "action.surface.closeTab": "Close current tab",
+  "action.surface.jumpTab": "Go to tab {number}",
+  "action.surface.nextTab": "Next tab",
+  "action.surface.prevTab": "Previous tab",
+  "action.terminal.clearBuffer": "Clear terminal buffer",
+  "action.terminal.fontSizeDown": "Decrease font size",
+  "action.terminal.fontSizeReset": "Reset font size",
+  "action.terminal.fontSizeUp": "Increase font size",
+  "action.terminal.new": "New terminal",
+  "action.terminal.openInActivePane": "Open terminal in current pane",
+  "action.terminal.selectAll": "Select all terminal content",
+  "action.terminal.textBox": "Open text box",
+  "action.terminal.wslShell": "WSL shell: {name}",
+  "action.workspace.next": "Next workspace",
+  "action.workspace.prev": "Previous workspace",
+  "action.workspace.switch": "Switch to {name}",
   "app.search.activeWindow": "Search active window",
   "app.search.placeholder": "Search active window",
   "app.commandPalette.open": "Open command palette",
@@ -350,6 +446,24 @@ const en: Record<I18nKey, string> = {
   "browser.dialog.promptLabel": "Value",
   "browser.dialog.promptTitle": "{source} requests input",
   "browser.dialog.submit": "Submit",
+  "browser.surface.address": "Page address",
+  "browser.surface.back": "Back",
+  "browser.surface.clickFailed": "Page click failed.",
+  "browser.surface.connecting": "Connecting to browser session...",
+  "browser.surface.connectionError": "Connection error",
+  "browser.surface.enterAddress": "Enter a URL to navigate.",
+  "browser.surface.forward": "Forward",
+  "browser.surface.go": "Go",
+  "browser.surface.inputFailed": "Page key input failed.",
+  "browser.surface.loading": "Loading",
+  "browser.surface.navigationFailed": "Navigation failed.",
+  "browser.surface.newTab": "New browser tab",
+  "browser.surface.noReadableText": "This page did not expose readable document text.",
+  "browser.surface.pageReady": "Page ready",
+  "browser.surface.previewTruncated": "Preview truncated.",
+  "browser.surface.reload": "Reload",
+  "browser.surface.renderFailed": "Could not render the page.",
+  "browser.surface.scrollFailed": "Page scroll failed.",
   "config.configuration": "Configuration",
   "config.export": "Export",
   "config.exportProject": "Export workspace",
@@ -363,6 +477,7 @@ const en: Record<I18nKey, string> = {
   "config.resetGlobalConfirm": "Reset global AgentMux config?",
   "config.resetProject": "Reset workspace",
   "config.resetProjectConfirm": "Reset workspace AgentMux config?",
+  "config.saveAppearanceFailed": "Appearance settings could not be saved.",
   "config.scopeGlobal": "Global",
   "config.scopeProject": "Workspace",
   "dialog.dismissToast": "Dismiss {title}",
@@ -383,6 +498,7 @@ const en: Record<I18nKey, string> = {
   "notifications.summary": "{count} active",
   "notifications.title": "Notifications",
   "pane.empty": "Empty pane",
+  "pane.none": "No panes to display.",
   "pane.invalidLayout": "Invalid pane layout",
   "pane.restoring": "Restoring",
   "settings.appearance": "Appearance",
@@ -401,6 +517,8 @@ const en: Record<I18nKey, string> = {
   "settings.tabs.workspace": "Workspace",
   "settings.theme": "Theme",
   "settings.accentColor": "Accent color",
+  "settings.accentCustom": "Custom",
+  "settings.accentHex": "Custom accent HEX color",
   "settings.uiFontSize": "UI font size",
   "settings.terminalInnerMargin": "Terminal inner margin",
   "settings.terminalGpuAcceleration": "Terminal GPU acceleration",
@@ -607,7 +725,44 @@ const en: Record<I18nKey, string> = {
 };
 
 const ko: Record<I18nKey, string> = {
+  "action.agent.jumpNextAttention": "다음 입력 대기 에이전트로 이동",
+  "action.agent.launchClaude": "Claude Code 실행 (지속 tmux)",
+  "action.agent.launchCodex": "Codex 실행 (지속 tmux)",
+  "action.agent.launchCustom": "사용자 지정 에이전트 실행...",
+  "action.app.fullscreen": "전체 화면 전환",
+  "action.app.setup": "Windows 설정",
+  "action.pane.broadcastToggle": "모든 페인에 입력 브로드캐스트",
+  "action.pane.focusDown": "아래쪽 페인 포커스",
+  "action.pane.focusLeft": "왼쪽 페인 포커스",
+  "action.pane.focusRight": "오른쪽 페인 포커스",
+  "action.pane.focusUp": "위쪽 페인 포커스",
+  "action.pane.growDown": "아래쪽으로 페인 크기 조절",
+  "action.pane.growLeft": "왼쪽으로 페인 크기 조절",
+  "action.pane.growRight": "오른쪽으로 페인 크기 조절",
+  "action.pane.growUp": "위쪽으로 페인 크기 조절",
+  "action.pane.zoomToggle": "페인 확대/복원",
+  "action.surface.closeTab": "현재 탭 닫기",
+  "action.surface.jumpTab": "{number}번 탭으로 이동",
+  "action.surface.nextTab": "다음 탭",
+  "action.surface.prevTab": "이전 탭",
+  "action.terminal.clearBuffer": "터미널 버퍼 지우기",
+  "action.terminal.fontSizeDown": "글꼴 크기 줄이기",
+  "action.terminal.fontSizeReset": "글꼴 크기 초기화",
+  "action.terminal.fontSizeUp": "글꼴 크기 키우기",
+  "action.terminal.new": "새 터미널",
+  "action.terminal.openInActivePane": "현재 페인에 터미널 열기",
+  "action.terminal.selectAll": "터미널 전체 선택",
+  "action.terminal.textBox": "텍스트 상자 열기",
+  "action.terminal.wslShell": "WSL 셸: {name}",
+  "action.workspace.next": "다음 워크스페이스",
+  "action.workspace.prev": "이전 워크스페이스",
+  "action.workspace.switch": "{name}(으)로 전환",
   "app.sidebar.toggle": "사이드바 열기/닫기",
+  "action.browser.openActivePane": "현재 페인에서 브라우저 열기",
+  "action.browser.openContextLink": "컨텍스트 링크 열기",
+  "action.browser.openNewTab": "새 브라우저 탭 열기",
+  "action.pane.splitDown": "아래로 분할",
+  "action.pane.splitRight": "오른쪽으로 분할",
   "app.search.activeWindow": "활성 창 검색",
   "app.search.placeholder": "활성 창 검색",
   "app.commandPalette.open": "명령 팔레트 열기",
@@ -670,6 +825,7 @@ const ko: Record<I18nKey, string> = {
   "notifications.summary": "활성 {count}개",
   "notifications.title": "알림",
   "pane.empty": "빈 페인",
+  "pane.none": "표시할 페인이 없습니다.",
   "pane.invalidLayout": "잘못된 페인 레이아웃",
   "pane.restoring": "복원 중",
   "settings.appearance": "모양",
@@ -688,6 +844,8 @@ const ko: Record<I18nKey, string> = {
   "settings.tabs.workspace": "워크스페이스",
   "settings.theme": "테마",
   "settings.accentColor": "강조 색상",
+  "settings.accentCustom": "사용자 지정",
+  "settings.accentHex": "사용자 지정 강조 색상 HEX 값",
   "settings.uiFontSize": "UI 글자 크기",
   "settings.terminalInnerMargin": "터미널 내부 여백",
   "settings.terminalGpuAcceleration": "터미널 GPU 가속",
@@ -804,6 +962,25 @@ const ko: Record<I18nKey, string> = {
   "browser.dialog.promptLabel": "값",
   "browser.dialog.promptTitle": "{source}에서 입력을 요청합니다",
   "browser.dialog.submit": "제출",
+  "browser.surface.address": "페이지 주소",
+  "browser.surface.back": "뒤로",
+  "browser.surface.clickFailed": "페이지 클릭에 실패했습니다.",
+  "browser.surface.connecting": "브라우저 세션에 연결하는 중...",
+  "browser.surface.connectionError": "연결 오류",
+  "browser.surface.enterAddress": "이동할 URL을 입력하세요.",
+  "browser.surface.forward": "앞으로",
+  "browser.surface.go": "이동",
+  "browser.surface.inputFailed": "페이지 키 입력에 실패했습니다.",
+  "browser.surface.loading": "불러오는 중",
+  "browser.surface.navigationFailed": "페이지 이동에 실패했습니다.",
+  "browser.surface.newTab": "새 브라우저 탭",
+  "browser.surface.noReadableText": "이 페이지에서 읽을 수 있는 문서 텍스트를 찾지 못했습니다.",
+  "browser.surface.pageReady": "페이지 준비됨",
+  "browser.surface.previewTruncated": "미리보기 일부를 생략했습니다.",
+  "browser.surface.reload": "새로고침",
+  "browser.surface.renderFailed": "페이지를 표시하지 못했습니다.",
+  "browser.surface.scrollFailed": "페이지 스크롤에 실패했습니다.",
+  "config.saveAppearanceFailed": "모양 설정을 저장하지 못했습니다.",
   "shortcuts.conflictsTitle": "단축키 충돌",
   "shortcuts.editDescription":
     "키 입력란에 포커스를 두고 조합을 누르세요. 두 단계 단축키일 때만 두 번째 입력란을 사용합니다.",

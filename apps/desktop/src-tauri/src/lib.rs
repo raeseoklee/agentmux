@@ -4326,6 +4326,7 @@ impl DesktopControlState {
             unreachable!("screenshot command returns screenshot result")
         };
         let byte_count = bytes.len();
+        let data_base64 = BASE64_STANDARD.encode(&bytes);
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &BrowserScreenshotResult {
@@ -4333,6 +4334,7 @@ impl DesktopControlState {
                 surface_id,
                 format,
                 byte_count,
+                data_base64,
             },
         ))
     }
@@ -9224,14 +9226,18 @@ fn normalize_theme(value: &str) -> Result<String, DesktopHostError> {
 }
 
 fn normalize_accent_key(value: &str) -> Result<String, DesktopHostError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(DesktopHostError::Control(ControlError::new(
-            ErrorCode::InvalidRequest,
-            "Accent key cannot be empty.",
-        )));
+    if matches!(value, "blue" | "orange" | "green" | "violet") {
+        return Ok(value.to_string());
     }
-    Ok(value.to_string())
+    if let Some(hex) = value.strip_prefix("custom:#") {
+        if hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(format!("custom:#{}", hex.to_ascii_uppercase()));
+        }
+    }
+    Err(DesktopHostError::Control(ControlError::new(
+        ErrorCode::InvalidRequest,
+        "Accent key must be blue, orange, green, violet, or custom:#RRGGBB.",
+    )))
 }
 
 fn normalize_font_size(value: f64) -> Result<f64, DesktopHostError> {
@@ -15303,13 +15309,13 @@ mod tests {
             RequestEnvelope::new(
                 "req_config_update",
                 "config.update",
-                r#"{"appearance":{"theme":"light","accent_key":"blue","font_size":14.5},"shortcuts":{"bindings":{"workspace.new":["ctrl+b","c"],"app.search":null}},"ui":{"terminal_inner_margin":9,"terminal_gpu_acceleration":"on"}}"#,
+                r#"{"appearance":{"theme":"light","accent_key":"custom:#13579b","font_size":14.5},"shortcuts":{"bindings":{"workspace.new":["ctrl+b","c"],"app.search":null}},"ui":{"terminal_inner_margin":9,"terminal_gpu_acceleration":"on"}}"#,
                 "configured-token",
             ),
         );
         let value = response_value(&update);
         assert_eq!(value["appearance"]["theme"], "light");
-        assert_eq!(value["appearance"]["accent_key"], "blue");
+        assert_eq!(value["appearance"]["accent_key"], "custom:#13579B");
         assert_eq!(value["appearance"]["font_size"], 14.5);
         assert_eq!(
             value["shortcuts"]["bindings"]["workspace.new"],
@@ -15342,7 +15348,7 @@ mod tests {
         );
         let value = response_value(&reloaded);
         assert_eq!(value["appearance"]["theme"], "light");
-        assert_eq!(value["appearance"]["accent_key"], "blue");
+        assert_eq!(value["appearance"]["accent_key"], "custom:#13579B");
         assert_eq!(value["appearance"]["font_size"], 14.5);
         assert_eq!(
             value["shortcuts"]["bindings"]["workspace.new"],
@@ -15360,6 +15366,20 @@ mod tests {
 
         cleanup_temp_db(&store_path);
         let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn accent_key_validation_matches_the_public_config_schema() {
+        assert_eq!(normalize_accent_key("blue").unwrap(), "blue");
+        assert_eq!(
+            normalize_accent_key("custom:#a1b2c3").unwrap(),
+            "custom:#A1B2C3"
+        );
+        assert!(normalize_accent_key(" custom:#a1b2c3 ").is_err());
+        assert!(normalize_accent_key("").is_err());
+        assert!(normalize_accent_key("custom:#GGGGGG").is_err());
+        assert!(normalize_accent_key("custom:#1234567").is_err());
+        assert!(normalize_accent_key("unknown").is_err());
     }
 
     #[test]
@@ -17775,6 +17795,13 @@ mod tests {
             .unwrap()
             .contains(&surface_id));
         assert!(screenshot["byte_count"].as_u64().unwrap() > 0);
+        let screenshot_bytes = BASE64_STANDARD
+            .decode(screenshot["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            screenshot_bytes.len() as u64,
+            screenshot["byte_count"].as_u64().unwrap()
+        );
 
         let click = agentmux_control(
             &state,
