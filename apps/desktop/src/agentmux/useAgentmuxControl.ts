@@ -234,7 +234,8 @@ function detailEqual(
       left.surfaceId !== right.surfaceId ||
       left.sessionId !== right.sessionId ||
       left.title !== right.title ||
-      left.surfaceType !== right.surfaceType
+      left.surfaceType !== right.surfaceType ||
+      left.resourceUri !== right.resourceUri
     ) {
       return false;
     }
@@ -415,6 +416,10 @@ export interface AgentmuxControl {
   closeSurface: (surfaceId: string) => Promise<void>;
   mountSurface: (surfaceId: string, paneId?: string) => Promise<void>;
   createBrowserSurface: (placement?: "new_tab" | "active_pane") => Promise<SurfaceSummary | null>;
+  createMarkdownSurface: (
+    path: string,
+    placement?: "new_tab" | "active_pane",
+  ) => Promise<SurfaceSummary | null>;
   browserNavigate: (surfaceId: string, url: string) => Promise<void>;
   browserReload: (surfaceId: string) => Promise<void>;
   browserBack: (surfaceId: string) => Promise<void>;
@@ -613,6 +618,13 @@ export function useAgentmuxControl(): AgentmuxControl {
     }
     fullRefreshInFlightRef.current = true;
     try {
+      const detailPromise = loadDetail(workspaceId);
+      const sidebarPromise = detailPromise.then((nextDetail) =>
+        client.getSidebarState(
+          workspaceId,
+          nextDetail.workspace.activePaneId ?? null,
+        ),
+      );
       // PR-5: profiles and workspace groups change only on explicit user
       // mutation; they are hydrated once and reloaded by their mutators, so the
       // periodic poll no longer fetches them (per-tick IPC drops 7 -> 4).
@@ -624,13 +636,12 @@ export function useAgentmuxControl(): AgentmuxControl {
         nextSidebarState,
         nextTeamTasks,
         nextTeamMessages
-      ] =
-        await Promise.all([
-          loadDetail(workspaceId),
+      ] = await Promise.all([
+          detailPromise,
           client.listAgentAttention(null),
           client.listAgentStates(null),
           client.listNotifications({ workspaceId: null, severity: null, includeDismissed: false }),
-          client.getSidebarState(workspaceId),
+          sidebarPromise,
           client.listTeamTasks(workspaceId),
           client.listTeamMessages(workspaceId, true)
         ]);
@@ -664,6 +675,19 @@ export function useAgentmuxControl(): AgentmuxControl {
         now - lastDetailRefreshAtRef.current >= DETAIL_POLL_INTERVAL_MS;
       const shouldLoadSidebar =
         now - lastSidebarRefreshAtRef.current >= SIDEBAR_POLL_INTERVAL_MS;
+      const detailPromise = shouldLoadDetail
+        ? loadDetail(workspaceId)
+        : Promise.resolve(null);
+      const sidebarPromise = shouldLoadSidebar
+        ? detailPromise.then((nextDetail) =>
+            client.getSidebarState(
+              workspaceId,
+              nextDetail?.workspace.activePaneId ??
+                detailRef.current?.workspace.activePaneId ??
+                null,
+            ),
+          )
+        : Promise.resolve(null);
       const [
         nextDetail,
         nextAttention,
@@ -672,13 +696,12 @@ export function useAgentmuxControl(): AgentmuxControl {
         nextSidebarState,
         nextTeamTasks,
         nextTeamMessages
-      ] =
-        await Promise.all([
-          shouldLoadDetail ? loadDetail(workspaceId) : Promise.resolve(null),
+      ] = await Promise.all([
+          detailPromise,
           client.listAgentAttention(null),
           client.listAgentStates(null),
           client.listNotifications({ workspaceId: null, severity: null, includeDismissed: false }),
-          shouldLoadSidebar ? client.getSidebarState(workspaceId) : Promise.resolve(null),
+          sidebarPromise,
           client.listTeamTasks(workspaceId),
           client.listTeamMessages(workspaceId, true)
         ]);
@@ -711,7 +734,10 @@ export function useAgentmuxControl(): AgentmuxControl {
       return;
     }
     try {
-      const next = await client.getSidebarState(workspaceId);
+      const next = await client.getSidebarState(
+        workspaceId,
+        detailRef.current?.workspace.activePaneId ?? null,
+      );
       lastSidebarRefreshAtRef.current = Date.now();
       setIfChanged(setSidebarState, next, sidebarStateEqual);
     } catch {
@@ -1027,7 +1053,10 @@ export function useAgentmuxControl(): AgentmuxControl {
       await reloadWorkspaces();
       if (activeRef.current === workspaceId) {
         await loadDetail(workspaceId);
-        const nextSidebarState = await client.getSidebarState(workspaceId);
+        const nextSidebarState = await client.getSidebarState(
+          workspaceId,
+          detailRef.current?.workspace.activePaneId ?? null,
+        );
         lastSidebarRefreshAtRef.current = Date.now();
         setIfChanged(setSidebarState, nextSidebarState, sidebarStateEqual);
       }
@@ -1508,6 +1537,19 @@ export function useAgentmuxControl(): AgentmuxControl {
     [client, getCurrentDetail, withActiveResult]
   );
 
+  const createMarkdownSurface = useCallback(
+    (path: string, placement: "new_tab" | "active_pane" = "new_tab") =>
+      withActiveResult(async (workspaceId) => {
+        if (!client.createMarkdownSurface) {
+          throw new Error("Markdown surfaces are not available in this mode.");
+        }
+        const current = await getCurrentDetail(workspaceId);
+        const paneId = placement === "active_pane" ? current.workspace.activePaneId : undefined;
+        return client.createMarkdownSurface(workspaceId, path, paneId, placement);
+      }),
+    [client, getCurrentDetail, withActiveResult]
+  );
+
   const browserNavigate = useCallback(
     async (surfaceId: string, url: string) => {
       try {
@@ -1801,8 +1843,11 @@ export function useAgentmuxControl(): AgentmuxControl {
   );
 
   const focusPane = useCallback(
-    (paneId: string) => withActive((workspaceId) => client.focusPane(workspaceId, paneId)),
-    [client, withActive]
+    async (paneId: string) => {
+      await withActive((workspaceId) => client.focusPane(workspaceId, paneId));
+      await refreshSidebar();
+    },
+    [client, refreshSidebar, withActive]
   );
 
   const closePane = useCallback(
@@ -2077,6 +2122,7 @@ export function useAgentmuxControl(): AgentmuxControl {
     closeSurface,
     mountSurface,
     createBrowserSurface,
+    createMarkdownSurface,
     browserNavigate,
     browserReload,
     browserBack,

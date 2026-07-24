@@ -900,3 +900,173 @@ body {
   height: 100%;
   border-radius: 7px;
 }
+
+.agentmux-markdown-surface {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--canvas);
+  color: var(--fg1);
+}
+
+.agentmux-markdown-toolbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 5px 9px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg3);
+}
+
+.agentmux-markdown-location {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agentmux-markdown-location strong,
+.agentmux-markdown-location span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agentmux-markdown-location strong {
+  color: var(--fg1);
+  font: 600 12px/1.2 'Pretendard Variable', Pretendard, 'Segoe UI', sans-serif;
+}
+
+.agentmux-markdown-location span {
+  color: var(--fg4);
+  font: 500 10px/1.2 'Cascadia Mono', Consolas, monospace;
+}
+
+.agentmux-markdown-search {
+  display: flex;
+  width: min(260px, 30vw);
+  height: 28px;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--canvas);
+  color: var(--fg4);
+}
+
+.agentmux-markdown-search:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.agentmux-markdown-search input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--fg1);
+  font: 500 11px/1 'Pretendard Variable', Pretendard, 'Segoe UI', sans-serif;
+}
+
+.agentmux-markdown-search span {
+  min-width: 28px;
+  text-align: right;
+  font: 500 10px/1 'Cascadia Mono', Consolas, monospace;
+}
+
+.agentmux-markdown-scroll {
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  overflow: auto;
+  scrollbar-gutter: auto;
+}
+
+.agentmux-markdown-article {
+  width: min(920px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 30px 0 80px;
+  color: var(--fg2);
+  font: 400 14px/1.7 'Pretendard Variable', Pretendard, 'Segoe UI', sans-serif;
+  overflow-wrap: anywhere;
+}
+
+.agentmux-markdown-article h1,
+.agentmux-markdown-article h2,
+.agentmux-markdown-article h3,
+.agentmux-markdown-article h4 {
+  margin: 1.45em 0 0.55em;
+  color: var(--fg1);
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+
+.agentmux-markdown-article h1 {
+  margin-top: 0;
+  padding-bottom: 0.35em;
+  border-bottom: 1px solid var(--border);
+  font-size: 26px;
+}
+
+.agentmux-markdown-article h2 { font-size: 20px; }
+.agentmux-markdown-article h3 { font-size: 16px; }
+.agentmux-markdown-article p,
+.agentmux-markdown-article ul,
+.agentmux-markdown-article ol,
+.agentmux-markdown-article blockquote { margin: 0.7em 0; }
+.agentmux-markdown-article a { color: var(--accent); text-decoration: none; }
+.agentmux-markdown-article a:hover { text-decoration: underline; }
+.agentmux-markdown-article img { display: block; max-width: 100%; margin: 16px auto; }
+.agentmux-markdown-article blockquote {
+  padding: 2px 14px;
+  border-left: 3px solid var(--accent);
+  color: var(--fg3);
+}
+
+.agentmux-markdown-article code {
+  border-radius: 4px;
+  background: var(--s2);
+  padding: 0.12em 0.36em;
+  color: var(--fg1);
+  font: 500 0.92em/1.55 'Cascadia Mono', 'JetBrains Mono', Consolas, monospace;
+}
+
+.agentmux-markdown-article pre {
+  overflow: auto;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg2);
+}
+
+.agentmux-markdown-article pre code { background: transparent; padding: 0; }
+.agentmux-markdown-article table { width: 100%; border-collapse: collapse; }
+.agentmux-markdown-article th,
+.agentmux-markdown-article td { padding: 7px 10px; border: 1px solid var(--border-strong); text-align: left; }
+.agentmux-markdown-article th { background: var(--s2); color: var(--fg1); }
+.agentmux-markdown-article hr { border: 0; border-top: 1px solid var(--border); }
+.agentmux-markdown-article input[type='checkbox'] { accent-color: var(--accent); }
+
+.agentmux-markdown-state,
+.agentmux-markdown-error {
+  margin: 28px auto;
+  width: min(920px, calc(100% - 48px));
+  font: 500 12px/1.5 'Pretendard Variable', Pretendard, 'Segoe UI', sans-serif;
+}
+
+.agentmux-markdown-state { color: var(--fg4); }
+.agentmux-markdown-error {
+  border-left: 3px solid var(--danger, #ef4444);
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--danger, #ef4444) 12%, transparent);
+  color: var(--fg1);
+}

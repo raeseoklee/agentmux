@@ -507,6 +507,27 @@ pub struct SurfaceCreateBrowserParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SurfaceCreateMarkdownParams {
+    pub workspace_id: String,
+    pub pane_id: Option<String>,
+    pub path: String,
+    pub placement: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MarkdownReadParams {
+    pub workspace_id: String,
+    pub surface_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MarkdownAssetReadParams {
+    pub workspace_id: String,
+    pub surface_id: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SurfaceCloseParams {
     pub workspace_id: String,
     pub surface_id: String,
@@ -734,6 +755,8 @@ pub struct NotificationClearParams {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SidebarWorkspaceParams {
     pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub pane_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1067,6 +1090,23 @@ pub struct SurfaceSummaryResult {
     pub title: String,
     pub session_id: Option<String>,
     pub browser_id: Option<String>,
+    pub resource_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MarkdownDocumentResult {
+    pub surface_id: String,
+    pub path: String,
+    pub title: String,
+    pub content: String,
+    pub modified_at_ms: u64,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MarkdownAssetResult {
+    pub data_url: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -3,6 +3,7 @@ use super::*;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -666,6 +667,37 @@ impl DesktopControlState {
         Ok(active)
     }
 
+    fn first_status_page_with_retry(
+        &self,
+        repository: &Repository,
+        repository_id: &str,
+        limit: usize,
+    ) -> Result<(CachedStatusScan, StatusScanFirstPage), DesktopHostError> {
+        for attempt in 0..3 {
+            let active = self.start_status_scan(repository, repository_id, limit)?;
+            match active.scan.wait_for_first_page() {
+                Ok(page) => return Ok((active, page)),
+                Err(GitError::StateUnavailable(message))
+                    if message.contains("status scan was cancelled") && attempt < 2 =>
+                {
+                    if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
+                        if scans
+                            .get(repository_id)
+                            .is_some_and(|current| current.generation == active.generation)
+                        {
+                            scans.remove(repository_id);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(25 * (attempt + 1) as u64));
+                }
+                Err(error) => return Err(vcs_error(error)),
+            }
+        }
+        Err(DesktopHostError::StateUnavailable(
+            "Git status scan could not stabilize after retries.".to_string(),
+        ))
+    }
+
     fn install_completed_status_scan(
         &self,
         workspace_id: &str,
@@ -898,8 +930,9 @@ impl DesktopControlState {
                 );
             }
 
-            let active = self.start_status_scan(&repository, &repository_id, limit)?;
-            return match active.scan.wait_for_first_page().map_err(vcs_error)? {
+            let (active, first_page) =
+                self.first_status_page_with_retry(&repository, &repository_id, limit)?;
+            return match first_page {
                 StatusScanFirstPage::Prefix(prefix) => {
                     let filter = GitStatusPageFilter::from_request(
                         params.state.as_deref(),
@@ -4883,7 +4916,7 @@ impl DesktopControlState {
         params.validate()?;
         if !is_safe_development_server_url(&params.url) {
             return Err(control_invalid_request(
-                "Development server URL must use http or https without credentials.",
+                "Development server URL must use http or https on localhost or a loopback address.",
             ));
         }
         let session = self
@@ -5262,7 +5295,33 @@ fn is_safe_development_server_url(url: &str) -> bool {
     else {
         return false;
     };
-    !authority.is_empty() && !authority.contains('@') && !authority.chars().any(char::is_whitespace)
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return false;
+        };
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        if !suffix.is_empty() && (!suffix.starts_with(':') || suffix[1..].parse::<u16>().is_err()) {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.is_empty() || port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    host == "localhost"
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]
@@ -5362,6 +5421,7 @@ mod tests {
                 title: format!("terminal-{index}"),
                 session_id: Some((*session_id).to_string()),
                 browser_id: None,
+                resource_uri: None,
                 created_at: now.clone(),
                 last_visible_at: Some(now.clone()),
                 updated_at: now.clone(),
@@ -6698,6 +6758,20 @@ mod tests {
             "session.terminate",
             serde_json::json!({"session_id": spawned.session_id, "mode": "kill"}).to_string(),
             DESKTOP_CONTROL_TOKEN,
+        ));
+    }
+
+    #[test]
+    fn development_server_candidates_require_a_local_host() {
+        assert!(is_safe_development_server_url("http://localhost:5173"));
+        assert!(is_safe_development_server_url("http://127.0.0.1:3000/path"));
+        assert!(is_safe_development_server_url("https://[::1]:4173"));
+        assert!(!is_safe_development_server_url("https://www.kopus.org"));
+        assert!(!is_safe_development_server_url(
+            "https://example.com/localhost"
+        ));
+        assert!(!is_safe_development_server_url(
+            "https://user@localhost:3000"
         ));
     }
 

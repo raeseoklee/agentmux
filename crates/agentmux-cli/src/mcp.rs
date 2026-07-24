@@ -66,6 +66,7 @@ const READ_TOOL_NAMES: &[&str] = &[
     "event_poll",
     "browser_snapshot",
     "browser_get",
+    "markdown_read",
     "team_task_list",
     "team_message_list",
     "diagnostics_summary",
@@ -85,6 +86,7 @@ const STANDARD_TOOL_NAMES: &[&str] = &[
     "terminal_send_key",
     "browser_open",
     "browser_open_split",
+    "markdown_open",
     "browser_navigate",
     "browser_click",
     "browser_fill",
@@ -143,6 +145,7 @@ const STANDARD_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
 #[cfg(test)]
 const STANDARD_ADDITIVE_TOOL_NAMES: &[&str] = &[
     "pane_focus",
+    "markdown_open",
     "team_message_send",
     "git_review_thread_create",
     "git_review_thread_update",
@@ -1463,6 +1466,30 @@ impl AgentMuxMcpServer {
         bound_string_result(result, "value", max_bytes)
     }
 
+    /// Read a workspace-scoped Markdown document through an existing Markdown surface.
+    #[tool(
+        name = "markdown_read",
+        annotations(
+            title = "Read Markdown document",
+            read_only_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn markdown_read(
+        &self,
+        Parameters(params): Parameters<MarkdownReadToolParams>,
+    ) -> CallToolResult {
+        self.call(
+            "markdown.read",
+            json!({
+                "workspace_id": params.workspace_id,
+                "surface_id": params.surface_id,
+            }),
+        )
+        .await
+    }
+
     /// List shared agent-team tasks, optionally restricted to a workspace.
     #[tool(
         name = "team_task_list",
@@ -2643,6 +2670,52 @@ impl AgentMuxMcpServer {
             }
         }
         CallToolResult::structured(surface)
+    }
+
+    /// Open a workspace-scoped Markdown file in a new tab or an existing pane.
+    #[tool(
+        name = "markdown_open",
+        annotations(
+            title = "Open Markdown document",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn markdown_open(
+        &self,
+        Parameters(params): Parameters<MarkdownOpenToolParams>,
+    ) -> CallToolResult {
+        let context = match self.resolve_context(params.workspace_id.clone()).await {
+            Ok(context) => context,
+            Err(message) => return control_error_result("system.identify", message),
+        };
+        let Some(workspace_id) = params.workspace_id.or(context.workspace_id) else {
+            return missing_context_result("workspace_id");
+        };
+        let placement = params.placement.unwrap_or_else(|| {
+            if params.pane_id.is_some() {
+                "active_pane".to_string()
+            } else {
+                "new_tab".to_string()
+            }
+        });
+        let pane_id = params.pane_id.or_else(|| {
+            (placement == "active_pane")
+                .then_some(context.pane_id)
+                .flatten()
+        });
+        self.call(
+            "surface.create_markdown",
+            json!({
+                "workspace_id": workspace_id,
+                "pane_id": pane_id,
+                "path": params.path,
+                "placement": placement,
+            }),
+        )
+        .await
     }
 
     /// Split the current pane, mount an embedded browser in the new pane, and roll back on failure.
@@ -5929,6 +6002,22 @@ struct BrowserOpenToolParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct MarkdownOpenToolParams {
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+    /// Workspace-relative, Windows, or WSL path to a Markdown document.
+    path: String,
+    /// new_tab or active_pane.
+    placement: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+struct MarkdownReadToolParams {
+    workspace_id: String,
+    surface_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Serialize)]
 struct BrowserOpenSplitToolParams {
     workspace_id: Option<String>,
     pane_id: Option<String>,
@@ -7284,6 +7373,7 @@ mod tests {
                 "git_review_thread_list",
                 "git_status_page",
                 "git_status_summary",
+                "markdown_read",
                 "session_list",
                 "team_message_list",
                 "team_task_list",

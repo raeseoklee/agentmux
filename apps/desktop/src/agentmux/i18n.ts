@@ -134,6 +134,14 @@ export type I18nKey =
   | "notifications.summary"
   | "notifications.title"
   | "pane.empty"
+  | "markdown.loadFailed"
+  | "markdown.loading"
+  | "markdown.nextMatch"
+  | "markdown.open"
+  | "markdown.previousMatch"
+  | "markdown.reload"
+  | "markdown.search"
+  | "markdown.unavailable"
   | "pane.none"
   | "pane.invalidLayout"
   | "pane.restoring"
@@ -498,6 +506,14 @@ const en: Record<I18nKey, string> = {
   "notifications.summary": "{count} active",
   "notifications.title": "Notifications",
   "pane.empty": "Empty pane",
+  "markdown.loadFailed": "Could not load the Markdown document.",
+  "markdown.loading": "Loading document...",
+  "markdown.nextMatch": "Next match",
+  "markdown.open": "Open Markdown...",
+  "markdown.previousMatch": "Previous match",
+  "markdown.reload": "Reload document",
+  "markdown.search": "Search document",
+  "markdown.unavailable": "Markdown viewing is not available in this mode.",
   "pane.none": "No panes to display.",
   "pane.invalidLayout": "Invalid pane layout",
   "pane.restoring": "Restoring",
@@ -825,6 +841,14 @@ const ko: Record<I18nKey, string> = {
   "notifications.summary": "활성 {count}개",
   "notifications.title": "알림",
   "pane.empty": "빈 페인",
+  "markdown.loadFailed": "마크다운 문서를 불러오지 못했습니다.",
+  "markdown.loading": "문서를 불러오는 중...",
+  "markdown.nextMatch": "다음 일치 항목",
+  "markdown.open": "마크다운 열기...",
+  "markdown.previousMatch": "이전 일치 항목",
+  "markdown.reload": "문서 새로고침",
+  "markdown.search": "문서 검색",
+  "markdown.unavailable": "이 모드에서는 마크다운 보기를 사용할 수 없습니다.",
   "pane.none": "표시할 페인이 없습니다.",
   "pane.invalidLayout": "잘못된 페인 레이아웃",
   "pane.restoring": "복원 중",

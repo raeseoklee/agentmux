@@ -207,27 +207,80 @@ export function IconChevronDown({ size = 13 }: IconProps) {
   );
 }
 
-export function IconWinMinimize({ size = 12 }: IconProps) {
+export function IconWinMinimize({ size = 13 }: IconProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.6" fill="none">
-      <path d="M5 12h14" />
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1"
+      shapeRendering="crispEdges"
+      aria-hidden="true"
+    >
+      <path d="M1 6.5h10" />
     </svg>
   );
 }
 
-export function IconWinMaximize({ size = 11 }: IconProps) {
+export function IconFileText({ size = 14 }: IconProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-      <rect x="4" y="4" width="16" height="16" rx="1.5" />
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 2h8l4 4v16H6z" />
+      <path d="M14 2v5h5M9 13h6M9 17h6" />
     </svg>
   );
 }
 
-export function IconWinRestore({ size = 11 }: IconProps) {
+export function IconWinMaximize({ size = 13 }: IconProps) {
   return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round">
-      <rect x="4" y="8" width="12" height="12" rx="1.5" />
-      <path d="M8 8V4h12v12h-4" />
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1"
+      shapeRendering="crispEdges"
+      aria-hidden="true"
+    >
+      <rect x="1.5" y="1.5" width="9" height="9" />
+    </svg>
+  );
+}
+
+export function IconWinRestore({ size = 13 }: IconProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1"
+      shapeRendering="crispEdges"
+      aria-hidden="true"
+    >
+      <path d="M3.5 3.5v-2h7v7h-2" />
+      <rect x="1.5" y="3.5" width="7" height="7" />
+    </svg>
+  );
+}
+
+export function IconWinClose({ size = 13 }: IconProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1"
+      strokeLinecap="square"
+      aria-hidden="true"
+    >
+      <path d="M1.75 1.75 10.25 10.25M10.25 1.75 1.75 10.25" />
     </svg>
   );
 }

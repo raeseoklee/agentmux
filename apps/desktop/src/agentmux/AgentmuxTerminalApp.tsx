@@ -66,6 +66,7 @@ import {
 } from "./actions";
 import { useAppDialogs } from "./dialogs";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
+import { MarkdownSurfacePanel } from "./MarkdownSurfacePanel";
 import {
   readSurfaceTitleOverrides,
   surfaceTitleOverride,
@@ -109,6 +110,7 @@ import {
   IconClose,
   IconDuplicate,
   IconFolder,
+  IconFileText,
   IconGear,
   IconGlobe,
   IconGrid,
@@ -123,6 +125,7 @@ import {
   IconSplitCols,
   IconSplitRows,
   IconSun,
+  IconWinClose,
   IconWinMaximize,
   IconWinMinimize,
   IconWinRestore,
@@ -1544,6 +1547,8 @@ interface PaneViewProps {
   ) => void;
   openDurableTerminalInPane: (paneId: string) => void;
   onOpenTerminalLink: (url: string, paneId: string) => void;
+  onOpenMarkdownDocument: (path: string) => void;
+  onOpenMarkdownExternal: (url: string) => void;
   onTerminalPastePaths: (payload: ExplorerFileDropPayload) => void;
   onTerminalExitIntent: (sessionId: string) => void;
   isDragOver: boolean;
@@ -1599,6 +1604,8 @@ const PaneView = memo(function PaneView({
   openTerminalProfileMenu,
   openDurableTerminalInPane,
   onOpenTerminalLink,
+  onOpenMarkdownDocument,
+  onOpenMarkdownExternal,
   onTerminalPastePaths,
   onTerminalExitIntent,
   onPaneDragStart,
@@ -1608,6 +1615,7 @@ const PaneView = memo(function PaneView({
   onMovePaneSurface,
   onTerminalError,
 }: PaneViewProps) {
+  const isMarkdown = surface?.surfaceType === "markdown";
   const restoringAgent = isRestorableAgentPlaceholder(
     session,
     agentState,
@@ -1655,7 +1663,7 @@ const PaneView = memo(function PaneView({
       key={pane.paneId}
       data-agentmux-pane={pane.paneId}
       data-agentmux-terminal-session={
-        session && !isBrowser ? session.sessionId : undefined
+        session && !isBrowser && !isMarkdown ? session.sessionId : undefined
       }
       data-agentmux-mounted={surface ? "true" : "false"}
       data-agentmux-mounted-surface={surface?.surfaceId ?? ""}
@@ -1897,7 +1905,7 @@ const PaneView = memo(function PaneView({
             overflow: "hidden",
           }}
         >
-          {session && isLiveSession(session) && !isBrowser ? (
+          {session && isLiveSession(session) && !isBrowser && !isMarkdown ? (
             <LiveTerminal
               key={session.sessionId}
               client={client}
@@ -1922,6 +1930,15 @@ const PaneView = memo(function PaneView({
             />
           ) : isBrowser && surface ? (
             <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} t={t} />
+          ) : isMarkdown && surface ? (
+            <MarkdownSurfacePanel
+              client={client}
+              surface={surface}
+              visible={visible}
+              t={t}
+              onOpenDocument={onOpenMarkdownDocument}
+              onOpenExternal={onOpenMarkdownExternal}
+            />
           ) : (restoringAgent || restoringTerminal) && session ? (
             <TerminalRestorePreview
               sessionId={session.sessionId}
@@ -3466,8 +3483,22 @@ export function AgentmuxTerminalApp() {
     }
     return branch || hash || "no git";
   }, [sidebarState?.gitBranch, sidebarState?.gitHash]);
+  const activeStatusCwd = activePaneId
+    ? (() => {
+        const pane = paneById.get(activePaneId);
+        const surface = pane?.mountedSurfaceId
+          ? surfaceById.get(pane.mountedSurfaceId)
+          : undefined;
+        return surface?.sessionId
+          ? sessionById.get(surface.sessionId)?.cwd?.trim() || null
+          : null;
+      })()
+    : null;
   const statusBarPath =
-    sidebarState?.cwd?.trim() || activeWorkspace?.projectRoot?.trim() || "";
+    activeStatusCwd ||
+    sidebarState?.cwd?.trim() ||
+    activeWorkspace?.projectRoot?.trim() ||
+    "";
   const canOpenStatusBarPath =
     Boolean(statusBarPath) && Boolean(window.__TAURI__?.core?.invoke);
   const handleOpenStatusBarPath = useCallback(async () => {
@@ -4983,6 +5014,18 @@ export function AgentmuxTerminalApp() {
           return;
         }
 
+        if (surface.surfaceType === "markdown") {
+          if (!surface.resourceUri || !client.createMarkdownSurface) return;
+          await client.createMarkdownSurface(
+            activeWorkspaceId,
+            surface.resourceUri,
+            null,
+            "new_tab",
+          );
+          await ctl.refresh();
+          return;
+        }
+
         const session = surface.sessionId
           ? sessionById.get(surface.sessionId)
           : undefined;
@@ -5160,6 +5203,61 @@ export function AgentmuxTerminalApp() {
       ctl.refresh,
     ],
   );
+  const openMarkdownDocument = useCallback(
+    (path: string) => {
+      void ctl.createMarkdownSurface(path, "new_tab");
+    },
+    [ctl],
+  );
+  const openMarkdownExternal = useCallback((url: string) => {
+    void openUrlInSystemBrowser(url);
+  }, []);
+  const openMarkdownFile = useCallback(async () => {
+    if (!activeWorkspaceId || !client.createMarkdownSurface) return;
+    const targetPaneId = terminalProfileMenu?.paneId ?? null;
+    closeTerminalProfileMenu();
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const projectRoot = activeWorkspace?.projectRoot?.trim();
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        defaultPath:
+          projectRoot && (/^[A-Za-z]:[\\/]/.test(projectRoot) || projectRoot.startsWith("\\\\"))
+            ? projectRoot
+            : undefined,
+        filters: [
+          {
+            name: "Markdown",
+            extensions: ["md", "markdown", "mdown", "mkd"],
+          },
+        ],
+      });
+      if (typeof selected !== "string" || !selected) return;
+      await client.createMarkdownSurface(
+        activeWorkspaceId,
+        selected,
+        targetPaneId,
+        targetPaneId ? "active_pane" : "new_tab",
+      );
+      await ctl.refresh();
+    } catch (cause) {
+      dialogs.toast({
+        title: t("markdown.loadFailed"),
+        description: cause instanceof Error ? cause.message : String(cause),
+        tone: "danger",
+      });
+    }
+  }, [
+    activeWorkspace?.projectRoot,
+    activeWorkspaceId,
+    client,
+    closeTerminalProfileMenu,
+    ctl,
+    dialogs,
+    t,
+    terminalProfileMenu?.paneId,
+  ]);
   const addTerminalProfile = useCallback(
     async (item: TerminalProfileMenuItem) => {
       if (item.disabled) {
@@ -7110,6 +7208,8 @@ export function AgentmuxTerminalApp() {
         openTerminalProfileMenu={openTerminalProfileMenu}
         openDurableTerminalInPane={openDurableTerminalInPane}
         onOpenTerminalLink={openTerminalLinkInBrowserSplit}
+        onOpenMarkdownDocument={openMarkdownDocument}
+        onOpenMarkdownExternal={openMarkdownExternal}
         onTerminalPastePaths={handleDroppedPaths}
         onTerminalExitIntent={queueTerminalExitRefresh}
         isDragOver={
@@ -7266,6 +7366,7 @@ export function AgentmuxTerminalApp() {
           >
             <Hov
               tag="button"
+              className="agentmux-window-control agentmux-window-minimize"
               ariaLabel={t("app.window.minimize")}
               title={t("app.window.minimize")}
               style={winCtlBtn}
@@ -7276,6 +7377,7 @@ export function AgentmuxTerminalApp() {
             </Hov>
             <Hov
               tag="button"
+              className="agentmux-window-control agentmux-window-maximize"
               ariaLabel={
                 windowMaximized
                   ? t("app.window.restore")
@@ -7294,13 +7396,14 @@ export function AgentmuxTerminalApp() {
             </Hov>
             <Hov
               tag="button"
+              className="agentmux-window-control agentmux-window-close"
               ariaLabel={t("app.window.close")}
               title={t("app.window.close")}
               style={winCtlBtn}
               hover={{ background: "#e81123", color: "#fff" }}
               onClick={closeWindow}
             >
-              <IconClose />
+              <IconWinClose />
             </Hov>
           </div>
         </div>
@@ -8634,7 +8737,7 @@ export function AgentmuxTerminalApp() {
                     }}
                   >
                     <span
-                      data-agentmux-tab-icon={surface.surfaceType === "browser" ? "browser" : "terminal"}
+                      data-agentmux-tab-icon={surface.surfaceType}
                       style={{
                         color: "var(--fg4)",
                         display: "flex",
@@ -8643,6 +8746,8 @@ export function AgentmuxTerminalApp() {
                     >
                       {surface.surfaceType === "browser" ? (
                         <IconGlobe size={13} />
+                      ) : surface.surfaceType === "markdown" ? (
+                        <IconFileText size={13} />
                       ) : (
                         <IconShellArrow />
                       )}
@@ -9022,6 +9127,41 @@ export function AgentmuxTerminalApp() {
                       </span>
                     </Hov>
                   ))}
+                  {client.createMarkdownSurface ? (
+                    <>
+                      <div
+                        style={{
+                          borderTop: "1px solid var(--border)",
+                          margin: "5px 0",
+                        }}
+                      />
+                      <Hov
+                        tag="button"
+                        className="agentmux-terminal-profile-menu-markdown"
+                        style={{ ...groupMenuItemStyle, padding: "8px 9px" }}
+                        hover={groupMenuItemHover}
+                        onClick={() => void openMarkdownFile()}
+                      >
+                        <span
+                          aria-hidden="true"
+                          style={{
+                            width: 22,
+                            height: 22,
+                            borderRadius: 5,
+                            flex: "none",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            background: "var(--accent-soft)",
+                            color: "var(--accent)",
+                          }}
+                        >
+                          <IconFileText size={12} />
+                        </span>
+                        <span>{t("markdown.open")}</span>
+                      </Hov>
+                    </>
+                  ) : null}
                 </div>
               </>
             ) : null}
@@ -9166,7 +9306,7 @@ export function AgentmuxTerminalApp() {
               workspace={activeWorkspace}
               activePaneId={activePaneId ?? null}
               activeSessionId={activeTerminalSession?.sessionId ?? null}
-              activeCwd={sidebarState?.cwd ?? null}
+              activeCwd={activeTerminalSession?.cwd ?? sidebarState?.cwd ?? null}
               onClose={closeOverlay}
               onRepositoryChanged={ctl.refreshSidebar}
               t={t}
@@ -12693,6 +12833,158 @@ function SettingsModal(props: SettingsModalProps) {
                   : t("updates.status.idle");
   const updateBusy =
     updateState.status === "checking" || updateState.status === "downloading";
+  const generalSettingsCard: CSSProperties = {
+    border: "1px solid var(--border)",
+    borderRadius: 8,
+    padding: 14,
+    marginBottom: 14,
+  };
+  const generalSettingsRow: CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) 180px",
+    alignItems: "center",
+    gap: 14,
+  };
+  const generalSettingsTitle: CSSProperties = {
+    display: "block",
+    font: `700 13px/1.2 ${FONT_SANS}`,
+    color: "var(--fg1)",
+  };
+  const generalSettingsHint: CSSProperties = {
+    display: "block",
+    font: `400 11.5px/1.45 ${FONT_SANS}`,
+    color: "var(--fg4)",
+    marginTop: 5,
+  };
+  const terminalBehaviorSettings = (
+    <>
+      <div
+        data-agentmux-terminal-start-settings
+        style={generalSettingsCard}
+      >
+        <label style={generalSettingsRow}>
+          <span style={{ minWidth: 0 }}>
+            <span style={generalSettingsTitle}>
+              {t("settings.terminalStartDirectory")}
+            </span>
+            <span style={generalSettingsHint}>
+              {t("settings.terminalStartDirectoryHint")}
+            </span>
+          </span>
+          <select
+            className="agentmux-terminal-start-directory"
+            aria-label={t("settings.terminalStartDirectory")}
+            value={terminalStartDirectory}
+            onChange={(event) =>
+              setTerminalStartDirectory(
+                event.currentTarget.value === "workspace"
+                  ? "workspace"
+                  : event.currentTarget.value === "custom"
+                    ? "custom"
+                    : "home",
+              )
+            }
+            style={fieldInput}
+          >
+            <option value="home">
+              {t("settings.terminalStartDirectory.home")}
+            </option>
+            <option value="workspace">
+              {t("settings.terminalStartDirectory.workspace")}
+            </option>
+            <option value="custom">
+              {t("settings.terminalStartDirectory.custom")}
+            </option>
+          </select>
+        </label>
+        {terminalStartDirectory === "custom" ? (
+          <label style={{ display: "block", marginTop: 12 }}>
+            <span style={fieldLabel}>
+              {t("settings.terminalStartCustomCwd")}
+            </span>
+            <input
+              className="agentmux-terminal-start-custom-cwd"
+              aria-label={t("settings.terminalStartCustomCwd")}
+              value={terminalStartCustomCwd}
+              placeholder={t("settings.terminalStartCustomCwdPlaceholder")}
+              onChange={(event) =>
+                setTerminalStartCustomCwd(event.currentTarget.value)
+              }
+              style={{ ...fieldInput, fontFamily: FONT_MONO }}
+            />
+          </label>
+        ) : null}
+      </div>
+      <div
+        data-agentmux-terminal-split-settings
+        style={generalSettingsCard}
+      >
+        <label style={generalSettingsRow}>
+          <span style={{ minWidth: 0 }}>
+            <span style={generalSettingsTitle}>
+              {t("settings.terminalSplitBehavior")}
+            </span>
+            <span style={generalSettingsHint}>
+              {t("settings.terminalSplitBehaviorHint")}
+            </span>
+          </span>
+          <select
+            className="agentmux-terminal-split-behavior"
+            aria-label={t("settings.terminalSplitBehavior")}
+            value={terminalSplitBehavior}
+            onChange={(event) =>
+              setTerminalSplitBehavior(
+                event.currentTarget.value === "empty"
+                  ? "empty"
+                  : "clone_current",
+              )
+            }
+            style={fieldInput}
+          >
+            <option value="clone_current">
+              {t("settings.terminalSplitBehavior.cloneCurrent")}
+            </option>
+            <option value="empty">
+              {t("settings.terminalSplitBehavior.empty")}
+            </option>
+          </select>
+        </label>
+      </div>
+      <div
+        data-agentmux-terminal-link-settings
+        style={generalSettingsCard}
+      >
+        <label style={generalSettingsRow}>
+          <span style={{ minWidth: 0 }}>
+            <span style={generalSettingsTitle}>
+              {t("settings.terminalLinkOpen")}
+            </span>
+            <span style={generalSettingsHint}>
+              {t("settings.terminalLinkOpenHint")}
+            </span>
+          </span>
+          <select
+            className="agentmux-terminal-link-open-mode"
+            aria-label={t("settings.terminalLinkOpen")}
+            value={terminalLinkOpenMode}
+            onChange={(event) =>
+              setTerminalLinkOpenMode(
+                event.currentTarget.value === "in-app" ? "in-app" : "system",
+              )
+            }
+            style={fieldInput}
+          >
+            <option value="system">
+              {t("settings.terminalLinkOpen.system")}
+            </option>
+            <option value="in-app">
+              {t("settings.terminalLinkOpen.inApp")}
+            </option>
+          </select>
+        </label>
+      </div>
+    </>
+  );
   const activateSettingsTab = (key: SettingsTab) => {
     setSettingsTab(key);
     window.requestAnimationFrame(() => {
@@ -13267,204 +13559,6 @@ function SettingsModal(props: SettingsModalProps) {
                 }}
               >
                 {t("settings.general")}
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 12,
-                  marginBottom: 9,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <div
-                    style={{
-                      font: `600 12px/1 ${FONT_SANS}`,
-                      color: "var(--fg2)",
-                    }}
-                  >
-                    {t("settings.terminalStartDirectory")}
-                  </div>
-                  <div
-                    style={{
-                      font: `400 11.5px/1.45 ${FONT_SANS}`,
-                      color: "var(--fg4)",
-                      marginTop: 5,
-                    }}
-                  >
-                    {t("settings.terminalStartDirectoryHint")}
-                  </div>
-                </div>
-                <select
-                  className="agentmux-terminal-start-directory"
-                  aria-label={t("settings.terminalStartDirectory")}
-                  value={terminalStartDirectory}
-                  onChange={(e) =>
-                    setTerminalStartDirectory(
-                      e.currentTarget.value === "workspace"
-                        ? "workspace"
-                        : e.currentTarget.value === "custom"
-                          ? "custom"
-                          : "home",
-                    )
-                  }
-                  style={{
-                    flex: "none",
-                    background: "var(--bg2)",
-                    color: "var(--fg1)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: "6px 8px",
-                    font: `500 11.5px/1 ${FONT_SANS}`,
-                  }}
-                >
-                  <option value="home">
-                    {t("settings.terminalStartDirectory.home")}
-                  </option>
-                  <option value="workspace">
-                    {t("settings.terminalStartDirectory.workspace")}
-                  </option>
-                  <option value="custom">
-                    {t("settings.terminalStartDirectory.custom")}
-                  </option>
-                </select>
-              </div>
-              {terminalStartDirectory === "custom" ? (
-                <input
-                  className="agentmux-terminal-start-custom-cwd"
-                  aria-label={t("settings.terminalStartCustomCwd")}
-                  value={terminalStartCustomCwd}
-                  placeholder={t("settings.terminalStartCustomCwdPlaceholder")}
-                  onChange={(event) =>
-                    setTerminalStartCustomCwd(event.currentTarget.value)
-                  }
-                  style={{
-                    width: "100%",
-                    boxSizing: "border-box",
-                    background: "var(--bg2)",
-                    color: "var(--fg1)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: "7px 9px",
-                    font: `500 11.5px/1 ${FONT_MONO}`,
-                    marginBottom: 24,
-                  }}
-                />
-              ) : (
-                <div style={{ marginBottom: 24 }} />
-              )}
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 12,
-                  marginBottom: 24,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <div
-                    style={{
-                      font: `600 12px/1 ${FONT_SANS}`,
-                      color: "var(--fg2)",
-                    }}
-                  >
-                    {t("settings.terminalSplitBehavior")}
-                  </div>
-                  <div
-                    style={{
-                      font: `400 11.5px/1.45 ${FONT_SANS}`,
-                      color: "var(--fg4)",
-                      marginTop: 5,
-                    }}
-                  >
-                    {t("settings.terminalSplitBehaviorHint")}
-                  </div>
-                </div>
-                <select
-                  className="agentmux-terminal-split-behavior"
-                  aria-label={t("settings.terminalSplitBehavior")}
-                  value={terminalSplitBehavior}
-                  onChange={(event) =>
-                    setTerminalSplitBehavior(
-                      event.currentTarget.value === "empty"
-                        ? "empty"
-                        : "clone_current",
-                    )
-                  }
-                  style={{
-                    flex: "none",
-                    background: "var(--bg2)",
-                    color: "var(--fg1)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: "6px 8px",
-                    font: `500 11.5px/1 ${FONT_SANS}`,
-                  }}
-                >
-                  <option value="clone_current">
-                    {t("settings.terminalSplitBehavior.cloneCurrent")}
-                  </option>
-                  <option value="empty">
-                    {t("settings.terminalSplitBehavior.empty")}
-                  </option>
-                </select>
-              </div>
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  gap: 12,
-                  marginBottom: 9,
-                }}
-              >
-                <div style={{ minWidth: 0 }}>
-                  <div
-                    style={{
-                      font: `600 12px/1 ${FONT_SANS}`,
-                      color: "var(--fg2)",
-                    }}
-                  >
-                    {t("settings.terminalLinkOpen")}
-                  </div>
-                  <div
-                    style={{
-                      font: `400 11.5px/1.45 ${FONT_SANS}`,
-                      color: "var(--fg4)",
-                      marginTop: 5,
-                    }}
-                  >
-                    {t("settings.terminalLinkOpenHint")}
-                  </div>
-                </div>
-                <select
-                  className="agentmux-terminal-link-open-mode"
-                  aria-label={t("settings.terminalLinkOpen")}
-                  value={terminalLinkOpenMode}
-                  onChange={(e) =>
-                    setTerminalLinkOpenMode(
-                      e.currentTarget.value === "in-app" ? "in-app" : "system",
-                    )
-                  }
-                  style={{
-                    flex: "none",
-                    background: "var(--bg2)",
-                    color: "var(--fg1)",
-                    border: "1px solid var(--border)",
-                    borderRadius: 6,
-                    padding: "6px 8px",
-                    font: `500 11.5px/1 ${FONT_SANS}`,
-                  }}
-                >
-                  <option value="system">
-                    {t("settings.terminalLinkOpen.system")}
-                  </option>
-                  <option value="in-app">
-                    {t("settings.terminalLinkOpen.inApp")}
-                  </option>
-                </select>
               </div>
             </>
           ) : null}
@@ -14459,6 +14553,7 @@ function SettingsModal(props: SettingsModalProps) {
                   </details>
                 ) : null}
               </div>
+              {terminalBehaviorSettings}
             </>
           ) : null}
 

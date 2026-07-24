@@ -43,19 +43,20 @@ use agentmux_ipc::{
     GitReviewCommentListParams, GitReviewCommentUpdateParams, GitReviewLineAnchor,
     GitReviewThreadCreateParams, GitReviewThreadDeliverParams, GitReviewThreadIdParams,
     GitReviewThreadListParams, GitReviewThreadMarkStaleParams, GitReviewThreadUpdateParams,
-    GitStatusPageParams, NamedPipeEventStream, NotificationClearParams, NotificationClearResult,
-    NotificationCreateParams, NotificationDismissParams, NotificationListParams,
-    NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
-    PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, ProfileListResult,
-    ProfileSummaryResult, RecoveryDiagnosticsResult, RequestEnvelope, ResponseEnvelope,
-    ResponseOutcome, SessionIdParams, SessionListParams, SessionListResult,
-    SessionOutputPressureParams, SessionReadRecentParams, SessionReadRecentResult,
-    SessionResizeParams, SessionSendKeyParams, SessionSendPasteParams, SessionSendTextParams,
-    SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams, SessionSpawnResult,
-    SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams, SidebarLogListParams,
-    SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult, SidebarStatusKeyParams,
-    SidebarStatusListResult, SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams,
-    SurfaceCreateBrowserParams, SurfaceSummaryResult, SystemCapabilitiesResult,
+    GitStatusPageParams, MarkdownDocumentResult, MarkdownReadParams, NamedPipeEventStream,
+    NotificationClearParams, NotificationClearResult, NotificationCreateParams,
+    NotificationDismissParams, NotificationListParams, NotificationListResult,
+    NotificationSummaryResult, PaneCloseParams, PaneFocusParams, PaneResizeLayoutParams,
+    PaneSplitParams, PaneSummaryResult, ProfileListResult, ProfileSummaryResult,
+    RecoveryDiagnosticsResult, RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionIdParams,
+    SessionListParams, SessionListResult, SessionOutputPressureParams, SessionReadRecentParams,
+    SessionReadRecentResult, SessionResizeParams, SessionSendKeyParams, SessionSendPasteParams,
+    SessionSendTextParams, SessionSnapshotParams, SessionSnapshotResult, SessionSpawnParams,
+    SessionSpawnResult, SessionSummaryResult, SessionTerminateParams, SidebarLogAddParams,
+    SidebarLogListParams, SidebarLogListResult, SidebarProgressSetParams, SidebarStateResult,
+    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusSetParams,
+    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
+    SurfaceCreateMarkdownParams, SurfaceSummaryResult, SystemCapabilitiesResult,
     SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams, WorkspaceCloseResult,
     WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
     WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
@@ -91,6 +92,7 @@ pub const COMMAND_FAMILIES: &[&str] = &[
     "notification",
     "events",
     "browser",
+    "markdown",
     "git",
     "mcp",
     "agent",
@@ -141,6 +143,7 @@ const PUBLIC_COMMAND_FAMILIES: &[&str] = &[
     "notification",
     "events",
     "browser",
+    "markdown",
     "git",
     "mcp",
     "agent",
@@ -190,6 +193,8 @@ pub fn usage_for(program_name: &str) -> String {
             "Try: {program_name} actions list --workspace <id> --json\n",
             "Try: {program_name} actions run custom.verify --workspace <id> --json\n",
             "Try: {program_name} browser open --workspace <id> --placement new-tab\n",
+            "Try: {program_name} markdown open README.md --workspace <id> --placement new-tab\n",
+            "Try: {program_name} markdown read <surface-id> --workspace <id>\n",
             "Try: {program_name} browser navigate <surface-id> https://example.com\n",
             "Try: {program_name} browser reload <surface-id>\n",
             "Try: {program_name} browser fill <surface-id> #q -- \"hello\"\n",
@@ -404,6 +409,9 @@ where
         }
         [family, command, rest @ ..] if family == "browser" => {
             run_browser_command(command, rest, &mut output)
+        }
+        [family, command, rest @ ..] if family == "markdown" => {
+            run_markdown_command(command, rest, &mut output)
         }
         [family, command, rest @ ..] if family == "mcp" => {
             mcp::run_command(command, rest, &mut output)
@@ -3255,6 +3263,108 @@ fn parse_browser_open_options(args: &[String]) -> Result<BrowserOpenOptions, Cli
         pane_id,
         profile,
         placement,
+    })
+}
+
+fn parse_markdown_open_options(args: &[String]) -> Result<MarkdownOpenOptions, CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut pane_id = pane_from_env();
+    let mut path = None;
+    let mut placement = Some("new_tab".to_string());
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" => {
+                pane_id = Some(normalize_tmux_pane_id(option_value(args, index, "--pane")?));
+                index += 2;
+            }
+            "--placement" => {
+                placement = Some(normalize_browser_cli_placement(option_value(
+                    args,
+                    index,
+                    "--placement",
+                )?)?);
+                index += 2;
+            }
+            "--new-tab" => {
+                placement = Some("new_tab".to_string());
+                index += 1;
+            }
+            "--active-pane" => {
+                placement = Some("active_pane".to_string());
+                index += 1;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown markdown open option '{value}'."
+                )));
+            }
+            value if path.is_none() => {
+                path = Some(value.to_string());
+                index += 1;
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "markdown open accepts one path, not '{value}'."
+                )));
+            }
+        }
+    }
+    Ok(MarkdownOpenOptions {
+        invoke,
+        workspace_id,
+        pane_id,
+        path: path.ok_or_else(|| {
+            CliError::InvalidArgs("markdown open requires a Markdown path.".to_string())
+        })?,
+        placement,
+    })
+}
+
+fn parse_markdown_read_options(args: &[String]) -> Result<MarkdownReadOptions, CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut surface_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::InvalidArgs(format!(
+                    "unknown markdown read option '{value}'."
+                )));
+            }
+            value if surface_id.is_none() => {
+                surface_id = Some(value.to_string());
+                index += 1;
+            }
+            value => {
+                return Err(CliError::InvalidArgs(format!(
+                    "markdown read accepts one surface id, not '{value}'."
+                )));
+            }
+        }
+    }
+    Ok(MarkdownReadOptions {
+        invoke,
+        workspace_id,
+        surface_id: surface_id.ok_or_else(|| {
+            CliError::InvalidArgs("markdown read requires a surface id.".to_string())
+        })?,
     })
 }
 
@@ -7283,6 +7393,7 @@ fn parse_sidebar_workspace_options(
 ) -> Result<SidebarWorkspaceOptions, CliError> {
     let mut invoke = ControlInvokeOptions::from_env();
     let mut workspace_id = workspace_from_env();
+    let mut pane_id = None;
     let mut index = 0;
     while index < args.len() {
         if parse_common_control_option(args, &mut index, &mut invoke)? {
@@ -7291,6 +7402,10 @@ fn parse_sidebar_workspace_options(
         match args[index].as_str() {
             "--workspace" => {
                 workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--pane" => {
+                pane_id = Some(option_value(args, index, "--pane")?.to_string());
                 index += 2;
             }
             value => {
@@ -7302,8 +7417,27 @@ fn parse_sidebar_workspace_options(
     }
     Ok(SidebarWorkspaceOptions {
         invoke,
-        params: SidebarWorkspaceParams { workspace_id },
+        params: SidebarWorkspaceParams {
+            workspace_id,
+            pane_id,
+        },
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownOpenOptions {
+    invoke: ControlInvokeOptions,
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+    path: String,
+    placement: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MarkdownReadOptions {
+    invoke: ControlInvokeOptions,
+    workspace_id: Option<String>,
+    surface_id: String,
 }
 
 fn parse_sidebar_log_options(args: &[String]) -> Result<SidebarLogOptions, CliError> {
@@ -13944,6 +14078,77 @@ where
     Ok(())
 }
 
+fn run_markdown_command<W>(command: &str, args: &[String], output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    match command {
+        "open" | "new" | "new-tab" => run_markdown_open(parse_markdown_open_options(args)?, output),
+        "read" | "show" => run_markdown_read(parse_markdown_read_options(args)?, output),
+        other => Err(CliError::InvalidArgs(format!(
+            "unknown markdown command '{other}'. Use open or read."
+        ))),
+    }
+}
+
+fn run_markdown_open<W>(options: MarkdownOpenOptions, output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let context = identify_context(&options.invoke, options.workspace_id)?;
+    let workspace_id = require_context_field(context.workspace_id.clone(), "workspace")?;
+    let pane_id = if options.placement.as_deref() == Some("active_pane") {
+        options.pane_id.or(context.pane_id)
+    } else {
+        options.pane_id
+    };
+    let params = SurfaceCreateMarkdownParams {
+        workspace_id,
+        pane_id,
+        path: options.path,
+        placement: options.placement,
+    };
+    let response = invoke_control("surface.create_markdown", &params, &options.invoke)?;
+    if options.invoke.json {
+        return write_json_response(&response, output);
+    }
+    let result: SurfaceSummaryResult = response_result(&response)?;
+    writeln!(
+        output,
+        "{}\t{}\t{}\t{}",
+        result.surface_id,
+        result.surface_type,
+        result.title,
+        result.resource_uri.as_deref().unwrap_or("-")
+    )?;
+    Ok(())
+}
+
+fn run_markdown_read<W>(options: MarkdownReadOptions, output: &mut W) -> Result<(), CliError>
+where
+    W: Write,
+{
+    let context = identify_context(&options.invoke, options.workspace_id)?;
+    let workspace_id = require_context_field(context.workspace_id, "workspace")?;
+    let response = invoke_control(
+        "markdown.read",
+        &MarkdownReadParams {
+            workspace_id,
+            surface_id: options.surface_id,
+        },
+        &options.invoke,
+    )?;
+    if options.invoke.json {
+        return write_json_response(&response, output);
+    }
+    let result: MarkdownDocumentResult = response_result(&response)?;
+    output.write_all(result.content.as_bytes())?;
+    if !result.content.ends_with('\n') {
+        writeln!(output)?;
+    }
+    Ok(())
+}
+
 fn run_browser_command<W>(command: &str, args: &[String], output: &mut W) -> Result<(), CliError>
 where
     W: Write,
@@ -20233,6 +20438,32 @@ HKEY_CURRENT_USER\Environment
     }
 
     #[test]
+    fn markdown_cli_options_preserve_workspace_pane_and_path() {
+        let open = parse_markdown_open_options(&[
+            "docs/agent report.md".to_string(),
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+            "--pane".to_string(),
+            "%pane_2".to_string(),
+            "--active-pane".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(open.workspace_id.as_deref(), Some("ws_1"));
+        assert_eq!(open.pane_id.as_deref(), Some("pane_2"));
+        assert_eq!(open.path, "docs/agent report.md");
+        assert_eq!(open.placement.as_deref(), Some("active_pane"));
+
+        let read = parse_markdown_read_options(&[
+            "surf_markdown".to_string(),
+            "--workspace".to_string(),
+            "ws_1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(read.workspace_id.as_deref(), Some("ws_1"));
+        assert_eq!(read.surface_id, "surf_markdown");
+    }
+
+    #[test]
     fn ssh_cli_options_parse_direct_and_profile_targets() {
         let direct = parse_ssh_options(&[
             "--json".to_string(),
@@ -21101,6 +21332,7 @@ HKEY_CURRENT_USER\Environment
                 title: "main".to_string(),
                 session_id: Some("ses_main".to_string()),
                 browser_id: None,
+                resource_uri: None,
             }],
             sessions: Vec::new(),
         };

@@ -126,6 +126,13 @@ function splitPath(path: string): { name: string; directory: string } {
   return { name: segments.pop() ?? path, directory: segments.join("/") };
 }
 
+export function isRecoverableGitSnapshotError(cause: unknown): boolean {
+  const message = cause instanceof Error ? cause.message : String(cause);
+  return /status scan was cancel(?:led|ed)|snapshot is no longer available|repository changed while its status snapshot was loading/i.test(
+    message,
+  );
+}
+
 function worktreeStateLabel(t: Translator, state: string): string {
   return t(WORKTREE_STATE_KEYS[state] ?? "sourceControl.worktreeStateUnknown");
 }
@@ -246,6 +253,7 @@ export function SourceControlPanel({
   const scrollRef = useRef<HTMLDivElement>(null);
   const splitRef = useRef<HTMLDivElement>(null);
   const refreshSequence = useRef(0);
+  const statusRetryCount = useRef(0);
   const threadSequence = useRef(0);
   const worktreeSequence = useRef(0);
   const loadedGeneration = useRef<number | null>(null);
@@ -540,12 +548,30 @@ export function SourceControlPanel({
         loadedGeneration.current = page.generation;
         loadedRepositoryId.current = page.repositoryId;
         lastRefresh.current = Date.now();
+        statusRetryCount.current = 0;
         setError(null);
         void loadWorktrees(expectedTarget);
         requestAnimationFrame(() => {
           if (scrollRef.current) scrollRef.current.scrollTop = scrollTop;
         });
       } catch (cause) {
+        if (
+          isRecoverableGitSnapshotError(cause) &&
+          sequence === refreshSequence.current &&
+          isCurrentTarget(expectedTarget) &&
+          query === serverQueryRef.current &&
+          statusRetryCount.current < 3
+        ) {
+          statusRetryCount.current += 1;
+          loadedGeneration.current = null;
+          loadedRepositoryId.current = null;
+          setError(null);
+          window.setTimeout(
+            () => void refresh(showLoading, false),
+            50 * statusRetryCount.current,
+          );
+          return;
+        }
         if (
           sequence === refreshSequence.current &&
           isCurrentTarget(expectedTarget) &&
@@ -603,6 +629,13 @@ export function SourceControlPanel({
       setNextCursor(page.nextCursor ?? null);
       loadedGeneration.current = page.generation;
     } catch (cause) {
+      if (isRecoverableGitSnapshotError(cause)) {
+        loadedGeneration.current = null;
+        loadedRepositoryId.current = null;
+        setError(null);
+        void refresh(true, false);
+        return;
+      }
       if (
         isCurrentTarget(operationTarget) &&
         query === serverQueryRef.current &&
@@ -637,6 +670,7 @@ export function SourceControlPanel({
     const expectedTarget = captureTarget();
     loadedGeneration.current = null;
     loadedRepositoryId.current = null;
+    statusRetryCount.current = 0;
     setLoadingMore(false);
     setBusy(false);
     setSummary(null);

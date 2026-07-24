@@ -487,6 +487,10 @@ CREATE INDEX IF NOT EXISTS idx_git_mutation_receipts_lifecycle
   );
 "#;
 
+pub const SURFACE_RESOURCE_URI_SCHEMA: &str = r#"
+ALTER TABLE surfaces ADD COLUMN resource_uri TEXT;
+"#;
+
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -567,6 +571,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 16,
         name: "git_mutation_lifecycle",
         sql: GIT_MUTATION_LIFECYCLE_SCHEMA,
+    },
+    Migration {
+        version: 17,
+        name: "surface_resource_uri",
+        sql: SURFACE_RESOURCE_URI_SCHEMA,
     },
 ];
 
@@ -661,6 +670,7 @@ pub struct PersistedSurface {
     pub title: String,
     pub session_id: Option<String>,
     pub browser_id: Option<String>,
+    pub resource_uri: Option<String>,
     pub created_at: String,
     pub last_visible_at: Option<String>,
     pub updated_at: String,
@@ -3286,7 +3296,7 @@ impl SqliteStore {
     ) -> StoreResult<Vec<PersistedSurface>> {
         let mut statement = self.connection.prepare(
             "SELECT surface_id, workspace_id, surface_type, title, session_id, browser_id,
-                    created_at, last_visible_at, updated_at
+                    resource_uri, created_at, last_visible_at, updated_at
              FROM surfaces
              WHERE workspace_id = ?1
              ORDER BY created_at ASC, surface_id ASC",
@@ -3325,7 +3335,7 @@ impl SqliteStore {
     fn list_all_surfaces(&self) -> StoreResult<Vec<PersistedSurface>> {
         let mut statement = self.connection.prepare(
             "SELECT surface_id, workspace_id, surface_type, title, session_id, browser_id,
-                    created_at, last_visible_at, updated_at
+                    resource_uri, created_at, last_visible_at, updated_at
              FROM surfaces
              ORDER BY created_at ASC, surface_id ASC",
         )?;
@@ -3638,15 +3648,16 @@ fn upsert_surface(connection: &Connection, surface: &PersistedSurface) -> StoreR
     connection.execute(
         "INSERT INTO surfaces (
             surface_id, workspace_id, surface_type, title, session_id, browser_id,
-            created_at, last_visible_at, updated_at
+            resource_uri, created_at, last_visible_at, updated_at
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(surface_id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             surface_type = excluded.surface_type,
             title = excluded.title,
             session_id = excluded.session_id,
             browser_id = excluded.browser_id,
+            resource_uri = excluded.resource_uri,
             last_visible_at = excluded.last_visible_at,
             updated_at = excluded.updated_at",
         params![
@@ -3656,6 +3667,7 @@ fn upsert_surface(connection: &Connection, surface: &PersistedSurface) -> StoreR
             surface.title,
             surface.session_id,
             surface.browser_id,
+            surface.resource_uri,
             surface.created_at,
             surface.last_visible_at,
             surface.updated_at
@@ -3753,9 +3765,10 @@ fn surface_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedSurfac
         title: row.get(3)?,
         session_id: row.get(4)?,
         browser_id: row.get(5)?,
-        created_at: row.get(6)?,
-        last_visible_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        resource_uri: row.get(6)?,
+        created_at: row.get(7)?,
+        last_visible_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -4181,7 +4194,7 @@ mod tests {
     #[test]
     fn applies_migrations_and_records_schema_version() {
         let store = SqliteStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
     }
 
     #[test]
@@ -4223,7 +4236,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 16);
+        assert_eq!(after, 17);
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
@@ -4348,7 +4361,7 @@ SELECT * FROM migration_atomicity_failure;
         );
 
         apply_migrations(&store.connection, MIGRATIONS).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
         assert_eq!(
             store
                 .load_worktree_operation("op_atomic_v12")
@@ -4372,7 +4385,7 @@ SELECT * FROM migration_atomicity_failure;
             .mark_worktree_operation_removed("op_v12", r#"{"owned":false}"#, "removed")
             .unwrap();
         assert_eq!(removed.state, WorktreeOperationState::Removed);
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
     }
 
     #[test]
@@ -4994,7 +5007,7 @@ SELECT * FROM migration_atomicity_failure;
             )
             .unwrap();
         assert!(table_exists);
-        assert_eq!(after, 16);
+        assert_eq!(after, 17);
     }
 
     #[test]
@@ -5232,6 +5245,12 @@ SELECT * FROM migration_atomicity_failure;
     fn git_mutation_lifecycle_schema_is_versioned() {
         assert_eq!(MIGRATIONS[15].version, 16);
         assert!(MIGRATIONS[15].sql.contains("ADD COLUMN lifecycle_state"));
+    }
+
+    #[test]
+    fn surface_resource_uri_schema_is_versioned() {
+        assert_eq!(MIGRATIONS[16].version, 17);
+        assert!(MIGRATIONS[16].sql.contains("ADD COLUMN resource_uri"));
     }
 
     #[test]
@@ -5957,6 +5976,7 @@ SELECT * FROM migration_atomicity_failure;
                 title: "Native shell".to_string(),
                 session_id: Some("ses_native".to_string()),
                 browser_id: None,
+                resource_uri: None,
                 created_at: "2026-06-18T00:00:00Z".to_string(),
                 last_visible_at: Some("2026-06-18T00:01:00Z".to_string()),
                 updated_at: "2026-06-18T00:01:00Z".to_string(),
