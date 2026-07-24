@@ -14,8 +14,11 @@ async function bootWithBrowser(page: Page) {
   );
   await page.keyboard.press("Control+Shift+P");
   await page.keyboard.type("browser");
+  await expect(page.getByText("Open new browser tab", { exact: true })).toBeVisible();
   await page.keyboard.press("Enter");
-  await expect(page.getByPlaceholder("URL")).toBeVisible();
+  await expect(page.getByLabel("Page address")).toBeVisible();
+  await expect(page.locator('[data-agentmux-tab-icon="browser"]')).toBeVisible();
+  await expect(page.locator(".agentmux-browser-surface-icon")).toBeVisible();
 }
 
 async function injectBrowserDialog(

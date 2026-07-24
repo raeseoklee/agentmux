@@ -791,7 +791,7 @@ body {
   border-radius: 4px;
   padding: 0 10px;
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-fg);
   font: 700 11.5px/1.2 var(--font-sans, system-ui, sans-serif);
   cursor: pointer;
 }

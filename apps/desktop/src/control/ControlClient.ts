@@ -770,6 +770,7 @@ export interface BrowserScreenshotResult {
   format: string;
   imageHandle: string;
   byteCount: number;
+  dataBase64: string;
 }
 
 export interface BrowserDomSnapshotResult {
@@ -2854,7 +2855,7 @@ class TauriControlClient implements ControlClient {
       workspace_id: workspaceId,
       repository_id: options.repositoryId ?? null,
       state: options.state ?? null,
-      query: options.query ?? null,
+      query: normalizeGitStatusPageFilter(options.query),
       cursor: options.cursor ?? null,
       limit: options.limit ?? null,
       generation: options.generation ?? null,
@@ -4128,6 +4129,8 @@ class BrowserPreviewControlClient implements ControlClient {
       format: resolvedFormat,
       imageHandle,
       byteCount: imageHandle.length,
+      dataBase64:
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
     };
   }
 
@@ -7333,7 +7336,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
         workspace_id: workspaceId,
         repository_id: options.repositoryId ?? null,
         state: options.state ?? null,
-        query: options.query ?? null,
+        query: normalizeGitStatusPageFilter(options.query),
         cursor: options.cursor ?? null,
         limit: options.limit ?? null,
         generation: options.generation ?? null,
@@ -8180,6 +8183,12 @@ const LEGACY_LOCAL_SOURCE_CONTROL_METHODS: readonly SourceControlMethod[] = [
   "git.commit",
 ];
 
+export function normalizeGitStatusPageFilter(
+  value?: string | null,
+): string | null {
+  return value?.trim() || null;
+}
+
 export function serverSourceControlMethods(
   capabilities: ServerCapabilitiesWire | undefined,
   mode?: string,
@@ -8741,6 +8750,7 @@ interface BrowserScreenshotResultWire {
   format: string;
   image_handle: string;
   byte_count: number;
+  data_base64: string;
 }
 
 interface BrowserDomSnapshotResultWire {
@@ -10593,6 +10603,7 @@ function mapBrowserScreenshot(
     format: value.format,
     imageHandle: value.image_handle,
     byteCount: value.byte_count,
+    dataBase64: value.data_base64,
   };
 }
 

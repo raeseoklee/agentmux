@@ -18,6 +18,7 @@ repository READMEs, release notes, and operational runbooks.
 
 - [Operations overview](./operations/README.md)
 - [Release runbook](./operations/release-runbook.md)
+- [Release quality gates](./operations/release-quality-gates.md)
 - [Main merge policy](./operations/main-merge-policy.md)
 - [Release policy](../release-policy.md)
 - [Release evidence](../release-evidence/0.1.3.md)

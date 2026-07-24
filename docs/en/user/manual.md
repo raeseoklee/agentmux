@@ -87,6 +87,9 @@ workspace sidebar attention, and OS notifications.
 
 AgentMux can open browser surfaces inside the workspace for documentation,
 issues, pull requests, local preview servers, and agent-generated links.
+The browser pane shows the rendered frame from the same managed CDP session
+used by AgentMux automation. Address navigation, back/forward, reload, clicks,
+mouse-wheel scrolling, and focused key input are sent back to that session.
 
 When a terminal prints an OSC 8 hyperlink or a plain `http://` / `https://`
 URL, Ctrl-click the link to open it in an embedded browser split beside that
@@ -117,7 +120,7 @@ shows contextual information such as:
 
 Use settings to manage:
 
-- Theme and terminal appearance.
+- Theme, preset accent colors, and custom HEX accent colors.
 - Terminal font size, inner margin, and GPU acceleration.
 - Default shell profile.
 - WSL diagnostics and distribution selection.

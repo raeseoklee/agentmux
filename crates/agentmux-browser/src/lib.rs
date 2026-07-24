@@ -536,6 +536,7 @@ pub struct BrowserDialogMessage {
 const BROWSER_DIALOG_HISTORY_LIMIT: usize = 500;
 const BROWSER_DIALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_DIALOG_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const BROWSER_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 struct ActiveBrowserDialog {
@@ -1174,11 +1175,7 @@ impl BrowserAutomation for InMemoryBrowserAutomation {
                         "Press selector must not be empty.",
                     ));
                 }
-                if key.trim().is_empty() {
-                    return Err(BrowserAutomationError::invalid_request(
-                        "Press key must not be empty.",
-                    ));
-                }
+                let key = normalize_browser_key(&key)?;
                 Ok(BrowserCommandResult::Pressed {
                     surface_id,
                     selector,
@@ -1440,9 +1437,8 @@ impl CdpBrowserAutomation {
     }
 
     pub fn with_executable(executable: impl Into<PathBuf>) -> Self {
-        let headless = env::var("AGENTMUX_BROWSER_HEADLESS")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let headless =
+            browser_headless_from_env_value(env::var("AGENTMUX_BROWSER_HEADLESS").ok().as_deref());
         Self::with_executable_and_headless(executable, headless)
     }
 
@@ -1520,7 +1516,14 @@ impl CdpBrowserAutomation {
             .arg("--disable-background-networking")
             .arg("--disable-sync");
         if self.headless {
-            command.arg("--headless=new").arg("--disable-gpu");
+            command
+                .arg("--headless=new")
+                .arg("--disable-gpu")
+                // BrowserSurfacePanel maps pointer positions from the captured
+                // PNG back into CDP CSS coordinates. Keeping the hidden browser
+                // at DPR 1 makes those coordinate spaces identical on Windows,
+                // including hosts configured for 125% or 150% display scaling.
+                .arg("--force-device-scale-factor=1");
         }
         let mut child = command
             .arg("about:blank")
@@ -1592,13 +1595,17 @@ impl CdpBrowserAutomation {
         }
         self.cancel_pending_dialog(&surface_id, "navigation")?;
         let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
-        let result = cdp_call(&websocket_url, "Page.navigate", json!({ "url": url }))?;
+        let result = cdp_call_and_wait_for_page_load(
+            &websocket_url,
+            "Page.navigate",
+            json!({ "url": url }),
+            BROWSER_NAVIGATION_TIMEOUT,
+        )?;
         if let Some(error_text) = result.get("errorText").and_then(Value::as_str) {
             return Err(BrowserAutomationError::automation_failed(format!(
                 "Browser navigation failed: {error_text}"
             )));
         }
-        thread::sleep(Duration::from_millis(100));
         if let Some(surface) = self.surfaces.get_mut(&surface_id) {
             surface.surface.current_url = Some(url.clone());
         }
@@ -1626,8 +1633,12 @@ impl CdpBrowserAutomation {
     ) -> BrowserAutomationResult<BrowserCommandResult> {
         self.cancel_pending_dialog(&surface_id, "navigation")?;
         let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
-        cdp_call(&websocket_url, "Page.reload", json!({}))?;
-        thread::sleep(Duration::from_millis(100));
+        cdp_call_and_wait_for_page_load(
+            &websocket_url,
+            "Page.reload",
+            json!({}),
+            BROWSER_NAVIGATION_TIMEOUT,
+        )?;
         let url = self.read_current_url(&surface_id, &websocket_url)?;
         Ok(BrowserCommandResult::Navigated { surface_id, url })
     }
@@ -1652,12 +1663,12 @@ impl CdpBrowserAutomation {
                 .and_then(|entries| entries.get(target_index as usize))
             {
                 if let Some(entry_id) = entry.get("id").and_then(Value::as_i64) {
-                    cdp_call(
+                    cdp_call_and_wait_for_page_load(
                         &websocket_url,
                         "Page.navigateToHistoryEntry",
                         json!({ "entryId": entry_id }),
+                        BROWSER_NAVIGATION_TIMEOUT,
                     )?;
-                    thread::sleep(Duration::from_millis(100));
                 }
             }
         }
@@ -3482,6 +3493,197 @@ fn cdp_call(websocket_url: &str, method: &str, params: Value) -> BrowserAutomati
     }
 }
 
+fn cdp_call_and_wait_for_page_load(
+    websocket_url: &str,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> BrowserAutomationResult<Value> {
+    let (mut socket, _) = connect(websocket_url).map_err(|error| {
+        BrowserAutomationError::automation_failed(format!(
+            "Failed to connect to browser target: {error}"
+        ))
+    })?;
+    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|error| {
+                BrowserAutomationError::automation_failed(format!(
+                    "Failed to configure browser navigation timeout: {error}"
+                ))
+            })?;
+    }
+
+    send_cdp_request(&mut socket, 1, "Page.enable", json!({}))?;
+    wait_for_cdp_response(&mut socket, 1, "Page.enable", timeout)?;
+
+    send_cdp_request(&mut socket, 2, "Page.getFrameTree", json!({}))?;
+    let frame_tree = wait_for_cdp_response(&mut socket, 2, "Page.getFrameTree", timeout)?;
+    let main_frame_id = frame_tree
+        .pointer("/frameTree/frame/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BrowserAutomationError::automation_failed(
+                "Browser frame tree response missing the main frame id.",
+            )
+        })?
+        .to_string();
+
+    send_cdp_request(&mut socket, 3, method, params)?;
+    let deadline = Instant::now() + timeout;
+    let mut command_result = None;
+    let mut load_observed = false;
+    let mut same_document_navigation_observed = false;
+
+    while Instant::now() < deadline {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let response: Value = serde_json::from_str(&text).map_err(|error| {
+                    BrowserAutomationError::automation_failed(format!(
+                        "Failed to parse browser command '{method}' response: {error}"
+                    ))
+                })?;
+                match response.get("method").and_then(Value::as_str) {
+                    Some("Page.loadEventFired") => load_observed = true,
+                    Some("Page.frameStoppedLoading")
+                        if response.pointer("/params/frameId").and_then(Value::as_str)
+                            == Some(main_frame_id.as_str()) =>
+                    {
+                        load_observed = true;
+                    }
+                    Some("Page.navigatedWithinDocument")
+                        if response.pointer("/params/frameId").and_then(Value::as_str)
+                            == Some(main_frame_id.as_str()) =>
+                    {
+                        same_document_navigation_observed = true;
+                    }
+                    _ => {}
+                }
+                if response.get("id").and_then(Value::as_u64) == Some(3) {
+                    if let Some(error) = response.get("error") {
+                        return Err(BrowserAutomationError::automation_failed(format!(
+                            "Browser command '{method}' failed: {}",
+                            cdp_protocol_error_message(error)
+                        )));
+                    }
+                    let result = response.get("result").cloned().ok_or_else(|| {
+                        BrowserAutomationError::automation_failed(format!(
+                            "Browser command '{method}' response missing result."
+                        ))
+                    })?;
+                    if result.get("errorText").is_some() {
+                        return Ok(result);
+                    }
+                    if method == "Page.navigate" && result.get("loaderId").is_none() {
+                        return Ok(result);
+                    }
+                    command_result = Some(result);
+                }
+                if load_observed || same_document_navigation_observed {
+                    if let Some(result) = command_result.take() {
+                        return Ok(result);
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => {
+                return Err(BrowserAutomationError::automation_failed(format!(
+                    "Browser target closed while waiting for '{method}'."
+                )));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => {
+                return Err(BrowserAutomationError::automation_failed(format!(
+                    "Failed while waiting for browser command '{method}': {error}"
+                )));
+            }
+        }
+    }
+
+    Err(BrowserAutomationError::automation_failed(format!(
+        "Timed out after {}ms waiting for browser page load after '{method}'.",
+        timeout.as_millis()
+    )))
+}
+
+fn send_cdp_request(
+    socket: &mut CdpWebSocket,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> BrowserAutomationResult<()> {
+    let request = json!({
+        "id": id,
+        "method": method,
+        "params": params,
+    });
+    socket
+        .send(Message::Text(request.to_string()))
+        .map_err(|error| {
+            BrowserAutomationError::automation_failed(format!(
+                "Failed to send browser command '{method}': {error}"
+            ))
+        })
+}
+
+fn wait_for_cdp_response(
+    socket: &mut CdpWebSocket,
+    request_id: u64,
+    method: &str,
+    timeout: Duration,
+) -> BrowserAutomationResult<Value> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                let response: Value = serde_json::from_str(&text).map_err(|error| {
+                    BrowserAutomationError::automation_failed(format!(
+                        "Failed to parse browser command '{method}' response: {error}"
+                    ))
+                })?;
+                if response.get("id").and_then(Value::as_u64) != Some(request_id) {
+                    continue;
+                }
+                if let Some(error) = response.get("error") {
+                    return Err(BrowserAutomationError::automation_failed(format!(
+                        "Browser command '{method}' failed: {}",
+                        cdp_protocol_error_message(error)
+                    )));
+                }
+                return response.get("result").cloned().ok_or_else(|| {
+                    BrowserAutomationError::automation_failed(format!(
+                        "Browser command '{method}' response missing result."
+                    ))
+                });
+            }
+            Ok(Message::Close(_)) => {
+                return Err(BrowserAutomationError::automation_failed(format!(
+                    "Browser target closed while waiting for '{method}'."
+                )));
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => {
+                return Err(BrowserAutomationError::automation_failed(format!(
+                    "Failed while waiting for browser command '{method}': {error}"
+                )));
+            }
+        }
+    }
+    Err(BrowserAutomationError::automation_failed(format!(
+        "Timed out after {}ms waiting for browser command '{method}'.",
+        timeout.as_millis()
+    )))
+}
+
 fn install_browser_recorders(websocket_url: &str) -> BrowserAutomationResult<()> {
     install_page_recorder(websocket_url, AGENTMUX_CONSOLE_RECORDER_SOURCE)?;
     install_page_recorder(websocket_url, AGENTMUX_ERROR_RECORDER_SOURCE)?;
@@ -3869,6 +4071,9 @@ fn normalize_browser_get_kind(
 }
 
 fn normalize_browser_key(key: &str) -> BrowserAutomationResult<String> {
+    if key == " " {
+        return Ok(" ".to_string());
+    }
     let trimmed = key.trim();
     if trimmed.is_empty() {
         return Err(BrowserAutomationError::invalid_request(
@@ -3889,6 +4094,15 @@ fn normalize_browser_key(key: &str) -> BrowserAutomationResult<String> {
         _ => trimmed,
     };
     Ok(normalized.to_string())
+}
+
+fn browser_headless_from_env_value(value: Option<&str>) -> bool {
+    match value.map(str::trim).map(|value| value.to_ascii_lowercase()) {
+        Some(value) if matches!(value.as_str(), "0" | "false" | "off") => false,
+        // Browser surfaces are embedded control surfaces. A visible Chromium
+        // window is reserved for an explicit debugging opt-out above.
+        Some(_) | None => true,
+    }
 }
 
 fn browser_key_event_params(event_type: &str, key: &str) -> Value {
@@ -4310,6 +4524,23 @@ mod tests {
             }
         );
 
+        let pressed_space = browser
+            .execute(BrowserCommand::PressKey {
+                surface_id: "surf_two".to_string(),
+                selector: "#q".to_string(),
+                key: " ".to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            pressed_space,
+            BrowserCommandResult::Pressed {
+                surface_id: "surf_two".to_string(),
+                selector: "#q".to_string(),
+                key: " ".to_string(),
+            }
+        );
+
         let selected = browser
             .execute(BrowserCommand::SelectValues {
                 surface_id: "surf_two".to_string(),
@@ -4640,6 +4871,24 @@ mod tests {
     }
 
     #[test]
+    fn cdp_browser_defaults_to_headless_and_allows_debug_opt_out() {
+        assert!(browser_headless_from_env_value(None));
+        assert!(browser_headless_from_env_value(Some("true")));
+        assert!(browser_headless_from_env_value(Some("unexpected")));
+        assert!(!browser_headless_from_env_value(Some("0")));
+        assert!(!browser_headless_from_env_value(Some("false")));
+        assert!(!browser_headless_from_env_value(Some("off")));
+    }
+
+    #[test]
+    fn browser_key_helpers_preserve_literal_space() {
+        assert_eq!(normalize_browser_key(" ").unwrap(), " ");
+        assert_eq!(normalize_browser_key("space").unwrap(), " ");
+        assert_eq!(browser_key_code(" "), Some("Space"));
+        assert_eq!(browser_windows_virtual_key_code(" "), Some(32));
+    }
+
+    #[test]
     fn runtime_result_value_reports_script_exceptions() {
         let result = json!({
             "exceptionDetails": {
@@ -4659,7 +4908,8 @@ mod tests {
             eprintln!("skipping CDP smoke because no supported browser executable was found");
             return;
         };
-        let fixture_url = start_browser_fixture_server();
+        let fixture_base_url = start_browser_fixture_server();
+        let fixture_url = format!("{fixture_base_url}/?delay=350");
         let mut browser = CdpBrowserAutomation::with_executable_and_headless(executable, true);
         let surface = browser
             .create_surface(
@@ -4670,17 +4920,85 @@ mod tests {
             .unwrap();
         assert!(surface.browser_id.starts_with("cdp_browser_"));
 
+        let navigation_started = Instant::now();
         browser
             .execute(BrowserCommand::Navigate {
                 surface_id: surface.surface_id.clone(),
                 url: fixture_url,
             })
             .unwrap();
+        assert!(
+            navigation_started.elapsed() >= Duration::from_millis(300),
+            "navigate returned before the delayed page finished loading"
+        );
+
+        let iframe_navigation_started = Instant::now();
+        browser
+            .execute(BrowserCommand::Navigate {
+                surface_id: surface.surface_id.clone(),
+                url: format!("{fixture_base_url}/?fixture=iframe"),
+            })
+            .unwrap();
+        assert!(
+            iframe_navigation_started.elapsed() >= Duration::from_millis(300),
+            "a child frame completed navigation before the main frame"
+        );
+
+        browser
+            .execute(BrowserCommand::Navigate {
+                surface_id: surface.surface_id.clone(),
+                url: format!("{fixture_base_url}/?fixture=spa"),
+            })
+            .unwrap();
+        browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: surface.surface_id.clone(),
+                script: "history.replaceState({}, '', '#zero'); history.pushState({}, '', '#one'); history.pushState({}, '', '#two'); window.location.href".to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let history_started = Instant::now();
+        let back_result = browser
+            .execute(BrowserCommand::GoBack {
+                surface_id: surface.surface_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            history_started.elapsed() < Duration::from_secs(2),
+            "same-document history navigation waited for a page load timeout"
+        );
+        let BrowserCommandResult::Navigated { url, .. } = back_result else {
+            panic!("expected back navigation result");
+        };
+        assert!(url.ends_with("#one"));
+
+        let forward_started = Instant::now();
+        let forward_result = browser
+            .execute(BrowserCommand::GoForward {
+                surface_id: surface.surface_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            forward_started.elapsed() < Duration::from_secs(2),
+            "same-document forward navigation waited for a page load timeout"
+        );
+        let BrowserCommandResult::Navigated { url, .. } = forward_result else {
+            panic!("expected forward navigation result");
+        };
+        assert!(url.ends_with("#two"));
         browser
             .execute(BrowserCommand::TypeText {
                 surface_id: surface.surface_id.clone(),
                 selector: "#q".to_string(),
                 text: "agentmux".to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        browser
+            .execute(BrowserCommand::PressKey {
+                surface_id: surface.surface_id.clone(),
+                selector: "#q".to_string(),
+                key: " ".to_string(),
                 frame_id: None,
             })
             .unwrap();
@@ -4707,8 +5025,21 @@ mod tests {
         };
         assert_eq!(surface_id, surface.surface_id);
         let value: Value = serde_json::from_str(&value_json).unwrap();
-        assert_eq!(value["value"], "agentmux");
+        assert_eq!(value["value"], "agentmux ");
         assert_eq!(value["clicked"], "yes");
+
+        let viewport = browser
+            .execute(BrowserCommand::Evaluate {
+                surface_id: surface.surface_id.clone(),
+                script: "({ dpr: window.devicePixelRatio, width: window.innerWidth, height: window.innerHeight })".to_string(),
+                frame_id: None,
+            })
+            .unwrap();
+        let BrowserCommandResult::Evaluated { value_json, .. } = viewport else {
+            panic!("expected viewport evaluation");
+        };
+        let viewport: Value = serde_json::from_str(&value_json).unwrap();
+        assert_eq!(viewport["dpr"], 1);
 
         let snapshot = browser
             .execute(BrowserCommand::DomSnapshot {
@@ -4730,7 +5061,12 @@ mod tests {
         let BrowserCommandResult::Screenshot { bytes, .. } = screenshot else {
             panic!("expected screenshot");
         };
-        assert!(!bytes.is_empty());
+        assert!(bytes.len() > 24);
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let png_width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let png_height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!(png_width as u64, viewport["width"].as_u64().unwrap());
+        assert_eq!(png_height as u64, viewport["height"].as_u64().unwrap());
     }
 
     #[test]
@@ -5022,22 +5358,53 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         thread::spawn(move || {
-            for _ in 0..4 {
+            for _ in 0..32 {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
                 let mut request_buffer = [0; 1024];
-                let _ = stream.read(&mut request_buffer);
-                let body = r#"<!doctype html>
+                let bytes_read = stream.read(&mut request_buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request_buffer[..bytes_read]);
+                let request_line = request.lines().next().unwrap_or_default();
+                if request_line.contains("delay=350") {
+                    thread::sleep(Duration::from_millis(350));
+                }
+                let (content_type, body) = if request_line.contains("slow.js") {
+                    (
+                        "application/javascript; charset=utf-8",
+                        "window.agentmuxSlowScriptLoaded = true;",
+                    )
+                } else if request_line.contains("fixture=iframe") {
+                    (
+                        "text/html; charset=utf-8",
+                        r#"<!doctype html>
+<html>
+  <head>
+    <title>AgentMux CDP iframe fixture</title>
+    <script src="/slow.js?delay=350"></script>
+  </head>
+  <body>
+    <iframe srcdoc="<p>child frame</p>"></iframe>
+    <input id="q" />
+    <button id="b" onclick="document.body.dataset.clicked='yes'">Go</button>
+  </body>
+</html>"#,
+                    )
+                } else {
+                    (
+                        "text/html; charset=utf-8",
+                        r#"<!doctype html>
 <html>
   <head><title>AgentMux CDP fixture</title></head>
   <body>
     <input id="q" />
     <button id="b" onclick="document.body.dataset.clicked='yes'">Go</button>
   </body>
-</html>"#;
+</html>"#,
+                    )
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );

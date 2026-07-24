@@ -83,9 +83,12 @@ async function captureShortcut(
 test("design boots without a default workspace and can create one", async ({ page }) => {
   await bootPreview(page, { ensureWorkspace: false });
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(0);
+  await expect(page.getByText("No panes to display.")).toBeVisible();
   await page.locator(".agentmux-workspace-plus").click();
   await expect(page.locator(".agentmux-workspace-card")).toHaveCount(1);
-  await expect(page.getByText("Workspace 1").first()).toBeVisible();
+  const inlineName = page.locator(".agentmux-workspace-inline-name-input");
+  await expect(inlineName).toHaveValue("Workspace 1");
+  await inlineName.press("Enter");
   await expect(page.locator(".agentmux-workspace-filter-input")).toBeVisible();
 });
 
@@ -1764,7 +1767,32 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
 
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
   await expect(activePaneTree.locator("[data-agentmux-pane]")).toHaveCount(1);
-  await expect(page.getByPlaceholder("URL")).toBeVisible();
+  await expect(page.getByLabel("Page address")).toBeVisible();
+  await expect(page.getByText("New browser tab").first()).toBeVisible();
+
+  await page.getByLabel("Page address").fill("localhost:5173");
+  await page.getByRole("button", { name: "Go" }).click();
+  await expect(page.getByText("Page ready").first()).toBeVisible();
+  const pageFrame = page.locator('img[src^="data:image/png;base64,"]');
+  await expect(pageFrame).toBeVisible();
+  await pageFrame.click({ position: { x: 8, y: 8 } });
+  await page.keyboard.type("a");
+  await pageFrame.dispatchEvent("wheel", { deltaY: 240 });
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
+    )
+    .toContain("click:");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
+    )
+    .toContain("press:");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
+    )
+    .toContain("scroll:");
 });
 
 test("agent tmux session opens as a separate top tab without splitting the current tab", async ({
@@ -2097,7 +2125,7 @@ test("notification action hooks execute configured UI actions", async ({
   await page
     .locator(".agentmux-notification-action-browser-openNewTab")
     .click();
-  await expect(page.getByPlaceholder("URL")).toBeVisible();
+  await expect(page.getByLabel("Page address")).toBeVisible();
 });
 
 test("command palette lists actions", async ({ page }) => {
@@ -2109,7 +2137,26 @@ test("command palette lists actions", async ({ page }) => {
   await page.keyboard.up("Control");
   await expect(page.locator(".agentmux-palette-item").first()).toBeVisible();
   await expect(page.locator(".agentmux-palette-item")).not.toHaveCount(0);
+  await expect(page.getByText("Split right", { exact: true })).toBeVisible();
+  await expect(page.getByText("Split down", { exact: true })).toBeVisible();
   await page.keyboard.press("Escape");
+});
+
+test("default English command palette has no Korean action titles", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.keyboard.press("Control+Shift+P");
+
+  const titles = await page.locator(".agentmux-palette-item").evaluateAll((items) =>
+    items
+      .map((item) => item.querySelector("span")?.textContent?.trim() ?? "")
+      .filter(Boolean),
+  );
+
+  expect(titles.length).toBeGreaterThan(0);
+  expect(titles).toContain("Next tab");
+  expect(titles.filter((title) => /[\uac00-\ud7a3]/u.test(title))).toEqual([]);
 });
 
 test("command palette supports arrow navigation and enter execution", async ({
@@ -2137,9 +2184,10 @@ test("command palette supports arrow navigation and enter execution", async ({
   await page.keyboard.up("Shift");
   await page.keyboard.up("Control");
   await page.keyboard.type("browser");
+  await expect(page.getByText("Open new browser tab", { exact: true })).toBeVisible();
   await page.keyboard.press("Enter");
 
-  await expect(page.getByPlaceholder("URL")).toBeVisible();
+  await expect(page.getByLabel("Page address")).toBeVisible();
 });
 
 test("shortcut bindings support config override and two-step chords", async ({
@@ -2448,7 +2496,7 @@ test("config can rebind workspace plus and surface tab actions", async ({
 
   await page.locator(".agentmux-new-terminal-tab").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(2);
-  await expect(page.getByPlaceholder("URL")).toBeVisible();
+  await expect(page.getByLabel("Page address")).toBeVisible();
 
   await page.locator(".agentmux-tab-action-custom-runTests").click();
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(3);
@@ -2457,13 +2505,121 @@ test("config can rebind workspace plus and surface tab actions", async ({
   });
 });
 
-test("theme toggle switches label", async ({ page }) => {
+test("theme toggle is icon-only and keeps an accessible action label", async ({
+  page,
+}) => {
   await bootPreview(page);
   const toggle = page.locator(".agentmux-theme-toggle");
-  const beforeText = await toggle.textContent();
+  const beforeLabel = await toggle.getAttribute("aria-label");
+  await expect(toggle).toHaveText("");
+  const toggleBox = await toggle.boundingBox();
+  expect(toggleBox?.width).toBeGreaterThanOrEqual(32);
+  expect(toggleBox?.height).toBeGreaterThanOrEqual(32);
+  const iconBox = await toggle.locator("svg").boundingBox();
+  expect(iconBox?.width).toBeGreaterThanOrEqual(16);
+  expect(iconBox?.height).toBeGreaterThanOrEqual(16);
+  const toggleColor = await toggle.evaluate((node) => getComputedStyle(node).color);
+  const colorChannels = toggleColor.match(/\d+(?:\.\d+)?/g)?.slice(0, 3) ?? [];
+  expect(new Set(colorChannels).size).toBe(1);
   await toggle.click();
-  const afterText = await toggle.textContent();
-  expect(afterText).not.toBe(beforeText);
+  const afterLabel = await toggle.getAttribute("aria-label");
+  expect(afterLabel).not.toBe(beforeLabel);
+});
+
+test("titlebar identity controls share one vertical center", async ({ page }) => {
+  await bootPreview(page);
+  const selectors = [
+    ".agentmux-sidebar-toggle",
+    ".agentmux-titlebar-brand",
+  ];
+  const boxes = await Promise.all(
+    selectors.map((selector) => page.locator(selector).boundingBox()),
+  );
+  const centers = boxes.map((box) => (box?.y ?? 0) + (box?.height ?? 0) / 2);
+  expect(Math.max(...centers) - Math.min(...centers)).toBeLessThanOrEqual(1);
+  const sidebarBox = boxes[0];
+  expect(sidebarBox?.width).toBeGreaterThanOrEqual(32);
+  expect(sidebarBox?.height).toBeGreaterThanOrEqual(32);
+  await expect(page.locator(".agentmux-titlebar-breadcrumb")).toHaveCount(0);
+});
+
+test("custom accent color previews immediately and persists", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-settings-open").click();
+  const color = page.locator(".agentmux-custom-accent-color");
+  await color.fill("#13579b");
+
+  await expect
+    .poll(() =>
+      page
+        .locator("[data-agentmux-root]")
+        .evaluate((node) =>
+          getComputedStyle(node).getPropertyValue("--accent").trim(),
+        ),
+    )
+    .toBe("#13579B");
+  await color.fill("#ffffff");
+  await expect
+    .poll(() =>
+      page
+        .locator("[data-agentmux-root]")
+        .evaluate((node) =>
+          getComputedStyle(node).getPropertyValue("--accent-fg").trim(),
+        ),
+    )
+    .toBe("#0A0A0B");
+  await page.locator(".agentmux-settings-close").click();
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await expect(panel).toBeVisible();
+  await expect(panel.getByRole("button", { name: "Commit staged changes" })).toHaveCSS(
+    "color",
+    "rgb(10, 10, 11)",
+  );
+  const accentConsumerColors = await page.evaluate(() => {
+    const host = document.querySelector("[data-agentmux-root]");
+    if (!host) {
+      throw new Error("AgentMux root not found");
+    }
+    const marker = document.createElement("span");
+    marker.className = "agentmux-source-control__thread-marker";
+    const composer = document.createElement("div");
+    composer.className = "agentmux-source-control__review-composer";
+    const reviewButton = document.createElement("button");
+    composer.append(reviewButton);
+    host.append(marker, composer);
+    const colors = {
+      marker: getComputedStyle(marker).color,
+      review: getComputedStyle(reviewButton).color,
+    };
+    marker.remove();
+    composer.remove();
+    return colors;
+  });
+  expect(accentConsumerColors).toEqual({
+    marker: "rgb(10, 10, 11)",
+    review: "rgb(10, 10, 11)",
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const raw = window.localStorage.getItem("agentmux.preview.config.v1");
+        return raw ? JSON.parse(raw).appearance?.accentKey : null;
+      }),
+    )
+    .toBe("custom:#FFFFFF");
+
+  await page.reload();
+  await waitForPreviewReady(page);
+  await expect
+    .poll(() =>
+      page
+        .locator("[data-agentmux-root]")
+        .evaluate((node) =>
+          getComputedStyle(node).getPropertyValue("--accent").trim(),
+        ),
+    )
+    .toBe("#FFFFFF");
 });
 
 test("UI chrome prioritizes Windows-native hinted fonts", async ({ page }) => {
@@ -2493,7 +2649,11 @@ test("dark settings selects expose a readable native popup palette", async ({
   await page.locator(".agentmux-settings-open").click();
 
   const selector = page.locator(".agentmux-terminal-start-directory");
+  await expect(selector).toBeHidden();
+  await page.locator(".agentmux-settings-tab-general").click();
   await expect(selector).toBeVisible();
+  await expect(page.locator(".agentmux-terminal-split-behavior")).toBeVisible();
+  await expect(page.locator(".agentmux-terminal-link-open-mode")).toBeVisible();
   const palette = await selector.evaluate((element) => {
     const selectStyle = window.getComputedStyle(element);
     const option = element.querySelector("option");

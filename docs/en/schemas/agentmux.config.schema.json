@@ -43,7 +43,17 @@
         },
         "accent_key": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 14,
+          "oneOf": [
+            {
+              "enum": ["blue", "orange", "green", "violet"]
+            },
+            {
+              "pattern": "^custom:#[0-9A-Fa-f]{6}$"
+            }
+          ],
+          "description": "Accent preset key (blue, orange, green, violet) or a custom color in custom:#RRGGBB form."
         },
         "font_size": {
           "type": "number",

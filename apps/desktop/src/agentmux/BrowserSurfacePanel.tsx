@@ -1,310 +1,577 @@
-import { type CSSProperties, useState } from "react";
+import {
+  type CSSProperties,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { ControlClient } from "../control/ControlClient";
+import { IconArrowLeft, IconArrowRight, IconGlobe, IconReload } from "./icons";
+import type { Translator } from "./i18n";
 
 const FONT_SANS =
   "'Pretendard Variable',Pretendard,-apple-system,'Segoe UI','Malgun Gothic',system-ui,sans-serif";
-const FONT_MONO = FONT_SANS;
+const FONT_MONO =
+  "'Cascadia Mono','JetBrains Mono','D2Coding','Consolas',monospace";
+const MAX_PREVIEW_CHARS = 12_000;
 
 const buttonStyle: CSSProperties = {
+  alignItems: "center",
   background: "var(--s2)",
   border: "1px solid var(--border)",
-  borderRadius: 7,
-  padding: "6px 10px",
+  borderRadius: 6,
   color: "var(--fg1)",
   cursor: "pointer",
+  display: "inline-flex",
   fontFamily: FONT_SANS,
   fontSize: 12,
+  justifyContent: "center",
+  minHeight: 30,
+  padding: "5px 9px",
 };
 
 const inputStyle: CSSProperties = {
   background: "var(--canvas)",
   border: "1px solid var(--border)",
-  borderRadius: 7,
-  padding: "6px 9px",
+  borderRadius: 6,
   color: "var(--fg1)",
-  outline: "none",
   fontFamily: FONT_MONO,
   fontSize: 12,
+  minHeight: 30,
+  outline: "none",
+  padding: "5px 9px",
 };
 
-type ScreenshotInfo = {
-  imageHandle: string;
+type BrowserLoadState = "idle" | "loading" | "ready" | "error";
+
+type BrowserPageFrame = {
   byteCount: number;
-  format: string;
+  dataUrl: string;
 };
 
-type LastAction =
-  | "navigate"
-  | "snapshot"
-  | "screenshot"
-  | "click"
-  | "type"
-  | "evaluate"
-  | null;
+export type BrowserPagePreview = {
+  title: string | null;
+  text: string;
+  truncated: boolean;
+};
+
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: '"',
+  };
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, token: string) => {
+    const isValidCodePoint = (codePoint: number) =>
+      Number.isFinite(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff;
+    const normalized = token.toLowerCase();
+    if (normalized.startsWith("#x")) {
+      const codePoint = Number.parseInt(normalized.slice(2), 16);
+      return isValidCodePoint(codePoint) ? String.fromCodePoint(codePoint) : entity;
+    }
+    if (normalized.startsWith("#")) {
+      const codePoint = Number.parseInt(normalized.slice(1), 10);
+      return isValidCodePoint(codePoint) ? String.fromCodePoint(codePoint) : entity;
+    }
+    return named[normalized] ?? entity;
+  });
+}
+
+function htmlToText(html: string): string {
+  const documentBody = html.match(/<body\b[^>]*>([\s\S]*?)<\/body\s*>/i)?.[1] ?? html;
+  return decodeHtmlEntities(
+    documentBody
+      .replace(/<!--[^]*?-->/g, "")
+      .replace(/<(script|style|noscript|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+      .replace(/<\/?(article|aside|blockquote|br|caption|div|dt|dd|figcaption|figure|h[1-6]|header|footer|li|main|nav|p|pre|section|table|tr)\b[^>]*>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\n{2,}/g, "\n")
+      .trim(),
+  );
+}
+
+export function summarizeBrowserDom(html: string): BrowserPagePreview {
+  const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i);
+  const title = titleMatch ? htmlToText(titleMatch[1]) || null : null;
+  const fullText = htmlToText(html);
+  return {
+    title,
+    text: fullText.slice(0, MAX_PREVIEW_CHARS),
+    truncated: fullText.length > MAX_PREVIEW_CHARS,
+  };
+}
+
+export function normalizeBrowserNavigationUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^(?:localhost|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?(?:[/?#]|$)/i.test(trimmed)) {
+    return `http://${trimmed}`;
+  }
+  if (/^[a-z][a-z\d+.-]*:/i.test(trimmed)) {
+    return trimmed;
+  }
+  return `https://${trimmed}`;
+}
+
+function isBlankUrl(value: string | null): boolean {
+  return !value || value === "about:blank";
+}
 
 export function BrowserSurfacePanel({
   client,
   surfaceId,
+  t,
 }: {
   client: ControlClient;
   surfaceId: string;
+  t: Translator;
 }) {
-  const [url, setUrl] = useState("https://example.invalid");
-  const [selector, setSelector] = useState("#q");
-  const [text, setText] = useState("agentmux");
-  const [script, setScript] = useState("document.title");
-
+  const [address, setAddress] = useState("");
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
-  const [lastAction, setLastAction] = useState<LastAction>(null);
-  const [snapshot, setSnapshot] = useState<string | null>(null);
-  const [evalValue, setEvalValue] = useState<string | null>(null);
-  const [screenshotInfo, setScreenshotInfo] = useState<ScreenshotInfo | null>(null);
+  const [loadState, setLoadState] = useState<BrowserLoadState>("idle");
+  const [preview, setPreview] = useState<BrowserPagePreview | null>(null);
+  const [pageFrame, setPageFrame] = useState<BrowserPageFrame | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const frameElementRef = useRef<HTMLDivElement | null>(null);
+  const frameImageRef = useRef<HTMLImageElement | null>(null);
+  const refreshTimerRef = useRef<number | null>(null);
 
-  async function handleNavigate() {
+  const loadPageFrame = useCallback(
+    async (url: string, failOnError = false) => {
+      if (isBlankUrl(url)) {
+        setPreview(null);
+        setPageFrame(null);
+        setPreviewError(null);
+        return;
+      }
+      try {
+        const [snapshot, screenshot] = await Promise.all([
+          client.browserDomSnapshot(surfaceId),
+          client.browserScreenshot(surfaceId, "png"),
+        ]);
+        setPreview(summarizeBrowserDom(snapshot.html));
+        setPageFrame({
+          byteCount: screenshot.byteCount,
+          dataUrl: `data:image/png;base64,${screenshot.dataBase64}`,
+        });
+        setPreviewError(null);
+      } catch (cause) {
+        const message =
+          cause instanceof Error ? cause.message : t("browser.surface.renderFailed");
+        setPreview(null);
+        setPageFrame(null);
+        setPreviewError(message);
+        if (failOnError) {
+          throw cause instanceof Error ? cause : new Error(message);
+        }
+      }
+    },
+    [client, surfaceId, t],
+  );
+
+  const applyNavigationResult = useCallback(
+    async (url: string) => {
+      setCurrentUrl(url);
+      setAddress(url);
+      await loadPageFrame(url, true);
+    },
+    [loadPageFrame],
+  );
+
+  const scheduleFrameRefresh = useCallback(() => {
+    if (refreshTimerRef.current !== null) {
+      window.clearTimeout(refreshTimerRef.current);
+    }
+    refreshTimerRef.current = window.setTimeout(() => {
+      refreshTimerRef.current = null;
+      if (currentUrl) {
+        void loadPageFrame(currentUrl);
+      }
+    }, 140);
+  }, [currentUrl, loadPageFrame]);
+
+  const refreshCurrentUrl = useCallback(async () => {
+    setLoadState("loading");
+    try {
+      const result = await client.browserCurrentUrl(surfaceId);
+      await applyNavigationResult(result.url);
+      setError(null);
+      setLoadState("ready");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("browser.surface.connectionError"));
+      setLoadState("error");
+    }
+  }, [applyNavigationResult, client, surfaceId, t]);
+
+  useEffect(() => {
+    void refreshCurrentUrl();
+  }, [refreshCurrentUrl]);
+
+  useEffect(
+    () => () => {
+      if (refreshTimerRef.current !== null) {
+        window.clearTimeout(refreshTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const navigate = useCallback(async () => {
+    const url = normalizeBrowserNavigationUrl(address);
+    if (!url) {
+      setError(t("browser.surface.enterAddress"));
+      setLoadState("error");
+      return;
+    }
+    setLoadState("loading");
+    setError(null);
     try {
       const result = await client.browserNavigate(surfaceId, url);
-      setCurrentUrl(result.url);
-      setLastAction("navigate");
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      await applyNavigationResult(result.url);
+      setLoadState("ready");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("browser.surface.navigationFailed"));
+      setLoadState("error");
     }
-  }
+  }, [address, applyNavigationResult, client, surfaceId, t]);
 
-  async function handleSnapshot() {
-    try {
-      const result = await client.browserDomSnapshot(surfaceId);
-      setSnapshot(result.html);
-      setLastAction("snapshot");
+  const runNavigationAction = useCallback(
+    async (action: "back" | "forward" | "reload") => {
+      setLoadState("loading");
       setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
+      try {
+        const result = await (
+          action === "back"
+            ? client.browserBack(surfaceId)
+            : action === "forward"
+              ? client.browserForward(surfaceId)
+              : client.browserReload(surfaceId)
+        );
+        await applyNavigationResult(result.url);
+        setLoadState("ready");
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : t("browser.surface.connectionError"));
+        setLoadState("error");
+      }
+    },
+    [applyNavigationResult, client, surfaceId, t],
+  );
 
-  async function handleScreenshot() {
-    try {
-      const result = await client.browserScreenshot(surfaceId, null);
-      setScreenshotInfo({
-        imageHandle: result.imageHandle,
-        byteCount: result.byteCount,
-        format: result.format,
-      });
-      setLastAction("screenshot");
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+  const statusLabel = useMemo(() => {
+    if (loadState === "loading") {
+      return t("browser.surface.loading");
     }
-  }
+    if (loadState === "error") {
+      return t("browser.surface.connectionError");
+    }
+    if (isBlankUrl(currentUrl)) {
+      return t("browser.surface.newTab");
+    }
+    return t("browser.surface.pageReady");
+  }, [currentUrl, loadState, t]);
 
-  async function handleClick() {
-    try {
-      await client.browserClick(surfaceId, { selector });
-      setLastAction("click");
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
+  const controlsDisabled = loadState === "loading";
 
-  async function handleType() {
-    try {
-      await client.browserType(surfaceId, selector, text);
-      setLastAction("type");
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
+  const handleFrameClick = useCallback(
+    async (event: React.MouseEvent<HTMLImageElement>) => {
+      const image = frameImageRef.current;
+      if (!image || image.naturalWidth <= 0 || image.naturalHeight <= 0) {
+        return;
+      }
+      const bounds = image.getBoundingClientRect();
+      const x = ((event.clientX - bounds.left) / bounds.width) * image.naturalWidth;
+      const y = ((event.clientY - bounds.top) / bounds.height) * image.naturalHeight;
+      frameElementRef.current?.focus();
+      try {
+        await client.browserClick(surfaceId, { x, y });
+        setError(null);
+        scheduleFrameRefresh();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : t("browser.surface.clickFailed"));
+      }
+    },
+    [client, scheduleFrameRefresh, surfaceId, t],
+  );
 
-  async function handleEvaluate() {
-    try {
-      const result = await client.browserEvaluate(surfaceId, script);
-      setEvalValue(result.valueJson);
-      setLastAction("evaluate");
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  }
+  const handleFrameWheel = useCallback(
+    (event: React.WheelEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      void client
+        .browserScroll(surfaceId, { x: event.deltaX, y: event.deltaY })
+        .then(() => {
+          setError(null);
+          scheduleFrameRefresh();
+        })
+        .catch((cause: unknown) => {
+          setError(cause instanceof Error ? cause.message : t("browser.surface.scrollFailed"));
+        });
+    },
+    [client, scheduleFrameRefresh, surfaceId, t],
+  );
+
+  const handleFrameKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+      const supportedKey = event.key.length === 1 || [
+        "Backspace",
+        "Delete",
+        "Enter",
+        "Escape",
+        "Tab",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "ArrowUp",
+        "Home",
+        "End",
+        "PageDown",
+        "PageUp",
+        "Space",
+      ].includes(event.key);
+      if (!supportedKey) {
+        return;
+      }
+      event.preventDefault();
+      void client
+        .browserPress(surfaceId, ":focus", event.key)
+        .then(() => {
+          setError(null);
+          scheduleFrameRefresh();
+        })
+        .catch((cause: unknown) => {
+          setError(cause instanceof Error ? cause.message : t("browser.surface.inputFailed"));
+        });
+    },
+    [client, scheduleFrameRefresh, surfaceId, t],
+  );
 
   return (
-    <div
+    <section
+      aria-label="Browser surface"
       style={{
-        height: "100%",
-        display: "flex",
-        flexDirection: "column",
-        minHeight: 0,
         background: "var(--term)",
         color: "var(--fg2)",
+        display: "flex",
+        flexDirection: "column",
         fontFamily: FONT_SANS,
         fontSize: 12,
+        height: "100%",
+        minHeight: 0,
       }}
     >
-      {/* Address row */}
-      <div
+      <header
         style={{
+          alignItems: "center",
+          borderBottom: "1px solid var(--border)",
           display: "flex",
+          flexWrap: "wrap",
           gap: 6,
           padding: "8px 10px",
-          borderBottom: "1px solid var(--border)",
-          alignItems: "center",
-          flexWrap: "wrap",
         }}
       >
-        <input
-          style={{ ...inputStyle, flex: 1, minWidth: 120 }}
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              void handleNavigate();
-            }
+        <span
+          aria-hidden="true"
+          className="agentmux-browser-surface-icon"
+          style={{ color: "var(--fg3)", display: "inline-flex", flex: "none" }}
+        >
+          <IconGlobe size={16} />
+        </span>
+        <button
+          aria-label={t("browser.surface.back")}
+          disabled={controlsDisabled}
+          onClick={() => void runNavigationAction("back")}
+          style={{ ...buttonStyle, padding: 0, width: 30 }}
+          title={t("browser.surface.back")}
+          type="button"
+        >
+          <IconArrowLeft size={15} />
+        </button>
+        <button
+          aria-label={t("browser.surface.forward")}
+          disabled={controlsDisabled}
+          onClick={() => void runNavigationAction("forward")}
+          style={{ ...buttonStyle, padding: 0, width: 30 }}
+          title={t("browser.surface.forward")}
+          type="button"
+        >
+          <IconArrowRight size={15} />
+        </button>
+        <button
+          aria-label={t("browser.surface.reload")}
+          disabled={controlsDisabled}
+          onClick={() => void runNavigationAction("reload")}
+          style={{ ...buttonStyle, padding: 0, width: 30 }}
+          title={t("browser.surface.reload")}
+          type="button"
+        >
+          <IconReload size={14} />
+        </button>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void navigate();
           }}
-          placeholder="URL"
-        />
-        <button style={buttonStyle} onClick={() => { void handleNavigate(); }}>
-          이동
-        </button>
-        <button style={buttonStyle} onClick={() => { void handleSnapshot(); }}>
-          스냅샷
-        </button>
-        <button style={buttonStyle} onClick={() => { void handleScreenshot(); }}>
-          스크린샷
-        </button>
-      </div>
+          style={{ display: "flex", flex: "1 1 260px", gap: 6, minWidth: 180 }}
+        >
+          <label htmlFor={`browser-address-${surfaceId}`} style={{ display: "contents" }}>
+            <span style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clipPath: "inset(50%)" }}>
+              {t("browser.surface.address")}
+            </span>
+            <input
+              aria-label={t("browser.surface.address")}
+              autoCapitalize="none"
+              autoCorrect="off"
+              disabled={controlsDisabled}
+              id={`browser-address-${surfaceId}`}
+              onChange={(event) => setAddress(event.target.value)}
+              placeholder="https://example.com"
+              spellCheck={false}
+              style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+              value={address}
+            />
+          </label>
+          <button disabled={controlsDisabled} style={buttonStyle} type="submit">
+            {t("browser.surface.go")}
+          </button>
+        </form>
+      </header>
 
-      {/* Controls row */}
       <div
+        aria-live="polite"
         style={{
-          display: "flex",
-          gap: 6,
-          padding: "8px 10px",
           borderBottom: "1px solid var(--border)",
-          alignItems: "center",
-          flexWrap: "wrap",
+          color: loadState === "error" ? "var(--red, #F87171)" : "var(--fg3)",
+          display: "flex",
+          gap: 8,
+          minHeight: 30,
+          padding: "7px 12px",
         }}
       >
-        <input
-          style={{ ...inputStyle, width: 100 }}
-          value={selector}
-          onChange={(e) => setSelector(e.target.value)}
-          placeholder="셀렉터"
-        />
-        <input
-          style={{ ...inputStyle, flex: 1, minWidth: 80 }}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder="입력할 텍스트"
-        />
-        <button style={buttonStyle} onClick={() => { void handleClick(); }}>
-          클릭
-        </button>
-        <button style={buttonStyle} onClick={() => { void handleType(); }}>
-          입력
-        </button>
-        <input
-          style={{ ...inputStyle, flex: 1, minWidth: 100 }}
-          value={script}
-          onChange={(e) => setScript(e.target.value)}
-          placeholder="스크립트"
-        />
-        <button style={buttonStyle} onClick={() => { void handleEvaluate(); }}>
-          실행
-        </button>
+        <strong style={{ color: "var(--fg1)", fontWeight: 600 }}>{statusLabel}</strong>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {currentUrl ?? t("browser.surface.connecting")}
+        </span>
       </div>
 
-      {/* Output area */}
-      <div
+      <main
         className="agentmux-scroll"
         style={{
-          flex: 1,
-          overflow: "auto",
-          padding: "10px 12px",
-          fontFamily: FONT_MONO,
-          fontSize: 12,
           display: "flex",
+          flex: 1,
           flexDirection: "column",
-          gap: 8,
+          gap: 12,
+          minHeight: 0,
+          overflow: "auto",
+          padding: "16px 18px",
         }}
       >
-        {error !== null && (
-          <div style={{ color: "var(--red, #F87171)", wordBreak: "break-all" }}>
-            <strong>오류:</strong> {error}
+        {error && (
+          <div
+            role="alert"
+            style={{
+              background: "color-mix(in srgb, var(--red, #F87171) 12%, var(--s1))",
+              border: "1px solid color-mix(in srgb, var(--red, #F87171) 45%, var(--border))",
+              borderRadius: 6,
+              color: "var(--fg1)",
+              lineHeight: 1.45,
+              padding: "10px 12px",
+              wordBreak: "break-word",
+            }}
+          >
+            {error}
           </div>
         )}
 
-        {lastAction === "navigate" && currentUrl !== null && (
-          <div>
-            <strong style={{ color: "var(--fg1)" }}>이동 완료:</strong>{" "}
-            <span>{currentUrl}</span>
-          </div>
-        )}
-
-        {lastAction === "click" && error === null && (
-          <div>
-            <strong style={{ color: "var(--fg1)" }}>클릭 완료</strong>{" "}
-            <span style={{ color: "var(--fg2)" }}>셀렉터: {selector}</span>
-          </div>
-        )}
-
-        {lastAction === "type" && error === null && (
-          <div>
-            <strong style={{ color: "var(--fg1)" }}>입력 완료</strong>{" "}
-            <span style={{ color: "var(--fg2)" }}>
-              셀렉터: {selector}, 텍스트: {text}
-            </span>
-          </div>
-        )}
-
-        {lastAction === "screenshot" && screenshotInfo !== null && (
-          <div>
-            <strong style={{ color: "var(--fg1)" }}>스크린샷:</strong>{" "}
-            <span>
-              핸들: {screenshotInfo.imageHandle} | 포맷: {screenshotInfo.format}{" "}
-              | 크기: {screenshotInfo.byteCount.toLocaleString()} bytes
-            </span>
-          </div>
-        )}
-
-        {lastAction === "evaluate" && evalValue !== null && (
-          <div>
-            <strong style={{ color: "var(--fg1)" }}>실행 결과:</strong>{" "}
-            <span>{evalValue}</span>
-          </div>
-        )}
-
-        {lastAction === "snapshot" && snapshot !== null && (
-          <div>
-            <strong style={{ color: "var(--fg1)" }}>DOM 스냅샷:</strong>
-            <pre
+        {pageFrame ? (
+          <div
+            aria-label="Interactive page preview"
+            onKeyDown={handleFrameKeyDown}
+            onWheel={handleFrameWheel}
+            ref={frameElementRef}
+            style={{
+              alignItems: "flex-start",
+              background: "#fff",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              display: "flex",
+              flex: "1 1 auto",
+              justifyContent: "center",
+              minHeight: 180,
+              minWidth: 0,
+              overflow: "auto",
+              outline: "none",
+            }}
+            tabIndex={0}
+            title={`${pageFrame.byteCount.toLocaleString()} byte page frame`}
+          >
+            <img
+              alt={preview?.title ?? currentUrl ?? "Browser page"}
+              draggable={false}
+              onClick={(event) => void handleFrameClick(event)}
+              ref={frameImageRef}
+              src={pageFrame.dataUrl}
               style={{
-                marginTop: 6,
-                padding: 8,
-                background: "var(--surface)",
-                border: "1px solid var(--border)",
-                borderRadius: 6,
-                overflow: "auto",
-                maxHeight: 300,
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-all",
-                color: "var(--fg2)",
-                fontFamily: FONT_MONO,
-                fontSize: 11,
+                cursor: "default",
+                display: "block",
+                height: "auto",
+                maxWidth: "100%",
+                userSelect: "none",
+                width: "100%",
               }}
-            >
-              {snapshot}
-            </pre>
+            />
+          </div>
+        ) : preview ? (
+          <article aria-label="Read-only page preview" style={{ minWidth: 0 }}>
+            {preview.title && (
+              <h2 style={{ color: "var(--fg1)", fontSize: 15, fontWeight: 650, margin: "0 0 10px" }}>
+                {preview.title}
+              </h2>
+            )}
+            {preview.text ? (
+              <pre
+                style={{
+                  background: "var(--canvas)",
+                  border: "1px solid var(--border)",
+                  borderRadius: 6,
+                  color: "var(--fg1)",
+                  fontFamily: FONT_MONO,
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  margin: 0,
+                  overflow: "auto",
+                  padding: 12,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
+                {preview.text}
+                {preview.truncated ? `\n\n${t("browser.surface.previewTruncated")}` : ""}
+              </pre>
+            ) : (
+              <p style={{ color: "var(--fg3)", margin: 0 }}>
+                {t("browser.surface.noReadableText")}
+              </p>
+            )}
+          </article>
+        ) : (
+          <div style={{ color: "var(--fg3)", lineHeight: 1.5, maxWidth: 620 }}>
+            <strong style={{ color: "var(--fg1)" }}>{t("browser.surface.newTab")}</strong>
+            {previewError && <p style={{ color: "var(--red, #F87171)", margin: "8px 0 0" }}>{previewError}</p>}
           </div>
         )}
-
-        {lastAction === null && error === null && (
-          <div style={{ color: "var(--fg2)", opacity: 0.5 }}>
-            URL을 입력하고 이동 버튼을 눌러 시작하세요.
-          </div>
-        )}
-      </div>
-    </div>
+      </main>
+    </section>
   );
 }

@@ -3,6 +3,7 @@
 This section is for release managers and maintainers.
 
 - [Release runbook](./release-runbook.md)
+- [Release quality gates](./release-quality-gates.md)
 - [Main merge policy](./main-merge-policy.md)
 - [Versioning and signed releases](../release/versioning.md)
 
