@@ -96,6 +96,19 @@ URL, Ctrl-click the link to open it in an embedded browser split beside that
 terminal. In browser-hosted sessions that use macOS-style shortcuts, Cmd-click
 works the same way.
 
+## Markdown Surfaces
+
+Open a local Markdown file from the terminal profile menu to review agent
+artifacts without leaving the workspace. Markdown surfaces can open in a new
+tab or replace the active empty pane. They provide rendered GitHub-flavored
+Markdown, document search, reload, relative document links, and local image
+previews.
+
+Markdown surfaces are read-only. AgentMux accepts Markdown files and supported
+local images only when their canonical paths stay inside the workspace project
+root. Remote images are not fetched by the viewer. Use the embedded browser for
+remote web content.
+
 ## Clipboard
 
 Use standard terminal clipboard behavior:

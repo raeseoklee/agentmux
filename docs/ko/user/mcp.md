@@ -58,6 +58,7 @@ agentmux mcp setup --help
 | 에이전트 worktree | `agent_worktree_list` | `agent_worktree_create`, `agent_worktree_recover` | `agent_worktree_remove` |
 | Diff 리뷰 | `git_review_thread_list`, `git_review_comment_list` | 호출자 소유 thread/comment 생성·수정, 소유 thread stale 표시, 허용된 대상에 소유 thread 전달, 소유 comment 삭제 | thread 삭제 및 호출자 소유 범위를 벗어난 리뷰 관리 |
 | 개발 서버 | `development_server_candidate_list` | 후보 무시 또는 브라우저 분할로 열기 | - |
+| Markdown 아티팩트 | `markdown_read` | 호출자 워크스페이스의 프로젝트 루트 내부 파일로 제한된 `markdown_open` | - |
 
 worktree 생성은 복구 가능한 saga입니다. Git worktree, AgentMux 워크스페이스,
 터미널과 에이전트 실행 중 뒤 단계가 실패하면 앞 단계를 역순으로 보상합니다.

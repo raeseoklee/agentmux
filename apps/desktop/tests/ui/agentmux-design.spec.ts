@@ -2543,6 +2543,41 @@ test("titlebar identity controls share one vertical center", async ({ page }) =>
   await expect(page.locator(".agentmux-titlebar-breadcrumb")).toHaveCount(0);
 });
 
+test("window caption controls use native-sized pixel-aligned glyphs", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  const controls = page.locator(".agentmux-window-control");
+  await expect(controls).toHaveCount(3);
+
+  const metrics = await controls.evaluateAll((elements) =>
+    elements.map((element) => {
+      const box = element.getBoundingClientRect();
+      const icon = element.querySelector("svg")?.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return {
+        width: box.width,
+        height: box.height,
+        borderRadius: style.borderRadius,
+        iconWidth: icon?.width ?? 0,
+        iconHeight: icon?.height ?? 0,
+      };
+    }),
+  );
+  for (const metric of metrics) {
+    expect(metric.width).toBe(46);
+    expect(metric.height).toBe(39);
+    expect(metric.borderRadius).toBe("0px");
+    expect(metric.iconWidth).toBe(13);
+    expect(metric.iconHeight).toBe(13);
+  }
+
+  const close = page.locator(".agentmux-window-close");
+  await close.hover();
+  await expect(close).toHaveCSS("background-color", "rgb(232, 17, 35)");
+  await expect(close).toHaveCSS("color", "rgb(255, 255, 255)");
+});
+
 test("custom accent color previews immediately and persists", async ({ page }) => {
   await bootPreview(page);
   await page.locator(".agentmux-settings-open").click();
@@ -2654,6 +2689,28 @@ test("dark settings selects expose a readable native popup palette", async ({
   await expect(selector).toBeVisible();
   await expect(page.locator(".agentmux-terminal-split-behavior")).toBeVisible();
   await expect(page.locator(".agentmux-terminal-link-open-mode")).toBeVisible();
+  const terminalCards = page.locator(
+    "[data-agentmux-terminal-start-settings], [data-agentmux-terminal-split-settings], [data-agentmux-terminal-link-settings]",
+  );
+  await expect(terminalCards).toHaveCount(3);
+  await expect(
+    page.locator(
+      "[data-agentmux-update-settings] ~ [data-agentmux-terminal-start-settings]",
+    ),
+  ).toHaveCount(1);
+  const cardMetrics = await page
+    .locator("[data-agentmux-app-version], [data-agentmux-terminal-start-settings]")
+    .evaluateAll((elements) =>
+      elements.map((element) => {
+        const style = window.getComputedStyle(element);
+        return {
+          borderRadius: style.borderRadius,
+          borderStyle: style.borderStyle,
+          paddingLeft: style.paddingLeft,
+        };
+      }),
+    );
+  expect(cardMetrics[1]).toEqual(cardMetrics[0]);
   const palette = await selector.evaluate((element) => {
     const selectStyle = window.getComputedStyle(element);
     const option = element.querySelector("option");

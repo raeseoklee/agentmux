@@ -59,6 +59,7 @@ use agentmux_ipc::{
     DiagnosticsBackendHealthResult, DiagnosticsExportResult, DiagnosticsOutputStreamResult,
     DiagnosticsQueuePressureResult, DockConfigResult, DockControlResult, DockGetParams,
     DockTrustParams, EnvVarParam, ErrorCode, EventSubscribeParams, EventSubscribeResult,
+    MarkdownAssetReadParams, MarkdownAssetResult, MarkdownDocumentResult, MarkdownReadParams,
     NotificationClearParams, NotificationClearResult, NotificationCreateParams,
     NotificationDismissParams, NotificationListParams, NotificationListResult,
     NotificationSummaryResult, PaneCloseParams, PaneFocusParams, PaneMountSurfaceParams,
@@ -71,19 +72,19 @@ use agentmux_ipc::{
     SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams, SidebarStateResult,
     SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult, SidebarStatusSetParams,
     SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
-    SurfaceMoveWorkspaceParams, SurfaceMoveWorkspaceResult, SurfaceSummaryResult,
-    SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult, TeamMessageListParams,
-    TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult, TeamMessageSendParams,
-    TeamTaskBlockParams, TeamTaskClaimParams, TeamTaskCreateParams, TeamTaskDependencyParams,
-    TeamTaskIdParams, TeamTaskListParams, TeamTaskListResult, TeamTaskResult, TerminalOpenParams,
-    TerminalPlacementResult, TerminalSplitParams, TmuxDiagnosticsParams, TmuxDiagnosticsResult,
-    WorkspaceCloseParams, WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult,
-    WorkspaceGroupCreateParams, WorkspaceGroupIdParams, WorkspaceGroupListParams,
-    WorkspaceGroupListResult, WorkspaceGroupMemberParams, WorkspaceGroupMemberResult,
-    WorkspaceGroupResult, WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult,
-    WorkspaceRenameParams, WorkspaceSummaryResult, WorkspaceUpdateParams,
-    WslDistributionListResult, WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME,
-    DEFAULT_LOCAL_CONTROL_TOKEN,
+    SurfaceCreateMarkdownParams, SurfaceMoveWorkspaceParams, SurfaceMoveWorkspaceResult,
+    SurfaceSummaryResult, SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult,
+    TeamMessageListParams, TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult,
+    TeamMessageSendParams, TeamTaskBlockParams, TeamTaskClaimParams, TeamTaskCreateParams,
+    TeamTaskDependencyParams, TeamTaskIdParams, TeamTaskListParams, TeamTaskListResult,
+    TeamTaskResult, TerminalOpenParams, TerminalPlacementResult, TerminalSplitParams,
+    TmuxDiagnosticsParams, TmuxDiagnosticsResult, WorkspaceCloseParams, WorkspaceCloseResult,
+    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
+    WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
+    WorkspaceGroupMemberParams, WorkspaceGroupMemberResult, WorkspaceGroupResult,
+    WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams,
+    WorkspaceSummaryResult, WorkspaceUpdateParams, WslDistributionListResult,
+    WslDistributionResult, DEFAULT_CONTROL_PIPE_NAME, DEFAULT_LOCAL_CONTROL_TOKEN,
 };
 use agentmux_store::{
     PersistedAgentState, PersistedDockTrust, PersistedNotification, PersistedPane,
@@ -101,6 +102,8 @@ mod five_track;
 pub const DESKTOP_CONTROL_TOKEN: &str = DEFAULT_LOCAL_CONTROL_TOKEN;
 const MAX_BROWSER_FAILURES: usize = 100;
 const MAX_CONTROL_AUDIT_RECORDS: usize = 1000;
+const MAX_MARKDOWN_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_MARKDOWN_ASSET_BYTES: u64 = 5 * 1024 * 1024;
 const APP_CONFIG_FILE_NAME: &str = "agentmux.json";
 const APP_CONFIG_FORMAT_VERSION: &str = "agentmux.config.v1";
 const DOCK_CONFIG_FILE_NAME: &str = "dock.json";
@@ -2566,9 +2569,12 @@ impl DesktopControlState {
                 "pane.mount_surface" => self.handle_pane_mount_surface(&request),
                 "pane.unmount_surface" => self.handle_pane_unmount_surface(&request),
                 "surface.create_browser" => self.handle_surface_create_browser(&request),
+                "surface.create_markdown" => self.handle_surface_create_markdown(&request),
                 "surface.close" => self.handle_surface_close(&request),
                 "surface.move_workspace" => self.handle_surface_move_workspace(&request),
                 "browser.navigate" => self.handle_browser_navigate(&request),
+                "markdown.read" => self.handle_markdown_read(&request),
+                "markdown.read_asset" => self.handle_markdown_read_asset(&request),
                 "browser.reload" => self.handle_browser_reload(&request),
                 "browser.back" => self.handle_browser_back(&request),
                 "browser.forward" => self.handle_browser_forward(&request),
@@ -4110,6 +4116,154 @@ impl DesktopControlState {
             request.id.clone(),
             &surface_summary(&surface),
         ))
+    }
+
+    fn handle_surface_create_markdown(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: SurfaceCreateMarkdownParams = request.parse_params()?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let mut bundle = store
+            .load_workspace_bundle(&params.workspace_id)?
+            .ok_or_else(|| workspace_not_found(&params.workspace_id))?;
+        let path = resolve_markdown_path(&bundle, &params.path)?;
+        let now = timestamp();
+        let pane_id = match params.placement.as_deref() {
+            Some("new_tab") => {
+                let pane_id = PaneId::new().to_string();
+                bundle.panes.push(PersistedPane {
+                    pane_id: pane_id.clone(),
+                    workspace_id: params.workspace_id.clone(),
+                    parent_pane_id: None,
+                    kind: "leaf".to_string(),
+                    split_axis: None,
+                    split_ratio: None,
+                    mounted_surface_id: None,
+                    last_focused_at: Some(now.clone()),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                });
+                bundle.workspace.root_pane_id = pane_id.clone();
+                bundle.workspace.active_pane_id = pane_id.clone();
+                pane_id
+            }
+            Some("active_pane") | None => params
+                .pane_id
+                .clone()
+                .unwrap_or_else(|| bundle.workspace.active_pane_id.clone()),
+            Some(value) => {
+                return Err(DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("Unsupported markdown surface placement '{value}'."),
+                )));
+            }
+        };
+        validate_browser_mount_target(&bundle, &pane_id)?;
+
+        let surface = persisted_markdown_surface(
+            SurfaceId::new().to_string(),
+            params.workspace_id,
+            &path,
+            &now,
+        );
+        mount_surface_in_bundle(&mut bundle, &pane_id, &surface.surface_id)?;
+        bundle.surfaces.push(surface.clone());
+        store.save_workspace_bundle(&bundle)?;
+
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &surface_summary(&surface),
+        ))
+    }
+
+    fn handle_markdown_read(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: MarkdownReadParams = request.parse_params()?;
+        let bundle = self.load_workspace_or_not_found(&params.workspace_id)?;
+        let surface = bundle
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == params.surface_id)
+            .ok_or_else(|| surface_not_found(&params.surface_id))?;
+        if surface.surface_type != "markdown" {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "Surface '{}' is not a markdown document.",
+                    params.surface_id
+                ),
+            )));
+        }
+        let resource_uri = surface.resource_uri.as_deref().ok_or_else(|| {
+            DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Markdown surface has no resource path.",
+            ))
+        })?;
+        let path = resolve_markdown_path(&bundle, resource_uri)?;
+        let metadata = fs::metadata(&path).map_err(markdown_io_error)?;
+        let content = fs::read_to_string(&path).map_err(markdown_io_error)?;
+        let modified_at_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or_default();
+        let result = MarkdownDocumentResult {
+            surface_id: surface.surface_id.clone(),
+            path: path.to_string_lossy().to_string(),
+            title: surface.title.clone(),
+            content,
+            modified_at_ms,
+            size_bytes: metadata.len(),
+        };
+        Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
+    }
+
+    fn handle_markdown_read_asset(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: MarkdownAssetReadParams = request.parse_params()?;
+        let bundle = self.load_workspace_or_not_found(&params.workspace_id)?;
+        let surface = bundle
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == params.surface_id)
+            .ok_or_else(|| surface_not_found(&params.surface_id))?;
+        if surface.surface_type != "markdown" {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "Surface '{}' is not a markdown document.",
+                    params.surface_id
+                ),
+            )));
+        }
+        let document_path = resolve_markdown_path(
+            &bundle,
+            surface.resource_uri.as_deref().ok_or_else(|| {
+                DesktopHostError::Control(ControlError::new(
+                    ErrorCode::InvalidRequest,
+                    "Markdown surface has no resource path.",
+                ))
+            })?,
+        )?;
+        let (path, mime) = resolve_markdown_asset_path(&bundle, &document_path, &params.path)?;
+        let metadata = fs::metadata(&path).map_err(markdown_io_error)?;
+        let bytes = fs::read(path).map_err(markdown_io_error)?;
+        let result = MarkdownAssetResult {
+            data_url: format!("data:{mime};base64,{}", BASE64_STANDARD.encode(bytes)),
+            size_bytes: metadata.len(),
+        };
+        Ok(ResponseEnvelope::ok_typed(request.id.clone(), &result))
     }
 
     fn handle_surface_close(
@@ -6610,15 +6764,31 @@ impl DesktopControlState {
         request: &RequestEnvelope,
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: SidebarWorkspaceParams = request.parse_params()?;
+        let workspace_id = {
+            let Ok(store) = self.store.lock() else {
+                return Err(DesktopHostError::StateUnavailable(
+                    "desktop store state is unavailable".to_string(),
+                ));
+            };
+            resolve_workspace_id(&store, params.workspace_id.as_deref())?
+        };
+        let git_context = self
+            .workspace_git_context_for_pane(&workspace_id, params.pane_id.as_deref())
+            .or_else(|_| self.workspace_git_context(&workspace_id))
+            .ok();
         let Ok(store) = self.store.lock() else {
             return Err(DesktopHostError::StateUnavailable(
                 "desktop store state is unavailable".to_string(),
             ));
         };
-        let workspace_id = resolve_workspace_id(&store, params.workspace_id.as_deref())?;
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &sidebar_state_result(&store, &workspace_id)?,
+            &sidebar_state_result(
+                &store,
+                &workspace_id,
+                params.pane_id.as_deref(),
+                git_context.as_ref(),
+            )?,
         ))
     }
 
@@ -7945,6 +8115,7 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "pane.mount_surface",
         "pane.unmount_surface",
         "surface.create_browser",
+        "surface.create_markdown",
         "surface.close",
         "surface.move_workspace",
         "terminal.open",
@@ -8020,6 +8191,8 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "sidebar.clear_log",
         "sidebar.list_log",
         "sidebar.state",
+        "markdown.read",
+        "markdown.read_asset",
         "browser.navigate",
         "browser.screenshot",
         "browser.dom_snapshot",
@@ -11186,6 +11359,7 @@ fn persisted_terminal_surface(
         }),
         session_id: Some(result.session_id.clone()),
         browser_id,
+        resource_uri: None,
         created_at: now.to_string(),
         last_visible_at: Some(now.to_string()),
         updated_at: now.to_string(),
@@ -11203,6 +11377,32 @@ fn persisted_browser_surface(surface: &BrowserSurface, now: &str) -> PersistedSu
             .unwrap_or_else(|| "Browser".to_string()),
         session_id: None,
         browser_id: Some(surface.browser_id.clone()),
+        resource_uri: None,
+        created_at: now.to_string(),
+        last_visible_at: Some(now.to_string()),
+        updated_at: now.to_string(),
+    }
+}
+
+fn persisted_markdown_surface(
+    surface_id: String,
+    workspace_id: String,
+    path: &Path,
+    now: &str,
+) -> PersistedSurface {
+    let title = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Markdown")
+        .to_string();
+    PersistedSurface {
+        surface_id,
+        workspace_id,
+        surface_type: "markdown".to_string(),
+        title,
+        session_id: None,
+        browser_id: None,
+        resource_uri: Some(path.to_string_lossy().to_string()),
         created_at: now.to_string(),
         last_visible_at: Some(now.to_string()),
         updated_at: now.to_string(),
@@ -11261,9 +11461,12 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "pane.mount_surface"
             | "pane.unmount_surface"
             | "surface.create_browser"
+            | "surface.create_markdown"
             | "surface.close"
             | "surface.move_workspace"
             | "diagnostics.control_audit"
+            | "markdown.read"
+            | "markdown.read_asset"
             | "browser.navigate"
             | "browser.reload"
             | "browser.back"
@@ -12823,6 +13026,7 @@ fn surface_summary(surface: &PersistedSurface) -> SurfaceSummaryResult {
         title: surface.title.clone(),
         session_id: surface.session_id.clone(),
         browser_id: surface.browser_id.clone(),
+        resource_uri: surface.resource_uri.clone(),
     }
 }
 
@@ -13102,17 +13306,23 @@ fn unblock_dependency_ready_tasks(
 fn sidebar_state_result(
     store: &SqliteStore,
     workspace_id: &str,
+    pane_id: Option<&str>,
+    git_context: Option<&GitCommandContext>,
 ) -> Result<SidebarStateResult, DesktopHostError> {
     let bundle = store
         .load_workspace_bundle(workspace_id)?
         .ok_or_else(|| workspace_not_found(workspace_id))?;
+    let selected_session_id = pane_id
+        .and_then(|pane_id| terminal_session_for_pane(&bundle, pane_id))
+        .map(|session| session.session_id.clone())
+        .or_else(|| active_session_id(&bundle));
     let cwd = bundle
         .sessions
         .iter()
-        .find(|session| Some(session.session_id.as_str()) == active_session_id(&bundle).as_deref())
+        .find(|session| Some(session.session_id.as_str()) == selected_session_id.as_deref())
         .and_then(|session| session.cwd.clone())
         .or(bundle.workspace.project_root);
-    let (git_branch, git_hash) = git_status_for_cwd(cwd.as_deref());
+    let (git_branch, git_hash) = git_status_for_context(git_context);
     Ok(SidebarStateResult {
         workspace_id: workspace_id.to_string(),
         cwd,
@@ -13136,27 +13346,45 @@ fn sidebar_state_result(
     })
 }
 
-fn git_status_for_cwd(cwd: Option<&str>) -> (Option<String>, Option<String>) {
-    let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) else {
+fn git_status_for_context(context: Option<&GitCommandContext>) -> (Option<String>, Option<String>) {
+    let Some(context) = context else {
         return (None, None);
     };
     // OSC 7 from a WSL shell reports a Linux path; native git needs a Windows
     // path, so translate /mnt/<drive>/… → <DRIVE>:\… (the common project-on-D:
     // case). Other paths pass through unchanged.
-    let cwd = translate_wsl_path(cwd);
-    let cwd = cwd.as_str();
-    if let Some(cached) = cached_git_status(cwd) {
+    let cache_key = match &context.host {
+        GitHost::Native => format!("native:{}", context.cwd),
+        GitHost::Wsl { distribution } => format!(
+            "wsl:{}:{}",
+            distribution.as_deref().unwrap_or_default(),
+            context.cwd
+        ),
+    };
+    if let Some(cached) = cached_git_status(&cache_key) {
         return cached;
     }
-    let branch = git_output(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|value| {
+    let output = |args: &[&str]| {
+        let args = args
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        let result = run_git_read_command(context, &args).ok()?;
+        if !result.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&result.stdout).trim().to_string();
+        (!value.is_empty()).then_some(value)
+    };
+    let branch = output(&["rev-parse", "--abbrev-ref", "HEAD"]).map(|value| {
         if value == "HEAD" {
             "detached".to_string()
         } else {
             value
         }
     });
-    let hash = git_output(cwd, &["rev-parse", "--short", "HEAD"]);
-    store_git_status(cwd, branch.clone(), hash.clone());
+    let hash = output(&["rev-parse", "--short", "HEAD"]);
+    store_git_status(&cache_key, branch.clone(), hash.clone());
     (branch, hash)
 }
 
@@ -13210,6 +13438,170 @@ fn translate_wsl_path(path: &str) -> String {
         after.replace('/', "\\")
     };
     format!("{}:{}", drive.to_ascii_uppercase(), win_rest)
+}
+
+fn workspace_host_path(path: &str, distribution: Option<&str>) -> PathBuf {
+    let translated = translate_wsl_path(path.trim());
+    if translated.starts_with('/') {
+        if let Some(distribution) = distribution
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        {
+            let suffix = translated.trim_start_matches('/').replace('/', "\\");
+            return PathBuf::from(format!(r"\\wsl.localhost\{distribution}\{suffix}"));
+        }
+    }
+    PathBuf::from(translated)
+}
+
+fn markdown_io_error(error: io::Error) -> DesktopHostError {
+    DesktopHostError::Control(ControlError::new(
+        ErrorCode::InvalidRequest,
+        format!("Could not read Markdown document: {error}"),
+    ))
+}
+
+fn resolve_markdown_path(
+    bundle: &WorkspaceBundle,
+    requested_path: &str,
+) -> Result<PathBuf, DesktopHostError> {
+    let requested_path = requested_path.trim();
+    if requested_path.is_empty() || requested_path.chars().any(char::is_control) {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            "Markdown path must not be empty or contain control characters.",
+        )));
+    }
+    let project_root = bundle
+        .workspace
+        .project_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Markdown documents require a workspace project root.",
+            ))
+        })?;
+    let distribution = bundle.workspace.environment_profile_id.as_deref();
+    let root = fs::canonicalize(workspace_host_path(project_root, distribution))
+        .map_err(markdown_io_error)?;
+    let requested = workspace_host_path(requested_path, distribution);
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    };
+    let candidate = fs::canonicalize(candidate).map_err(markdown_io_error)?;
+    if !candidate.starts_with(&root) {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::PermissionDenied,
+            "Markdown documents must stay inside the workspace project root.",
+        )));
+    }
+    let extension = candidate
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(
+        extension.as_deref(),
+        Some("md" | "markdown" | "mdown" | "mkd")
+    ) {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            "Only Markdown files can be opened in the Markdown viewer.",
+        )));
+    }
+    let metadata = fs::metadata(&candidate).map_err(markdown_io_error)?;
+    if !metadata.is_file() {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            "Markdown path must point to a file.",
+        )));
+    }
+    if metadata.len() > MAX_MARKDOWN_BYTES {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Markdown document exceeds the {} MiB limit.",
+                MAX_MARKDOWN_BYTES / 1024 / 1024
+            ),
+        )));
+    }
+    Ok(candidate)
+}
+
+fn resolve_markdown_asset_path(
+    bundle: &WorkspaceBundle,
+    document_path: &Path,
+    requested_path: &str,
+) -> Result<(PathBuf, &'static str), DesktopHostError> {
+    let requested_path = requested_path.trim();
+    if requested_path.is_empty()
+        || requested_path.chars().any(char::is_control)
+        || requested_path.starts_with("data:")
+        || requested_path.starts_with("http://")
+        || requested_path.starts_with("https://")
+    {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            "Markdown image must use a local workspace path.",
+        )));
+    }
+    let project_root = bundle.workspace.project_root.as_deref().ok_or_else(|| {
+        DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            "Markdown images require a workspace project root.",
+        ))
+    })?;
+    let distribution = bundle.workspace.environment_profile_id.as_deref();
+    let root = fs::canonicalize(workspace_host_path(project_root, distribution))
+        .map_err(markdown_io_error)?;
+    let requested = workspace_host_path(requested_path, distribution);
+    let candidate = if requested.is_absolute() {
+        requested
+    } else {
+        document_path
+            .parent()
+            .unwrap_or(root.as_path())
+            .join(requested)
+    };
+    let candidate = fs::canonicalize(candidate).map_err(markdown_io_error)?;
+    if !candidate.starts_with(&root) {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::PermissionDenied,
+            "Markdown images must stay inside the workspace project root.",
+        )));
+    }
+    let mime = match candidate
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => {
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::InvalidRequest,
+                "Markdown viewer supports PNG, JPEG, GIF, and WebP images.",
+            )))
+        }
+    };
+    let metadata = fs::metadata(&candidate).map_err(markdown_io_error)?;
+    if !metadata.is_file() || metadata.len() > MAX_MARKDOWN_ASSET_BYTES {
+        return Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Markdown image must be a file no larger than {} MiB.",
+                MAX_MARKDOWN_ASSET_BYTES / 1024 / 1024
+            ),
+        )));
+    }
+    Ok((candidate, mime))
 }
 
 fn is_host_process_working_dir(path: &str) -> bool {
@@ -13280,23 +13672,6 @@ fn default_windows_shell_cwd() -> Option<String> {
         )
         .map(|path| path.to_string_lossy().to_string())
         .filter(|value| !value.trim().is_empty())
-}
-
-fn git_output(cwd: &str, args: &[&str]) -> Option<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(cwd).args(args);
-    configure_read_only_git_command(&mut command);
-    hide_console_window(&mut command);
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
 }
 
 #[cfg(test)]
@@ -13913,6 +14288,7 @@ fn is_mutating_control_method(method: &str) -> bool {
             | "pane.mount_surface"
             | "pane.unmount_surface"
             | "surface.create_browser"
+            | "surface.create_markdown"
             | "surface.close"
             | "surface.move_workspace"
             | "terminal.open"
@@ -15122,6 +15498,7 @@ mod tests {
             title: "Right terminal".to_string(),
             session_id: Some("ses_right".to_string()),
             browser_id: None,
+            resource_uri: None,
             created_at: "2026-06-18T00:00:00Z".to_string(),
             last_visible_at: None,
             updated_at: "2026-06-18T00:00:00Z".to_string(),
@@ -19513,6 +19890,7 @@ mod tests {
                 title: "Failed recovery".to_string(),
                 session_id: Some("ses_failed".to_string()),
                 browser_id: None,
+                resource_uri: None,
                 created_at: "before".to_string(),
                 last_visible_at: None,
                 updated_at: "before".to_string(),
@@ -19717,6 +20095,7 @@ mod tests {
             title: "Peer terminal".to_string(),
             session_id: Some("ses_peer".to_string()),
             browser_id: None,
+            resource_uri: None,
             created_at: "before".to_string(),
             last_visible_at: None,
             updated_at: "before".to_string(),
@@ -19804,6 +20183,7 @@ mod tests {
                 title: "Context terminal".to_string(),
                 session_id: Some("ses_context".to_string()),
                 browser_id: None,
+                resource_uri: None,
                 created_at: "before".to_string(),
                 last_visible_at: None,
                 updated_at: "before".to_string(),
@@ -21125,6 +21505,56 @@ mod tests {
         state.notify_direct("noop_id", "session.respawned", "title", "body");
     }
 
+    #[test]
+    fn markdown_paths_are_confined_to_the_workspace_root() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-markdown-root-{}", unique_time_id()));
+        let outside =
+            std::env::temp_dir().join(format!("agentmux-markdown-outside-{}", unique_time_id()));
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("docs").join("guide.md"), "# Guide").unwrap();
+        fs::write(outside.join("private.md"), "# Private").unwrap();
+
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.workspace.project_root = Some(root.to_string_lossy().into_owned());
+        let resolved = resolve_markdown_path(&bundle, "docs/guide.md").unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(root.join("docs/guide.md")).unwrap()
+        );
+
+        let error = resolve_markdown_path(
+            &bundle,
+            outside.join("private.md").to_string_lossy().as_ref(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("workspace project root"));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn markdown_assets_reject_remote_and_non_image_paths() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-markdown-assets-{}", unique_time_id()));
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("README.md");
+        fs::write(&document, "![asset](asset.txt)").unwrap();
+        fs::write(root.join("asset.txt"), "not an image").unwrap();
+
+        let mut bundle = workspace_bundle_with_unmounted_surface();
+        bundle.workspace.project_root = Some(root.to_string_lossy().into_owned());
+        let remote = resolve_markdown_asset_path(&bundle, &document, "https://example.com/a.png")
+            .unwrap_err();
+        assert!(remote.to_string().contains("local workspace path"));
+        let unsupported = resolve_markdown_asset_path(&bundle, &document, "asset.txt").unwrap_err();
+        assert!(unsupported.to_string().contains("supports PNG"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn workspace_bundle_with_unmounted_surface() -> WorkspaceBundle {
         WorkspaceBundle {
             workspace: PersistedWorkspace {
@@ -21188,6 +21618,7 @@ mod tests {
                 title: "Detached terminal".to_string(),
                 session_id: Some("ses_surface".to_string()),
                 browser_id: None,
+                resource_uri: None,
                 created_at: "2026-06-18T00:00:00Z".to_string(),
                 last_visible_at: None,
                 updated_at: "2026-06-18T00:00:00Z".to_string(),

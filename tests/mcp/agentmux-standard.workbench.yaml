@@ -19,7 +19,7 @@ tests:
         equals: success
       - kind: count
         path: $.tools
-        equals: 55
+        equals: 57
       - kind: contains
         path: $.tools[*].name
         value: terminal_open
@@ -62,6 +62,9 @@ tests:
       - kind: contains
         path: $.tools[*].name
         value: development_server_candidate_open_in_split
+      - kind: contains
+        path: $.tools[*].name
+        value: markdown_open
   - id: standard-profile-denies-full-call
     description: Dispatch rejects a full tool even when a client calls it directly
     act:

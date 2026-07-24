@@ -580,6 +580,16 @@ export interface SurfaceSummary {
   title: string;
   sessionId?: string | null;
   browserId?: string | null;
+  resourceUri?: string | null;
+}
+
+export interface MarkdownDocument {
+  surfaceId: string;
+  path: string;
+  title: string;
+  content: string;
+  modifiedAtMs: number;
+  sizeBytes: number;
 }
 
 export interface WorkspaceDetail {
@@ -908,6 +918,21 @@ export interface ControlClient {
     profile?: string | null,
     placement?: TerminalPlacement,
   ): Promise<SurfaceSummary>;
+  createMarkdownSurface?(
+    workspaceId: string,
+    path: string,
+    paneId?: string | null,
+    placement?: TerminalPlacement,
+  ): Promise<SurfaceSummary>;
+  readMarkdown?(
+    workspaceId: string,
+    surfaceId: string,
+  ): Promise<MarkdownDocument>;
+  readMarkdownAsset?(
+    workspaceId: string,
+    surfaceId: string,
+    path: string,
+  ): Promise<string>;
   closeSurface(
     workspaceId: string,
     surfaceId: string,
@@ -1307,7 +1332,10 @@ export interface ControlClient {
     candidateId: string,
     options?: { paneId?: string | null },
   ): Promise<{ surfaceId: string; url: string }>;
-  getSidebarState(workspaceId?: string | null): Promise<SidebarState>;
+  getSidebarState(
+    workspaceId?: string | null,
+    paneId?: string | null,
+  ): Promise<SidebarState>;
 }
 
 interface TauriChannel<T> {
@@ -1703,6 +1731,55 @@ class TauriControlClient implements ControlClient {
       },
     );
     return mapSurface(result);
+  }
+
+  async createMarkdownSurface(
+    workspaceId: string,
+    path: string,
+    paneId?: string | null,
+    placement?: TerminalPlacement,
+  ): Promise<SurfaceSummary> {
+    const result = await this.call<SurfaceSummaryWire>(
+      "surface.create_markdown",
+      {
+        workspace_id: workspaceId,
+        pane_id: paneId ?? null,
+        path,
+        placement: placement ?? null,
+      },
+    );
+    return mapSurface(result);
+  }
+
+  async readMarkdown(
+    workspaceId: string,
+    surfaceId: string,
+  ): Promise<MarkdownDocument> {
+    const result = await this.call<MarkdownDocumentWire>("markdown.read", {
+      workspace_id: workspaceId,
+      surface_id: surfaceId,
+    });
+    return {
+      surfaceId: result.surface_id,
+      path: result.path,
+      title: result.title,
+      content: result.content,
+      modifiedAtMs: result.modified_at_ms,
+      sizeBytes: result.size_bytes,
+    };
+  }
+
+  async readMarkdownAsset(
+    workspaceId: string,
+    surfaceId: string,
+    path: string,
+  ): Promise<string> {
+    const result = await this.call<{ data_url: string }>("markdown.read_asset", {
+      workspace_id: workspaceId,
+      surface_id: surfaceId,
+      path,
+    });
+    return result.data_url;
   }
 
   async closeSurface(
@@ -2954,9 +3031,13 @@ class TauriControlClient implements ControlClient {
     };
   }
 
-  async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
+  async getSidebarState(
+    workspaceId?: string | null,
+    paneId?: string | null,
+  ): Promise<SidebarState> {
     const result = await this.call<SidebarStateWire>("sidebar.state", {
       workspace_id: workspaceId ?? null,
+      pane_id: paneId ?? null,
     });
     return mapSidebarState(result);
   }
@@ -5468,7 +5549,10 @@ class BrowserPreviewControlClient implements ControlClient {
     };
   }
 
-  async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
+  async getSidebarState(
+    workspaceId?: string | null,
+    _paneId?: string | null,
+  ): Promise<SidebarState> {
     const workspace = workspaceId
       ? this.findWorkspace(workspaceId)
       : this.workspaces[0];
@@ -7664,7 +7748,10 @@ class ServerControlClient extends BrowserPreviewControlClient {
     return { surfaceId: result.surface_id, url: result.candidate.url };
   }
 
-  async getSidebarState(workspaceId?: string | null): Promise<SidebarState> {
+  async getSidebarState(
+    workspaceId?: string | null,
+    _paneId?: string | null,
+  ): Promise<SidebarState> {
     await this.hydrateServerState();
     const workspace = workspaceId
       ? this.findServerWorkspace(workspaceId)
@@ -8306,6 +8393,16 @@ interface SurfaceSummaryWire {
   title: string;
   session_id?: string | null;
   browser_id?: string | null;
+  resource_uri?: string | null;
+}
+
+interface MarkdownDocumentWire {
+  surface_id: string;
+  path: string;
+  title: string;
+  content: string;
+  modified_at_ms: number;
+  size_bytes: number;
 }
 
 interface SessionSummaryWire {
@@ -8924,6 +9021,7 @@ function mapSurface(value: SurfaceSummaryWire): SurfaceSummary {
     title: value.title,
     sessionId: value.session_id,
     browserId: value.browser_id,
+    resourceUri: value.resource_uri,
   };
 }
 

@@ -141,6 +141,30 @@ Navigate:
 agentmux browser navigate <surface-id> https://example.com
 ```
 
+## Markdown Surfaces
+
+Open a Markdown artifact in a new tab:
+
+```powershell
+agentmux markdown open docs/report.md --workspace <workspace-id> --new-tab
+```
+
+Open it in the selected pane:
+
+```powershell
+agentmux markdown open docs/report.md --workspace <workspace-id> `
+  --pane <pane-id> --active-pane
+```
+
+Read the current document metadata and source:
+
+```powershell
+agentmux markdown read <surface-id> --workspace <workspace-id>
+```
+
+Paths are resolved inside the workspace project root. Markdown surfaces are
+read-only and reject files outside that root.
+
 ## Diagnostics
 
 Export diagnostics:

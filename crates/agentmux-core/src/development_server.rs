@@ -1,6 +1,7 @@
 //! ANSI/OSC-safe development server URL discovery from a raw PTY byte stream.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 const DEFAULT_MAX_BUFFER_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_CANDIDATE_BYTES: usize = 2048;
@@ -259,7 +260,17 @@ fn normalize_host(host: &str) -> Option<String> {
     {
         return None;
     }
+    if !is_local_development_host(inner) {
+        return None;
+    }
     Some(normalized)
+}
+
+fn is_local_development_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(test)]
@@ -304,6 +315,17 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn ignores_ordinary_external_links_in_terminal_output() {
+        let mut detector = PtyUrlDetector::new(PtyUrlDetectorConfig::default());
+        let found = detector.push(
+            b"documentation: https://www.kopus.org and https://example.com/guide\n",
+            &metadata(),
+            1,
+        );
+        assert!(found.is_empty());
     }
 
     #[test]
