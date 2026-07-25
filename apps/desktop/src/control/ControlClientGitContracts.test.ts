@@ -116,6 +116,156 @@ describe("server source-control capability handshake", () => {
     });
   });
 
+  it("binds server Git requests to the active pane session context", async () => {
+    let controlRequest: Record<string, unknown> | null = null;
+    const fetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/state")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              result: {
+                mode: "local",
+                capabilities: { control_methods: ["git.status_page"] },
+                workspaces: [
+                  {
+                    workspace_id: "workspace-1",
+                    name: "Server",
+                    root_pane_id: "root",
+                    active_pane_id: "root",
+                    project_root: "D:\\fallback",
+                  },
+                ],
+                sessions: [],
+                defaults: { backend_profile: "Ubuntu" },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.includes("/api/sessions?workspace=")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              result: {
+                sessions: [
+                  {
+                    session_id: "session-1",
+                    backend_kind: "wsl-direct",
+                    backend_profile: "Debian",
+                    state: "running",
+                    cwd: "/mnt/d/work/repo",
+                  },
+                ],
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        controlRequest = JSON.parse(init?.body as string) as Record<
+          string,
+          unknown
+        >;
+        return new Response(
+          JSON.stringify({ ok: true, result: gitStatusPageResult }),
+          { status: 200 },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetch);
+    vi.stubGlobal("window", {
+      addEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      __AGENTMUX_SERVER__: {
+        baseUrl: "http://127.0.0.1:8765",
+        mode: "local",
+        capabilities: { control_methods: ["git.status_page"] },
+        defaults: { backend_profile: "Ubuntu" },
+      },
+    });
+
+    const client = createControlClient();
+    await client.getWorkspace("workspace-1");
+    await client.getGitStatusPage("workspace-1", { paneId: "root" });
+
+    expect(controlRequest).toMatchObject({
+      method: "git.status_page",
+      context: {
+        cwd: "/mnt/d/work/repo",
+        backend: "wsl-direct",
+        backend_profile: "Debian",
+      },
+    });
+  });
+
+  it("uses the desktop WSL login-shell bootstrap in server mode", async () => {
+    let spawnRequest: Record<string, unknown> | null = null;
+    const fetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/state")) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              result: {
+                mode: "local",
+                capabilities: { control_methods: [] },
+                workspaces: [
+                  {
+                    workspace_id: "workspace-1",
+                    name: "Server",
+                    root_pane_id: "root",
+                    active_pane_id: "root",
+                    project_root: "D:\\work\\repo",
+                  },
+                ],
+                sessions: [],
+                defaults: { backend_profile: "Ubuntu" },
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        spawnRequest = JSON.parse(init?.body as string) as Record<
+          string,
+          unknown
+        >;
+        return new Response(
+          JSON.stringify({ ok: true, result: { session_id: "session-1" } }),
+          { status: 200 },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetch);
+    vi.stubGlobal("window", {
+      addEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      __AGENTMUX_SERVER__: {
+        baseUrl: "http://127.0.0.1:8765",
+        mode: "local",
+        capabilities: { control_methods: [] },
+        defaults: { backend_profile: "Ubuntu" },
+      },
+    });
+
+    await createControlClient().spawnWslTerminal(
+      "workspace-1",
+      "Ubuntu",
+      "/mnt/d/work/repo",
+    );
+
+    expect(spawnRequest).toMatchObject({
+      backend: "wsl-direct",
+      backend_profile: "Ubuntu",
+      cwd: "/mnt/d/work/repo",
+      command: ["sh", "-c", expect.stringContaining("getent passwd")],
+    });
+    const command = (spawnRequest as unknown as Record<string, unknown>)
+      .command as string[];
+    expect(command[2]).toContain("ZDOTDIR");
+  });
+
   it("enables local Git only when the server probe reports success", () => {
     expect(serverSupportsSourceControl({ source_control: true }, "local")).toBe(true);
     expect(serverSupportsSourceControl({ source_control: false }, "local")).toBe(false);

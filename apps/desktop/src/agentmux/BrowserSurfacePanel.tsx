@@ -1,13 +1,23 @@
 import {
-  type CSSProperties,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
 import type { ControlClient } from "../control/ControlClient";
-import { IconArrowLeft, IconArrowRight, IconGlobe, IconReload } from "./icons";
+import {
+  IconArrowLeft,
+  IconArrowRight,
+  IconCamera,
+  IconClose,
+  IconCopy,
+  IconExternalLink,
+  IconMinus,
+  IconMoreVertical,
+  IconPlus,
+  IconReload,
+  IconSearch,
+} from "./icons";
 import type { Translator } from "./i18n";
 
 const FONT_SANS =
@@ -15,33 +25,6 @@ const FONT_SANS =
 const FONT_MONO =
   "'Cascadia Mono','JetBrains Mono','D2Coding','Consolas',monospace";
 const MAX_PREVIEW_CHARS = 12_000;
-
-const buttonStyle: CSSProperties = {
-  alignItems: "center",
-  background: "var(--s2)",
-  border: "1px solid var(--border)",
-  borderRadius: 6,
-  color: "var(--fg1)",
-  cursor: "pointer",
-  display: "inline-flex",
-  fontFamily: FONT_SANS,
-  fontSize: 12,
-  justifyContent: "center",
-  minHeight: 30,
-  padding: "5px 9px",
-};
-
-const inputStyle: CSSProperties = {
-  background: "var(--canvas)",
-  border: "1px solid var(--border)",
-  borderRadius: 6,
-  color: "var(--fg1)",
-  fontFamily: FONT_MONO,
-  fontSize: 12,
-  minHeight: 30,
-  outline: "none",
-  padding: "5px 9px",
-};
 
 type BrowserLoadState = "idle" | "loading" | "ready" | "error";
 
@@ -126,14 +109,28 @@ function isBlankUrl(value: string | null): boolean {
   return !value || value === "about:blank";
 }
 
+function fallbackPageTitle(url: string | null): string | null {
+  if (isBlankUrl(url)) return null;
+  try {
+    const parsed = new URL(url as string);
+    return parsed.hostname || parsed.href;
+  } catch {
+    return url?.trim() || null;
+  }
+}
+
 export function BrowserSurfacePanel({
   client,
   surfaceId,
   t,
+  onTitleChange,
+  onOpenExternal,
 }: {
   client: ControlClient;
   surfaceId: string;
   t: Translator;
+  onTitleChange?: (surfaceId: string, title: string | null) => void;
+  onOpenExternal: (url: string) => Promise<boolean>;
 }) {
   const [address, setAddress] = useState("");
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
@@ -142,12 +139,53 @@ export function BrowserSurfacePanel({
   const [pageFrame, setPageFrame] = useState<BrowserPageFrame | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState("");
+  const [findCount, setFindCount] = useState<number | null>(null);
+  const [findBusy, setFindBusy] = useState(false);
+  const [zoomPercent, setZoomPercent] = useState(100);
+  const [copiedLink, setCopiedLink] = useState(false);
+  const [copiedScreenshot, setCopiedScreenshot] = useState(false);
+  const addressInputRef = useRef<HTMLInputElement | null>(null);
+  const findInputRef = useRef<HTMLInputElement | null>(null);
+  const menuRootRef = useRef<HTMLDivElement | null>(null);
   const frameElementRef = useRef<HTMLDivElement | null>(null);
   const frameImageRef = useRef<HTMLImageElement | null>(null);
   const refreshTimerRef = useRef<number | null>(null);
+  const viewportTimerRef = useRef<number | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+  const lastViewportRef = useRef("");
+  const viewportQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const frameRequestRef = useRef(0);
+
+  const syncViewport = useCallback(async () => {
+    const element = frameElementRef.current;
+    if (!element) return false;
+    const width = Math.max(1, Math.min(8192, Math.round(element.clientWidth)));
+    const height = Math.max(1, Math.min(8192, Math.round(element.clientHeight)));
+    const key = `${width}x${height}`;
+    if (key === lastViewportRef.current) return false;
+    let changed = false;
+    const queued = viewportQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (key === lastViewportRef.current) return;
+        await client.browserSetViewport(surfaceId, width, height);
+        lastViewportRef.current = key;
+        changed = true;
+      });
+    viewportQueueRef.current = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    await queued;
+    return changed;
+  }, [client, surfaceId]);
 
   const loadPageFrame = useCallback(
     async (url: string, failOnError = false) => {
+      const request = ++frameRequestRef.current;
       if (isBlankUrl(url)) {
         setPreview(null);
         setPageFrame(null);
@@ -155,10 +193,12 @@ export function BrowserSurfacePanel({
         return;
       }
       try {
+        await syncViewport();
         const [snapshot, screenshot] = await Promise.all([
           client.browserDomSnapshot(surfaceId),
           client.browserScreenshot(surfaceId, "png"),
         ]);
+        if (request !== frameRequestRef.current) return;
         setPreview(summarizeBrowserDom(snapshot.html));
         setPageFrame({
           byteCount: screenshot.byteCount,
@@ -166,6 +206,7 @@ export function BrowserSurfacePanel({
         });
         setPreviewError(null);
       } catch (cause) {
+        if (request !== frameRequestRef.current) return;
         const message =
           cause instanceof Error ? cause.message : t("browser.surface.renderFailed");
         setPreview(null);
@@ -176,7 +217,7 @@ export function BrowserSurfacePanel({
         }
       }
     },
-    [client, surfaceId, t],
+    [client, surfaceId, syncViewport, t],
   );
 
   const applyNavigationResult = useCallback(
@@ -222,9 +263,72 @@ export function BrowserSurfacePanel({
       if (refreshTimerRef.current !== null) {
         window.clearTimeout(refreshTimerRef.current);
       }
+      if (viewportTimerRef.current !== null) {
+        window.clearTimeout(viewportTimerRef.current);
+      }
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
     },
     [],
   );
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (!menuRootRef.current?.contains(event.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeMenu);
+    return () => document.removeEventListener("pointerdown", closeMenu);
+  }, [menuOpen]);
+
+  useEffect(() => {
+    if (findOpen) {
+      findInputRef.current?.focus();
+      findInputRef.current?.select();
+    }
+  }, [findOpen]);
+
+  useEffect(() => {
+    onTitleChange?.(
+      surfaceId,
+      preview?.title?.trim() || fallbackPageTitle(currentUrl),
+    );
+  }, [currentUrl, onTitleChange, preview?.title, surfaceId]);
+
+  useEffect(() => {
+    const element = frameElementRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const refreshForViewport = () => {
+      if (viewportTimerRef.current !== null) {
+        window.clearTimeout(viewportTimerRef.current);
+      }
+      viewportTimerRef.current = window.setTimeout(() => {
+        viewportTimerRef.current = null;
+        void syncViewport()
+          .then((changed) => {
+            if (changed && currentUrl && !isBlankUrl(currentUrl)) {
+              void loadPageFrame(currentUrl);
+            }
+          })
+          .catch((cause: unknown) => {
+            setError(cause instanceof Error ? cause.message : t("browser.surface.renderFailed"));
+          });
+      }, 80);
+    };
+    const observer = new ResizeObserver(refreshForViewport);
+    observer.observe(element);
+    refreshForViewport();
+    return () => {
+      observer.disconnect();
+      if (viewportTimerRef.current !== null) {
+        window.clearTimeout(viewportTimerRef.current);
+        viewportTimerRef.current = null;
+      }
+    };
+  }, [currentUrl, loadPageFrame, syncViewport, t]);
 
   const navigate = useCallback(async () => {
     const url = normalizeBrowserNavigationUrl(address);
@@ -267,20 +371,150 @@ export function BrowserSurfacePanel({
     [applyNavigationResult, client, surfaceId, t],
   );
 
-  const statusLabel = useMemo(() => {
-    if (loadState === "loading") {
-      return t("browser.surface.loading");
-    }
-    if (loadState === "error") {
-      return t("browser.surface.connectionError");
-    }
-    if (isBlankUrl(currentUrl)) {
-      return t("browser.surface.newTab");
-    }
-    return t("browser.surface.pageReady");
-  }, [currentUrl, loadState, t]);
-
   const controlsDisabled = loadState === "loading";
+  const addressUrl = normalizeBrowserNavigationUrl(address);
+  const externalUrl = normalizeBrowserNavigationUrl(
+    currentUrl && !isBlankUrl(currentUrl) ? currentUrl : address,
+  );
+  const showNavigateAction = Boolean(addressUrl && addressUrl !== currentUrl);
+
+  const openExternal = useCallback(async () => {
+    if (!externalUrl) return;
+    setError(null);
+    try {
+      if (await onOpenExternal(externalUrl)) return;
+      setError(t("browser.surface.externalOpenFailed"));
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : t("browser.surface.externalOpenFailed"),
+      );
+    }
+  }, [externalUrl, onOpenExternal, t]);
+
+  const runFind = useCallback(async () => {
+    const query = findQuery.trim();
+    if (!query) {
+      setFindCount(null);
+      return;
+    }
+    setFindBusy(true);
+    setError(null);
+    try {
+      const result = await client.browserFind(surfaceId, query, { limit: 1 });
+      await client.browserEvaluate(
+        surfaceId,
+        `window.find(${JSON.stringify(query)}, false, false, true, false, false, false)`,
+      );
+      setFindCount(result.count);
+      if (currentUrl && !isBlankUrl(currentUrl)) {
+        await loadPageFrame(currentUrl);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t("browser.surface.findFailed"));
+    } finally {
+      setFindBusy(false);
+    }
+  }, [client, currentUrl, findQuery, loadPageFrame, surfaceId, t]);
+
+  const applyZoom = useCallback(
+    async (percent: number) => {
+      const next = Math.max(25, Math.min(500, percent));
+      setLoadState("loading");
+      setError(null);
+      try {
+        await client.browserZoom(surfaceId, next);
+        setZoomPercent(next);
+        if (currentUrl && !isBlankUrl(currentUrl)) {
+          await loadPageFrame(currentUrl);
+        }
+        setLoadState("ready");
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : t("browser.surface.zoomFailed"));
+        setLoadState("error");
+      }
+    },
+    [client, currentUrl, loadPageFrame, surfaceId, t],
+  );
+
+  const copyCurrentLink = useCallback(async () => {
+    if (!externalUrl) return;
+    setError(null);
+    try {
+      try {
+        await navigator.clipboard.writeText(externalUrl);
+      } catch {
+        const clipboard = await import("@tauri-apps/plugin-clipboard-manager");
+        await clipboard.writeText(externalUrl);
+      }
+      setCopiedLink(true);
+      setCopiedScreenshot(false);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopiedLink(false);
+      }, 1400);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : t("browser.surface.externalOpenFailed"),
+      );
+    }
+  }, [externalUrl, t]);
+
+  const copyPageScreenshot = useCallback(async () => {
+    if (!pageFrame) return;
+    setError(null);
+    try {
+      const response = await fetch(pageFrame.dataUrl);
+      const blob = await response.blob();
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      try {
+        const clipboard = await import("@tauri-apps/plugin-clipboard-manager");
+        await clipboard.writeImage(bytes);
+      } catch (tauriError) {
+        if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+          throw tauriError;
+        }
+        await navigator.clipboard.write([
+          new ClipboardItem({ "image/png": blob }),
+        ]);
+      }
+      setCopiedLink(false);
+      setCopiedScreenshot(true);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        copyTimerRef.current = null;
+        setCopiedScreenshot(false);
+      }, 1400);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : t("browser.surface.screenshotFailed"),
+      );
+    }
+  }, [pageFrame, t]);
+
+  const handleBrowserShortcut = useCallback((event: React.KeyboardEvent<HTMLElement>) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    const key = event.key.toLowerCase();
+    if (key === "l") {
+      event.preventDefault();
+      addressInputRef.current?.focus();
+      addressInputRef.current?.select();
+    } else if (key === "f") {
+      event.preventDefault();
+      setMenuOpen(false);
+      setFindOpen(true);
+    }
+  }, []);
 
   const handleFrameClick = useCallback(
     async (event: React.MouseEvent<HTMLImageElement>) => {
@@ -360,6 +594,7 @@ export function BrowserSurfacePanel({
   return (
     <section
       aria-label="Browser surface"
+      onKeyDown={handleBrowserShortcut}
       style={{
         background: "var(--term)",
         color: "var(--fg2)",
@@ -371,28 +606,12 @@ export function BrowserSurfacePanel({
         minHeight: 0,
       }}
     >
-      <header
-        style={{
-          alignItems: "center",
-          borderBottom: "1px solid var(--border)",
-          display: "flex",
-          flexWrap: "wrap",
-          gap: 6,
-          padding: "8px 10px",
-        }}
-      >
-        <span
-          aria-hidden="true"
-          className="agentmux-browser-surface-icon"
-          style={{ color: "var(--fg3)", display: "inline-flex", flex: "none" }}
-        >
-          <IconGlobe size={16} />
-        </span>
+      <header className="agentmux-browser-toolbar">
         <button
           aria-label={t("browser.surface.back")}
+          className="agentmux-browser-nav-button"
           disabled={controlsDisabled}
           onClick={() => void runNavigationAction("back")}
-          style={{ ...buttonStyle, padding: 0, width: 30 }}
           title={t("browser.surface.back")}
           type="button"
         >
@@ -400,9 +619,9 @@ export function BrowserSurfacePanel({
         </button>
         <button
           aria-label={t("browser.surface.forward")}
+          className="agentmux-browser-nav-button"
           disabled={controlsDisabled}
           onClick={() => void runNavigationAction("forward")}
-          style={{ ...buttonStyle, padding: 0, width: 30 }}
           title={t("browser.surface.forward")}
           type="button"
         >
@@ -410,25 +629,22 @@ export function BrowserSurfacePanel({
         </button>
         <button
           aria-label={t("browser.surface.reload")}
+          className={`agentmux-browser-nav-button${controlsDisabled ? " is-loading" : ""}`}
           disabled={controlsDisabled}
           onClick={() => void runNavigationAction("reload")}
-          style={{ ...buttonStyle, padding: 0, width: 30 }}
           title={t("browser.surface.reload")}
           type="button"
         >
           <IconReload size={14} />
         </button>
         <form
+          className="agentmux-browser-address-form"
           onSubmit={(event) => {
             event.preventDefault();
             void navigate();
           }}
-          style={{ display: "flex", flex: "1 1 260px", gap: 6, minWidth: 180 }}
         >
-          <label htmlFor={`browser-address-${surfaceId}`} style={{ display: "contents" }}>
-            <span style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clipPath: "inset(50%)" }}>
-              {t("browser.surface.address")}
-            </span>
+          <div className="agentmux-browser-address-shell">
             <input
               aria-label={t("browser.surface.address")}
               autoCapitalize="none"
@@ -437,85 +653,228 @@ export function BrowserSurfacePanel({
               id={`browser-address-${surfaceId}`}
               onChange={(event) => setAddress(event.target.value)}
               placeholder="https://example.com"
+              ref={addressInputRef}
               spellCheck={false}
-              style={{ ...inputStyle, flex: 1, minWidth: 0 }}
               value={address}
             />
-          </label>
-          <button disabled={controlsDisabled} style={buttonStyle} type="submit">
-            {t("browser.surface.go")}
-          </button>
+            <span className="agentmux-browser-address-actions">
+              {showNavigateAction && (
+                <button
+                  aria-label={t("browser.surface.go")}
+                  className="agentmux-browser-address-action agentmux-browser-address-go"
+                  disabled={controlsDisabled}
+                  title={t("browser.surface.go")}
+                  type="submit"
+                >
+                  <IconArrowRight size={14} />
+                </button>
+              )}
+              <button
+                aria-label={t("browser.surface.openExternal")}
+                className="agentmux-browser-address-action agentmux-browser-open-external"
+                disabled={controlsDisabled || !externalUrl}
+                onClick={() => void openExternal()}
+                title={t("browser.surface.openExternal")}
+                type="button"
+              >
+                <IconExternalLink size={14} />
+              </button>
+            </span>
+          </div>
         </form>
+        <div className="agentmux-browser-menu-root" ref={menuRootRef}>
+          <button
+            aria-expanded={menuOpen}
+            aria-haspopup="menu"
+            aria-label={t("browser.surface.more")}
+            className="agentmux-browser-nav-button"
+            onClick={() => setMenuOpen((open) => !open)}
+            title={t("browser.surface.more")}
+            type="button"
+          >
+            <IconMoreVertical size={14} />
+          </button>
+          {menuOpen && (
+            <div className="agentmux-browser-menu" role="menu">
+              <button
+                className="agentmux-browser-menu-item"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setFindOpen(true);
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <IconSearch size={14} />
+                <span>{t("browser.surface.find")}</span>
+              </button>
+              <div
+                aria-label={t("browser.surface.zoom")}
+                className="agentmux-browser-menu-zoom"
+                role="group"
+              >
+                <span>{t("browser.surface.zoom")}</span>
+                <div>
+                  <button
+                    aria-label={t("browser.surface.zoomOut")}
+                    disabled={controlsDisabled || zoomPercent <= 25}
+                    onClick={() => void applyZoom(zoomPercent - 25)}
+                    title={t("browser.surface.zoomOut")}
+                    type="button"
+                  >
+                    <IconMinus size={13} />
+                  </button>
+                  <button
+                    aria-label={t("browser.surface.zoomReset")}
+                    disabled={controlsDisabled || zoomPercent === 100}
+                    onClick={() => void applyZoom(100)}
+                    title={t("browser.surface.zoomReset")}
+                    type="button"
+                  >
+                    {zoomPercent}%
+                  </button>
+                  <button
+                    aria-label={t("browser.surface.zoomIn")}
+                    disabled={controlsDisabled || zoomPercent >= 500}
+                    onClick={() => void applyZoom(zoomPercent + 25)}
+                    title={t("browser.surface.zoomIn")}
+                    type="button"
+                  >
+                    <IconPlus size={13} />
+                  </button>
+                </div>
+              </div>
+              <div className="agentmux-browser-menu-separator" />
+              <button
+                className="agentmux-browser-menu-item"
+                disabled={!externalUrl}
+                onClick={() => void copyCurrentLink()}
+                role="menuitem"
+                type="button"
+              >
+                <IconCopy size={14} />
+                <span>
+                  {copiedLink
+                    ? t("browser.surface.copied")
+                    : t("browser.surface.copyLink")}
+                </span>
+              </button>
+              <button
+                className="agentmux-browser-menu-item"
+                disabled={!pageFrame}
+                onClick={() => void copyPageScreenshot()}
+                role="menuitem"
+                type="button"
+              >
+                <IconCamera size={14} />
+                <span>
+                  {copiedScreenshot
+                    ? t("browser.surface.screenshotCopied")
+                    : t("browser.surface.screenshotCopy")}
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
-      <div
-        aria-live="polite"
-        style={{
-          borderBottom: "1px solid var(--border)",
-          color: loadState === "error" ? "var(--red, #F87171)" : "var(--fg3)",
-          display: "flex",
-          gap: 8,
-          minHeight: 30,
-          padding: "7px 12px",
-        }}
-      >
-        <strong style={{ color: "var(--fg1)", fontWeight: 600 }}>{statusLabel}</strong>
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {currentUrl ?? t("browser.surface.connecting")}
-        </span>
-      </div>
+      {controlsDisabled && (
+        <div
+          aria-hidden="true"
+          className="agentmux-browser-loading-track"
+        >
+          <span />
+        </div>
+      )}
+
+      {findOpen && (
+        <form
+          className="agentmux-browser-findbar"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void runFind();
+          }}
+        >
+          <IconSearch size={13} />
+          <input
+            aria-label={t("browser.surface.find")}
+            disabled={findBusy}
+            onChange={(event) => {
+              setFindQuery(event.target.value);
+              setFindCount(null);
+            }}
+            ref={findInputRef}
+            value={findQuery}
+          />
+          <span aria-live="polite">
+            {findCount === null
+              ? ""
+              : t("browser.surface.findCount", { count: findCount })}
+          </span>
+          <button
+            aria-label={t("browser.surface.find")}
+            disabled={findBusy || !findQuery.trim()}
+            title={t("browser.surface.find")}
+            type="submit"
+          >
+            <IconArrowRight size={13} />
+          </button>
+          <button
+            aria-label={t("common.dismiss")}
+            onClick={() => setFindOpen(false)}
+            title={t("common.dismiss")}
+            type="button"
+          >
+            <IconClose size={11} />
+          </button>
+        </form>
+      )}
+
+      {error && (
+        <div className="agentmux-browser-error-banner" role="alert">
+          <span>{error}</span>
+          <button
+            aria-label={t("common.dismiss")}
+            onClick={() => setError(null)}
+            title={t("common.dismiss")}
+            type="button"
+          >
+            <IconClose size={11} />
+          </button>
+        </div>
+      )}
 
       <main
-        className="agentmux-scroll"
         style={{
           display: "flex",
           flex: 1,
           flexDirection: "column",
-          gap: 12,
           minHeight: 0,
-          overflow: "auto",
-          padding: "16px 18px",
+          minWidth: 0,
+          overflow: "hidden",
+          padding: 0,
+          position: "relative",
         }}
       >
-        {error && (
-          <div
-            role="alert"
-            style={{
-              background: "color-mix(in srgb, var(--red, #F87171) 12%, var(--s1))",
-              border: "1px solid color-mix(in srgb, var(--red, #F87171) 45%, var(--border))",
-              borderRadius: 6,
-              color: "var(--fg1)",
-              lineHeight: 1.45,
-              padding: "10px 12px",
-              wordBreak: "break-word",
-            }}
-          >
-            {error}
-          </div>
-        )}
-
-        {pageFrame ? (
-          <div
-            aria-label="Interactive page preview"
-            onKeyDown={handleFrameKeyDown}
-            onWheel={handleFrameWheel}
-            ref={frameElementRef}
-            style={{
-              alignItems: "flex-start",
-              background: "#fff",
-              border: "1px solid var(--border)",
-              borderRadius: 4,
-              display: "flex",
-              flex: "1 1 auto",
-              justifyContent: "center",
-              minHeight: 180,
-              minWidth: 0,
-              overflow: "auto",
-              outline: "none",
-            }}
-            tabIndex={0}
-            title={`${pageFrame.byteCount.toLocaleString()} byte page frame`}
-          >
+        <div
+          aria-label="Interactive page preview"
+          onKeyDown={handleFrameKeyDown}
+          onWheel={handleFrameWheel}
+          ref={frameElementRef}
+          style={{
+            alignItems: "stretch",
+            background: pageFrame ? "#fff" : "var(--term)",
+            display: "flex",
+            flex: "1 1 0",
+            justifyContent: "stretch",
+            minHeight: 0,
+            minWidth: 0,
+            overflow: "hidden",
+            outline: "none",
+          }}
+          tabIndex={0}
+        >
+          {pageFrame ? (
             <img
               alt={preview?.title ?? currentUrl ?? "Browser page"}
               draggable={false}
@@ -525,52 +884,84 @@ export function BrowserSurfacePanel({
               style={{
                 cursor: "default",
                 display: "block",
-                height: "auto",
-                maxWidth: "100%",
+                height: "100%",
+                maxWidth: "none",
+                objectFit: "fill",
                 userSelect: "none",
                 width: "100%",
               }}
             />
-          </div>
-        ) : preview ? (
-          <article aria-label="Read-only page preview" style={{ minWidth: 0 }}>
-            {preview.title && (
-              <h2 style={{ color: "var(--fg1)", fontSize: 15, fontWeight: 650, margin: "0 0 10px" }}>
-                {preview.title}
-              </h2>
-            )}
-            {preview.text ? (
-              <pre
-                style={{
-                  background: "var(--canvas)",
-                  border: "1px solid var(--border)",
-                  borderRadius: 6,
-                  color: "var(--fg1)",
-                  fontFamily: FONT_MONO,
-                  fontSize: 12,
-                  lineHeight: 1.5,
-                  margin: 0,
-                  overflow: "auto",
-                  padding: 12,
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-word",
-                }}
-              >
-                {preview.text}
-                {preview.truncated ? `\n\n${t("browser.surface.previewTruncated")}` : ""}
-              </pre>
-            ) : (
-              <p style={{ color: "var(--fg3)", margin: 0 }}>
-                {t("browser.surface.noReadableText")}
-              </p>
-            )}
-          </article>
-        ) : (
-          <div style={{ color: "var(--fg3)", lineHeight: 1.5, maxWidth: 620 }}>
-            <strong style={{ color: "var(--fg1)" }}>{t("browser.surface.newTab")}</strong>
-            {previewError && <p style={{ color: "var(--red, #F87171)", margin: "8px 0 0" }}>{previewError}</p>}
-          </div>
-        )}
+          ) : preview ? (
+            <article
+              aria-label="Read-only page preview"
+              style={{ minWidth: 0, overflow: "auto", padding: 18 }}
+            >
+              {preview.title && (
+                <h2
+                  style={{
+                    color: "var(--fg1)",
+                    fontSize: 15,
+                    fontWeight: 650,
+                    margin: "0 0 10px",
+                  }}
+                >
+                  {preview.title}
+                </h2>
+              )}
+              {preview.text ? (
+                <pre
+                  style={{
+                    background: "var(--canvas)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 6,
+                    color: "var(--fg1)",
+                    fontFamily: FONT_MONO,
+                    fontSize: 12,
+                    lineHeight: 1.5,
+                    margin: 0,
+                    overflow: "auto",
+                    padding: 12,
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {preview.text}
+                  {preview.truncated
+                    ? `\n\n${t("browser.surface.previewTruncated")}`
+                    : ""}
+                </pre>
+              ) : (
+                <p style={{ color: "var(--fg3)", margin: 0 }}>
+                  {t("browser.surface.noReadableText")}
+                </p>
+              )}
+            </article>
+          ) : (
+            <div
+              style={{
+                alignSelf: "center",
+                color: "var(--fg3)",
+                lineHeight: 1.5,
+                maxWidth: 620,
+                padding: 18,
+              }}
+            >
+              <strong style={{ color: "var(--fg1)" }}>
+                {t("browser.surface.newTab")}
+              </strong>
+              {previewError && (
+                <p
+                  style={{
+                    color: "var(--red, #F87171)",
+                    margin: "8px 0 0",
+                  }}
+                >
+                  {previewError}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
       </main>
     </section>
   );

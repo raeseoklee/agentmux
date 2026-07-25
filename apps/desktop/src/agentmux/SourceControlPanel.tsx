@@ -56,6 +56,14 @@ interface PanelTarget {
   generation: number;
 }
 
+interface CachedStatusView {
+  summary: GitStatusSummary;
+  changes: GitChangeSummary[];
+  nextCursor: string | null;
+  filteredCount: number | null;
+  storedAt: number;
+}
+
 interface SourceControlAction {
   retryKey: string;
   idempotencyKey: string;
@@ -79,6 +87,7 @@ type Row =
   | { kind: "empty"; key: string; text: string };
 
 const PAGE_SIZE = 250;
+const MAX_STATUS_VIEW_CACHE_ENTRIES = 24;
 const MIN_CHANGE_HEIGHT = 120;
 const MIN_DIFF_HEIGHT = 180;
 const SPLIT_RATIO_STORAGE_KEY = "agentmux.sourceControl.changeListRatio.v1";
@@ -128,9 +137,27 @@ function splitPath(path: string): { name: string; directory: string } {
 
 export function isRecoverableGitSnapshotError(cause: unknown): boolean {
   const message = cause instanceof Error ? cause.message : String(cause);
-  return /status scan was cancel(?:led|ed)|snapshot is no longer available|repository changed while its status snapshot was loading/i.test(
+  return /status scan was cancel(?:led|ed)|snapshot is no longer available|repository changed while its status snapshot was loading|repository generation changed/i.test(
     message,
   );
+}
+
+function statusViewCacheKey(targetKey: string, query: string): string {
+  return `${targetKey}\u001f${query}`;
+}
+
+function rememberStatusView(
+  cache: Map<string, CachedStatusView>,
+  key: string,
+  view: Omit<CachedStatusView, "storedAt">,
+): void {
+  cache.delete(key);
+  cache.set(key, { ...view, storedAt: Date.now() });
+  if (cache.size <= MAX_STATUS_VIEW_CACHE_ENTRIES) return;
+  const oldest = [...cache.entries()].sort(
+    ([, left], [, right]) => left.storedAt - right.storedAt,
+  )[0]?.[0];
+  if (oldest) cache.delete(oldest);
 }
 
 function worktreeStateLabel(t: Translator, state: string): string {
@@ -258,8 +285,10 @@ export function SourceControlPanel({
   const worktreeSequence = useRef(0);
   const loadedGeneration = useRef<number | null>(null);
   const loadedRepositoryId = useRef<string | null>(null);
+  const statusViewCache = useRef(new Map<string, CachedStatusView>());
   const lastRefresh = useRef(0);
   const eventTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const retryTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const actionSequence = useRef(0);
   const actionNamespace = useRef(
     `panel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
@@ -363,6 +392,13 @@ export function SourceControlPanel({
     return () => window.clearTimeout(timeout);
   }, [filter]);
 
+  useEffect(
+    () => () => {
+      if (retryTimer.current) window.clearTimeout(retryTimer.current);
+    },
+    [],
+  );
+
   useEffect(() => {
     try {
       window.localStorage.setItem(SPLIT_RATIO_STORAGE_KEY, String(ratio));
@@ -446,9 +482,15 @@ export function SourceControlPanel({
 
   const refresh = useCallback(
     async (showLoading = false, reuseLoadedSnapshot = false) => {
+      if (retryTimer.current) {
+        window.clearTimeout(retryTimer.current);
+        retryTimer.current = null;
+      }
       const sequence = ++refreshSequence.current;
       const expectedTarget = captureTarget();
       const query = serverQueryRef.current;
+      const cacheKey = statusViewCacheKey(expectedTarget.key, query);
+      const cachedView = statusViewCache.current.get(cacheKey) ?? null;
       const requestedGeneration = reuseLoadedSnapshot
         ? loadedGeneration.current
         : null;
@@ -485,10 +527,12 @@ export function SourceControlPanel({
         loadedGeneration.current = page.generation;
         loadedRepositoryId.current = page.repositoryId;
         if (!page.summary) {
-          setSummary(null);
-          setChanges(page.changes);
-          setNextCursor(null);
-          setFilteredCount(null);
+          if (!cachedView) {
+            setSummary(null);
+            setChanges(page.changes);
+            setNextCursor(null);
+            setFilteredCount(null);
+          }
           setError(null);
           setLoading(false);
           await new Promise<void>((resolve) =>
@@ -545,6 +589,12 @@ export function SourceControlPanel({
         setChanges(page.changes);
         setNextCursor(page.nextCursor ?? null);
         setFilteredCount(page.totalCount ?? null);
+        rememberStatusView(statusViewCache.current, cacheKey, {
+          summary: nextSummary,
+          changes: page.changes,
+          nextCursor: page.nextCursor ?? null,
+          filteredCount: page.totalCount ?? null,
+        });
         loadedGeneration.current = page.generation;
         loadedRepositoryId.current = page.repositoryId;
         lastRefresh.current = Date.now();
@@ -560,16 +610,21 @@ export function SourceControlPanel({
           sequence === refreshSequence.current &&
           isCurrentTarget(expectedTarget) &&
           query === serverQueryRef.current &&
-          statusRetryCount.current < 3
+          statusRetryCount.current < 6
         ) {
           statusRetryCount.current += 1;
           loadedGeneration.current = null;
           loadedRepositoryId.current = null;
           setError(null);
-          window.setTimeout(
-            () => void refresh(showLoading, false),
-            50 * statusRetryCount.current,
-          );
+          retryTimer.current = window.setTimeout(() => {
+            retryTimer.current = null;
+            if (
+              isCurrentTarget(expectedTarget) &&
+              query === serverQueryRef.current
+            ) {
+              void refresh(showLoading, false);
+            }
+          }, 80 * statusRetryCount.current);
           return;
         }
         if (
@@ -625,7 +680,20 @@ export function SourceControlPanel({
         await refresh();
         return;
       }
-      setChanges((current) => [...current, ...page.changes]);
+      setChanges((current) => {
+        const merged = [...current, ...page.changes];
+        rememberStatusView(
+          statusViewCache.current,
+          statusViewCacheKey(operationTarget.key, query),
+          {
+            summary,
+            changes: merged,
+            nextCursor: page.nextCursor ?? null,
+            filteredCount,
+          },
+        );
+        return merged;
+      });
       setNextCursor(page.nextCursor ?? null);
       loadedGeneration.current = page.generation;
     } catch (cause) {
@@ -655,6 +723,7 @@ export function SourceControlPanel({
     activePaneId,
     captureTarget,
     client,
+    filteredCount,
     isCurrentTarget,
     loadingMore,
     nextCursor,
@@ -671,12 +740,21 @@ export function SourceControlPanel({
     loadedGeneration.current = null;
     loadedRepositoryId.current = null;
     statusRetryCount.current = 0;
+    if (retryTimer.current) {
+      window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
     setLoadingMore(false);
     setBusy(false);
-    setSummary(null);
-    setChanges([]);
-    setNextCursor(null);
-    setFilteredCount(null);
+    const cachedView = statusViewCache.current.get(
+      statusViewCacheKey(expectedTarget.key, serverQueryRef.current),
+    );
+    setSummary(cachedView?.summary ?? null);
+    setChanges(cachedView?.changes ?? []);
+    setNextCursor(cachedView?.nextCursor ?? null);
+    setFilteredCount(cachedView?.filteredCount ?? null);
+    loadedGeneration.current = cachedView?.summary.generation ?? null;
+    loadedRepositoryId.current = cachedView?.summary.repositoryId ?? null;
     setSelection(null);
     setDiff(null);
     setThreads([]);
@@ -685,7 +763,7 @@ export function SourceControlPanel({
     setWorktrees([]);
     setCommitMessage("");
     setError(null);
-    void refresh(true, false);
+    void refresh(!cachedView, false);
     void client
       .getWorkspace(workspace.workspaceId)
       .then((detail) => {
@@ -708,10 +786,16 @@ export function SourceControlPanel({
     if (previousQueryRef.current === serverQuery) return;
     previousQueryRef.current = serverQuery;
     setLoadingMore(false);
-    setChanges([]);
-    setNextCursor(null);
-    setFilteredCount(null);
-    void refresh(true, true);
+    const cachedView = statusViewCache.current.get(
+      statusViewCacheKey(targetKeyRef.current, serverQuery),
+    );
+    setSummary(cachedView?.summary ?? null);
+    setChanges(cachedView?.changes ?? []);
+    setNextCursor(cachedView?.nextCursor ?? null);
+    setFilteredCount(cachedView?.filteredCount ?? null);
+    loadedGeneration.current = cachedView?.summary.generation ?? null;
+    loadedRepositoryId.current = cachedView?.summary.repositoryId ?? null;
+    void refresh(!cachedView, Boolean(cachedView));
   }, [refresh, serverQuery]);
 
   useEffect(() => {

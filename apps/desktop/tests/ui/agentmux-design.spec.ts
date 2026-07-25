@@ -1771,10 +1771,41 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
   await expect(page.getByText("New browser tab").first()).toBeVisible();
 
   await page.getByLabel("Page address").fill("localhost:5173");
+  const addressShell = page.locator(".agentmux-browser-address-shell");
+  await expect(
+    addressShell.getByRole("button", { name: "Open in system browser" }),
+  ).toHaveCount(1);
   await page.getByRole("button", { name: "Go" }).click();
-  await expect(page.getByText("Page ready").first()).toBeVisible();
+  await expect(page.getByText("Page ready")).toHaveCount(0);
+  await expect(page.locator(".agentmux-surface-tab").last()).toContainText(
+    "http://localhost:5173",
+  );
+  await page.evaluate(() => {
+    (window as unknown as { __agentmuxOpenedExternal?: string }).__agentmuxOpenedExternal = "";
+    window.open = ((url?: string | URL) => {
+      (window as unknown as { __agentmuxOpenedExternal?: string }).__agentmuxOpenedExternal =
+        String(url ?? "");
+      return window;
+    }) as typeof window.open;
+  });
+  await page.getByRole("button", { name: "Open in system browser" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __agentmuxOpenedExternal?: string })
+            .__agentmuxOpenedExternal,
+      ),
+    )
+    .toBe("http://localhost:5173");
   const pageFrame = page.locator('img[src^="data:image/png;base64,"]');
   await expect(pageFrame).toBeVisible();
+  const frameBox = await page.getByLabel("Interactive page preview").boundingBox();
+  const imageBox = await pageFrame.boundingBox();
+  expect(frameBox).not.toBeNull();
+  expect(imageBox).not.toBeNull();
+  expect(Math.abs((frameBox?.width ?? 0) - (imageBox?.width ?? 0))).toBeLessThan(2);
+  expect(Math.abs((frameBox?.height ?? 0) - (imageBox?.height ?? 0))).toBeLessThan(2);
   await pageFrame.click({ position: { x: 8, y: 8 } });
   await page.keyboard.type("a");
   await pageFrame.dispatchEvent("wheel", { deltaY: 240 });
@@ -1793,6 +1824,90 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
       page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
     )
     .toContain("scroll:");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
+    )
+    .toContain("viewport:");
+
+  await page.getByRole("button", { name: "More browser actions" }).click();
+  await expect(page.getByRole("menu")).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Copy page screenshot" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Zoom in" }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
+    )
+    .toContain("zoom:");
+
+  await page.getByRole("menuitem", { name: "Find in page" }).click();
+  const findBar = page.locator(".agentmux-browser-findbar");
+  await expect(findBar).toBeVisible();
+  await findBar.getByRole("textbox", { name: "Find in page" }).fill("localhost");
+  await findBar.getByRole("button", { name: "Find in page" }).click();
+  await expect(findBar.getByText("1 matches")).toBeVisible();
+});
+
+test("source control keeps the last complete snapshot while a transient refresh recovers", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-status-git-button").click();
+  const panel = page.getByTestId("source-control-panel");
+  await expect(panel.getByText("main", { exact: true })).toBeVisible();
+  await expect(panel.getByTestId("source-control-change-working")).toHaveCount(1);
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { failNextGitStatusPage(message?: string): void };
+    }).__AGENTMUX_PREVIEW__?.failNextGitStatusPage();
+  });
+  await panel.getByRole("button", { name: "Refresh" }).click();
+
+  await expect(panel.getByText("main", { exact: true })).toBeVisible();
+  await expect(panel.getByTestId("source-control-change-working")).toHaveCount(1);
+  await expect(
+    panel.getByText(/snapshot is no longer available/i),
+  ).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const requests = (window as unknown as {
+          __AGENTMUX_PREVIEW__?: { gitRequests(): Array<{ operation: string }> };
+        }).__AGENTMUX_PREVIEW__?.gitRequests() ?? [];
+        return requests.filter((request) => request.operation === "page").length;
+      }),
+    )
+    .toBeGreaterThan(1);
+});
+
+test("pane browser button opens a browser in an adjacent split", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const activeTree = page.locator(
+    '[data-agentmux-tab-pane-tree][data-agentmux-tab-active="true"]',
+  );
+  await expect(activeTree.locator("[data-agentmux-pane]")).toHaveCount(1);
+
+  const browserButton = activeTree.locator(".agentmux-pane-open-browser");
+  await expect(browserButton).toHaveCount(1);
+  await expect
+    .poll(() =>
+      browserButton.evaluate((element) =>
+        element.nextElementSibling?.classList.contains(
+          "agentmux-pane-split-vertical",
+        ),
+      ),
+    )
+    .toBe(true);
+
+  await browserButton.click();
+
+  await expect(activeTree.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(activeTree.getByLabel("Page address")).toBeVisible();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 });
 
 test("agent tmux session opens as a separate top tab without splitting the current tab", async ({
@@ -2938,7 +3053,7 @@ test("terminal GPU acceleration setting persists and reports policy diagnostics"
   ).toHaveText(["자동", "켜기", "끄기"]);
   await expect(
     page.locator(".agentmux-terminal-gpu-acceleration-hint"),
-  ).toContainText("포커스된 터미널만");
+  ).toContainText("포커스된 Terminal만");
 });
 
 test("settings reload config applies external changes without restart", async ({

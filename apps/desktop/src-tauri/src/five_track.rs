@@ -54,7 +54,6 @@ use agentmux_vcs::{
     StatusReadResult, StatusScan, StatusScanFirstPage, StatusSnapshot,
 };
 const LEGACY_GIT_STATUS: &str = "git.status";
-const STATUS_CACHE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const REPOSITORY_MONITOR_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const REPOSITORY_FALLBACK_STATUS_INTERVAL: Duration = Duration::from_secs(30);
 const REPOSITORY_EVENT_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -579,10 +578,7 @@ impl DesktopControlState {
         let generation = self.five_track.shared.git.generation(repository);
         if let Ok(cache) = self.five_track.shared.git_status_cache.lock() {
             if let Some(entry) = cache.get(&repository_id) {
-                if entry.snapshot.summary.generation == generation
-                    && (requested_generation.is_some()
-                        || entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE)
-                {
+                if entry.snapshot.summary.generation == generation {
                     validate_generation(requested_generation, generation)?;
                     return Ok((repository_id, entry.clone()));
                 }
@@ -724,6 +720,15 @@ impl DesktopControlState {
             captured_at: Instant::now(),
         };
         if let Ok(mut cache) = self.five_track.shared.git_status_cache.lock() {
+            if cache.len() >= MAX_OBSERVED_REPOSITORIES && !cache.contains_key(repository_id) {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.captured_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
             cache.insert(repository_id.to_string(), cached.clone());
         }
         if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
@@ -749,11 +754,17 @@ impl DesktopControlState {
         }
     }
 
-    fn observe_repository(&self, workspace_id: &str, repository_id: &str, repository: &Repository) {
+    fn observe_repository(
+        &self,
+        workspace_id: &str,
+        repository_id: &str,
+        repository: &Repository,
+    ) -> bool {
         let key = format!("{workspace_id}|{repository_id}");
         let Ok(mut observed) = self.five_track.shared.observed_repositories.lock() else {
-            return;
+            return false;
         };
+        let observation_created = !observed.contains_key(&key);
         if observed.len() >= MAX_OBSERVED_REPOSITORIES && !observed.contains_key(&key) {
             if let Some(oldest_key) = observed
                 .iter()
@@ -801,6 +812,7 @@ impl DesktopControlState {
                 debounce_cancel: None,
                 last_observed_at: Instant::now(),
             });
+        observation_created
     }
 
     fn observe_and_arm_repository(
@@ -809,7 +821,21 @@ impl DesktopControlState {
         repository_id: &str,
         repository: &Repository,
     ) {
-        self.observe_repository(workspace_id, repository_id, repository);
+        let had_cached_snapshot = self
+            .five_track
+            .shared
+            .git_status_cache
+            .lock()
+            .ok()
+            .is_some_and(|cache| cache.contains_key(repository_id));
+        let observation_created = self.observe_repository(workspace_id, repository_id, repository);
+        if observation_created && had_cached_snapshot {
+            self.five_track
+                .shared
+                .git
+                .mark_repository_changed(repository);
+            self.invalidate_status_snapshot(repository_id);
+        }
         let key = format!("{workspace_id}|{repository_id}");
         arm_observed_repository(
             &self.five_track.shared,
@@ -917,10 +943,7 @@ impl DesktopControlState {
                 .lock()
                 .ok()
                 .and_then(|cache| cache.get(&repository_id).cloned())
-                .filter(|entry| {
-                    entry.snapshot.summary.generation == generation
-                        && entry.captured_at.elapsed() <= STATUS_CACHE_MAX_AGE
-                });
+                .filter(|entry| entry.snapshot.summary.generation == generation);
             if let Some(cached) = cached {
                 return self.complete_status_page_response(
                     request,
@@ -5494,13 +5517,11 @@ mod tests {
 
     #[test]
     fn repository_monitor_policy_is_change_driven_and_bounded() {
-        let status_cache_max_age = std::hint::black_box(STATUS_CACHE_MAX_AGE);
         let fallback_interval = std::hint::black_box(REPOSITORY_FALLBACK_STATUS_INTERVAL);
         let watcher_starts = std::hint::black_box(MAX_WATCHER_STARTS_PER_TICK);
         let fallback_reads = std::hint::black_box(MAX_FALLBACK_STATUS_READS_PER_TICK);
         let event_debounce = std::hint::black_box(REPOSITORY_EVENT_DEBOUNCE);
 
-        assert!(status_cache_max_age >= Duration::from_secs(5 * 60));
         assert!(
             fallback_interval >= Duration::from_secs(30),
             "fallback Git status must remain low-frequency"
@@ -5548,6 +5569,51 @@ mod tests {
         )));
         drop(observed);
         fs::remove_dir_all(repository_path).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn reobserved_repository_invalidates_cache_after_monitor_gap() {
+        let repository_path = create_git_repository("watcher-gap");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .expect("resolved repository");
+        let (repository_id, cached) = host
+            .status_snapshot("ws_watcher_gap", &repository)
+            .expect("initial cached snapshot");
+        let key = format!("ws_watcher_gap|{repository_id}");
+        if let Some(mut observation) = host
+            .five_track
+            .shared
+            .observed_repositories
+            .lock()
+            .unwrap()
+            .remove(&key)
+        {
+            if let Some(cancel) = observation.watch_cancel.take() {
+                cancel.request();
+            }
+        }
+
+        host.observe_and_arm_repository("ws_watcher_gap", &repository_id, &repository);
+
+        assert!(
+            host.five_track.shared.git.generation(&repository) > cached.snapshot.summary.generation
+        );
+        assert!(!host
+            .five_track
+            .shared
+            .git_status_cache
+            .lock()
+            .unwrap()
+            .contains_key(&repository_id));
+        fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
     }
 
     fn assert_large_git_page_pipeline(file_count: usize, budget: Duration) {

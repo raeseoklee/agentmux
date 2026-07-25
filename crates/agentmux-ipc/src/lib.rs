@@ -999,6 +999,13 @@ pub struct BrowserZoomParams {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BrowserViewportParams {
+    pub surface_id: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BrowserWaitForSelectorParams {
     pub surface_id: String,
     pub selector: String,
@@ -1154,6 +1161,8 @@ pub struct SessionSummaryResult {
     pub session_id: String,
     pub workspace_id: String,
     pub backend_kind: String,
+    #[serde(default)]
+    pub backend_profile: Option<String>,
     pub state: String,
     pub exit_code: Option<i32>,
     pub backend_native_id: Option<String>,
@@ -4131,6 +4140,16 @@ mod tests {
         let params: BrowserDomSnapshotParams = request.parse_params().unwrap();
         assert_eq!(params.surface_id, "surf_browser");
         assert_eq!(params.frame_id.as_deref(), Some("frame_1"));
+
+        let request = RequestEnvelope::new(
+            "req_browser_viewport",
+            "browser.viewport",
+            r#"{"surface_id":"surf_browser","width":1280,"height":720}"#,
+            "token",
+        );
+        let params: BrowserViewportParams = request.parse_params().unwrap();
+        assert_eq!(params.width, 1280);
+        assert_eq!(params.height, 720);
 
         let request = RequestEnvelope::new(
             "req_browser_click",

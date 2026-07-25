@@ -1017,6 +1017,15 @@ struct ServerControlRequest {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+    #[serde(default)]
+    context: Option<ServerControlContext>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ServerControlContext {
+    cwd: Option<String>,
+    backend: Option<String>,
+    backend_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8375,7 +8384,12 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(options: ServerOptions) -> Self {
+    fn new(mut options: ServerOptions) -> Self {
+        if options.mode == ServerMode::Local && options.cwd.is_none() {
+            options.cwd = std::env::current_dir()
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+        }
         let local_control = match options.mode {
             ServerMode::Local => Some(LocalServerControl::new(&options)),
             ServerMode::DesktopBridge => None,
@@ -8442,14 +8456,64 @@ impl ServerState {
     }
 
     fn source_control_available(&self) -> bool {
-        self.options.mode == ServerMode::DesktopBridge || self.local_git.is_some()
+        true
+    }
+
+    fn apply_local_git_context(
+        &mut self,
+        workspace_id: Option<&str>,
+        context: Option<&ServerControlContext>,
+    ) -> Result<(), CliError> {
+        if self.options.mode != ServerMode::Local {
+            return Ok(());
+        }
+        let Some(context) = context else {
+            return Ok(());
+        };
+        let cwd = context
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if cwd.is_none() {
+            return Ok(());
+        }
+        let workspace_id = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| self.default_workspace_id())
+            .unwrap_or_else(|| SERVER_LOCAL_WORKSPACE_ID.to_string());
+        let backend = context
+            .backend
+            .as_deref()
+            .or(self.options.backend.as_deref());
+        let backend_profile = context
+            .backend_profile
+            .as_deref()
+            .or(self.options.backend_profile.as_deref());
+        match self.local_git.as_mut() {
+            Some(git) => git
+                .retarget(&workspace_id, backend, backend_profile, cwd)
+                .map_err(CliError::Control),
+            None => {
+                self.local_git =
+                    ServerLocalGit::probe(&workspace_id, backend, backend_profile, cwd);
+                if self.local_git.is_some() {
+                    Ok(())
+                } else {
+                    Err(CliError::Control(
+                        "Git is not available for the active pane directory.".to_string(),
+                    ))
+                }
+            }
+        }
     }
 
     fn control_methods(&self) -> Vec<&'static str> {
         match self.options.mode {
             ServerMode::DesktopBridge => server_desktop_control_methods().to_vec(),
-            ServerMode::Local if self.local_git.is_some() => ServerLocalGit::methods().to_vec(),
-            ServerMode::Local => Vec::new(),
+            ServerMode::Local => ServerLocalGit::methods().to_vec(),
         }
     }
 
@@ -9679,11 +9743,16 @@ fn server_control_response(request: &HttpRequest, state: &mut ServerState) -> Ht
         Err(error) => return api_error_response(400, &error.to_string()),
     };
     let method = parsed.method.trim();
-    let capability_available = state.options.mode != ServerMode::Local || state.local_git.is_some();
-    if method.len() > 128
-        || !capability_available
-        || !server_control_method_allowed(method, state.options.mode)
-    {
+    if ServerLocalGit::supports_method(method) {
+        let workspace_id = parsed
+            .params
+            .get("workspace_id")
+            .and_then(serde_json::Value::as_str);
+        if let Err(error) = state.apply_local_git_context(workspace_id, parsed.context.as_ref()) {
+            return api_error_response(503, &server_control_error_message(error, &state.options));
+        }
+    }
+    if method.len() > 128 || !server_control_method_allowed(method, state.options.mode) {
         return api_error_response(403, "Control method is not available through server mode.");
     }
     match state
@@ -19057,7 +19126,7 @@ mod tests {
     }
 
     #[test]
-    fn local_server_source_control_capability_requires_a_successful_probe() {
+    fn local_server_source_control_capability_follows_the_active_pane() {
         let cwd = std::env::temp_dir().join(format!(
             "agentmux-server-non-repository-{}-{}",
             std::process::id(),
@@ -19075,8 +19144,8 @@ mod tests {
         ])
         .unwrap();
         let state = ServerState::new(options);
-        assert!(!state.source_control_available());
-        assert!(state.control_methods().is_empty());
+        assert!(state.source_control_available());
+        assert_eq!(state.control_methods(), ServerLocalGit::methods());
         fs::remove_dir_all(cwd).unwrap();
     }
 

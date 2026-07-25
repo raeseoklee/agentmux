@@ -229,6 +229,36 @@ impl ServerLocalGit {
         })
     }
 
+    pub(crate) fn retarget(
+        &mut self,
+        workspace_id: &str,
+        backend: Option<&str>,
+        backend_profile: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<(), String> {
+        let context = local_git_context(backend, backend_profile, cwd).ok_or_else(|| {
+            "The active pane directory is not a supported Git context.".to_string()
+        })?;
+        let repository = self
+            .client
+            .resolve_repository(&context)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "The active pane directory is not inside a Git repository.".to_string()
+            })?;
+        let repository_id = repository_id(&repository);
+        if self.workspace_id == workspace_id && self.repository_id == repository_id {
+            return Ok(());
+        }
+        self.repository = repository;
+        self.repository_id = repository_id;
+        self.workspace_id = workspace_id.to_string();
+        self.status_snapshot = None;
+        self.status_scan = None;
+        self.status_refresh_count = 0;
+        Ok(())
+    }
+
     pub(crate) fn methods() -> &'static [&'static str] {
         &[
             "git.status",

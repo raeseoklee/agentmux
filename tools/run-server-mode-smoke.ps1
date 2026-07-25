@@ -132,6 +132,7 @@ try {
   $wslDistributionCount = $null
   $wslSessionId = $null
   $wslRecentContainsEcho = $null
+  $wslSessionProfilePreserved = $null
   if ($expectedWslDistributions.Count -gt 0) {
     $wsl = Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl/api/wsl/distributions" -Headers $apiHeaders -TimeoutSec 5
     $wslDistributions = (($wsl.Content | ConvertFrom-Json).result.distributions)
@@ -167,6 +168,18 @@ try {
       throw "server WSL terminal did not emit the smoke marker."
     }
     $wslRecentContainsEcho = $true
+    $wslSessions = Invoke-WebRequest `
+      -UseBasicParsing `
+      -Uri "$baseUrl/api/sessions?workspace=ws_server" `
+      -Headers $apiHeaders `
+      -TimeoutSec 5
+    $wslSession = ($wslSessions.Content | ConvertFrom-Json).result.sessions |
+      Where-Object { $_.session_id -eq $wslSessionId } |
+      Select-Object -First 1
+    if (-not $wslSession -or $wslSession.backend_profile -ne $distribution) {
+      throw "server session summary did not preserve the selected WSL distribution."
+    }
+    $wslSessionProfilePreserved = $true
     try {
       $null = Invoke-WebRequest `
         -UseBasicParsing `
@@ -233,6 +246,7 @@ try {
     wslDistributionCount = $wslDistributionCount
     wslSessionId = $wslSessionId
     wslRecentContainsEcho = $wslRecentContainsEcho
+    wslSessionProfilePreserved = $wslSessionProfilePreserved
     spawnStatus = $spawn.StatusCode
     sessionId = $sessionId
     recentContainsEcho = $true

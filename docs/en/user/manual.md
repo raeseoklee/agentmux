@@ -173,7 +173,9 @@ configuration import, update, and diagnostics commands.
 
 ## Server Mode
 
-AgentMux can also run in a local server mode for browser access to the same UI.
+AgentMux can also run in a local server mode for browser access to the same
+React workspace UI used by the desktop app. The selected Pane drives Terminal
+cwd, backend context, Source Control, and the status bar.
 
 Example:
 
@@ -183,3 +185,9 @@ agentmux server --workspace <workspace-id> --port 8765
 
 By default, server mode is intended for local access. Do not expose it to an
 untrusted network unless an explicit remote-access policy has been configured.
+
+Local mode owns its Terminal sessions directly. Desktop-bridge mode connects
+the web UI to the running desktop control plane and is required for durable
+WSL-tmux and desktop-persisted Workspace state. See the
+[server-mode guide](./server-mode.md) for supported profiles, security, and
+current parity limits.
