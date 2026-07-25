@@ -85,21 +85,37 @@ export type I18nKey =
   | "browser.surface.address"
   | "browser.surface.back"
   | "browser.surface.clickFailed"
+  | "browser.surface.copied"
+  | "browser.surface.copyLink"
   | "browser.surface.connecting"
   | "browser.surface.connectionError"
   | "browser.surface.enterAddress"
+  | "browser.surface.externalOpenFailed"
   | "browser.surface.forward"
+  | "browser.surface.find"
+  | "browser.surface.findCount"
+  | "browser.surface.findFailed"
   | "browser.surface.go"
   | "browser.surface.inputFailed"
   | "browser.surface.loading"
   | "browser.surface.navigationFailed"
   | "browser.surface.newTab"
   | "browser.surface.noReadableText"
+  | "browser.surface.more"
+  | "browser.surface.openExternal"
   | "browser.surface.pageReady"
   | "browser.surface.previewTruncated"
   | "browser.surface.reload"
   | "browser.surface.renderFailed"
   | "browser.surface.scrollFailed"
+  | "browser.surface.screenshotCopied"
+  | "browser.surface.screenshotCopy"
+  | "browser.surface.screenshotFailed"
+  | "browser.surface.zoom"
+  | "browser.surface.zoomFailed"
+  | "browser.surface.zoomIn"
+  | "browser.surface.zoomOut"
+  | "browser.surface.zoomReset"
   | "config.configuration"
   | "config.export"
   | "config.exportProject"
@@ -457,21 +473,37 @@ const en: Record<I18nKey, string> = {
   "browser.surface.address": "Page address",
   "browser.surface.back": "Back",
   "browser.surface.clickFailed": "Page click failed.",
+  "browser.surface.copied": "Link copied",
+  "browser.surface.copyLink": "Copy page link",
   "browser.surface.connecting": "Connecting to browser session...",
   "browser.surface.connectionError": "Connection error",
   "browser.surface.enterAddress": "Enter a URL to navigate.",
+  "browser.surface.externalOpenFailed": "Could not open the page in the system browser.",
   "browser.surface.forward": "Forward",
+  "browser.surface.find": "Find in page",
+  "browser.surface.findCount": "{count} matches",
+  "browser.surface.findFailed": "Page search failed.",
   "browser.surface.go": "Go",
   "browser.surface.inputFailed": "Page key input failed.",
   "browser.surface.loading": "Loading",
   "browser.surface.navigationFailed": "Navigation failed.",
   "browser.surface.newTab": "New browser tab",
   "browser.surface.noReadableText": "This page did not expose readable document text.",
+  "browser.surface.more": "More browser actions",
+  "browser.surface.openExternal": "Open in system browser",
   "browser.surface.pageReady": "Page ready",
   "browser.surface.previewTruncated": "Preview truncated.",
   "browser.surface.reload": "Reload",
   "browser.surface.renderFailed": "Could not render the page.",
   "browser.surface.scrollFailed": "Page scroll failed.",
+  "browser.surface.screenshotCopied": "Screenshot copied",
+  "browser.surface.screenshotCopy": "Copy page screenshot",
+  "browser.surface.screenshotFailed": "Could not copy the page screenshot.",
+  "browser.surface.zoom": "Zoom",
+  "browser.surface.zoomFailed": "Page zoom failed.",
+  "browser.surface.zoomIn": "Zoom in",
+  "browser.surface.zoomOut": "Zoom out",
+  "browser.surface.zoomReset": "Reset zoom",
   "config.configuration": "Configuration",
   "config.export": "Export",
   "config.exportProject": "Export workspace",
@@ -989,21 +1021,37 @@ const ko: Record<I18nKey, string> = {
   "browser.surface.address": "페이지 주소",
   "browser.surface.back": "뒤로",
   "browser.surface.clickFailed": "페이지 클릭에 실패했습니다.",
+  "browser.surface.copied": "링크 복사됨",
+  "browser.surface.copyLink": "페이지 링크 복사",
   "browser.surface.connecting": "브라우저 세션에 연결하는 중...",
   "browser.surface.connectionError": "연결 오류",
   "browser.surface.enterAddress": "이동할 URL을 입력하세요.",
+  "browser.surface.externalOpenFailed": "시스템 브라우저에서 페이지를 열지 못했습니다.",
   "browser.surface.forward": "앞으로",
+  "browser.surface.find": "페이지에서 찾기",
+  "browser.surface.findCount": "{count}개 일치",
+  "browser.surface.findFailed": "페이지 검색에 실패했습니다.",
   "browser.surface.go": "이동",
   "browser.surface.inputFailed": "페이지 키 입력에 실패했습니다.",
   "browser.surface.loading": "불러오는 중",
   "browser.surface.navigationFailed": "페이지 이동에 실패했습니다.",
   "browser.surface.newTab": "새 브라우저 탭",
   "browser.surface.noReadableText": "이 페이지에서 읽을 수 있는 문서 텍스트를 찾지 못했습니다.",
+  "browser.surface.more": "브라우저 작업 더 보기",
+  "browser.surface.openExternal": "시스템 브라우저에서 열기",
   "browser.surface.pageReady": "페이지 준비됨",
   "browser.surface.previewTruncated": "미리보기 일부를 생략했습니다.",
   "browser.surface.reload": "새로고침",
   "browser.surface.renderFailed": "페이지를 표시하지 못했습니다.",
   "browser.surface.scrollFailed": "페이지 스크롤에 실패했습니다.",
+  "browser.surface.screenshotCopied": "스크린샷 복사됨",
+  "browser.surface.screenshotCopy": "페이지 스크린샷 복사",
+  "browser.surface.screenshotFailed": "페이지 스크린샷을 복사하지 못했습니다.",
+  "browser.surface.zoom": "확대/축소",
+  "browser.surface.zoomFailed": "페이지 확대/축소에 실패했습니다.",
+  "browser.surface.zoomIn": "확대",
+  "browser.surface.zoomOut": "축소",
+  "browser.surface.zoomReset": "확대/축소 초기화",
   "config.saveAppearanceFailed": "모양 설정을 저장하지 못했습니다.",
   "shortcuts.conflictsTitle": "단축키 충돌",
   "shortcuts.editDescription":
@@ -1112,6 +1160,26 @@ const resources: Record<AppLocaleLanguage, Record<I18nKey, string>> = {
   ko,
 };
 
+const KO_PRODUCT_TERMS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\uC6CC\uD06C\uC2A4\uD398\uC774\uC2A4|\bworkspace\b/gi, "Workspace"],
+  [/\uD130\uBBF8\uB110|\bterminal\b/gi, "Terminal"],
+  [/\uD398\uC778|\bpane\b/gi, "Pane"],
+  [/\uD0ED|\btab\b/gi, "Tab"],
+  [/\bgit\b/gi, "Git"],
+  [/\bmcp\b/gi, "MCP"],
+];
+
+function preserveProductTerms(language: AppLocaleLanguage, text: string): string {
+  if (language !== "ko") {
+    return text;
+  }
+  return KO_PRODUCT_TERMS.reduce(
+    (result, [termPattern, productTerm]) =>
+      result.replace(termPattern, productTerm),
+    text,
+  );
+}
+
 export function normalizeLanguage(value: string | null | undefined): AppLocaleLanguage {
   const normalized = value?.trim().toLowerCase();
   return normalized === "ko" || normalized === "ko-kr" || normalized === "ko_kr"
@@ -1127,6 +1195,6 @@ export function createTranslator(language: AppLocaleLanguage): Translator {
         text = text.replaceAll(`{${name}}`, String(value));
       }
     }
-    return text;
+    return preserveProductTerms(language, text);
   };
 }

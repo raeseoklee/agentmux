@@ -18,7 +18,7 @@ async function bootWithBrowser(page: Page) {
   await page.keyboard.press("Enter");
   await expect(page.getByLabel("Page address")).toBeVisible();
   await expect(page.locator('[data-agentmux-tab-icon="browser"]')).toBeVisible();
-  await expect(page.locator(".agentmux-browser-surface-icon")).toBeVisible();
+  await expect(page.locator(".agentmux-browser-surface-icon")).toHaveCount(0);
 }
 
 async function injectBrowserDialog(

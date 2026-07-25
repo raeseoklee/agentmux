@@ -284,6 +284,11 @@ pub enum BrowserCommand {
         surface_id: String,
         percent: u16,
     },
+    SetViewport {
+        surface_id: String,
+        width: u32,
+        height: u32,
+    },
     WaitForSelector {
         surface_id: String,
         selector: String,
@@ -331,6 +336,7 @@ impl BrowserCommand {
             | BrowserCommand::HighlightSelector { surface_id, .. }
             | BrowserCommand::FocusSelector { surface_id, .. }
             | BrowserCommand::SetZoom { surface_id, .. }
+            | BrowserCommand::SetViewport { surface_id, .. }
             | BrowserCommand::WaitForSelector { surface_id, .. }
             | BrowserCommand::Evaluate { surface_id, .. } => surface_id,
         }
@@ -455,6 +461,11 @@ pub enum BrowserCommandResult {
     Zoomed {
         surface_id: String,
         percent: u16,
+    },
+    ViewportSet {
+        surface_id: String,
+        width: u32,
+        height: u32,
     },
     WaitedForSelector {
         surface_id: String,
@@ -1364,6 +1375,19 @@ impl BrowserAutomation for InMemoryBrowserAutomation {
                 Ok(BrowserCommandResult::Zoomed {
                     surface_id,
                     percent,
+                })
+            }
+            BrowserCommand::SetViewport {
+                surface_id,
+                width,
+                height,
+            } => {
+                self.require_surface(&surface_id)?;
+                validate_viewport_size(width, height)?;
+                Ok(BrowserCommandResult::ViewportSet {
+                    surface_id,
+                    width,
+                    height,
                 })
             }
             BrowserCommand::WaitForSelector {
@@ -2590,6 +2614,35 @@ impl CdpBrowserAutomation {
         })
     }
 
+    fn execute_set_viewport(
+        &self,
+        surface_id: String,
+        width: u32,
+        height: u32,
+    ) -> BrowserAutomationResult<BrowserCommandResult> {
+        validate_viewport_size(width, height)?;
+        let websocket_url = self.require_surface(&surface_id)?.websocket_url.clone();
+        cdp_call(
+            &websocket_url,
+            "Emulation.setDeviceMetricsOverride",
+            json!({
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": 1,
+                "mobile": false,
+                "screenWidth": width,
+                "screenHeight": height,
+                "positionX": 0,
+                "positionY": 0,
+            }),
+        )?;
+        Ok(BrowserCommandResult::ViewportSet {
+            surface_id,
+            width,
+            height,
+        })
+    }
+
     fn execute_evaluate(
         &self,
         surface_id: String,
@@ -2838,6 +2891,11 @@ impl BrowserAutomation for CdpBrowserAutomation {
                 surface_id,
                 percent,
             } => self.execute_set_zoom(surface_id, percent),
+            BrowserCommand::SetViewport {
+                surface_id,
+                width,
+                height,
+            } => self.execute_set_viewport(surface_id, width, height),
             BrowserCommand::WaitForSelector {
                 surface_id,
                 selector,
@@ -4035,6 +4093,15 @@ fn validate_zoom_percent(percent: u16) -> BrowserAutomationResult<()> {
     Ok(())
 }
 
+fn validate_viewport_size(width: u32, height: u32) -> BrowserAutomationResult<()> {
+    if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
+        return Err(BrowserAutomationError::invalid_request(
+            "Browser viewport dimensions must be between 1 and 8192 pixels.",
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_browser_get_kind(
     kind: &str,
     attribute: Option<&str>,
@@ -4871,6 +4938,14 @@ mod tests {
     }
 
     #[test]
+    fn browser_viewport_dimensions_are_bounded() {
+        assert!(validate_viewport_size(1, 1).is_ok());
+        assert!(validate_viewport_size(8192, 8192).is_ok());
+        assert!(validate_viewport_size(0, 720).is_err());
+        assert!(validate_viewport_size(1280, 8193).is_err());
+    }
+
+    #[test]
     fn cdp_browser_defaults_to_headless_and_allows_debug_opt_out() {
         assert!(browser_headless_from_env_value(None));
         assert!(browser_headless_from_env_value(Some("true")));
@@ -5028,6 +5103,22 @@ mod tests {
         assert_eq!(value["value"], "agentmux ");
         assert_eq!(value["clicked"], "yes");
 
+        let viewport_result = browser
+            .execute(BrowserCommand::SetViewport {
+                surface_id: surface.surface_id.clone(),
+                width: 900,
+                height: 600,
+            })
+            .unwrap();
+        assert_eq!(
+            viewport_result,
+            BrowserCommandResult::ViewportSet {
+                surface_id: surface.surface_id.clone(),
+                width: 900,
+                height: 600,
+            }
+        );
+
         let viewport = browser
             .execute(BrowserCommand::Evaluate {
                 surface_id: surface.surface_id.clone(),
@@ -5040,6 +5131,8 @@ mod tests {
         };
         let viewport: Value = serde_json::from_str(&value_json).unwrap();
         assert_eq!(viewport["dpr"], 1);
+        assert_eq!(viewport["width"], 900);
+        assert_eq!(viewport["height"], 600);
 
         let snapshot = browser
             .execute(BrowserCommand::DomSnapshot {

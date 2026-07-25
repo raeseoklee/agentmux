@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Sender, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -237,13 +239,15 @@ pub(crate) fn execute(
 /// Unlike `execute`, this path never assembles stdout into one large `Vec`. The bounded
 /// synchronous channel applies backpressure to the child reader while preserving the existing
 /// timeout, process termination, and stderr capture guarantees.
-pub(crate) fn execute_streaming_stdout<F>(
+pub(crate) fn execute_streaming_stdout<C, F>(
     spec: &CommandSpec,
     operation: &str,
     limits: CaptureLimits,
+    mut is_cancelled: C,
     mut on_stdout: F,
 ) -> Result<StreamingExecutionOutput>
 where
+    C: FnMut() -> bool,
     F: FnMut(&[u8]) -> Result<()>,
 {
     let mut command = Command::new(&spec.program);
@@ -274,7 +278,8 @@ where
         overflow_tx,
     );
     let (stdout_tx, stdout_rx) = mpsc::sync_channel(4);
-    let stdout_reader = spawn_stream_reader(stdout, stdout_tx);
+    let stdout_reader_stop = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_stream_reader(stdout, stdout_tx, Arc::clone(&stdout_reader_stop));
     let started_at = Instant::now();
     let mut stdout_closed = false;
     let mut status = None;
@@ -282,8 +287,18 @@ where
     let mut first_stdout_after = None;
 
     while !stdout_closed || status.is_none() {
+        if is_cancelled() {
+            terminate(&mut child);
+            stdout_reader_stop.store(true, Ordering::Release);
+            let _ = join_stream_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(GitError::StateUnavailable(format!(
+                "{operation} was cancelled."
+            )));
+        }
         if let Ok((stream, limit)) = overflow_rx.try_recv() {
             terminate(&mut child);
+            stdout_reader_stop.store(true, Ordering::Release);
             let _ = join_stream_reader(stdout_reader);
             let _ = join_reader(stderr_reader);
             return Err(GitError::OutputLimit {
@@ -298,6 +313,7 @@ where
                 let next = stdout_bytes.saturating_add(bytes.len());
                 if next > limits.stdout_bytes {
                     terminate(&mut child);
+                    stdout_reader_stop.store(true, Ordering::Release);
                     let _ = join_stream_reader(stdout_reader);
                     let _ = join_reader(stderr_reader);
                     return Err(GitError::OutputLimit {
@@ -312,6 +328,7 @@ where
                 stdout_bytes = next;
                 if let Err(error) = on_stdout(&bytes) {
                     terminate(&mut child);
+                    stdout_reader_stop.store(true, Ordering::Release);
                     let _ = join_stream_reader(stdout_reader);
                     let _ = join_reader(stderr_reader);
                     return Err(error);
@@ -319,6 +336,7 @@ where
             }
             Ok(Err(error)) => {
                 terminate(&mut child);
+                stdout_reader_stop.store(true, Ordering::Release);
                 let _ = join_stream_reader(stdout_reader);
                 let _ = join_reader(stderr_reader);
                 return Err(GitError::Io {
@@ -338,6 +356,7 @@ where
             }
             Err(error) => {
                 terminate(&mut child);
+                stdout_reader_stop.store(true, Ordering::Release);
                 let _ = join_stream_reader(stdout_reader);
                 let _ = join_reader(stderr_reader);
                 return Err(GitError::Io {
@@ -348,6 +367,7 @@ where
         }
         if status.is_none() && started_at.elapsed() >= limits.timeout {
             terminate(&mut child);
+            stdout_reader_stop.store(true, Ordering::Release);
             let _ = join_stream_reader(stdout_reader);
             let _ = join_reader(stderr_reader);
             return Err(GitError::Timeout {
@@ -442,6 +462,7 @@ fn join_reader(reader: thread::JoinHandle<io::Result<ReaderOutput>>) -> Result<R
 fn spawn_stream_reader<R>(
     mut reader: R,
     sender: SyncSender<io::Result<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<io::Result<()>>
 where
     R: Read + Send + 'static,
@@ -453,8 +474,19 @@ where
             if count == 0 {
                 break;
             }
-            if sender.send(Ok(buffer[..count].to_vec())).is_err() {
-                break;
+            let mut message = Ok(buffer[..count].to_vec());
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match sender.try_send(message) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(pending)) => {
+                        message = pending;
+                        thread::sleep(PROCESS_POLL_INTERVAL);
+                    }
+                    Err(TrySendError::Disconnected(_)) => return Ok(()),
+                }
             }
         }
         Ok(())
@@ -485,6 +517,8 @@ fn hide_console_window(_command: &mut Command) {}
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     use super::*;
 
@@ -564,5 +598,59 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn streaming_process_runner_terminates_cancelled_child() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            worker_cancelled.store(true, Ordering::Release);
+        });
+        let started_at = Instant::now();
+        let result = execute_streaming_stdout(
+            &CommandSpec {
+                program: "ping.exe".to_string(),
+                args: vec!["-n".to_string(), "10".to_string(), "127.0.0.1".to_string()],
+                env: BTreeMap::new(),
+            },
+            "exercise cancellation",
+            CaptureLimits {
+                timeout: Duration::from_secs(10),
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                stdout_overflow: OverflowPolicy::Fail,
+            },
+            || cancelled.load(Ordering::Acquire),
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(GitError::StateUnavailable(_))));
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn saturated_stream_reader_stops_without_waiting_for_receiver_capacity() {
+        let payload = vec![b'x'; 16 * 1024 * 8];
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = spawn_stream_reader(Cursor::new(payload), sender, Arc::clone(&stop));
+
+        thread::sleep(Duration::from_millis(25));
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !reader.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let stopped_while_receiver_was_full = reader.is_finished();
+
+        drop(receiver);
+        join_stream_reader(reader).expect("stream reader should stop cleanly");
+        assert!(
+            stopped_while_receiver_was_full,
+            "stream reader must observe cancellation even when its channel is full"
+        );
     }
 }

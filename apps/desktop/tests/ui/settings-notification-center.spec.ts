@@ -122,6 +122,32 @@ test("settings traps focus and restores the caller after Escape", async ({ page 
   await expect(trigger).toBeFocused();
 });
 
+test("settings close control stays fixed while the active page scrolls", async ({
+  page,
+}) => {
+  await bootPreview(page);
+
+  await page.locator(".agentmux-settings-open").click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  const scroller = dialog.locator(".agentmux-scroll");
+  const close = dialog.locator(".agentmux-settings-close");
+  const initialBox = await close.boundingBox();
+  expect(initialBox).not.toBeNull();
+
+  await scroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await expect(close).toBeVisible();
+  const scrolledBox = await close.boundingBox();
+  expect(scrolledBox).not.toBeNull();
+  expect(scrolledBox?.x).toBeCloseTo(initialBox?.x ?? 0, 0);
+  expect(scrolledBox?.y).toBeCloseTo(initialBox?.y ?? 0, 0);
+
+  await close.click();
+  await expect(dialog).toHaveCount(0);
+});
+
 test("notification action opens the dedicated attention center", async ({ page }) => {
   await bootPreview(page);
   await page.getByRole("button", { name: "Open terminal" }).click();

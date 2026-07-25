@@ -2,6 +2,7 @@ export interface TerminalSession {
   sessionId: string;
   state: string;
   backendKind: string;
+  backendProfile?: string | null;
   backendNativeId?: string | null;
   cwd?: string | null;
 }
@@ -958,6 +959,11 @@ export interface ControlClient {
     surfaceId: string,
     options?: { frameId?: string | null },
   ): Promise<BrowserDomSnapshotResult>;
+  browserSetViewport(
+    surfaceId: string,
+    width: number,
+    height: number,
+  ): Promise<BrowserActionResult>;
   browserClick(
     surfaceId: string,
     target: BrowserClickTarget,
@@ -1150,6 +1156,7 @@ export interface ControlClient {
    */
   snapshot?(sessionId: string, sinceOffset?: number): Promise<OutputSnapshot>;
   outputStreamMode?(): "tauri-channel" | "websocket" | null;
+  outputStreamConnected?(sessionId: string): boolean | null;
   subscribeOutput?(
     sessionId: string,
     onFrame: (fromOffset: number, bytes: Uint8Array) => void,
@@ -1897,6 +1904,19 @@ class TauriControlClient implements ControlClient {
       },
     );
     return mapBrowserDomSnapshot(result);
+  }
+
+  async browserSetViewport(
+    surfaceId: string,
+    width: number,
+    height: number,
+  ): Promise<BrowserActionResult> {
+    const result = await this.call<BrowserActionResultWire>("browser.viewport", {
+      surface_id: surfaceId,
+      width,
+      height,
+    });
+    return mapBrowserAction(result);
   }
 
   async browserClick(
@@ -3359,6 +3379,7 @@ class BrowserPreviewControlClient implements ControlClient {
     paneId: string | null;
     query: string | null;
   }> = [];
+  private nextGitStatusPageFailure: string | null = null;
   private readonly browserSurfaces: SurfaceSummary[] = [];
   private readonly browserUrls = new Map<string, string>();
   private readonly browserActionLog: string[] = [];
@@ -3434,6 +3455,10 @@ class BrowserPreviewControlClient implements ControlClient {
         return id ? [...(this.terminalResizeLog.get(id) ?? [])] : [];
       },
       gitRequests: () => [...this.gitRequestLog],
+      failNextGitStatusPage: (message) => {
+        this.nextGitStatusPageFailure =
+          message ?? "Git status snapshot is no longer available; refresh page zero.";
+      },
       setGitStatusFileCount: (count) =>
         this.setPreviewGitStatusFileCount(count),
       holdGitReviewCreate: () => this.holdGitReviewCreate(),
@@ -4226,8 +4251,18 @@ class BrowserPreviewControlClient implements ControlClient {
     );
     return {
       surfaceId,
-      html: `<html data-agentmux-surface="${surfaceId}"><body>${url}</body></html>`,
+      html: `<html data-agentmux-surface="${surfaceId}"><head><title>${url}</title></head><body>${url}</body></html>`,
     };
+  }
+
+  async browserSetViewport(
+    surfaceId: string,
+    width: number,
+    height: number,
+  ): Promise<BrowserActionResult> {
+    this.findBrowserSurface(surfaceId);
+    this.browserActionLog.push(`viewport:${surfaceId}:${width}x${height}`);
+    return { surfaceId, ok: true };
   }
 
   async browserClick(
@@ -4863,6 +4898,11 @@ class BrowserPreviewControlClient implements ControlClient {
       paneId?: string | null;
     } = {},
   ): Promise<GitStatusPage> {
+    if (this.nextGitStatusPageFailure) {
+      const message = this.nextGitStatusPageFailure;
+      this.nextGitStatusPageFailure = null;
+      throw new Error(message);
+    }
     this.gitRequestLog.push({
       operation: "page",
       paneId: options.paneId ?? null,
@@ -6729,6 +6769,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
   private readonly serverPanes = new Map<string, PaneSummary[]>();
   private readonly serverSurfaces = new Map<string, SurfaceSummary[]>();
   private readonly serverSessions = new Map<string, TerminalSession>();
+  private readonly serverSessionProfiles = new Map<string, string | null>();
   private readonly serverOutputSockets = new Map<string, WebSocket>();
   private serverWorkspaceCounter = 0;
   private serverPaneCounter = 0;
@@ -7073,7 +7114,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
       workspaceId,
       backend: "conpty",
       backendProfile: null,
-      command,
+      command: commandWithNativeCwdTracking(command),
       cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
       paneId,
@@ -7093,7 +7134,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
       backend: "wsl-direct",
       backendProfile:
         distribution ?? this.serverDefaults.backend_profile ?? null,
-      command: ["bash", "-l"],
+      command: ["sh", "-c", WSL_LOGIN_SHELL_WITH_CWD_TRACKING],
       cwd: cwd ?? this.serverDefaults.cwd ?? null,
       placement,
       paneId,
@@ -7209,6 +7250,12 @@ class ServerControlClient extends BrowserPreviewControlClient {
 
   outputStreamMode(): "websocket" | null {
     return typeof WebSocket === "undefined" ? null : "websocket";
+  }
+
+  outputStreamConnected(sessionId: string): boolean {
+    return (
+      this.serverOutputSockets.get(sessionId)?.readyState === WebSocket.OPEN
+    );
   }
 
   async subscribeOutput(
@@ -7750,17 +7797,35 @@ class ServerControlClient extends BrowserPreviewControlClient {
 
   async getSidebarState(
     workspaceId?: string | null,
-    _paneId?: string | null,
+    paneId?: string | null,
   ): Promise<SidebarState> {
     await this.hydrateServerState();
     const workspace = workspaceId
       ? this.findServerWorkspace(workspaceId)
       : [...this.serverWorkspaces.values()][0];
+    if (workspace) {
+      await this.refreshServerWorkspaceSessions(workspace.workspaceId);
+    }
+    const context = workspace
+      ? this.resolveServerControlContext(workspace.workspaceId, paneId)
+      : null;
+    const git =
+      workspace && this.supportsSourceControlMethod("git.status_summary")
+        ? await this.getGitStatusSummary(
+            workspace.workspaceId,
+            null,
+            paneId ?? workspace.activePaneId,
+          ).catch(() => null)
+        : null;
     return {
       workspaceId: workspace?.workspaceId ?? workspaceId ?? "ws_server",
-      cwd: workspace?.projectRoot ?? this.serverDefaults.cwd ?? null,
-      gitBranch: null,
-      gitHash: null,
+      cwd:
+        context?.cwd ??
+        workspace?.projectRoot ??
+        this.serverDefaults.cwd ??
+        null,
+      gitBranch: git?.branch ?? null,
+      gitHash: git?.headOid?.slice(0, 8) ?? null,
       ports: [],
       statuses: [],
       progress: null,
@@ -7778,6 +7843,18 @@ class ServerControlClient extends BrowserPreviewControlClient {
       this.ensureServerWorkspace(mapWorkspace(wire));
     }
     return state;
+  }
+
+  private async refreshServerWorkspaceSessions(
+    workspaceId: string,
+  ): Promise<SurfaceSummary[]> {
+    const result = await this.serverApi<{
+      sessions: SessionSummaryWire[];
+    }>(`/api/sessions?workspace=${encodeURIComponent(workspaceId)}`);
+    return this.syncServerSessions(
+      workspaceId,
+      result.sessions.map(mapSession),
+    );
   }
 
   private setServerCapabilities(
@@ -7841,6 +7918,14 @@ class ServerControlClient extends BrowserPreviewControlClient {
   ): SurfaceSummary[] {
     for (const session of sessions) {
       this.serverSessions.set(session.sessionId, session);
+      this.serverSessionProfiles.set(
+        session.sessionId,
+        session.backendKind.startsWith("wsl")
+          ? (session.backendProfile ??
+              this.serverDefaults.backend_profile ??
+              null)
+          : null,
+      );
     }
     const sessionIds = new Set(sessions.map((session) => session.sessionId));
     let surfaces = this.serverSurfaces.get(workspaceId) ?? [];
@@ -7916,9 +8001,15 @@ class ServerControlClient extends BrowserPreviewControlClient {
     const session: TerminalSession = {
       sessionId: result.session_id,
       backendKind: options.backend,
+      backendProfile: options.backendProfile,
       state: "running",
+      cwd: options.cwd,
     };
     this.serverSessions.set(session.sessionId, session);
+    this.serverSessionProfiles.set(
+      session.sessionId,
+      options.backendProfile,
+    );
     const surfaces = this.serverSurfaces.get(options.workspaceId) ?? [];
     const surface = this.createServerSurface(
       options.workspaceId,
@@ -8021,6 +8112,7 @@ class ServerControlClient extends BrowserPreviewControlClient {
       },
     );
     this.serverSessions.delete(sessionId);
+    this.serverSessionProfiles.delete(sessionId);
   }
 
   private clearMissingServerSurfaceMounts(workspaceId: string): void {
@@ -8092,10 +8184,54 @@ class ServerControlClient extends BrowserPreviewControlClient {
         "unsupported_method",
       );
     }
+    const record =
+      params && typeof params === "object"
+        ? (params as Record<string, unknown>)
+        : null;
+    const workspaceId =
+      typeof record?.workspace_id === "string" ? record.workspace_id : null;
+    const paneId = typeof record?.pane_id === "string" ? record.pane_id : null;
+    const context = workspaceId
+      ? this.resolveServerControlContext(workspaceId, paneId)
+      : null;
     return this.serverApi<T>("/api/control", {
       method: "POST",
-      body: JSON.stringify({ method, params }),
+      body: JSON.stringify({ method, params, context }),
     });
+  }
+
+  private resolveServerControlContext(
+    workspaceId: string,
+    paneId?: string | null,
+  ): {
+    cwd: string | null;
+    backend: string | null;
+    backend_profile: string | null;
+  } {
+    const workspace = this.serverWorkspaces.get(workspaceId);
+    const selectedPaneId = paneId ?? workspace?.activePaneId ?? null;
+    const pane = (this.serverPanes.get(workspaceId) ?? []).find(
+      (candidate) => candidate.paneId === selectedPaneId,
+    );
+    const surface = (this.serverSurfaces.get(workspaceId) ?? []).find(
+      (candidate) => candidate.surfaceId === pane?.mountedSurfaceId,
+    );
+    const session = surface?.sessionId
+      ? this.serverSessions.get(surface.sessionId)
+      : null;
+    return {
+      cwd:
+        session?.cwd ??
+        workspace?.projectRoot ??
+        this.serverDefaults.cwd ??
+        null,
+      backend: session?.backendKind ?? this.serverDefaults.backend ?? null,
+      backend_profile: session?.sessionId
+        ? (this.serverSessionProfiles.get(session.sessionId) ?? null)
+        : (workspace?.defaultWslDistribution ??
+          this.serverDefaults.backend_profile ??
+          null),
+    };
   }
 
   private async openServerOutputSocket(
@@ -8242,6 +8378,7 @@ interface BrowserPreviewApi {
     paneId: string | null;
     query: string | null;
   }>;
+  failNextGitStatusPage(message?: string): void;
   setGitStatusFileCount(count: number): void;
   holdGitReviewCreate(): void;
   releaseGitReviewCreate(): void;
@@ -8408,6 +8545,7 @@ interface MarkdownDocumentWire {
 interface SessionSummaryWire {
   session_id: string;
   backend_kind: string;
+  backend_profile?: string | null;
   state: string;
   backend_native_id?: string | null;
   cwd?: string | null;
@@ -9029,6 +9167,7 @@ function mapSession(value: SessionSummaryWire): TerminalSession {
   return {
     sessionId: value.session_id,
     backendKind: value.backend_kind,
+    backendProfile: value.backend_profile ?? null,
     state: value.state,
     backendNativeId: value.backend_native_id,
     cwd: value.cwd ?? null,

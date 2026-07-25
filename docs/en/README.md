@@ -9,6 +9,7 @@ repository READMEs, release notes, and operational runbooks.
 - [User manual](./user/manual.md)
 - [CLI guide](./user/cli.md)
 - [MCP control plane](./user/mcp.md)
+- [Server mode](./user/server-mode.md)
 - [Feature overview](./features.md)
 - [Known limitations](./user/known-limitations.md)
 - [Troubleshooting](./user/troubleshooting.md)

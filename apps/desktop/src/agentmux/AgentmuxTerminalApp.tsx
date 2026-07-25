@@ -1538,6 +1538,7 @@ interface PaneViewProps {
   t: Translator;
   focusPane: (paneId: string) => void;
   splitPaneBy: (paneId: string, axis: "horizontal" | "vertical") => void;
+  openBrowserInSplit: (paneId: string) => void;
   closePane: (paneId: string) => void;
   closeSurface: (surfaceId: string) => void;
   openTerminalInPane: (paneId: string) => void;
@@ -1570,6 +1571,8 @@ interface PaneViewProps {
   ) => void;
   onMovePaneSurface: (paneId: string, direction: -1 | 1) => void;
   onTerminalError: () => void;
+  onBrowserTitleChange: (surfaceId: string, title: string | null) => void;
+  onOpenBrowserExternal: (url: string) => Promise<boolean>;
 }
 
 const PaneView = memo(function PaneView({
@@ -1598,6 +1601,7 @@ const PaneView = memo(function PaneView({
   isBroadcast = false,
   focusPane,
   splitPaneBy,
+  openBrowserInSplit,
   closePane,
   closeSurface,
   openTerminalInPane,
@@ -1614,6 +1618,8 @@ const PaneView = memo(function PaneView({
   onPaneDrop,
   onMovePaneSurface,
   onTerminalError,
+  onBrowserTitleChange,
+  onOpenBrowserExternal,
 }: PaneViewProps) {
   const isMarkdown = surface?.surfaceType === "markdown";
   const restoringAgent = isRestorableAgentPlaceholder(
@@ -1848,6 +1854,20 @@ const PaneView = memo(function PaneView({
           </Hov>
           <Hov
             tag="span"
+            className="agentmux-pane-open-browser"
+            ariaLabel={t("action.browser.openActivePane")}
+            title={t("action.browser.openActivePane")}
+            style={PANE_WIN_BTN_STYLE}
+            hover={PANE_WIN_BTN_HOVER_STYLE}
+            onClick={(e) => {
+              e.stopPropagation();
+              openBrowserInSplit(pane.paneId);
+            }}
+          >
+            <IconGlobe size={12} />
+          </Hov>
+          <Hov
+            tag="span"
             className="agentmux-pane-split-vertical"
             style={PANE_WIN_BTN_STYLE}
             hover={PANE_WIN_BTN_HOVER_STYLE}
@@ -1929,7 +1949,14 @@ const PaneView = memo(function PaneView({
               onExitIntent={() => onTerminalExitIntent(session.sessionId)}
             />
           ) : isBrowser && surface ? (
-            <BrowserSurfacePanel client={client} surfaceId={surface.surfaceId} t={t} />
+            <BrowserSurfacePanel
+              key={surface.surfaceId}
+              client={client}
+              surfaceId={surface.surfaceId}
+              t={t}
+              onTitleChange={onBrowserTitleChange}
+              onOpenExternal={onOpenBrowserExternal}
+            />
           ) : isMarkdown && surface ? (
             <MarkdownSurfacePanel
               client={client}
@@ -2087,6 +2114,7 @@ export function AgentmuxTerminalApp() {
   const [surfaceTitleOverrides, setSurfaceTitleOverrides] = useState<Record<string, string>>(
     () => readSurfaceTitleOverrides(),
   );
+  const [browserPageTitles, setBrowserPageTitles] = useState<Record<string, string>>({});
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null);
   const [renamingTabDraft, setRenamingTabDraft] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -5203,6 +5231,67 @@ export function AgentmuxTerminalApp() {
       ctl.refresh,
     ],
   );
+  const openBrowserInPaneSplit = useCallback(
+    async (paneId: string) => {
+      if (!activeWorkspaceId) return;
+      try {
+        const splitDetail = await client.splitPane(
+          activeWorkspaceId,
+          paneId,
+          "vertical",
+        );
+        const browserPaneId = targetPaneForSplitBrowser(splitDetail, paneId);
+        if (!browserPaneId) {
+          throw new Error("Could not find a split pane for the browser.");
+        }
+        await client.createBrowserSurface(
+          activeWorkspaceId,
+          browserPaneId,
+          "default",
+          "active_pane",
+        );
+        await client.focusPane(activeWorkspaceId, browserPaneId);
+        await ctl.refresh();
+      } catch (error) {
+        console.warn("[agentmux] failed to open browser in split pane", {
+          error,
+          paneId,
+        });
+        dialogs.toast({
+          title: t("browser.surface.connectionError"),
+          description:
+            error instanceof Error
+              ? error.message
+              : t("browser.surface.navigationFailed"),
+          tone: "danger",
+        });
+      }
+    },
+    [activeWorkspaceId, client, ctl, dialogs, t],
+  );
+  const updateBrowserPageTitle = useCallback(
+    (surfaceId: string, title: string | null) => {
+      setBrowserPageTitles((current) => {
+        const normalized = title?.trim() ?? "";
+        if (!normalized) {
+          if (!(surfaceId in current)) return current;
+          const next = { ...current };
+          delete next[surfaceId];
+          return next;
+        }
+        if (current[surfaceId] === normalized) return current;
+        return { ...current, [surfaceId]: normalized };
+      });
+    },
+    [],
+  );
+  const displaySurfaceTitle = useCallback(
+    (surface: SurfaceSummary) =>
+      surfaceTitleOverrides[surface.surfaceId] ??
+      browserPageTitles[surface.surfaceId] ??
+      surface.title,
+    [browserPageTitles, surfaceTitleOverrides],
+  );
   const openMarkdownDocument = useCallback(
     (path: string) => {
       void ctl.createMarkdownSurface(path, "new_tab");
@@ -5930,7 +6019,7 @@ export function AgentmuxTerminalApp() {
     const rawTitle = await dialogs.prompt({
       title: t("surface.tab.renameTitle"),
       label: t("surface.tab.nameLabel"),
-      initialValue: surfaceTitleOverrides[surface.surfaceId] ?? surface.title,
+      initialValue: displaySurfaceTitle(surface),
       required: true,
       confirmLabel: t("common.save"),
       cancelLabel: t("common.cancel"),
@@ -5939,7 +6028,7 @@ export function AgentmuxTerminalApp() {
     if (title !== null) {
       setSurfaceTitleOverride(surface.surfaceId, title);
     }
-  }, [dialogs, setSurfaceTitleOverride, surfaceTitleOverrides, t]);
+  }, [dialogs, displaySurfaceTitle, setSurfaceTitleOverride, t]);
 
   const commitTabRename = useCallback((surfaceId: string) => {
     const title = surfaceTitleOverride(renamingTabDraft);
@@ -7169,7 +7258,7 @@ export function AgentmuxTerminalApp() {
       ? (agentState?.telemetry ?? null)
       : null;
     const isBrowser = surface?.surfaceType === "browser";
-    const title = surface?.title ?? t("pane.empty");
+    const title = surface ? displaySurfaceTitle(surface) : t("pane.empty");
     const dot = restoringAgent
       ? "var(--accent)"
       : sessionDotColor(T, session, hasAttention);
@@ -7202,6 +7291,7 @@ export function AgentmuxTerminalApp() {
         t={t}
         focusPane={focusPaneStable}
         splitPaneBy={splitPaneBy}
+        openBrowserInSplit={openBrowserInPaneSplit}
         closePane={closePaneStable}
         closeSurface={closeSurfaceStable}
         openTerminalInPane={openTerminalInPane}
@@ -7224,6 +7314,8 @@ export function AgentmuxTerminalApp() {
         onPaneDrop={onPaneDropStable}
         onMovePaneSurface={onMovePaneSurfaceStable}
         onTerminalError={refreshStable}
+        onBrowserTitleChange={updateBrowserPageTitle}
+        onOpenBrowserExternal={openUrlInSystemBrowser}
       />
     );
     } finally {
@@ -8494,7 +8586,7 @@ export function AgentmuxTerminalApp() {
                             textOverflow: "ellipsis",
                           }}
                         >
-                          {surfaceTitleOverrides[surface.surfaceId] ?? surface.title}
+                          {displaySurfaceTitle(surface)}
                         </div>
                         <div
                           style={{
@@ -8680,7 +8772,7 @@ export function AgentmuxTerminalApp() {
                     ? Boolean(attentionBySession.get(session.sessionId))
                     : false;
                 const displayTitle =
-                  surfaceTitleOverrides[surface.surfaceId] ?? surface.title;
+                  displaySurfaceTitle(surface);
                 return (
                   <Hov
                     key={surface.surfaceId}
@@ -13054,6 +13146,7 @@ function SettingsModal(props: SettingsModalProps) {
           borderRadius: 13,
           boxShadow: "0 30px 80px rgba(0,0,0,0.45)",
           display: "flex",
+          position: "relative",
           overflow: "hidden",
         }}
       >
@@ -13117,6 +13210,33 @@ function SettingsModal(props: SettingsModalProps) {
             );
           })}
         </div>
+        <Hov
+          tag="button"
+          className="agentmux-settings-close"
+          ariaLabel={t("common.close")}
+          data-overlay-autofocus="true"
+          style={{
+            position: "absolute",
+            top: 16,
+            right: 16,
+            zIndex: 2,
+            width: 28,
+            height: 28,
+            borderRadius: 7,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            color: "var(--fg3)",
+            cursor: "pointer",
+            border: "1px solid transparent",
+            background: "var(--surface)",
+            padding: 0,
+          }}
+          hover={{ background: "var(--s2)", color: "var(--fg1)" }}
+          onClick={onClose}
+        >
+          <IconClose size={14} />
+        </Hov>
         <div
           id={`agentmux-settings-panel-${settingsTab}`}
           className="agentmux-scroll"
@@ -13130,33 +13250,6 @@ function SettingsModal(props: SettingsModalProps) {
             position: "relative",
           }}
         >
-          <Hov
-            tag="button"
-            className="agentmux-settings-close"
-            ariaLabel={t("common.close")}
-            data-overlay-autofocus="true"
-            style={{
-              position: "absolute",
-              top: 16,
-              right: 16,
-              width: 28,
-              height: 28,
-              borderRadius: 7,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              color: "var(--fg3)",
-              cursor: "pointer",
-              border: "1px solid transparent",
-              background: "transparent",
-              padding: 0,
-            }}
-            hover={{ background: "var(--s2)", color: "var(--fg1)" }}
-            onClick={onClose}
-          >
-            <IconClose size={14} />
-          </Hov>
-
           {settingsTab === "appearance" ? (
             <>
               <div

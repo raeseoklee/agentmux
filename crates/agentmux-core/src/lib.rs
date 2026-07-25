@@ -290,6 +290,7 @@ pub struct Surface {
 pub struct Session {
     pub session_id: SessionId,
     pub backend_kind: BackendKind,
+    pub backend_profile: Option<String>,
     pub backend_attachment_id: Option<BackendAttachmentId>,
     pub backend_native_id: Option<String>,
     pub workspace_id: WorkspaceId,
@@ -373,6 +374,7 @@ pub struct RuntimeSessionSummary {
     pub session_id: SessionId,
     pub workspace_id: WorkspaceId,
     pub backend_kind: BackendKind,
+    pub backend_profile: Option<String>,
     pub state: SessionState,
     pub exit_code: Option<i32>,
     pub backend_native_id: Option<String>,
@@ -478,6 +480,7 @@ where
         let session_id = SessionId::new();
         let now = SystemTime::now();
         let command = spec.command.clone();
+        let backend_profile = spec.backend_profile.clone();
         let handle = self.backend.spawn(SpawnRequest {
             session_id: session_id.to_string(),
             workspace_id: Some(spec.workspace_id.to_string()),
@@ -492,6 +495,7 @@ where
         let session = Session {
             session_id: session_id.clone(),
             backend_kind: backend_kind_from_backend(handle.backend_kind),
+            backend_profile,
             backend_attachment_id: None,
             backend_native_id: handle.backend_native_id,
             workspace_id: spec.workspace_id,
@@ -513,6 +517,7 @@ where
         let now = SystemTime::now();
         let backend = spec.backend;
         let backend_ref = spec.backend_ref.clone();
+        let backend_profile = spec.backend_profile.clone();
         let handle = self.backend.attach(AttachRequest {
             session_id: session_id.to_string(),
             backend: backend_kind_to_backend(backend),
@@ -524,6 +529,7 @@ where
         let session = Session {
             session_id: session_id.clone(),
             backend_kind: backend_kind_from_backend(handle.backend_kind),
+            backend_profile,
             backend_attachment_id: None,
             backend_native_id: handle.backend_native_id.or(Some(backend_ref.clone())),
             workspace_id: spec.workspace_id,
@@ -617,6 +623,7 @@ where
                 session_id: session.session_id.clone(),
                 workspace_id: session.workspace_id.clone(),
                 backend_kind: session.backend_kind,
+                backend_profile: session.backend_profile.clone(),
                 state: session.state.clone(),
                 exit_code: session.exit_code,
                 backend_native_id: session.backend_native_id.clone(),
@@ -639,6 +646,7 @@ where
                 session_id: session.session_id.clone(),
                 workspace_id: session.workspace_id.clone(),
                 backend_kind: session.backend_kind,
+                backend_profile: session.backend_profile.clone(),
                 state: session.state.clone(),
                 exit_code: session.exit_code,
                 backend_native_id: session.backend_native_id.clone(),
@@ -2466,6 +2474,7 @@ fn session_summary_result(summary: RuntimeSessionSummary) -> SessionSummaryResul
         session_id: summary.session_id.to_string(),
         workspace_id: summary.workspace_id.to_string(),
         backend_kind: backend_kind_label(summary.backend_kind).to_string(),
+        backend_profile: summary.backend_profile,
         state: session_state_label(&summary.state),
         exit_code: summary.exit_code,
         backend_native_id: summary.backend_native_id,
@@ -2749,7 +2758,7 @@ mod tests {
         let spawn = control.handle_request(request(
             "req_spawn_events",
             "session.spawn",
-            r#"{"workspace_id":"ws_events","command":["cmd.exe"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
+            r#"{"workspace_id":"ws_events","backend":"wsl-direct","backend_profile":"Debian","command":["bash"],"cwd":null,"columns":80,"rows":24,"durability":"ephemeral"}"#,
         ));
         let session_id = ok_json(&spawn)
             .split("\"session_id\":\"")
@@ -2766,6 +2775,7 @@ mod tests {
         let list: SessionListResult = serde_json::from_str(ok_json(&list)).unwrap();
         assert_eq!(list.sessions.len(), 1);
         assert_eq!(list.sessions[0].session_id, session_id);
+        assert_eq!(list.sessions[0].backend_profile.as_deref(), Some("Debian"));
         assert_eq!(list.sessions[0].state, "running");
 
         let send = control.handle_request(request(

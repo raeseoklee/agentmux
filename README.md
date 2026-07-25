@@ -19,6 +19,7 @@ workspace.
 - Track agent running, waiting, completed, and failed states.
 - Show workspace and pane attention badges when an agent needs intervention.
 - Open agent-generated links in embedded browser panes.
+- Serve the same workspace UI through an authenticated local web endpoint.
 - Expose a local CLI/control plane for automation, diagnostics, and integration.
 
 AgentMux is Windows-only for the current product line. WSL is a first-class
@@ -56,8 +57,8 @@ and uploads the assets to GitHub Releases.
 After downloading an installer:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\AgentMux_0.1.8_x64-setup.exe
-gh attestation verify .\AgentMux_0.1.8_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+Get-FileHash -Algorithm SHA256 .\AgentMux_<version>_x64-setup.exe
+gh attestation verify .\AgentMux_<version>_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 GitHub Artifact Attestation is release provenance, not Windows Authenticode
@@ -86,6 +87,7 @@ See [Known limitations](./docs/en/user/known-limitations.md) and
 - [Feature overview](./docs/en/features.md)
 - [CLI guide](./docs/en/user/cli.md)
 - [MCP control plane](./docs/en/user/mcp.md)
+- [Server mode](./docs/en/user/server-mode.md)
 - [Troubleshooting](./docs/en/user/troubleshooting.md)
 - [Versioning and release verification](./docs/en/release/versioning.md)
 - [Platform backlog](./docs/en/backlog/platform-backlog.md)

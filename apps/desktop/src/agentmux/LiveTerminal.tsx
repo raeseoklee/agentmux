@@ -81,6 +81,9 @@ const ACTIVITY_HOT_POLLS = 12;
 const MAX_PENDING_STREAM_FRAMES = 256;
 const MAX_PENDING_STREAM_BYTES = 1024 * 1024;
 const TRANSPORT_DIAGNOSTIC_FLUSH_MS = 250;
+const SERVER_STREAM_CATCHUP_ACTIVE_MS = 750;
+const SERVER_STREAM_CATCHUP_INACTIVE_MS = 3_000;
+const SERVER_STREAM_CATCHUP_HIDDEN_MS = 8_000;
 // Retain a recently visible terminal's GPU context through ordinary tab
 // switching. This avoids tearing down and rebuilding the renderer while the
 // user compares adjacent tabs, while still releasing inactive contexts.
@@ -899,12 +902,20 @@ export function LiveTerminal({
       let diagnosticFlushTimer: number | null = null;
       let pressureReportTimer: number | null = null;
       let resyncRetryTimer: number | null = null;
+      let streamCatchupTimer: number | null = null;
       let unsubscribeOutput: (() => void) | null = null;
 
       const clearResyncRetry = () => {
         if (resyncRetryTimer !== null) {
           window.clearTimeout(resyncRetryTimer);
           resyncRetryTimer = null;
+        }
+      };
+
+      const clearStreamCatchup = () => {
+        if (streamCatchupTimer !== null) {
+          window.clearTimeout(streamCatchupTimer);
+          streamCatchupTimer = null;
         }
       };
 
@@ -1126,6 +1137,28 @@ export function LiveTerminal({
         }, delayMs);
       };
 
+      const scheduleStreamCatchup = () => {
+        clearStreamCatchup();
+        if (!alive || liveOutputMode !== "websocket") {
+          return;
+        }
+        const delayMs = documentHidden()
+          ? SERVER_STREAM_CATCHUP_HIDDEN_MS
+          : activeRef.current
+            ? SERVER_STREAM_CATCHUP_ACTIVE_MS
+            : SERVER_STREAM_CATCHUP_INACTIVE_MS;
+        streamCatchupTimer = window.setTimeout(() => {
+          streamCatchupTimer = null;
+          const streamConnected = client.outputStreamConnected?.(sessionId);
+          const catchup = streamConnected === true ? Promise.resolve() : resync();
+          void catchup.finally(() => {
+            if (alive) {
+              scheduleStreamCatchup();
+            }
+          });
+        }, delayMs);
+      };
+
       const applyFrame = (fromOffset: number, bytes: Uint8Array) => {
         if (!alive || bytes.length === 0) {
           return;
@@ -1178,6 +1211,8 @@ export function LiveTerminal({
         broadcastText(text);
       });
 
+      scheduleStreamCatchup();
+
       void client
         .subscribeOutput(sessionId, applyFrame)
         .then((unsubscribe) => {
@@ -1190,12 +1225,17 @@ export function LiveTerminal({
         })
         .catch(() => {
           if (alive) {
-            onError?.();
+            // The authenticated HTTP snapshot/input APIs remain available
+            // when a browser or proxy rejects the long-lived socket. The
+            // catch-up loop keeps the terminal usable and converges to the
+            // authoritative output offset without remounting xterm.
+            scheduleResync(0);
           }
         });
 
       return () => {
         clearResyncRetry();
+        clearStreamCatchup();
         discardTerminalOutput(renderer);
         flushTransportDiagnostics();
         flushPressureReport();

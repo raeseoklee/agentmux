@@ -53,20 +53,20 @@ use agentmux_ipc::{
     BrowserHighlightParams, BrowserHistoryEntryResult, BrowserHistoryResult, BrowserHoverParams,
     BrowserNavigateParams, BrowserNavigationResult, BrowserPressParams, BrowserScreenshotParams,
     BrowserScreenshotResult, BrowserScrollParams, BrowserSelectParams, BrowserStorageEntryResult,
-    BrowserStorageResult, BrowserSurfaceParams, BrowserTypeParams, BrowserWaitForSelectorParams,
-    BrowserWaitForSelectorResult, BrowserZoomParams, ControlAuditListParams,
-    ControlAuditListResult, ControlAuditRecord, ControlError, ControlPipeConnection,
-    DiagnosticsBackendHealthResult, DiagnosticsExportResult, DiagnosticsOutputStreamResult,
-    DiagnosticsQueuePressureResult, DockConfigResult, DockControlResult, DockGetParams,
-    DockTrustParams, EnvVarParam, ErrorCode, EventSubscribeParams, EventSubscribeResult,
-    MarkdownAssetReadParams, MarkdownAssetResult, MarkdownDocumentResult, MarkdownReadParams,
-    NotificationClearParams, NotificationClearResult, NotificationCreateParams,
-    NotificationDismissParams, NotificationListParams, NotificationListResult,
-    NotificationSummaryResult, PaneCloseParams, PaneFocusParams, PaneMountSurfaceParams,
-    PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult, PaneUnmountSurfaceParams,
-    ProfileCreateParams, ProfileIdParams, ProfileListResult, ProfileSummaryResult,
-    ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, SessionAttachParams, SessionIdParams,
+    BrowserStorageResult, BrowserSurfaceParams, BrowserTypeParams, BrowserViewportParams,
+    BrowserWaitForSelectorParams, BrowserWaitForSelectorResult, BrowserZoomParams,
+    ControlAuditListParams, ControlAuditListResult, ControlAuditRecord, ControlError,
+    ControlPipeConnection, DiagnosticsBackendHealthResult, DiagnosticsExportResult,
+    DiagnosticsOutputStreamResult, DiagnosticsQueuePressureResult, DockConfigResult,
+    DockControlResult, DockGetParams, DockTrustParams, EnvVarParam, ErrorCode,
+    EventSubscribeParams, EventSubscribeResult, MarkdownAssetReadParams, MarkdownAssetResult,
+    MarkdownDocumentResult, MarkdownReadParams, NotificationClearParams, NotificationClearResult,
+    NotificationCreateParams, NotificationDismissParams, NotificationListParams,
+    NotificationListResult, NotificationSummaryResult, PaneCloseParams, PaneFocusParams,
+    PaneMountSurfaceParams, PaneResizeLayoutParams, PaneSplitParams, PaneSummaryResult,
+    PaneUnmountSurfaceParams, ProfileCreateParams, ProfileIdParams, ProfileListResult,
+    ProfileSummaryResult, ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult,
+    RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionAttachParams, SessionIdParams,
     SessionSendPasteParams, SessionSendTextParams, SessionSpawnParams, SessionSpawnResult,
     SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams, SidebarLogListResult,
     SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams, SidebarStateResult,
@@ -2604,6 +2604,7 @@ impl DesktopControlState {
                 "browser.highlight" => self.handle_browser_highlight(&request),
                 "browser.focus" => self.handle_browser_focus(&request),
                 "browser.zoom" => self.handle_browser_zoom(&request),
+                "browser.viewport" => self.handle_browser_viewport(&request),
                 "browser.wait_for_selector" => self.handle_browser_wait_for_selector(&request),
                 "browser.evaluate" => self.handle_browser_evaluate(&request),
                 "agent.get_state" => self.handle_agent_get_state(&request),
@@ -3579,10 +3580,17 @@ impl DesktopControlState {
         request: &RequestEnvelope,
     ) -> Result<ResponseEnvelope, DesktopHostError> {
         let params: WorkspaceIdParams = request.parse_params()?;
-        let bundle = self.load_workspace_or_not_found(&params.workspace_id)?;
+        let Ok(store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let bundle = store
+            .load_workspace_bundle(&params.workspace_id)?
+            .ok_or_else(|| workspace_not_found(&params.workspace_id))?;
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -3906,7 +3914,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -3928,7 +3936,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -3969,7 +3977,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -3998,7 +4006,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -4020,7 +4028,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -4042,7 +4050,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -4302,7 +4310,7 @@ impl DesktopControlState {
 
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
-            &workspace_detail(bundle),
+            &workspace_detail(&store, bundle)?,
         ))
     }
 
@@ -4327,7 +4335,7 @@ impl DesktopControlState {
             {
                 return Err(surface_not_found(&params.surface_id).into());
             }
-            let detail = workspace_detail(source);
+            let detail = workspace_detail(&store, source)?;
             return Ok(ResponseEnvelope::ok_typed(
                 request.id.clone(),
                 &SurfaceMoveWorkspaceResult {
@@ -4360,8 +4368,8 @@ impl DesktopControlState {
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &SurfaceMoveWorkspaceResult {
-                source: workspace_detail(source),
-                target: workspace_detail(target),
+                source: workspace_detail(&store, source)?,
+                target: workspace_detail(&store, target)?,
             },
         ))
     }
@@ -4511,6 +4519,31 @@ impl DesktopControlState {
         Ok(ResponseEnvelope::ok_typed(
             request.id.clone(),
             &BrowserDomSnapshotResult { surface_id, html },
+        ))
+    }
+
+    fn handle_browser_viewport(
+        &self,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, DesktopHostError> {
+        let params: BrowserViewportParams = request.parse_params()?;
+        let result = self.execute_browser_command(
+            "browser.viewport",
+            BrowserCommand::SetViewport {
+                surface_id: params.surface_id,
+                width: params.width,
+                height: params.height,
+            },
+        )?;
+        let BrowserCommandResult::ViewportSet { surface_id, .. } = result else {
+            unreachable!("browser viewport command returns viewport result")
+        };
+        Ok(ResponseEnvelope::ok_typed(
+            request.id.clone(),
+            &BrowserActionResult {
+                surface_id,
+                ok: true,
+            },
         ))
     }
 
@@ -8196,6 +8229,7 @@ fn desktop_control_methods() -> &'static [&'static str] {
         "browser.navigate",
         "browser.screenshot",
         "browser.dom_snapshot",
+        "browser.viewport",
         "browser.frames",
         "browser.storage",
         "browser.cookies",
@@ -11474,6 +11508,7 @@ fn is_desktop_store_method(method: &str) -> bool {
             | "browser.current_url"
             | "browser.screenshot"
             | "browser.dom_snapshot"
+            | "browser.viewport"
             | "browser.frames"
             | "browser.storage"
             | "browser.cookies"
@@ -12993,17 +13028,27 @@ fn normalize_optional_workspace_group_text(value: Option<String>) -> Option<Stri
         .filter(|text| !text.is_empty())
 }
 
-fn workspace_detail(bundle: WorkspaceBundle) -> WorkspaceDetailResult {
-    WorkspaceDetailResult {
+fn workspace_detail(
+    store: &SqliteStore,
+    bundle: WorkspaceBundle,
+) -> Result<WorkspaceDetailResult, DesktopHostError> {
+    let sessions = bundle
+        .sessions
+        .iter()
+        .map(|session| {
+            let backend_profile = store
+                .load_session_launch_spec(&session.session_id)?
+                .and_then(|spec| clean_optional_text(spec.backend_profile));
+            Ok(persisted_session_summary(session, backend_profile))
+        })
+        .collect::<Result<Vec<_>, DesktopHostError>>()?;
+
+    Ok(WorkspaceDetailResult {
         workspace: workspace_summary(&bundle.workspace),
         panes: bundle.panes.iter().map(pane_summary).collect(),
         surfaces: bundle.surfaces.iter().map(surface_summary).collect(),
-        sessions: bundle
-            .sessions
-            .iter()
-            .map(persisted_session_summary)
-            .collect(),
-    }
+        sessions,
+    })
 }
 
 fn pane_summary(pane: &PersistedPane) -> PaneSummaryResult {
@@ -13109,11 +13154,15 @@ fn resolve_optional_workspace_id(
         .map(|workspace| workspace.workspace_id.clone()))
 }
 
-fn persisted_session_summary(session: &PersistedSession) -> SessionSummaryResult {
+fn persisted_session_summary(
+    session: &PersistedSession,
+    backend_profile: Option<String>,
+) -> SessionSummaryResult {
     SessionSummaryResult {
         session_id: session.session_id.clone(),
         workspace_id: session.workspace_id.clone(),
         backend_kind: session.backend_kind.clone(),
+        backend_profile,
         state: session.state.clone(),
         exit_code: session.exit_code,
         backend_native_id: session.backend_native_id.clone(),
@@ -14336,6 +14385,7 @@ fn is_mutating_control_method(method: &str) -> bool {
             | "browser.check"
             | "browser.focus"
             | "browser.zoom"
+            | "browser.viewport"
             | "browser.evaluate"
             | "profile.create"
             | "profile.update"
@@ -17598,6 +17648,75 @@ mod tests {
     }
 
     #[test]
+    fn workspace_get_preserves_session_launch_backend_profile() {
+        let state = DesktopControlState::new();
+        let create = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_profile_workspace",
+                "workspace.create",
+                r#"{"name":"Profile contract","project_root":"C:\\","backend_profile":null}"#,
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        let workspace_id = response_string_field(&create, "workspace_id");
+        let now = timestamp();
+        let session_id = "ses_non_default_wsl".to_string();
+        {
+            let mut store = state.store.lock().unwrap();
+            let mut bundle = store
+                .load_workspace_bundle(&workspace_id)
+                .unwrap()
+                .expect("profile workspace");
+            bundle.sessions.push(PersistedSession {
+                session_id: session_id.clone(),
+                workspace_id: workspace_id.clone(),
+                backend_kind: "wsl-direct".to_string(),
+                backend_attachment_id: None,
+                backend_native_id: None,
+                cwd: Some("/home/agentmux".to_string()),
+                command: vec!["bash".to_string()],
+                state: "running".to_string(),
+                exit_code: None,
+                durability: "ephemeral".to_string(),
+                created_at: now.clone(),
+                last_seen_at: Some(now.clone()),
+                updated_at: now.clone(),
+            });
+            store.save_workspace_bundle(&bundle).unwrap();
+            store
+                .upsert_session_launch_spec(&PersistedSessionLaunchSpec {
+                    session_id: session_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    backend_profile: Some("Debian".to_string()),
+                    env: Vec::new(),
+                    columns: 120,
+                    rows: 30,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+
+        let detail = response_value(&agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_profile_workspace_get",
+                "workspace.get",
+                serde_json::json!({ "workspace_id": workspace_id }).to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        ));
+        let session = detail["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["session_id"] == session_id)
+            .expect("persisted WSL session");
+        assert_eq!(session["backend_kind"], "wsl-direct");
+        assert_eq!(session["backend_profile"], "Debian");
+    }
+
+    #[test]
     #[cfg(windows)]
     fn terminal_split_compensates_post_spawn_persistence_failure() {
         fn fail_persistence(
@@ -19156,6 +19275,7 @@ mod tests {
             session_id: "ses_tmux".to_string(),
             workspace_id: "ws_tmux".to_string(),
             backend_kind: "wsl-tmux-control".to_string(),
+            backend_profile: Some("Ubuntu".to_string()),
             state: "running".to_string(),
             exit_code: None,
             backend_native_id: Some("agentmux_tmux".to_string()),
@@ -20436,6 +20556,7 @@ mod tests {
             session_id: "ses_dock".to_string(),
             workspace_id: "ws_dock".to_string(),
             backend_kind: "wsl-direct".to_string(),
+            backend_profile: None,
             state: "running".to_string(),
             exit_code: None,
             backend_native_id: None,

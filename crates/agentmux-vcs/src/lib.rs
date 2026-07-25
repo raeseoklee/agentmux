@@ -40,6 +40,7 @@ const MAX_REVISION_BYTES: usize = 1024;
 #[derive(Clone, Copy, Debug)]
 pub struct GitConfig {
     pub command_timeout: Duration,
+    pub status_command_timeout: Duration,
     pub resolve_output_bytes: usize,
     pub status_output_bytes: usize,
     pub status_entry_limit: usize,
@@ -53,6 +54,7 @@ impl Default for GitConfig {
     fn default() -> Self {
         Self {
             command_timeout: Duration::from_secs(15),
+            status_command_timeout: Duration::from_secs(90),
             resolve_output_bytes: 64 * 1024,
             status_output_bytes: 16 * 1024 * 1024,
             status_entry_limit: MAX_STATUS_ENTRIES,
@@ -62,6 +64,19 @@ impl Default for GitConfig {
             stderr_output_bytes: 1024 * 1024,
         }
     }
+}
+
+fn status_arguments() -> [String; 8] {
+    [
+        "--no-optional-locks".to_string(),
+        "-c".to_string(),
+        "core.quotePath=false".to_string(),
+        "status".to_string(),
+        "--porcelain=v2".to_string(),
+        "--branch".to_string(),
+        "-z".to_string(),
+        "--untracked-files=all".to_string(),
+    ]
 }
 
 #[derive(Clone, Debug)]
@@ -279,7 +294,7 @@ impl GitClient {
 
     pub fn read_status_with_metrics(&self, repository: &Repository) -> Result<StatusReadResult> {
         let generation = self.generation(repository);
-        self.read_status_with_progress(repository, generation, |_, _| Ok(()))
+        self.read_status_with_progress(repository, generation, || false, |_, _| Ok(()))
     }
 
     pub fn start_status_scan(
@@ -308,8 +323,12 @@ impl GitClient {
         thread::Builder::new()
             .name("agentmux-git-status".to_string())
             .spawn(move || {
-                let result =
-                    client.read_status_with_progress(&repository, generation, |parser, elapsed| {
+                let cancellation = Arc::clone(&worker_scan.shared);
+                let result = client.read_status_with_progress(
+                    &repository,
+                    generation,
+                    || cancellation.cancelled.load(Ordering::Acquire),
+                    |parser, elapsed| {
                         if worker_scan.shared.cancelled.load(Ordering::Acquire) {
                             return Err(GitError::StateUnavailable(
                                 "Git status scan was cancelled.".to_string(),
@@ -328,7 +347,8 @@ impl GitClient {
                             });
                         }
                         Ok(())
-                    });
+                    },
+                );
                 worker_scan.finish(result);
             })
             .map_err(|error| GitError::Io {
@@ -338,26 +358,20 @@ impl GitClient {
         Ok(scan)
     }
 
-    fn read_status_with_progress<F>(
+    fn read_status_with_progress<C, F>(
         &self,
         repository: &Repository,
         generation: u64,
+        is_cancelled: C,
         mut on_progress: F,
     ) -> Result<StatusReadResult>
     where
+        C: FnMut() -> bool,
         F: FnMut(&PorcelainV2StreamParser, Duration) -> Result<()>,
     {
         let repository_lock = self.repository_lock(&repository.key());
         let _guard = recover_read(&repository_lock);
-        let arguments = [
-            "-c".to_string(),
-            "core.quotePath=false".to_string(),
-            "status".to_string(),
-            "--porcelain=v2".to_string(),
-            "--branch".to_string(),
-            "-z".to_string(),
-            "--untracked-files=all".to_string(),
-        ];
+        let arguments = status_arguments();
         let spec = build_git_command_spec(&repository.context(), &arguments, true);
         let mut parser = PorcelainV2StreamParser::new(self.config.status_entry_limit);
         let started_at = Instant::now();
@@ -366,11 +380,12 @@ impl GitClient {
             &spec,
             "read repository status",
             CaptureLimits {
-                timeout: self.config.command_timeout,
+                timeout: self.config.status_command_timeout,
                 stdout_bytes: self.config.status_output_bytes,
                 stderr_bytes: self.config.stderr_output_bytes,
                 stdout_overflow: OverflowPolicy::Fail,
             },
+            is_cancelled,
             |chunk| {
                 parser.push(chunk)?;
                 if first_change_after.is_none() && parser.file_count() > 0 {
@@ -1489,6 +1504,16 @@ mod tests {
                 "/mnt/d/worktree"
             ]
         );
+    }
+
+    #[test]
+    fn status_scan_is_read_only_and_uses_its_large_repository_budget() {
+        let arguments = status_arguments();
+        assert_eq!(arguments[0], "--no-optional-locks");
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--porcelain=v2"));
+        assert!(GitConfig::default().status_command_timeout >= Duration::from_secs(60));
     }
 
     #[test]

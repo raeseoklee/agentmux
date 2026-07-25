@@ -55,6 +55,21 @@ surface for Linux development workflows.
 - Local named-pipe control plane for desktop automation.
 - Event polling and subscription APIs for agents and external tools.
 
+## Server Mode
+
+- The server reuses the desktop React workspace shell instead of maintaining a
+  separate web UI.
+- Local server terminals support WSL direct, PowerShell, and Command Prompt.
+  WSL uses the same login-shell bootstrap and shell theme environment as the
+  desktop path.
+- Source Control and the bottom status bar follow the active Pane directory,
+  backend, branch, and commit instead of the server process directory.
+- Desktop-bridge mode exposes the running desktop control plane through the
+  authenticated web endpoint.
+- Embedded Browser surfaces, durable WSL-tmux control, and persisted desktop
+  layout still require the desktop host. See the
+  [server-mode guide](./user/server-mode.md) for the exact boundary.
+
 ## Packaging and Operations
 
 - Windows NSIS installer builds through GitHub Actions.

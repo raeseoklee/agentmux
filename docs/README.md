@@ -6,6 +6,8 @@ The default documentation language is English.
 - [Korean documentation](./ko/README.md)
 - [Advanced agent workflows](./en/user/advanced-agent-workflows.md)
 - [고급 에이전트 워크플로](./ko/user/advanced-agent-workflows.md)
+- [Server mode](./en/user/server-mode.md)
+- [Server mode 한국어 안내](./ko/user/server-mode.md)
 - [Release policy](./release-policy.md)
 - [Release evidence](./release-evidence/0.1.3.md)
 
