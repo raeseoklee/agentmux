@@ -114,6 +114,8 @@ const TEXT_BOX_MIN_LINES: u8 = 2;
 const TEXT_BOX_MAX_LINES: u8 = 12;
 const TERMINAL_INNER_MARGIN_MIN: u8 = 0;
 const TERMINAL_INNER_MARGIN_MAX: u8 = 32;
+const PANE_OUTER_MARGIN_MIN: u8 = 0;
+const PANE_OUTER_MARGIN_MAX: u8 = 32;
 const GIT_STATUS_CACHE_TTL: Duration = Duration::from_secs(3);
 const GIT_REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(60);
 const GIT_REPOSITORY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -7151,6 +7153,9 @@ impl DesktopControlState {
             if let Some(margin) = ui.terminal_inner_margin {
                 config.ui.terminal_inner_margin = Some(normalize_terminal_inner_margin(margin)?);
             }
+            if let Some(margin) = ui.pane_outer_margin {
+                config.ui.pane_outer_margin = Some(normalize_pane_outer_margin(margin)?);
+            }
             if let Some(acceleration) = ui.terminal_gpu_acceleration {
                 config.ui.terminal_gpu_acceleration =
                     Some(normalize_terminal_gpu_acceleration(&acceleration)?);
@@ -9535,6 +9540,9 @@ fn normalize_app_config_ui(ui: &mut AppConfigUi) -> Result<(), DesktopHostError>
     if let Some(margin) = ui.terminal_inner_margin {
         ui.terminal_inner_margin = Some(normalize_terminal_inner_margin(margin)?);
     }
+    if let Some(margin) = ui.pane_outer_margin {
+        ui.pane_outer_margin = Some(normalize_pane_outer_margin(margin)?);
+    }
     if let Some(acceleration) = ui.terminal_gpu_acceleration.take() {
         ui.terminal_gpu_acceleration = Some(normalize_terminal_gpu_acceleration(&acceleration)?);
     }
@@ -9684,6 +9692,19 @@ fn invalid_terminal_inner_margin(value: u8) -> DesktopHostError {
             "Config ui.terminal_inner_margin must be between {TERMINAL_INNER_MARGIN_MIN} and {TERMINAL_INNER_MARGIN_MAX}; got {value}."
         ),
     ))
+}
+
+fn normalize_pane_outer_margin(value: u8) -> Result<u8, DesktopHostError> {
+    if (PANE_OUTER_MARGIN_MIN..=PANE_OUTER_MARGIN_MAX).contains(&value) {
+        Ok(value)
+    } else {
+        Err(DesktopHostError::Control(ControlError::new(
+            ErrorCode::InvalidRequest,
+            format!(
+                "Config ui.pane_outer_margin must be between {PANE_OUTER_MARGIN_MIN} and {PANE_OUTER_MARGIN_MAX}; got {value}."
+            ),
+        )))
+    }
 }
 
 fn normalize_terminal_gpu_acceleration(value: &str) -> Result<String, DesktopHostError> {
@@ -10555,6 +10576,9 @@ fn merge_app_config_ui(ui: &mut AppConfigUi, overrides: AppConfigUi) {
     }
     if overrides.terminal_inner_margin.is_some() {
         ui.terminal_inner_margin = overrides.terminal_inner_margin;
+    }
+    if overrides.pane_outer_margin.is_some() {
+        ui.pane_outer_margin = overrides.pane_outer_margin;
     }
     if overrides.terminal_gpu_acceleration.is_some() {
         ui.terminal_gpu_acceleration = overrides.terminal_gpu_acceleration;
@@ -15736,7 +15760,7 @@ mod tests {
             RequestEnvelope::new(
                 "req_config_update",
                 "config.update",
-                r#"{"appearance":{"theme":"light","accent_key":"custom:#13579b","font_size":14.5},"shortcuts":{"bindings":{"workspace.new":["ctrl+b","c"],"app.search":null}},"ui":{"terminal_inner_margin":9,"terminal_gpu_acceleration":"on"}}"#,
+                r#"{"appearance":{"theme":"light","accent_key":"custom:#13579b","font_size":14.5},"shortcuts":{"bindings":{"workspace.new":["ctrl+b","c"],"app.search":null}},"ui":{"terminal_inner_margin":9,"pane_outer_margin":7,"terminal_gpu_acceleration":"on"}}"#,
                 "configured-token",
             ),
         );
@@ -15753,6 +15777,7 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(value["ui"]["terminal_inner_margin"], serde_json::json!(9));
+        assert_eq!(value["ui"]["pane_outer_margin"], serde_json::json!(7));
         assert_eq!(
             value["ui"]["terminal_gpu_acceleration"],
             serde_json::json!("on")
@@ -15786,6 +15811,7 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(value["ui"]["terminal_inner_margin"], serde_json::json!(9));
+        assert_eq!(value["ui"]["pane_outer_margin"], serde_json::json!(7));
         assert_eq!(
             value["ui"]["terminal_gpu_acceleration"],
             serde_json::json!("on")
@@ -15793,6 +15819,12 @@ mod tests {
 
         cleanup_temp_db(&store_path);
         let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn pane_outer_margin_rejects_values_above_the_supported_limit() {
+        let error = normalize_pane_outer_margin(PANE_OUTER_MARGIN_MAX + 1).unwrap_err();
+        assert!(error.to_string().contains("pane_outer_margin"));
     }
 
     #[test]

@@ -838,7 +838,7 @@ body {
 
 .agentmux-tab-pane-tree {
   position: absolute;
-  inset: 9px;
+  inset: var(--agentmux-pane-outer-margin, 9px);
   display: flex;
   min-width: 0;
   min-height: 0;

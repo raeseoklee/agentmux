@@ -129,10 +129,19 @@ test("settings close control stays fixed while the active page scrolls", async (
 
   await page.locator(".agentmux-settings-open").click();
   const dialog = page.getByRole("dialog", { name: "Settings" });
+  const header = dialog.locator(".agentmux-settings-header");
   const scroller = dialog.locator(".agentmux-scroll");
   const close = dialog.locator(".agentmux-settings-close");
+  const headerBox = await header.boundingBox();
+  const scrollerBox = await scroller.boundingBox();
   const initialBox = await close.boundingBox();
+  expect(headerBox).not.toBeNull();
+  expect(scrollerBox).not.toBeNull();
   expect(initialBox).not.toBeNull();
+  expect(headerBox?.y).toBeLessThan(scrollerBox?.y ?? 0);
+  expect((headerBox?.y ?? 0) + (headerBox?.height ?? 0)).toBeLessThanOrEqual(
+    (scrollerBox?.y ?? 0) + 1,
+  );
 
   await scroller.evaluate((element) => {
     element.scrollTop = element.scrollHeight;

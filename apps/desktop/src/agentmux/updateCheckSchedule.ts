@@ -1,5 +1,5 @@
-export const AUTO_UPDATE_PERIODIC_INTERVAL_MS = 4 * 60 * 60 * 1_000;
-export const AUTO_UPDATE_RESUME_STALE_MS = 30 * 60 * 1_000;
+export const AUTO_UPDATE_PERIODIC_INTERVAL_MS = 60 * 60 * 1_000;
+export const AUTO_UPDATE_RESUME_STALE_MS = 15 * 60 * 1_000;
 
 export type UpdateLifecycleStatus =
   | "idle"

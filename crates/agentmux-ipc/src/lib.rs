@@ -1814,6 +1814,8 @@ pub struct AppConfigUi {
     #[serde(default)]
     pub terminal_inner_margin: Option<u8>,
     #[serde(default)]
+    pub pane_outer_margin: Option<u8>,
+    #[serde(default)]
     pub terminal_gpu_acceleration: Option<String>,
     #[serde(default)]
     pub terminal_start_directory: Option<String>,
@@ -1993,6 +1995,7 @@ pub struct AppConfigUiUpdate {
     pub surface_tab_actions: Option<Vec<String>>,
     pub text_box_max_lines: Option<u8>,
     pub terminal_inner_margin: Option<u8>,
+    pub pane_outer_margin: Option<u8>,
     pub terminal_gpu_acceleration: Option<String>,
     pub terminal_start_directory: Option<String>,
     pub terminal_start_custom_cwd: Option<String>,

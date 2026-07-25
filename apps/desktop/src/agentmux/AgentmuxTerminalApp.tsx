@@ -66,6 +66,11 @@ import {
 } from "./actions";
 import { useAppDialogs } from "./dialogs";
 import { BrowserSurfacePanel } from "./BrowserSurfacePanel";
+import {
+  closeNativeBrowser,
+  navigateNativeBrowser,
+  supportsNativeBrowser,
+} from "./nativeBrowser";
 import { MarkdownSurfacePanel } from "./MarkdownSurfacePanel";
 import {
   readSurfaceTitleOverrides,
@@ -489,6 +494,9 @@ const TEXT_BOX_MAX_LINES = 12;
 const TERMINAL_INNER_MARGIN_DEFAULT = 0;
 const TERMINAL_INNER_MARGIN_MIN = 0;
 const TERMINAL_INNER_MARGIN_MAX = 32;
+const PANE_OUTER_MARGIN_DEFAULT = 9;
+const PANE_OUTER_MARGIN_MIN = 0;
+const PANE_OUTER_MARGIN_MAX = 32;
 const WORKSPACE_GROUP_DRAG_TYPE = "application/x-agentmux-workspace-group";
 const WORKSPACE_MEMBER_DRAG_TYPE = "application/x-agentmux-workspace-member";
 const WORKSPACE_CARD_DRAG_TYPE = "application/x-agentmux-workspace-card";
@@ -1953,6 +1961,7 @@ const PaneView = memo(function PaneView({
               key={surface.surfaceId}
               client={client}
               surfaceId={surface.surfaceId}
+              visible={visible}
               t={t}
               onTitleChange={onBrowserTitleChange}
               onOpenExternal={onOpenBrowserExternal}
@@ -2574,13 +2583,11 @@ export function AgentmuxTerminalApp() {
         });
         return update;
       } catch (cause) {
-        if (!background) {
-          setUpdateState({
-            status: "error",
-            message: updateErrorMessage(cause),
-            lastCheckedAt: new Date().toISOString(),
-          });
-        }
+        setUpdateState({
+          status: "error",
+          message: updateErrorMessage(cause),
+          lastCheckedAt: new Date().toISOString(),
+        });
         return null;
       } finally {
         if (updateCheckInFlightRef.current === request) {
@@ -2920,6 +2927,22 @@ export function AgentmuxTerminalApp() {
   const panes = useMemo(() => detail?.panes ?? [], [detail]);
   const surfaces = useMemo(() => detail?.surfaces ?? [], [detail]);
   const sessions = useMemo(() => detail?.sessions ?? [], [detail]);
+  const previousNativeBrowserSurfaceIdsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!supportsNativeBrowser()) return;
+    const current = new Set(
+      surfaces
+        .filter((surface) => surface.surfaceType === "browser")
+        .map((surface) => surface.surfaceId),
+    );
+    for (const surfaceId of previousNativeBrowserSurfaceIdsRef.current) {
+      if (!current.has(surfaceId)) {
+        void closeNativeBrowser(surfaceId).catch(() => undefined);
+      }
+    }
+    previousNativeBrowserSurfaceIdsRef.current = current;
+  }, [surfaces]);
 
   useEffect(() => {
     const browserSurfaces = surfaces.filter(
@@ -5145,6 +5168,39 @@ export function AgentmuxTerminalApp() {
   const addTerminal = useCallback(async () => {
     await runTerminalLaunch(() => ctl.spawnDefaultTerminal());
   }, [ctl, runTerminalLaunch]);
+  const reusableBrowserSurface = useCallback(() => {
+    const activePane = activePaneId ? paneById.get(activePaneId) : undefined;
+    const activeSurface = activePane?.mountedSurfaceId
+      ? surfaceById.get(activePane.mountedSurfaceId)
+      : undefined;
+    if (activeSurface?.surfaceType === "browser") return activeSurface;
+    return surfaces.find((surface) => surface.surfaceType === "browser") ?? null;
+  }, [activePaneId, paneById, surfaceById, surfaces]);
+  const focusBrowserSurface = useCallback(
+    async (surface: SurfaceSummary) => {
+      const host = panes.find(
+        (pane) => pane.mountedSurfaceId === surface.surfaceId,
+      );
+      if (host) {
+        await ctl.focusPane(host.paneId);
+      } else {
+        await ctl.mountSurface(surface.surfaceId);
+      }
+    },
+    [ctl, panes],
+  );
+  const navigateBrowserSurface = useCallback(
+    async (surfaceId: string, url: string) => {
+      await client.browserNavigate(surfaceId, url);
+      if (supportsNativeBrowser()) {
+        // Desktop rendering uses a native WebView2 child while the control
+        // plane retains its headless browser for automation/server parity.
+        // Keep both guests on the same programmatic navigation target.
+        await navigateNativeBrowser(surfaceId, url).catch(() => undefined);
+      }
+    },
+    [client],
+  );
   const openContextLink = useCallback(async () => {
     const selectedText = window.getSelection()?.toString() ?? "";
     const url =
@@ -5164,12 +5220,26 @@ export function AgentmuxTerminalApp() {
         .map((state) => extractFirstUrl(state.reason))
         .find((candidate): candidate is string => Boolean(candidate)) ??
       null;
-    const surface = await ctl.createBrowserSurface("new_tab");
+    const surface =
+      reusableBrowserSurface() ?? (await ctl.createBrowserSurface("new_tab"));
     if (surface && url) {
-      await ctl.browserNavigate(surface.surfaceId, url);
+      await navigateBrowserSurface(surface.surfaceId, url);
+    }
+    if (surface) {
+      await focusBrowserSurface(surface);
     }
     closeOverlay();
-  }, [attention, closeOverlay, ctl, notifications, teamMessages, teamTasks]);
+  }, [
+    attention,
+    closeOverlay,
+    ctl,
+    focusBrowserSurface,
+    navigateBrowserSurface,
+    notifications,
+    reusableBrowserSurface,
+    teamMessages,
+    teamTasks,
+  ]);
   const openTerminalLinkInBrowserSplit = useCallback(
     async (rawUrl: string, paneId: string) => {
       const url = normalizeHttpUrl(rawUrl);
@@ -5177,8 +5247,15 @@ export function AgentmuxTerminalApp() {
         return;
       }
 
-      // Default: hand off to the OS browser so OAuth/login loopback callbacks
-      // (Claude Code, etc.) complete. The in-app split browser is opt-in.
+      const existing = reusableBrowserSurface();
+      if (existing) {
+        await navigateBrowserSurface(existing.surfaceId, url);
+        await focusBrowserSurface(existing);
+        return;
+      }
+
+      // With no reusable in-app browser, honor the configured default. The
+      // system browser remains important for OAuth/login loopback callbacks.
       if (terminalLinkOpenMode === "system") {
         const opened = await openUrlInSystemBrowser(url);
         if (opened) {
@@ -5208,7 +5285,7 @@ export function AgentmuxTerminalApp() {
           "default",
           "active_pane",
         );
-        await client.browserNavigate(surface.surfaceId, url);
+        await navigateBrowserSurface(surface.surfaceId, url);
         await ctl.refresh();
       } catch (error) {
         console.warn("[agentmux] failed to open terminal link in split browser", {
@@ -5218,7 +5295,7 @@ export function AgentmuxTerminalApp() {
         });
         const surface = await ctl.createBrowserSurface("new_tab");
         if (surface) {
-          await ctl.browserNavigate(surface.surfaceId, url);
+          await navigateBrowserSurface(surface.surfaceId, url);
         }
       }
     },
@@ -5226,15 +5303,22 @@ export function AgentmuxTerminalApp() {
       terminalLinkOpenMode,
       activeWorkspaceId,
       client,
-      ctl.browserNavigate,
       ctl.createBrowserSurface,
       ctl.refresh,
+      focusBrowserSurface,
+      navigateBrowserSurface,
+      reusableBrowserSurface,
     ],
   );
   const openBrowserInPaneSplit = useCallback(
     async (paneId: string) => {
       if (!activeWorkspaceId) return;
       try {
+        const existing = reusableBrowserSurface();
+        if (existing) {
+          await focusBrowserSurface(existing);
+          return;
+        }
         const splitDetail = await client.splitPane(
           activeWorkspaceId,
           paneId,
@@ -5267,7 +5351,15 @@ export function AgentmuxTerminalApp() {
         });
       }
     },
-    [activeWorkspaceId, client, ctl, dialogs, t],
+    [
+      activeWorkspaceId,
+      client,
+      ctl,
+      dialogs,
+      focusBrowserSurface,
+      reusableBrowserSurface,
+      t,
+    ],
   );
   const updateBrowserPageTitle = useCallback(
     (surfaceId: string, title: string | null) => {
@@ -6414,7 +6506,9 @@ export function AgentmuxTerminalApp() {
         keywords: ["browser", "surface", "pane"],
         disabled: activePaneId === null,
         run: () => {
-          void ctl.createBrowserSurface("active_pane");
+          if (activePaneId) {
+            void openBrowserInPaneSplit(activePaneId);
+          }
           closeOverlay();
         },
       },
@@ -6754,6 +6848,7 @@ export function AgentmuxTerminalApp() {
       isDark,
       jumpNextAttention,
       openContextLink,
+      openBrowserInPaneSplit,
       openNotificationPanel,
       openTerminalInPane,
       openTextBoxComposer,
@@ -6823,6 +6918,7 @@ export function AgentmuxTerminalApp() {
   const terminalInnerMargin = clampTerminalInnerMargin(
     uiConfig.terminalInnerMargin,
   );
+  const paneOuterMargin = clampPaneOuterMargin(uiConfig.paneOuterMargin);
   const terminalStartDirectory =
     uiConfig.terminalStartDirectory ?? "home";
   const terminalStartCustomCwd = uiConfig.terminalStartCustomCwd ?? "";
@@ -6858,6 +6954,27 @@ export function AgentmuxTerminalApp() {
           {
             ui: {
               terminalInnerMargin: nextMargin,
+            },
+          },
+          activeWorkspaceId,
+        )
+        .then((config) => applyConfig(config))
+        .catch(() => undefined);
+    },
+    [activeWorkspaceId, applyConfig, client],
+  );
+  const updatePaneOuterMargin = useCallback(
+    (value: number) => {
+      const nextMargin = clampPaneOuterMargin(value);
+      setUiConfig((current) => ({
+        ...current,
+        paneOuterMargin: nextMargin,
+      }));
+      void client
+        .updateConfig(
+          {
+            ui: {
+              paneOuterMargin: nextMargin,
             },
           },
           activeWorkspaceId,
@@ -7187,7 +7304,7 @@ export function AgentmuxTerminalApp() {
           style={{
             display: "flex",
             flexDirection: column ? "column" : "row",
-            gap: 2,
+            gap: 0,
             minWidth: 0,
             minHeight: 0,
             flex: "1 1 0",
@@ -7209,6 +7326,7 @@ export function AgentmuxTerminalApp() {
           {first && second ? (
             <SplitHandle
               vertical={!column}
+              spacing={paneOuterMargin}
               onResize={(value) => ctl.resizePane(pane.paneId, value)}
             />
           ) : null}
@@ -7272,7 +7390,10 @@ export function AgentmuxTerminalApp() {
         pane={pane}
         surface={surface}
         session={session}
-        visible={visible}
+        visible={
+          visible &&
+          (!isBrowser || overlay === null || overlay === "sourceControl")
+        }
         active={active}
         isBrowser={isBrowser}
         agentState={agentState}
@@ -9308,7 +9429,13 @@ export function AgentmuxTerminalApp() {
 
             <div
               className="agentmux-tab-pane-stack"
-              style={{ flex: 1, minHeight: 0, padding: 9 }}
+              style={
+                {
+                  flex: 1,
+                  minHeight: 0,
+                  "--agentmux-pane-outer-margin": `${paneOuterMargin}px`,
+                } as CSSProperties
+              }
             >
               {!ready ? (
                 <div
@@ -9600,6 +9727,7 @@ export function AgentmuxTerminalApp() {
             accentKey={accentKey}
             fontSize={fontSize}
             terminalInnerMargin={terminalInnerMargin}
+            paneOuterMargin={paneOuterMargin}
             terminalGpuAcceleration={terminalGpuAcceleration}
             terminalStartDirectory={terminalStartDirectory}
             terminalStartCustomCwd={terminalStartCustomCwd}
@@ -9631,6 +9759,7 @@ export function AgentmuxTerminalApp() {
             setAccentKey={setAccentKey}
             setFontSize={setFontSize}
             setTerminalInnerMargin={updateTerminalInnerMargin}
+            setPaneOuterMargin={updatePaneOuterMargin}
             setTerminalGpuAcceleration={updateTerminalGpuAcceleration}
             setTerminalStartDirectory={updateTerminalStartDirectory}
             setTerminalStartCustomCwd={updateTerminalStartCustomCwd}
@@ -11442,6 +11571,16 @@ function clampTerminalInnerMargin(value: number | null | undefined): number {
   );
 }
 
+function clampPaneOuterMargin(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return PANE_OUTER_MARGIN_DEFAULT;
+  }
+  return Math.min(
+    PANE_OUTER_MARGIN_MAX,
+    Math.max(PANE_OUTER_MARGIN_MIN, Math.round(value)),
+  );
+}
+
 function textBoxMaxHeight(maxLines: number): number {
   return Math.ceil(maxLines * 17.4 + 20);
 }
@@ -11936,6 +12075,7 @@ interface SettingsModalProps {
   accentKey: string;
   fontSize: number;
   terminalInnerMargin: number;
+  paneOuterMargin: number;
   terminalGpuAcceleration: TerminalGpuAccelerationMode;
   terminalStartDirectory: TerminalStartDirectory;
   terminalStartCustomCwd: string;
@@ -11968,6 +12108,7 @@ interface SettingsModalProps {
   setAccentKey: (key: string) => void;
   setFontSize: (size: number) => void;
   setTerminalInnerMargin: (size: number) => void;
+  setPaneOuterMargin: (size: number) => void;
   setTerminalGpuAcceleration: (mode: TerminalGpuAccelerationMode) => void;
   setTerminalStartDirectory: (value: TerminalStartDirectory) => void;
   setTerminalStartCustomCwd: (value: string) => void;
@@ -12564,6 +12705,7 @@ function SettingsModal(props: SettingsModalProps) {
     accentKey,
     fontSize,
     terminalInnerMargin,
+    paneOuterMargin,
     terminalGpuAcceleration,
     terminalStartDirectory,
     terminalStartCustomCwd,
@@ -12596,6 +12738,7 @@ function SettingsModal(props: SettingsModalProps) {
     setAccentKey,
     setFontSize,
     setTerminalInnerMargin,
+    setPaneOuterMargin,
     setTerminalGpuAcceleration,
     setTerminalStartDirectory,
     setTerminalStartCustomCwd,
@@ -13210,46 +13353,66 @@ function SettingsModal(props: SettingsModalProps) {
             );
           })}
         </div>
-        <Hov
-          tag="button"
-          className="agentmux-settings-close"
-          ariaLabel={t("common.close")}
-          data-overlay-autofocus="true"
-          style={{
-            position: "absolute",
-            top: 16,
-            right: 16,
-            zIndex: 2,
-            width: 28,
-            height: 28,
-            borderRadius: 7,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "var(--fg3)",
-            cursor: "pointer",
-            border: "1px solid transparent",
-            background: "var(--surface)",
-            padding: 0,
-          }}
-          hover={{ background: "var(--s2)", color: "var(--fg1)" }}
-          onClick={onClose}
-        >
-          <IconClose size={14} />
-        </Hov>
         <div
-          id={`agentmux-settings-panel-${settingsTab}`}
-          className="agentmux-scroll"
-          role="tabpanel"
-          aria-labelledby={`agentmux-settings-tab-${settingsTab}`}
-          tabIndex={0}
+          className="agentmux-settings-main"
           style={{
+            display: "flex",
+            minWidth: 0,
             flex: 1,
-            overflow: "auto",
-            padding: "24px 28px",
-            position: "relative",
+            flexDirection: "column",
           }}
         >
+          <div
+            className="agentmux-settings-header"
+            style={{
+              height: 56,
+              flex: "none",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              padding: "0 18px",
+              borderBottom: "1px solid var(--border)",
+              background: "var(--surface)",
+            }}
+          >
+            <Hov
+              tag="button"
+              className="agentmux-settings-close"
+              ariaLabel={t("common.close")}
+              data-overlay-autofocus="true"
+              style={{
+                width: 28,
+                height: 28,
+                borderRadius: 7,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                color: "var(--fg3)",
+                cursor: "pointer",
+                border: "1px solid transparent",
+                background: "transparent",
+                padding: 0,
+              }}
+              hover={{ background: "var(--s2)", color: "var(--fg1)" }}
+              onClick={onClose}
+            >
+              <IconClose size={14} />
+            </Hov>
+          </div>
+          <div
+            id={`agentmux-settings-panel-${settingsTab}`}
+            className="agentmux-scroll"
+            role="tabpanel"
+            aria-labelledby={`agentmux-settings-tab-${settingsTab}`}
+            tabIndex={0}
+            style={{
+              minHeight: 0,
+              flex: 1,
+              overflow: "auto",
+              padding: "24px 28px",
+              position: "relative",
+            }}
+          >
           {settingsTab === "appearance" ? (
             <>
               <div
@@ -13572,6 +13735,48 @@ function SettingsModal(props: SettingsModalProps) {
                 value={terminalInnerMargin}
                 onChange={(e) =>
                   setTerminalInnerMargin(Number(e.currentTarget.value))
+                }
+                style={{
+                  width: "100%",
+                  accentColor: "var(--accent)",
+                  marginBottom: 24,
+                }}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: 9,
+                }}
+              >
+                <span
+                  style={{
+                    font: `600 12px/1 ${FONT_SANS}`,
+                    color: "var(--fg2)",
+                  }}
+                >
+                  {t("settings.paneOuterMargin")}
+                </span>
+                <span
+                  style={{
+                    font: `600 12px/1 ${FONT_MONO}`,
+                    color: "var(--accent)",
+                  }}
+                >
+                  {paneOuterMargin}px
+                </span>
+              </div>
+              <input
+                className="agentmux-pane-outer-margin"
+                aria-label={t("settings.paneOuterMargin")}
+                type="range"
+                min={PANE_OUTER_MARGIN_MIN}
+                max={PANE_OUTER_MARGIN_MAX}
+                step={1}
+                value={paneOuterMargin}
+                onChange={(event) =>
+                  setPaneOuterMargin(Number(event.currentTarget.value))
                 }
                 style={{
                   width: "100%",
@@ -14967,6 +15172,7 @@ function SettingsModal(props: SettingsModalProps) {
               </div>
             </>
           ) : null}
+          </div>
         </div>
       </div>
     </div>
