@@ -3,6 +3,7 @@ import {
   normalizeBrowserNavigationUrl,
   summarizeBrowserDom,
 } from "./BrowserSurfacePanel";
+import { normalizeBrowserScrollDelta } from "../control/ControlClient";
 
 describe("browser surface helpers", () => {
   it("normalizes a user-entered host without using an invalid placeholder", () => {
@@ -30,5 +31,12 @@ describe("browser surface helpers", () => {
 
     expect(preview.text).toHaveLength(12_000);
     expect(preview.truncated).toBe(true);
+  });
+
+  it("converts high-resolution wheel deltas to the integer IPC contract", () => {
+    expect(normalizeBrowserScrollDelta(18.75)).toBe(18);
+    expect(normalizeBrowserScrollDelta(-9.25)).toBe(-9);
+    expect(normalizeBrowserScrollDelta(Number.NaN)).toBeNull();
+    expect(normalizeBrowserScrollDelta(null)).toBeNull();
   });
 });

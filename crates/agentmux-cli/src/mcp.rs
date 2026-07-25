@@ -6886,6 +6886,7 @@ struct ConfigUiToolUpdate {
     surface_tab_actions: Option<Vec<String>>,
     text_box_max_lines: Option<u8>,
     terminal_inner_margin: Option<u8>,
+    pane_outer_margin: Option<u8>,
     terminal_gpu_acceleration: Option<String>,
     terminal_start_directory: Option<String>,
     terminal_start_custom_cwd: Option<String>,

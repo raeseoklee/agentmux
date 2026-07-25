@@ -19,6 +19,19 @@ import {
   IconSearch,
 } from "./icons";
 import type { Translator } from "./i18n";
+import {
+  NATIVE_BROWSER_LAYOUT_EVENT,
+  findInNativeBrowser,
+  hideNativeBrowser,
+  listenToNativeBrowser,
+  measureNativeBrowserBounds,
+  mountNativeBrowser,
+  navigateNativeBrowser,
+  runNativeBrowserNavigation,
+  setNativeBrowserZoom,
+  supportsNativeBrowser,
+  updateNativeBrowserBounds,
+} from "./nativeBrowser";
 
 const FONT_SANS =
   "'Pretendard Variable',Pretendard,-apple-system,'Segoe UI','Malgun Gothic',system-ui,sans-serif";
@@ -122,12 +135,14 @@ function fallbackPageTitle(url: string | null): string | null {
 export function BrowserSurfacePanel({
   client,
   surfaceId,
+  visible = true,
   t,
   onTitleChange,
   onOpenExternal,
 }: {
   client: ControlClient;
   surfaceId: string;
+  visible?: boolean;
   t: Translator;
   onTitleChange?: (surfaceId: string, title: string | null) => void;
   onOpenExternal: (url: string) => Promise<boolean>;
@@ -147,6 +162,9 @@ export function BrowserSurfacePanel({
   const [zoomPercent, setZoomPercent] = useState(100);
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedScreenshot, setCopiedScreenshot] = useState(false);
+  const [nativeBrowserReady, setNativeBrowserReady] = useState(false);
+  const [nativeTitle, setNativeTitle] = useState<string | null>(null);
+  const nativeBrowser = supportsNativeBrowser();
   const addressInputRef = useRef<HTMLInputElement | null>(null);
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const menuRootRef = useRef<HTMLDivElement | null>(null);
@@ -158,6 +176,52 @@ export function BrowserSurfacePanel({
   const lastViewportRef = useRef("");
   const viewportQueueRef = useRef<Promise<void>>(Promise.resolve());
   const frameRequestRef = useRef(0);
+  const wheelDeltaRef = useRef({ x: 0, y: 0 });
+  const wheelAnimationFrameRef = useRef<number | null>(null);
+  const wheelQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const nativeBrowserMountedRef = useRef(false);
+  const nativeBrowserMountRef = useRef<ReturnType<typeof mountNativeBrowser> | null>(null);
+  const nativeBrowserGenerationRef = useRef(0);
+
+  const syncNativeBrowser = useCallback(
+    async (url: string, shouldShow = visible) => {
+      const element = frameElementRef.current;
+      if (!nativeBrowser || !element) return false;
+      const bounds = measureNativeBrowserBounds(element);
+      if (!bounds) return false;
+      const unobstructed =
+        shouldShow &&
+        !menuOpen &&
+        !Boolean(document.querySelector('[role="dialog"]'));
+      if (nativeBrowserMountedRef.current) {
+        await updateNativeBrowserBounds(surfaceId, bounds, unobstructed);
+        return true;
+      }
+      const generation = nativeBrowserGenerationRef.current;
+      const mount =
+        nativeBrowserMountRef.current ??
+        mountNativeBrowser(surfaceId, url, bounds, unobstructed);
+      nativeBrowserMountRef.current = mount;
+      const result = await mount.finally(() => {
+        if (nativeBrowserMountRef.current === mount) {
+          nativeBrowserMountRef.current = null;
+        }
+      });
+      if (generation !== nativeBrowserGenerationRef.current) {
+        await hideNativeBrowser(surfaceId).catch(() => undefined);
+        return false;
+      }
+      nativeBrowserMountedRef.current = true;
+      await updateNativeBrowserBounds(surfaceId, bounds, unobstructed);
+      setNativeBrowserReady(true);
+      if (result.url && result.url !== "about:blank") {
+        setCurrentUrl(result.url);
+        setAddress(result.url);
+      }
+      return true;
+    },
+    [menuOpen, nativeBrowser, surfaceId, visible],
+  );
 
   const syncViewport = useCallback(async () => {
     const element = frameElementRef.current;
@@ -186,6 +250,20 @@ export function BrowserSurfacePanel({
   const loadPageFrame = useCallback(
     async (url: string, failOnError = false) => {
       const request = ++frameRequestRef.current;
+      if (nativeBrowser) {
+        try {
+          await syncNativeBrowser(url || "about:blank");
+          setPreview(null);
+          setPageFrame(null);
+          setPreviewError(null);
+        } catch (cause) {
+          const message =
+            cause instanceof Error ? cause.message : t("browser.surface.renderFailed");
+          setPreviewError(message);
+          if (failOnError) throw cause instanceof Error ? cause : new Error(message);
+        }
+        return;
+      }
       if (isBlankUrl(url)) {
         setPreview(null);
         setPageFrame(null);
@@ -217,7 +295,7 @@ export function BrowserSurfacePanel({
         }
       }
     },
-    [client, surfaceId, syncViewport, t],
+    [client, nativeBrowser, surfaceId, syncNativeBrowser, syncViewport, t],
   );
 
   const applyNavigationResult = useCallback(
@@ -258,6 +336,104 @@ export function BrowserSurfacePanel({
     void refreshCurrentUrl();
   }, [refreshCurrentUrl]);
 
+  useEffect(() => {
+    if (!nativeBrowser) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listenToNativeBrowser(surfaceId, {
+      onPageLoad: (event) => {
+        if (disposed) return;
+        setCurrentUrl(event.url);
+        setAddress(event.url);
+        setLoadState(event.state === "started" ? "loading" : "ready");
+        setError(null);
+      },
+      onTitle: (event) => {
+        if (!disposed) setNativeTitle(event.title.trim() || null);
+      },
+    })
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisten = cleanup;
+      })
+      .catch((cause: unknown) => {
+        if (!disposed) {
+          setError(cause instanceof Error ? cause.message : t("browser.surface.connectionError"));
+        }
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [nativeBrowser, surfaceId, t]);
+
+  useEffect(() => {
+    if (!nativeBrowser || !currentUrl) return;
+    void syncNativeBrowser(currentUrl).catch((cause: unknown) => {
+      setError(cause instanceof Error ? cause.message : t("browser.surface.renderFailed"));
+    });
+  }, [currentUrl, nativeBrowser, syncNativeBrowser, t]);
+
+  useEffect(() => {
+    if (!nativeBrowser) return;
+    let frame: number | null = null;
+    const syncLayout = () => {
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        void syncNativeBrowser(currentUrl || "about:blank").catch((cause: unknown) => {
+          setError(cause instanceof Error ? cause.message : t("browser.surface.renderFailed"));
+        });
+      });
+    };
+    window.addEventListener(NATIVE_BROWSER_LAYOUT_EVENT, syncLayout);
+    return () => {
+      window.removeEventListener(NATIVE_BROWSER_LAYOUT_EVENT, syncLayout);
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
+  }, [currentUrl, nativeBrowser, syncNativeBrowser, t]);
+
+  useEffect(() => {
+    if (!nativeBrowser) return;
+    let disposed = false;
+    let queued = false;
+    const updateVisibility = () => {
+      if (queued || disposed) return;
+      queued = true;
+      window.requestAnimationFrame(() => {
+        queued = false;
+        if (disposed || !nativeBrowserMountedRef.current) return;
+        if (!visible) {
+          void hideNativeBrowser(surfaceId).catch(() => undefined);
+          return;
+        }
+        const element = frameElementRef.current;
+        const bounds = element ? measureNativeBrowserBounds(element) : null;
+        if (!bounds) return;
+        const occluded = menuOpen || Boolean(document.querySelector('[role="dialog"]'));
+        void updateNativeBrowserBounds(surfaceId, bounds, !occluded).catch(() => undefined);
+      });
+    };
+    updateVisibility();
+    const observer = new MutationObserver(updateVisibility);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      disposed = true;
+      observer.disconnect();
+    };
+  }, [menuOpen, nativeBrowser, surfaceId, visible]);
+
+  useEffect(
+    () => () => {
+      nativeBrowserGenerationRef.current += 1;
+      if (nativeBrowserMountedRef.current) {
+        void hideNativeBrowser(surfaceId).catch(() => undefined);
+        nativeBrowserMountedRef.current = false;
+      }
+    },
+    [surfaceId],
+  );
+
   useEffect(
     () => () => {
       if (refreshTimerRef.current !== null) {
@@ -268,6 +444,9 @@ export function BrowserSurfacePanel({
       }
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
+      }
+      if (wheelAnimationFrameRef.current !== null) {
+        window.cancelAnimationFrame(wheelAnimationFrameRef.current);
       }
     },
     [],
@@ -294,9 +473,9 @@ export function BrowserSurfacePanel({
   useEffect(() => {
     onTitleChange?.(
       surfaceId,
-      preview?.title?.trim() || fallbackPageTitle(currentUrl),
+      nativeTitle || preview?.title?.trim() || fallbackPageTitle(currentUrl),
     );
-  }, [currentUrl, onTitleChange, preview?.title, surfaceId]);
+  }, [currentUrl, nativeTitle, onTitleChange, preview?.title, surfaceId]);
 
   useEffect(() => {
     const element = frameElementRef.current;
@@ -307,6 +486,12 @@ export function BrowserSurfacePanel({
       }
       viewportTimerRef.current = window.setTimeout(() => {
         viewportTimerRef.current = null;
+        if (nativeBrowser) {
+          void syncNativeBrowser(currentUrl || "about:blank").catch((cause: unknown) => {
+            setError(cause instanceof Error ? cause.message : t("browser.surface.renderFailed"));
+          });
+          return;
+        }
         void syncViewport()
           .then((changed) => {
             if (changed && currentUrl && !isBlankUrl(currentUrl)) {
@@ -316,7 +501,7 @@ export function BrowserSurfacePanel({
           .catch((cause: unknown) => {
             setError(cause instanceof Error ? cause.message : t("browser.surface.renderFailed"));
           });
-      }, 80);
+      }, nativeBrowser ? 0 : 80);
     };
     const observer = new ResizeObserver(refreshForViewport);
     observer.observe(element);
@@ -328,7 +513,7 @@ export function BrowserSurfacePanel({
         viewportTimerRef.current = null;
       }
     };
-  }, [currentUrl, loadPageFrame, syncViewport, t]);
+  }, [currentUrl, loadPageFrame, nativeBrowser, syncNativeBrowser, syncViewport, t]);
 
   const navigate = useCallback(async () => {
     const url = normalizeBrowserNavigationUrl(address);
@@ -340,6 +525,14 @@ export function BrowserSurfacePanel({
     setLoadState("loading");
     setError(null);
     try {
+      if (nativeBrowser) {
+        await syncNativeBrowser(currentUrl || "about:blank");
+        await navigateNativeBrowser(surfaceId, url);
+        setCurrentUrl(url);
+        setAddress(url);
+        void client.browserNavigate(surfaceId, url).catch(() => undefined);
+        return;
+      }
       const result = await client.browserNavigate(surfaceId, url);
       await applyNavigationResult(result.url);
       setLoadState("ready");
@@ -347,13 +540,24 @@ export function BrowserSurfacePanel({
       setError(cause instanceof Error ? cause.message : t("browser.surface.navigationFailed"));
       setLoadState("error");
     }
-  }, [address, applyNavigationResult, client, surfaceId, t]);
+  }, [address, applyNavigationResult, client, currentUrl, nativeBrowser, surfaceId, syncNativeBrowser, t]);
 
   const runNavigationAction = useCallback(
     async (action: "back" | "forward" | "reload") => {
       setLoadState("loading");
       setError(null);
       try {
+        if (nativeBrowser) {
+          await runNativeBrowserNavigation(surfaceId, action);
+          void (
+            action === "back"
+              ? client.browserBack(surfaceId)
+              : action === "forward"
+                ? client.browserForward(surfaceId)
+                : client.browserReload(surfaceId)
+          ).catch(() => undefined);
+          return;
+        }
         const result = await (
           action === "back"
             ? client.browserBack(surfaceId)
@@ -368,7 +572,7 @@ export function BrowserSurfacePanel({
         setLoadState("error");
       }
     },
-    [applyNavigationResult, client, surfaceId, t],
+    [applyNavigationResult, client, nativeBrowser, surfaceId, t],
   );
 
   const controlsDisabled = loadState === "loading";
@@ -402,6 +606,13 @@ export function BrowserSurfacePanel({
     setFindBusy(true);
     setError(null);
     try {
+      if (nativeBrowser) {
+        await findInNativeBrowser(surfaceId, query);
+        void client.browserFind(surfaceId, query, { limit: 1 }).then((result) => {
+          setFindCount(result.count);
+        }).catch(() => undefined);
+        return;
+      }
       const result = await client.browserFind(surfaceId, query, { limit: 1 });
       await client.browserEvaluate(
         surfaceId,
@@ -416,7 +627,7 @@ export function BrowserSurfacePanel({
     } finally {
       setFindBusy(false);
     }
-  }, [client, currentUrl, findQuery, loadPageFrame, surfaceId, t]);
+  }, [client, currentUrl, findQuery, loadPageFrame, nativeBrowser, surfaceId, t]);
 
   const applyZoom = useCallback(
     async (percent: number) => {
@@ -424,6 +635,13 @@ export function BrowserSurfacePanel({
       setLoadState("loading");
       setError(null);
       try {
+        if (nativeBrowser) {
+          await setNativeBrowserZoom(surfaceId, next);
+          setZoomPercent(next);
+          setLoadState("ready");
+          void client.browserZoom(surfaceId, next).catch(() => undefined);
+          return;
+        }
         await client.browserZoom(surfaceId, next);
         setZoomPercent(next);
         if (currentUrl && !isBlankUrl(currentUrl)) {
@@ -435,7 +653,7 @@ export function BrowserSurfacePanel({
         setLoadState("error");
       }
     },
-    [client, currentUrl, loadPageFrame, surfaceId, t],
+    [client, currentUrl, loadPageFrame, nativeBrowser, surfaceId, t],
   );
 
   const copyCurrentLink = useCallback(async () => {
@@ -540,15 +758,37 @@ export function BrowserSurfacePanel({
   const handleFrameWheel = useCallback(
     (event: React.WheelEvent<HTMLDivElement>) => {
       event.preventDefault();
-      void client
-        .browserScroll(surfaceId, { x: event.deltaX, y: event.deltaY })
-        .then(() => {
-          setError(null);
-          scheduleFrameRefresh();
-        })
-        .catch((cause: unknown) => {
-          setError(cause instanceof Error ? cause.message : t("browser.surface.scrollFailed"));
-        });
+      const pageSize = Math.max(1, frameElementRef.current?.clientHeight ?? 800);
+      const scale = event.deltaMode === 1 ? 32 : event.deltaMode === 2 ? pageSize : 1;
+      wheelDeltaRef.current.x += event.deltaX * scale;
+      wheelDeltaRef.current.y += event.deltaY * scale;
+      if (wheelAnimationFrameRef.current !== null) return;
+      wheelAnimationFrameRef.current = window.requestAnimationFrame(() => {
+        wheelAnimationFrameRef.current = null;
+        const x = Math.trunc(wheelDeltaRef.current.x);
+        const y = Math.trunc(wheelDeltaRef.current.y);
+        wheelDeltaRef.current.x -= x;
+        wheelDeltaRef.current.y -= y;
+        if (x === 0 && y === 0) return;
+        const queued = wheelQueueRef.current
+          .catch(() => undefined)
+          .then(() => client.browserScroll(surfaceId, { x, y }))
+          .then(() => {
+            setError(null);
+            scheduleFrameRefresh();
+          })
+          .catch((cause: unknown) => {
+            setError(
+              cause instanceof Error
+                ? cause.message
+                : t("browser.surface.scrollFailed"),
+            );
+          });
+        wheelQueueRef.current = queued.then(
+          () => undefined,
+          () => undefined,
+        );
+      });
     },
     [client, scheduleFrameRefresh, surfaceId, t],
   );
@@ -857,13 +1097,13 @@ export function BrowserSurfacePanel({
         }}
       >
         <div
-          aria-label="Interactive page preview"
-          onKeyDown={handleFrameKeyDown}
-          onWheel={handleFrameWheel}
+          aria-label={nativeBrowser ? "Native browser viewport" : "Interactive page preview"}
+          onKeyDown={nativeBrowser ? undefined : handleFrameKeyDown}
+          onWheel={nativeBrowser ? undefined : handleFrameWheel}
           ref={frameElementRef}
           style={{
             alignItems: "stretch",
-            background: pageFrame ? "#fff" : "var(--term)",
+            background: nativeBrowser || pageFrame ? "#fff" : "var(--term)",
             display: "flex",
             flex: "1 1 0",
             justifyContent: "stretch",
@@ -872,9 +1112,15 @@ export function BrowserSurfacePanel({
             overflow: "hidden",
             outline: "none",
           }}
-          tabIndex={0}
+          tabIndex={nativeBrowser ? -1 : 0}
         >
-          {pageFrame ? (
+          {nativeBrowser ? (
+            <div
+              aria-hidden="true"
+              className="agentmux-native-browser-placeholder"
+              data-native-browser-ready={nativeBrowserReady ? "true" : "false"}
+            />
+          ) : pageFrame ? (
             <img
               alt={preview?.title ?? currentUrl ?? "Browser page"}
               draggable={false}

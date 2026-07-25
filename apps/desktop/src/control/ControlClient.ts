@@ -674,6 +674,7 @@ export interface AppConfigUi {
   surfaceTabActions?: string[] | null;
   textBoxMaxLines?: number | null;
   terminalInnerMargin?: number | null;
+  paneOuterMargin?: number | null;
   terminalGpuAcceleration?: TerminalGpuAcceleration | null;
   terminalStartDirectory?: TerminalStartDirectory | null;
   terminalStartCustomCwd?: string | null;
@@ -2005,8 +2006,8 @@ class TauriControlClient implements ControlClient {
     const result = await this.call<BrowserActionResultWire>("browser.scroll", {
       surface_id: surfaceId,
       selector: options.selector ?? null,
-      x: options.x ?? null,
-      y: options.y ?? null,
+      x: normalizeBrowserScrollDelta(options.x),
+      y: normalizeBrowserScrollDelta(options.y),
       frame_id: options.frameId ?? null,
     });
     return mapBrowserAction(result);
@@ -2296,6 +2297,7 @@ class TauriControlClient implements ControlClient {
             surface_tab_actions: update.ui.surfaceTabActions,
             text_box_max_lines: update.ui.textBoxMaxLines,
             terminal_inner_margin: update.ui.terminalInnerMargin,
+            pane_outer_margin: update.ui.paneOuterMargin,
             terminal_gpu_acceleration: update.ui.terminalGpuAcceleration,
             terminal_start_directory: update.ui.terminalStartDirectory,
             terminal_start_custom_cwd: update.ui.terminalStartCustomCwd,
@@ -6476,6 +6478,7 @@ class BrowserPreviewControlClient implements ControlClient {
         surfaceTabActions: null,
         textBoxMaxLines: null,
         terminalInnerMargin: null,
+        paneOuterMargin: null,
         terminalGpuAcceleration: "auto",
         terminalStartDirectory: "home",
         terminalStartCustomCwd: null,
@@ -8898,6 +8901,7 @@ interface AppConfigWire {
     surface_tab_actions?: string[] | null;
     text_box_max_lines?: number | null;
     terminal_inner_margin?: number | null;
+    pane_outer_margin?: number | null;
     terminal_gpu_acceleration?: string | null;
     terminal_start_directory?: string | null;
     terminal_start_custom_cwd?: string | null;
@@ -9577,6 +9581,7 @@ function mapAppConfig(value: AppConfigWire): AppConfig {
       surfaceTabActions: value.ui?.surface_tab_actions ?? null,
       textBoxMaxLines: value.ui?.text_box_max_lines ?? null,
       terminalInnerMargin: value.ui?.terminal_inner_margin ?? null,
+      paneOuterMargin: value.ui?.pane_outer_margin ?? null,
       terminalGpuAcceleration: normalizeTerminalGpuAcceleration(
         value.ui?.terminal_gpu_acceleration,
       ),
@@ -9652,6 +9657,7 @@ function appConfigExportSnapshot(
       surface_tab_actions: config.ui.surfaceTabActions ?? null,
       text_box_max_lines: config.ui.textBoxMaxLines ?? null,
       terminal_inner_margin: config.ui.terminalInnerMargin ?? null,
+      pane_outer_margin: config.ui.paneOuterMargin ?? null,
       terminal_gpu_acceleration: config.ui.terminalGpuAcceleration ?? "auto",
       terminal_start_directory: config.ui.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config.ui.terminalStartCustomCwd ?? null,
@@ -9699,6 +9705,7 @@ function previewProjectConfigExportSnapshot(
       surface_tab_actions: config?.ui?.surfaceTabActions ?? null,
       text_box_max_lines: config?.ui?.textBoxMaxLines ?? null,
       terminal_inner_margin: config?.ui?.terminalInnerMargin ?? null,
+      pane_outer_margin: config?.ui?.paneOuterMargin ?? null,
       terminal_gpu_acceleration: config?.ui?.terminalGpuAcceleration ?? null,
       terminal_start_directory: config?.ui?.terminalStartDirectory ?? null,
       terminal_start_custom_cwd: config?.ui?.terminalStartCustomCwd ?? null,
@@ -9751,6 +9758,8 @@ function mergePreviewProjectConfig(
         project.ui?.textBoxMaxLines ?? base.ui.textBoxMaxLines ?? null,
       terminalInnerMargin:
         project.ui?.terminalInnerMargin ?? base.ui.terminalInnerMargin ?? null,
+      paneOuterMargin:
+        project.ui?.paneOuterMargin ?? base.ui.paneOuterMargin ?? null,
       terminalGpuAcceleration:
         project.ui?.terminalGpuAcceleration ??
         base.ui.terminalGpuAcceleration ??
@@ -9865,6 +9874,7 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
     "surface_tab_actions" in ui ||
     "text_box_max_lines" in ui ||
     "terminal_inner_margin" in ui ||
+    "pane_outer_margin" in ui ||
     "terminal_gpu_acceleration" in ui;
   if (!hasSnakeCase) {
     const config = raw as Partial<AppConfig>;
@@ -9935,6 +9945,10 @@ function previewConfigFromImport(value: unknown): Partial<AppConfig> {
       terminalInnerMargin:
         typeof ui.terminal_inner_margin === "number"
           ? ui.terminal_inner_margin
+          : null,
+      paneOuterMargin:
+        typeof ui.pane_outer_margin === "number"
+          ? ui.pane_outer_margin
           : null,
       ...("terminal_gpu_acceleration" in ui
         ? {
@@ -10577,6 +10591,19 @@ function sanitizeTerminalInnerMargin(value: unknown): number | null {
   return Math.min(32, Math.max(0, rounded));
 }
 
+function sanitizePaneOuterMargin(value: unknown): number | null {
+  return sanitizeTerminalInnerMargin(value);
+}
+
+export function normalizeBrowserScrollDelta(
+  value: number | null | undefined,
+): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+  return Math.min(2_147_483_647, Math.max(-2_147_483_648, Math.trunc(value)));
+}
+
 function normalizeTerminalStartDirectory(
   value: unknown,
 ): TerminalStartDirectory {
@@ -10629,6 +10656,7 @@ function sanitizeAppConfigUi(
     terminalInnerMargin: sanitizeTerminalInnerMargin(
       value?.terminalInnerMargin,
     ),
+    paneOuterMargin: sanitizePaneOuterMargin(value?.paneOuterMargin),
     terminalGpuAcceleration: normalizeTerminalGpuAcceleration(
       value?.terminalGpuAcceleration,
     ),

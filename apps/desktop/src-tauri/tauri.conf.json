@@ -1,6 +1,6 @@
 {
   "productName": "AgentMux",
-  "version": "0.1.24",
+  "version": "0.1.25",
   "identifier": "dev.agentmux.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -24,8 +24,10 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
-      "endpoints": [],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU5MjY3NDU1QzA5NkY0OEEKUldTSzlKYkFWWFFtNldOd2NXYTA3V3NUTGt5VEF2K2FrVlNPQ29NVXhQSG9pc3Vkd01ELzc0K1YK",
+      "endpoints": [
+        "https://github.com/raeseoklee/agentmux/releases/latest/download/latest.json"
+      ],
       "windows": {
         "installMode": "passive"
       }

@@ -181,6 +181,7 @@ export type I18nKey =
   | "settings.accentHex"
   | "settings.uiFontSize"
   | "settings.terminalInnerMargin"
+  | "settings.paneOuterMargin"
   | "settings.terminalGpuAcceleration"
   | "settings.terminalGpuAccelerationHint"
   | "settings.terminalGpuAcceleration.auto"
@@ -390,7 +391,7 @@ export const SUPPORTED_LANGUAGES: Array<{
 
 const en: Record<I18nKey, string> = {
   "app.sidebar.toggle": "Toggle sidebar",
-  "action.browser.openActivePane": "Open browser in current pane",
+  "action.browser.openActivePane": "Open or focus browser",
   "action.browser.openContextLink": "Open context link",
   "action.browser.openNewTab": "Open new browser tab",
   "action.agent.jumpNextAttention": "Jump to next waiting agent",
@@ -569,6 +570,7 @@ const en: Record<I18nKey, string> = {
   "settings.accentHex": "Custom accent HEX color",
   "settings.uiFontSize": "UI font size",
   "settings.terminalInnerMargin": "Terminal inner margin",
+  "settings.paneOuterMargin": "Pane outer margin",
   "settings.terminalGpuAcceleration": "Terminal GPU acceleration",
   "settings.terminalGpuAccelerationHint":
     "Auto uses WebGL when supported and stable. Only the focused terminal uses GPU rendering.",
@@ -806,7 +808,7 @@ const ko: Record<I18nKey, string> = {
   "action.workspace.prev": "이전 워크스페이스",
   "action.workspace.switch": "{name}(으)로 전환",
   "app.sidebar.toggle": "사이드바 열기/닫기",
-  "action.browser.openActivePane": "현재 페인에서 브라우저 열기",
+  "action.browser.openActivePane": "브라우저 열기 또는 전환",
   "action.browser.openContextLink": "컨텍스트 링크 열기",
   "action.browser.openNewTab": "새 브라우저 탭 열기",
   "action.pane.splitDown": "아래로 분할",
@@ -904,6 +906,7 @@ const ko: Record<I18nKey, string> = {
   "settings.accentHex": "사용자 지정 강조 색상 HEX 값",
   "settings.uiFontSize": "UI 글자 크기",
   "settings.terminalInnerMargin": "터미널 내부 여백",
+  "settings.paneOuterMargin": "Pane 외부 여백",
   "settings.terminalGpuAcceleration": "터미널 GPU 가속",
   "settings.terminalGpuAccelerationHint":
     "자동은 WebGL을 사용할 수 있고 안정적인 환경에서 활성화합니다. 포커스된 터미널만 GPU 렌더링을 사용합니다.",

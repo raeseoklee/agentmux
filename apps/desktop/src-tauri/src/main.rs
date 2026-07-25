@@ -1,7 +1,10 @@
 // Hide the Windows console window for the GUI app, including local dev/debug launches.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use agentmux_desktop_host::{
     agentmux_control as handle_agentmux_control, default_control_pipe_name,
@@ -10,7 +13,7 @@ use agentmux_desktop_host::{
     DesktopNotificationAdapter, OutputStreamFrame,
 };
 use agentmux_ipc::{RequestEnvelope, ResponseEnvelope};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
@@ -25,6 +28,342 @@ const WINDOWS_APP_USER_MODEL_ID: &str = "dev.agentmux.desktop";
 
 const UPDATE_NOTIFICATION_OPEN_EVENT: &str = "agentmux://open-update-settings";
 const UPDATE_NOTIFICATION_ACTION: &str = "open_update";
+const NATIVE_BROWSER_PAGE_LOAD_EVENT: &str = "agentmux://native-browser-page-load";
+const NATIVE_BROWSER_TITLE_EVENT: &str = "agentmux://native-browser-title";
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct NativeBrowserBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeBrowserMountResult {
+    url: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeBrowserPageLoadPayload {
+    surface_id: String,
+    url: String,
+    state: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeBrowserTitlePayload {
+    surface_id: String,
+    title: String,
+}
+
+#[derive(Default)]
+struct NativeBrowserLayoutState {
+    revisions: Mutex<HashMap<String, u64>>,
+}
+
+impl NativeBrowserLayoutState {
+    fn accept(&self, surface_id: &str, revision: u64) -> Result<bool, String> {
+        let mut revisions = self
+            .revisions
+            .lock()
+            .map_err(|_| "native browser layout state is unavailable".to_string())?;
+        let current = revisions.get(surface_id).copied().unwrap_or(0);
+        if revision <= current {
+            return Ok(false);
+        }
+        revisions.insert(surface_id.to_string(), revision);
+        Ok(true)
+    }
+}
+
+fn native_browser_label(surface_id: &str) -> Result<String, String> {
+    let surface_id = surface_id.trim();
+    if surface_id.is_empty() || surface_id.len() > 160 {
+        return Err("invalid browser surface id".to_string());
+    }
+    if !surface_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | ':'))
+    {
+        return Err("browser surface id contains unsupported characters".to_string());
+    }
+    Ok(format!("native-browser-{surface_id}"))
+}
+
+fn native_browser_url(value: &str) -> Result<tauri::Url, String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err("browser URL must not be empty or contain control characters".to_string());
+    }
+    let url = tauri::Url::parse(value).map_err(|error| format!("invalid browser URL: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https" | "about") {
+        return Err(format!("unsupported browser URL scheme: {}", url.scheme()));
+    }
+    Ok(url)
+}
+
+fn validate_native_browser_bounds(
+    bounds: NativeBrowserBounds,
+) -> Result<NativeBrowserBounds, String> {
+    let values = [bounds.x, bounds.y, bounds.width, bounds.height];
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err("browser bounds must be finite".to_string());
+    }
+    if bounds.width < 1.0 || bounds.height < 1.0 {
+        return Err("browser bounds must have a positive size".to_string());
+    }
+    if bounds.width > 16_384.0 || bounds.height > 16_384.0 {
+        return Err("browser bounds exceed the supported size".to_string());
+    }
+    Ok(NativeBrowserBounds {
+        x: bounds.x.max(0.0),
+        y: bounds.y.max(0.0),
+        width: bounds.width,
+        height: bounds.height,
+    })
+}
+
+fn apply_native_browser_bounds(
+    webview: &tauri::Webview,
+    bounds: NativeBrowserBounds,
+    visible: bool,
+) -> Result<(), String> {
+    let bounds = validate_native_browser_bounds(bounds)?;
+    if !visible {
+        // WebView2 is a child HWND and always paints above the parent webview.
+        // Moving it off-screen as well as hiding it prevents a stale child
+        // frame from covering modal UI during resize and window-move races.
+        webview.hide().map_err(|error| error.to_string())?;
+        return webview
+            .set_bounds(tauri::Rect {
+                position: tauri::Position::Logical(tauri::LogicalPosition::new(
+                    -32_000.0, -32_000.0,
+                )),
+                size: tauri::Size::Logical(tauri::LogicalSize::new(1.0, 1.0)),
+            })
+            .map_err(|error| error.to_string());
+    }
+    webview
+        .set_bounds(tauri::Rect {
+            position: tauri::Position::Logical(tauri::LogicalPosition::new(bounds.x, bounds.y)),
+            size: tauri::Size::Logical(tauri::LogicalSize::new(bounds.width, bounds.height)),
+        })
+        .map_err(|error| error.to_string())?;
+    webview.show().map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn native_browser_mount(
+    app: tauri::AppHandle,
+    layout_state: tauri::State<'_, NativeBrowserLayoutState>,
+    surface_id: String,
+    url: String,
+    bounds: NativeBrowserBounds,
+    visible: bool,
+    revision: u64,
+) -> Result<NativeBrowserMountResult, String> {
+    let label = native_browser_label(&surface_id)?;
+    let bounds = validate_native_browser_bounds(bounds)?;
+    if !layout_state.accept(&surface_id, revision)? {
+        let webview = app
+            .get_webview(&label)
+            .ok_or_else(|| "native browser view is not mounted".to_string())?;
+        return Ok(NativeBrowserMountResult {
+            url: webview
+                .url()
+                .map_err(|error| error.to_string())?
+                .to_string(),
+        });
+    }
+    if let Some(webview) = app.get_webview(&label) {
+        apply_native_browser_bounds(&webview, bounds, visible)?;
+        return Ok(NativeBrowserMountResult {
+            url: webview
+                .url()
+                .map_err(|error| error.to_string())?
+                .to_string(),
+        });
+    }
+
+    let target_url = native_browser_url(&url)?;
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "AgentMux main window is unavailable".to_string())?;
+    let page_load_app = app.clone();
+    let page_load_surface_id = surface_id.clone();
+    let title_app = app.clone();
+    let title_surface_id = surface_id.clone();
+    let builder =
+        tauri::webview::WebviewBuilder::new(label, tauri::WebviewUrl::External(target_url))
+            .on_navigation(|url| matches!(url.scheme(), "http" | "https" | "about"))
+            .on_page_load(move |_webview, payload| {
+                let state = match payload.event() {
+                    tauri::webview::PageLoadEvent::Started => "started",
+                    tauri::webview::PageLoadEvent::Finished => "finished",
+                };
+                let _ = page_load_app.emit_to(
+                    "main",
+                    NATIVE_BROWSER_PAGE_LOAD_EVENT,
+                    NativeBrowserPageLoadPayload {
+                        surface_id: page_load_surface_id.clone(),
+                        url: payload.url().to_string(),
+                        state,
+                    },
+                );
+            })
+            .on_document_title_changed(move |_webview, title| {
+                let _ = title_app.emit_to(
+                    "main",
+                    NATIVE_BROWSER_TITLE_EVENT,
+                    NativeBrowserTitlePayload {
+                        surface_id: title_surface_id.clone(),
+                        title,
+                    },
+                );
+            });
+    let webview = window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(bounds.x, bounds.y),
+            tauri::LogicalSize::new(bounds.width, bounds.height),
+        )
+        .map_err(|error| error.to_string())?;
+    if !visible {
+        apply_native_browser_bounds(&webview, bounds, false)?;
+    }
+    Ok(NativeBrowserMountResult {
+        url: webview
+            .url()
+            .map_err(|error| error.to_string())?
+            .to_string(),
+    })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_update_bounds(
+    app: tauri::AppHandle,
+    layout_state: tauri::State<'_, NativeBrowserLayoutState>,
+    surface_id: String,
+    bounds: NativeBrowserBounds,
+    visible: bool,
+    revision: u64,
+) -> Result<(), String> {
+    let label = native_browser_label(&surface_id)?;
+    if !layout_state.accept(&surface_id, revision)? {
+        return Ok(());
+    }
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "native browser view is not mounted".to_string())?;
+    apply_native_browser_bounds(&webview, bounds, visible)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_hide(
+    app: tauri::AppHandle,
+    layout_state: tauri::State<'_, NativeBrowserLayoutState>,
+    surface_id: String,
+    revision: u64,
+) -> Result<(), String> {
+    let label = native_browser_label(&surface_id)?;
+    if !layout_state.accept(&surface_id, revision)? {
+        return Ok(());
+    }
+    if let Some(webview) = app.get_webview(&label) {
+        apply_native_browser_bounds(
+            &webview,
+            NativeBrowserBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_close(app: tauri::AppHandle, surface_id: String) -> Result<(), String> {
+    let label = native_browser_label(&surface_id)?;
+    if let Some(webview) = app.get_webview(&label) {
+        webview.close().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_navigate(
+    app: tauri::AppHandle,
+    surface_id: String,
+    url: String,
+) -> Result<(), String> {
+    let label = native_browser_label(&surface_id)?;
+    let url = native_browser_url(&url)?;
+    app.get_webview(&label)
+        .ok_or_else(|| "native browser view is not mounted".to_string())?
+        .navigate(url)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_navigation(
+    app: tauri::AppHandle,
+    surface_id: String,
+    action: String,
+) -> Result<(), String> {
+    let label = native_browser_label(&surface_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "native browser view is not mounted".to_string())?;
+    match action.as_str() {
+        "back" => webview.eval("history.back()"),
+        "forward" => webview.eval("history.forward()"),
+        "reload" => webview.reload(),
+        _ => return Err("unsupported native browser navigation action".to_string()),
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_set_zoom(
+    app: tauri::AppHandle,
+    surface_id: String,
+    percent: u16,
+) -> Result<(), String> {
+    if !(25..=500).contains(&percent) {
+        return Err("browser zoom must be between 25 and 500 percent".to_string());
+    }
+    let label = native_browser_label(&surface_id)?;
+    app.get_webview(&label)
+        .ok_or_else(|| "native browser view is not mounted".to_string())?
+        .set_zoom(f64::from(percent) / 100.0)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn native_browser_find(
+    app: tauri::AppHandle,
+    surface_id: String,
+    query: String,
+) -> Result<(), String> {
+    if query.chars().count() > 2_048 {
+        return Err("browser find query is too long".to_string());
+    }
+    let label = native_browser_label(&surface_id)?;
+    let encoded = serde_json::to_string(&query).map_err(|error| error.to_string())?;
+    app.get_webview(&label)
+        .ok_or_else(|| "native browser view is not mounted".to_string())?
+        .eval(format!(
+            "window.find({encoded}, false, false, true, false, false, false)"
+        ))
+        .map_err(|error| error.to_string())
+}
 
 #[cfg(windows)]
 fn set_windows_app_user_model_id() {
@@ -498,6 +837,7 @@ fn main() {
             }
             Ok(())
         })
+        .manage(NativeBrowserLayoutState::default())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             agentmux_control,
@@ -510,7 +850,15 @@ fn main() {
             open_external_url,
             open_path_in_explorer,
             clipboard_materialize_attachments,
-            show_update_available_notification
+            show_update_available_notification,
+            native_browser_mount,
+            native_browser_update_bounds,
+            native_browser_hide,
+            native_browser_close,
+            native_browser_navigate,
+            native_browser_navigation,
+            native_browser_set_zoom,
+            native_browser_find
         ])
         .run(tauri::generate_context!())
         .expect("failed to run AgentMux desktop app");
@@ -519,6 +867,53 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_browser_contract_rejects_unsafe_ids_urls_and_bounds() {
+        assert_eq!(
+            native_browser_label("surface-1").unwrap(),
+            "native-browser-surface-1"
+        );
+        assert!(native_browser_label("").is_err());
+        assert!(native_browser_label("surface with spaces").is_err());
+
+        assert!(native_browser_url("https://example.com/docs").is_ok());
+        assert!(native_browser_url("about:blank").is_ok());
+        assert!(native_browser_url("file:///C:/Windows/System32").is_err());
+        assert!(native_browser_url("javascript:alert(1)").is_err());
+
+        assert!(validate_native_browser_bounds(NativeBrowserBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 1280.0,
+            height: 720.0,
+        })
+        .is_ok());
+        assert!(validate_native_browser_bounds(NativeBrowserBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 720.0,
+        })
+        .is_err());
+        assert!(validate_native_browser_bounds(NativeBrowserBounds {
+            x: f64::NAN,
+            y: 0.0,
+            width: 1280.0,
+            height: 720.0,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn native_browser_layout_rejects_stale_revisions() {
+        let state = NativeBrowserLayoutState::default();
+        assert!(state.accept("surface-1", 1).unwrap());
+        assert!(state.accept("surface-1", 3).unwrap());
+        assert!(!state.accept("surface-1", 2).unwrap());
+        assert!(!state.accept("surface-1", 3).unwrap());
+        assert!(state.accept("surface-2", 1).unwrap());
+    }
 
     #[test]
     fn update_notification_fields_reject_empty_control_and_oversized_values() {

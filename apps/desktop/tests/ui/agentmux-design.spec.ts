@@ -1808,7 +1808,7 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
   expect(Math.abs((frameBox?.height ?? 0) - (imageBox?.height ?? 0))).toBeLessThan(2);
   await pageFrame.click({ position: { x: 8, y: 8 } });
   await page.keyboard.type("a");
-  await pageFrame.dispatchEvent("wheel", { deltaY: 240 });
+  await pageFrame.dispatchEvent("wheel", { deltaY: 240.2777777910232544 });
   await expect
     .poll(() =>
       page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
@@ -1824,6 +1824,11 @@ test("browser surface opens as a separate top tab", async ({ page }) => {
       page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
     )
     .toContain("scroll:");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
+    )
+    .not.toContain("240.277");
   await expect
     .poll(() =>
       page.evaluate(() => (window as any).__AGENTMUX_PREVIEW__?.browserActions()?.join("\n")),
@@ -1907,6 +1912,12 @@ test("pane browser button opens a browser in an adjacent split", async ({ page }
 
   await expect(activeTree.locator("[data-agentmux-pane]")).toHaveCount(2);
   await expect(activeTree.getByLabel("Page address")).toBeVisible();
+  await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
+
+  await activeTree.locator(".agentmux-pane-open-browser").first().click();
+
+  await expect(activeTree.locator("[data-agentmux-pane]")).toHaveCount(2);
+  await expect(activeTree.getByLabel("Page address")).toHaveCount(1);
   await expect(page.locator(".agentmux-surface-tab")).toHaveCount(1);
 });
 
@@ -2894,6 +2905,81 @@ test("terminal inner margin setting applies to live terminals", async ({
   await page.waitForFunction(() => {
     const raw = window.localStorage.getItem("agentmux.preview.config.v1");
     return raw ? JSON.parse(raw).ui?.terminalInnerMargin === 12 : false;
+  });
+});
+
+test("pane outer margin setting updates layout and persists", async ({ page }) => {
+  await bootPreview(page);
+
+  const paneTree = page.locator(".agentmux-tab-pane-tree").first();
+  await paneTree.locator(".agentmux-pane-split-vertical").first().click();
+  const splitHandle = paneTree.locator('[data-agentmux-split-handle="vertical"]');
+  const splitSpacing = () =>
+    splitHandle.evaluate((node) => {
+      const style = getComputedStyle(node);
+      return (
+        Number.parseFloat(style.width) +
+        Number.parseFloat(style.marginLeft) +
+        Number.parseFloat(style.marginRight)
+      );
+    });
+  await expect
+    .poll(() => paneTree.evaluate((node) => getComputedStyle(node).top))
+    .toBe("9px");
+  await expect.poll(splitSpacing).toBe(9);
+
+  await page.evaluate(() => {
+    (window as unknown as { __agentmuxNativeLayoutEvents?: number })
+      .__agentmuxNativeLayoutEvents = 0;
+    window.addEventListener("agentmux:native-browser-layout", () => {
+      const state = window as unknown as { __agentmuxNativeLayoutEvents?: number };
+      state.__agentmuxNativeLayoutEvents =
+        (state.__agentmuxNativeLayoutEvents ?? 0) + 1;
+    });
+  });
+  const treeBounds = await paneTree.boundingBox();
+  const handleBounds = await splitHandle.boundingBox();
+  if (!treeBounds || !handleBounds) throw new Error("split layout is unavailable");
+  await page.mouse.move(
+    handleBounds.x + handleBounds.width / 2,
+    handleBounds.y + handleBounds.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    treeBounds.x + treeBounds.width * 0.7,
+    handleBounds.y + handleBounds.height / 2,
+  );
+  await expect
+    .poll(() =>
+      splitHandle.evaluate((node) => {
+        const before = node.previousElementSibling as HTMLElement | null;
+        return before?.style.flex ?? "";
+      }),
+    )
+    .toMatch(/^0\.[6-8]/);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as unknown as { __agentmuxNativeLayoutEvents?: number })
+            .__agentmuxNativeLayoutEvents ?? 0,
+      ),
+    )
+    .toBeGreaterThan(0);
+  await page.mouse.up();
+
+  await page.locator(".agentmux-settings-open").click();
+  const marginSlider = page.locator(".agentmux-pane-outer-margin");
+  await expect(marginSlider).toHaveValue("9");
+  await marginSlider.fill("3");
+
+  await expect
+    .poll(() => paneTree.evaluate((node) => getComputedStyle(node).top))
+    .toBe("3px");
+  await expect.poll(splitSpacing).toBe(3);
+  await page.waitForFunction(() => {
+    const raw = window.localStorage.getItem("agentmux.preview.config.v1");
+    return raw ? JSON.parse(raw).ui?.paneOuterMargin === 3 : false;
   });
 });
 
