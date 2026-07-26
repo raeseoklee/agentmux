@@ -247,6 +247,7 @@ import {
   AUTO_UPDATE_PERIODIC_INTERVAL_MS,
   AUTO_UPDATE_RESUME_STALE_MS,
   isAutomaticUpdateCheckDue,
+  shouldStartAutomaticUpdateCheck,
   shouldPauseAutomaticUpdateChecks,
   type UpdateLifecycleStatus,
 } from "./updateCheckSchedule";
@@ -2135,6 +2136,7 @@ export function AgentmuxTerminalApp() {
     initZoom();
   }, []);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [updateSettingsLoaded, setUpdateSettingsLoaded] = useState(false);
   const [configPath, setConfigPath] = useState("");
   const [projectConfigPath, setProjectConfigPath] = useState<string | null>(
     null,
@@ -2245,6 +2247,7 @@ export function AgentmuxTerminalApp() {
   const broadcastRootIdRef = useRef<string | null>(null);
   const terminalLaunchPendingRef = useRef(false);
   const lastUpdateCheckAttemptAtRef = useRef<number | null>(null);
+  const startupUpdateCheckStartedRef = useRef(false);
   const updateCheckInFlightRef = useRef<Promise<TauriUpdate | null> | null>(
     null,
   );
@@ -2309,6 +2312,10 @@ export function AgentmuxTerminalApp() {
         applyConfig(config);
       } catch {
         // Config should not block the terminal UI; defaults remain usable.
+      } finally {
+        if (!cancelled) {
+          setUpdateSettingsLoaded(true);
+        }
       }
       try {
         const diagnostics = await client.configDiagnostics(activeWorkspaceId);
@@ -2489,6 +2496,7 @@ export function AgentmuxTerminalApp() {
   const setAutoUpdateCheck = useCallback((autoCheck: boolean) => {
     if (autoCheck) {
       lastUpdateCheckAttemptAtRef.current = null;
+      startupUpdateCheckStartedRef.current = false;
     }
     setUpdatesConfig((current) => ({ ...current, autoCheck }));
   }, []);
@@ -2648,6 +2656,20 @@ export function AgentmuxTerminalApp() {
   }, [checkForUpdates]);
   useEffect(() => {
     if (
+      !shouldStartAutomaticUpdateCheck(
+        updateSettingsLoaded,
+        updatesConfig.autoCheck,
+        startupUpdateCheckStartedRef.current,
+      )
+    ) {
+      return;
+    }
+
+    startupUpdateCheckStartedRef.current = true;
+    void checkForUpdates({ background: !isTauriDesktopRuntime() });
+  }, [checkForUpdates, updateSettingsLoaded, updatesConfig.autoCheck]);
+  useEffect(() => {
+    if (
       !configLoaded ||
       !updatesConfig.autoCheck ||
       shouldPauseAutomaticUpdateChecks(
@@ -2676,7 +2698,6 @@ export function AgentmuxTerminalApp() {
       void checkForUpdates({ background: true });
     };
 
-    checkIfDue(AUTO_UPDATE_RESUME_STALE_MS);
     const interval = window.setInterval(
       () => checkIfDue(AUTO_UPDATE_PERIODIC_INTERVAL_MS),
       AUTO_UPDATE_PERIODIC_INTERVAL_MS,

@@ -73,6 +73,32 @@ recovery guidance.
 
 AgentMux exposes typed MCP tools for agent-oriented panes:
 
+### Runtime requirements
+
+Visible agent workers execute inside the selected WSL distribution. The
+following requirements are checked in that Linux environment, not on Windows:
+
+| Worker kind | Required runtime |
+| --- | --- |
+| `codex-pane` | A WSL-native `codex` executable on the Linux `PATH`, plus completed Codex authentication. It starts an independent Codex CLI, not a built-in Codex subagent thread. |
+| `claude-teams` | A WSL-native, authenticated `claude` executable and the AgentMux tmux-compatible wrapper. |
+| `omo`, `omx`, `omc` | The matching integration executable and AgentMux wrapper inside or reachable from the selected WSL distribution. |
+
+Install `tmux` in the distribution used for durable sessions. Set the AgentMux
+workspace project root and default WSL distribution before starting a team so
+workers inherit the intended directory and runtime. Check the selected runtime
+from WSL with `command -v codex`, `codex --version`, or the equivalent agent
+command. A result under `/mnt/c/...` identifies a Windows installation and is
+not proof that the Linux worker can start.
+
+The integration shim captures the Linux `PATH` when it crosses from WSL into
+`agentmux.exe`; it does not replace missing Linux tools with entries from the
+Windows `PATH`. Diagnose wrapper-based integrations before launch:
+
+```powershell
+agentmux integrations doctor claude-teams --distribution Ubuntu --json
+```
+
 | Tool | Profile | Purpose |
 | --- | --- | --- |
 | `agent_worker_list` | `read` | List AgentMux-managed tmux integration workers and independent Codex pane workers. |
@@ -287,6 +313,21 @@ The managed entry runs the installed absolute path as:
 agentmux.exe mcp serve --profile standard
 ```
 
+Those commands configure a Codex process running as the Windows user. A
+WSL-native Codex process reads `/home/<linux-user>/.codex/config.toml` instead,
+so register AgentMux from inside that distribution after installing Codex:
+
+```bash
+codex mcp add agentmux -- \
+  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  mcp serve --profile standard
+codex mcp get agentmux
+```
+
+The WSL command relies on Windows interoperability to launch the installed
+`agentmux.exe`. Keep the AgentMux desktop running while checking MCP health or
+using workspace tools.
+
 ## Configure Claude Code
 
 Claude Code uses JSON configuration, normally `%USERPROFILE%\.claude.json`.
@@ -295,6 +336,21 @@ Claude Code uses JSON configuration, normally `%USERPROFILE%\.claude.json`.
 agentmux mcp setup --client claude --profile read --json
 agentmux mcp setup --client claude --profile standard --install --json
 ```
+
+Those commands configure Windows Claude Code. Claude Code running inside an
+AgentMux WSL pane has a separate Linux user configuration. Register the same
+stdio server from inside WSL:
+
+```bash
+claude mcp add --scope user --transport stdio agentmux -- \
+  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  mcp serve --profile standard
+claude mcp get agentmux
+```
+
+For Claude Code Agent Teams whose tmux descendants should become AgentMux
+panes, start the lead through `agentmux integrations launch claude-teams` and
+use an adaptive team with `auto_adopt_tmux: true`.
 
 `setup` is preview-only unless `--install` is present. Installation preserves
 unrelated settings, rejects an unrelated server already named `agentmux`, and

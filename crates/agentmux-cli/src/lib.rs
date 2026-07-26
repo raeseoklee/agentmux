@@ -17067,15 +17067,28 @@ where
         &token,
     );
     request.caller = resolved_control_caller(options, caller);
-    let response =
-        agentmux_ipc::send_named_pipe_request(&options.pipe_name, &request, Duration::from_secs(5))
-            .map_err(|error| {
-                CliError::Control(format!(
-                    "failed to reach AgentMux control pipe '{}': {error}",
-                    options.pipe_name
-                ))
-            })?;
+    let response = agentmux_ipc::send_named_pipe_request(
+        &options.pipe_name,
+        &request,
+        control_request_timeout(method),
+    )
+    .map_err(|error| {
+        CliError::Control(format!(
+            "failed to reach AgentMux control pipe '{}': {error}",
+            options.pipe_name
+        ))
+    })?;
     Ok(response)
+}
+
+fn control_request_timeout(method: &str) -> Duration {
+    match method {
+        // A cold exact scan of a large Windows repository can legitimately exceed the
+        // five-second control-plane default. The VCS layer still enforces its own bounded
+        // 90-second deadline, so leave enough transport headroom for the response.
+        "git.status_summary" | "git.status_page" => Duration::from_secs(95),
+        _ => Duration::from_secs(5),
+    }
 }
 
 fn resolved_control_caller(
@@ -18238,6 +18251,22 @@ mod tests {
         assert!(text.contains("actions list"));
         assert!(text.contains("notify"));
         assert!(text.contains("sidebar-state"));
+    }
+
+    #[test]
+    fn git_status_requests_allow_the_vcs_deadline_to_finish() {
+        assert_eq!(
+            control_request_timeout("git.status_summary"),
+            Duration::from_secs(95)
+        );
+        assert_eq!(
+            control_request_timeout("git.status_page"),
+            Duration::from_secs(95)
+        );
+        assert_eq!(
+            control_request_timeout("workspace.list"),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]

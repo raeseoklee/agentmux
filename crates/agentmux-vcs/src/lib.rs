@@ -66,7 +66,7 @@ impl Default for GitConfig {
     }
 }
 
-fn status_arguments() -> [String; 8] {
+fn status_arguments() -> [String; 9] {
     [
         "--no-optional-locks".to_string(),
         "-c".to_string(),
@@ -75,7 +75,15 @@ fn status_arguments() -> [String; 8] {
         "--porcelain=v2".to_string(),
         "--branch".to_string(),
         "-z".to_string(),
-        "--untracked-files=all".to_string(),
+        // Keep the parent repository scan bounded to the state it owns. A dirty
+        // submodule worktree is queried when that repository becomes the active
+        // pane; recursively probing it here can dominate cold status latency.
+        // Gitlink commit changes are still reported by this mode.
+        "--ignore-submodules=dirty".to_string(),
+        // Keep untracked directories collapsed. Expanding every generated file can turn a
+        // small status view into megabytes of IPC payload while providing little value until
+        // the user stages or opens that directory.
+        "--untracked-files=normal".to_string(),
     ]
 }
 
@@ -1370,6 +1378,13 @@ fn normalize_context(context: &GitContext) -> Result<GitContext> {
         return Err(GitError::InvalidPath(context.cwd.clone()));
     }
     let mut context = context.clone();
+    #[cfg(windows)]
+    if matches!(context.host, GitHost::Wsl { .. }) {
+        if let Some(path) = wsl_mounted_windows_path(&context.cwd) {
+            context.host = GitHost::Native;
+            context.cwd = path;
+        }
+    }
     if matches!(context.host, GitHost::Native) {
         let path = Path::new(&context.cwd);
         if path.is_file() {
@@ -1377,6 +1392,23 @@ fn normalize_context(context: &GitContext) -> Result<GitContext> {
         }
     }
     Ok(context)
+}
+
+#[cfg(windows)]
+fn wsl_mounted_windows_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let rest = normalized.strip_prefix("/mnt/")?;
+    let mut parts = rest.splitn(2, '/');
+    let drive = parts.next()?;
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let tail = parts.next().unwrap_or_default().replace('/', "\\");
+    Some(if tail.is_empty() {
+        format!("{}:\\", drive.to_ascii_uppercase())
+    } else {
+        format!("{}:\\{tail}", drive.to_ascii_uppercase())
+    })
 }
 
 fn ensure_success(success: bool, output: &ExecutionOutput, operation: &str) -> Result<()> {
@@ -1513,7 +1545,145 @@ mod tests {
         assert!(arguments
             .iter()
             .any(|argument| argument == "--porcelain=v2"));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--untracked-files=normal"));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--ignore-submodules=dirty"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--untracked-files=all"));
         assert!(GitConfig::default().status_command_timeout >= Duration::from_secs(60));
+    }
+
+    #[test]
+    fn status_scan_collapses_nested_untracked_files_into_their_directory() {
+        let directory = TempDir::new().expect("temporary repository should be created");
+        let context = GitContext::native(directory.path().to_string_lossy());
+        let client = GitClient::default();
+        run_setup(&client, &context, &["init", "-q"]);
+        let generated = directory.path().join("generated");
+        fs::create_dir(&generated).expect("generated fixture directory should be created");
+        fs::write(generated.join("first.txt"), b"one").expect("first fixture should be written");
+        fs::write(generated.join("second.txt"), b"two").expect("second fixture should be written");
+
+        let repository = client
+            .require_repository(&context)
+            .expect("repository should resolve");
+        let snapshot = client
+            .read_status(&repository)
+            .expect("status should be readable");
+
+        assert_eq!(snapshot.summary.file_count, 1);
+        assert_eq!(snapshot.summary.untracked_count, 1);
+        assert_eq!(snapshot.files[0].path, "generated/");
+    }
+
+    #[test]
+    fn parent_status_defers_dirty_submodule_worktrees_but_keeps_gitlink_changes() {
+        let directory = TempDir::new().expect("temporary repository should be created");
+        let parent_context = GitContext::native(directory.path().to_string_lossy());
+        let client = GitClient::default();
+        run_setup(&client, &parent_context, &["init", "-q"]);
+        run_setup(
+            &client,
+            &parent_context,
+            &["config", "user.name", "AgentMux Test"],
+        );
+        run_setup(
+            &client,
+            &parent_context,
+            &["config", "user.email", "agentmux@example.invalid"],
+        );
+
+        let child_path = directory.path().join("deps").join("child");
+        fs::create_dir_all(&child_path).expect("submodule fixture directory should be created");
+        let child_context = GitContext::native(child_path.to_string_lossy());
+        run_setup(&client, &child_context, &["init", "-q"]);
+        run_setup(
+            &client,
+            &child_context,
+            &["config", "user.name", "AgentMux Test"],
+        );
+        run_setup(
+            &client,
+            &child_context,
+            &["config", "user.email", "agentmux@example.invalid"],
+        );
+        fs::write(child_path.join("tracked.txt"), "initial\n")
+            .expect("submodule fixture should be written");
+        run_setup(&client, &child_context, &["add", "tracked.txt"]);
+        run_setup(&client, &child_context, &["commit", "-q", "-m", "initial"]);
+        let child_head = run_setup_output(&client, &child_context, &["rev-parse", "HEAD"]);
+
+        run_setup(
+            &client,
+            &parent_context,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                child_head.trim(),
+                "deps/child",
+            ],
+        );
+        run_setup(
+            &client,
+            &parent_context,
+            &["commit", "-q", "-m", "track gitlink"],
+        );
+        let parent = client
+            .require_repository(&parent_context)
+            .expect("parent repository should resolve");
+
+        fs::write(child_path.join("tracked.txt"), "dirty\n")
+            .expect("submodule fixture should become dirty");
+        let dirty_only = client
+            .read_status(&parent)
+            .expect("parent status should load");
+        assert!(dirty_only.files.is_empty());
+
+        run_setup(&client, &child_context, &["add", "tracked.txt"]);
+        run_setup(
+            &client,
+            &child_context,
+            &["commit", "-q", "-m", "advance gitlink"],
+        );
+        let advanced = client
+            .read_status(&parent)
+            .expect("parent status should keep gitlink commit changes");
+        assert_eq!(advanced.summary.file_count, 1);
+        assert_eq!(advanced.files[0].path, "deps/child");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mounted_windows_wsl_context_uses_native_git() {
+        let normalized = normalize_context(&GitContext::wsl(
+            "/mnt/d/work/repo",
+            Some("Ubuntu".to_string()),
+        ))
+        .expect("mounted Windows context should normalize");
+
+        assert_eq!(normalized.host, GitHost::Native);
+        assert_eq!(normalized.cwd, r"D:\work\repo");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn linux_wsl_context_keeps_its_distribution() {
+        let normalized = normalize_context(&GitContext::wsl(
+            "/home/irae/work/repo",
+            Some("Ubuntu".to_string()),
+        ))
+        .expect("Linux context should normalize");
+
+        assert_eq!(
+            normalized,
+            GitContext::wsl("/home/irae/work/repo", Some("Ubuntu".to_string()))
+        );
     }
 
     #[test]
@@ -1800,10 +1970,8 @@ mod tests {
         let context = GitContext::native(directory.path().to_string_lossy());
         let client = GitClient::default();
         run_setup(&client, &context, &["init", "-q"]);
-        let generated = directory.path().join("generated");
-        fs::create_dir(&generated).expect("generated fixture directory should be created");
         for index in 0..file_count {
-            fs::write(generated.join(format!("file-{index:05}.txt")), b"x")
+            fs::write(directory.path().join(format!("file-{index:05}.txt")), b"x")
                 .expect("performance fixture should be written");
         }
 
@@ -2097,6 +2265,10 @@ mod tests {
     }
 
     fn run_setup(client: &GitClient, context: &GitContext, arguments: &[&str]) {
+        let _ = run_setup_output(client, context, arguments);
+    }
+
+    fn run_setup_output(client: &GitClient, context: &GitContext, arguments: &[&str]) -> String {
         let arguments = arguments
             .iter()
             .map(|argument| argument.to_string())
@@ -2117,6 +2289,7 @@ mod tests {
             "prepare the test repository",
         )
         .expect("Git setup should succeed");
+        output_text(&output.stdout)
     }
 
     fn synthetic_mixed_status(count: usize) -> Vec<u8> {

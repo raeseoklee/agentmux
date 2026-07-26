@@ -71,6 +71,51 @@ worktree 생성은 복구 가능한 saga입니다. Git worktree, AgentMux 워크
 
 AgentMux는 에이전트용 페인을 위한 typed MCP 도구를 제공합니다.
 
+### 실행 환경 요구사항
+
+화면에 표시되는 에이전트 워커는 선택한 WSL 배포판 안에서 실행됩니다. 다음
+요구사항은 Windows가 아니라 해당 Linux 환경을 기준으로 충족해야 합니다.
+
+| 워커 종류 | 필요한 실행 환경 |
+| --- | --- |
+| `codex-pane` | Linux `PATH`에 있는 WSL 네이티브 `codex` 실행 파일과 완료된 Codex 인증. Codex 내장 서브에이전트가 아니라 독립 Codex CLI를 시작합니다. |
+| `claude-teams` | WSL 네이티브 `claude` 실행 파일, 완료된 인증, AgentMux tmux 호환 wrapper. |
+| `omo`, `omx`, `omc` | 선택한 WSL 배포판 안에 있거나 그 배포판에서 실행 가능한 해당 통합 실행 파일과 AgentMux wrapper. |
+
+durable Session에 사용할 배포판에는 `tmux`가 설치되어 있어야 합니다. 팀을
+시작하기 전에 AgentMux Workspace의 Project Root와 기본 WSL 배포판을 설정하면
+새 워커가 올바른 작업 디렉터리와 실행 환경을 상속합니다. WSL에서 다음과 같이
+확인하십시오.
+
+```bash
+command -v codex
+codex --version
+command -v claude
+claude --version
+```
+
+`command -v` 결과가 `/mnt/c/...` 아래라면 Windows 설치본입니다. 명령 이름이
+발견되더라도 Linux 워커가 실행될 수 있다는 뜻은 아닙니다. 해당 WSL 배포판에
+CLI를 별도로 설치하고 인증해야 합니다. 예를 들어 Codex는 다음과 같이 사용자
+로컬 경로에 설치할 수 있습니다.
+
+```bash
+npm install -g --prefix "$HOME/.local" @openai/codex@latest
+hash -r
+command -v codex
+codex --version
+codex login
+```
+
+정상적인 경로 예시는 `/home/<user>/.local/bin/codex`입니다. AgentMux shim은
+WSL에서 Windows `agentmux.exe`로 넘어갈 때 Linux `PATH`를 캡처하지만, 누락된
+Linux 도구를 Windows `PATH`의 프로그램으로 대체하지 않습니다. wrapper 기반
+통합은 실행 전에 다음과 같이 진단할 수 있습니다.
+
+```powershell
+agentmux integrations doctor claude-teams --distribution Ubuntu --json
+```
+
 | 도구 | 프로필 | 용도 |
 | --- | --- | --- |
 | `agent_worker_list` | `read` | AgentMux가 관리하는 tmux 통합 워커와 독립 Codex 페인 워커 조회 |
@@ -258,6 +303,21 @@ agentmux mcp setup --client codex --profile standard --install --json
 첫 번째 명령은 변경 내용을 미리보기만 하고, 두 번째 명령은 검토한 설정을
 적용합니다.
 
+위 명령은 Windows에서 실행되는 Codex의 설정을 구성합니다. AgentMux WSL
+Pane에서 실행되는 네이티브 Codex는 `/home/<linux-user>/.codex/config.toml`을
+별도로 사용하므로, Codex 설치 후 해당 WSL 배포판 안에서 MCP를 등록하십시오.
+
+```bash
+codex mcp add agentmux -- \
+  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  mcp serve --profile standard
+codex mcp get agentmux
+```
+
+WSL 명령은 Windows interop으로 설치된 `agentmux.exe`를 실행합니다. MCP 상태를
+확인하거나 Workspace 도구를 사용할 때는 AgentMux 데스크톱을 실행해 두어야
+합니다.
+
 ## Claude Code 설정
 
 Claude Code는 기본적으로 `%USERPROFILE%\.claude.json` JSON 설정을
@@ -267,6 +327,21 @@ Claude Code는 기본적으로 `%USERPROFILE%\.claude.json` JSON 설정을
 agentmux mcp setup --client claude --profile read --json
 agentmux mcp setup --client claude --profile standard --install --json
 ```
+
+위 명령은 Windows Claude Code 설정을 구성합니다. AgentMux WSL Pane 안에서
+실행되는 Claude Code는 Linux 사용자 설정을 별도로 사용하므로 WSL 안에서 다음
+명령으로 등록하십시오.
+
+```bash
+claude mcp add --scope user --transport stdio agentmux -- \
+  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  mcp serve --profile standard
+claude mcp get agentmux
+```
+
+Claude Code Agent Teams가 만든 tmux descendant를 AgentMux Pane으로 자동
+편입하려면 `agentmux integrations launch claude-teams`로 lead를 시작하고
+`auto_adopt_tmux: true`인 적응형 팀을 사용하십시오.
 
 `--install`이 없으면 설정 파일을 수정하지 않습니다. 설치 시 기존의 관련
 없는 설정을 유지하고 `agentmux` 이름 충돌을 거부합니다. 미리보기 이후

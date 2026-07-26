@@ -3,10 +3,18 @@ import {
   AUTO_UPDATE_PERIODIC_INTERVAL_MS,
   AUTO_UPDATE_RESUME_STALE_MS,
   isAutomaticUpdateCheckDue,
+  shouldStartAutomaticUpdateCheck,
   shouldPauseAutomaticUpdateChecks,
 } from "./updateCheckSchedule";
 
 describe("automatic update check schedule", () => {
+  it("starts exactly once as soon as automatic update settings are loaded", () => {
+    expect(shouldStartAutomaticUpdateCheck(false, true, false)).toBe(false);
+    expect(shouldStartAutomaticUpdateCheck(true, false, false)).toBe(false);
+    expect(shouldStartAutomaticUpdateCheck(true, true, false)).toBe(true);
+    expect(shouldStartAutomaticUpdateCheck(true, true, true)).toBe(false);
+  });
+
   it("checks immediately when no previous attempt exists", () => {
     expect(
       isAutomaticUpdateCheckDue(null, 1_000, AUTO_UPDATE_RESUME_STALE_MS),

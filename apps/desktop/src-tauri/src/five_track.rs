@@ -90,6 +90,7 @@ struct CachedStatusSnapshot {
     repository: Repository,
     snapshot: Arc<StatusSnapshot>,
     page_indexes: Arc<GitStatusPageIndexes>,
+    scan_started_at: Instant,
     captured_at: Instant,
 }
 
@@ -608,6 +609,7 @@ impl DesktopControlState {
             repository,
             &repository_id,
             active.generation,
+            active.started_at,
             result,
         )?;
         Ok((repository_id, cached))
@@ -648,6 +650,7 @@ impl DesktopControlState {
             .shared
             .git
             .mark_repository_changed(repository);
+        let started_at = Instant::now();
         let scan = self
             .five_track
             .shared
@@ -657,7 +660,7 @@ impl DesktopControlState {
         let active = CachedStatusScan {
             generation,
             scan,
-            started_at: Instant::now(),
+            started_at,
         };
         scans.insert(repository_id.to_string(), active.clone());
         Ok(active)
@@ -700,23 +703,39 @@ impl DesktopControlState {
         repository: &Repository,
         repository_id: &str,
         generation: u64,
+        scan_started_at: Instant,
         result: Arc<StatusReadResult>,
     ) -> Result<CachedStatusSnapshot, DesktopHostError> {
-        if result.snapshot.summary.generation != generation
-            || self.five_track.shared.git.generation(repository) != generation
-        {
+        if result.snapshot.summary.generation != generation {
             if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
                 scans.remove(repository_id);
+            }
+            return Err(DesktopHostError::Control(ControlError::new(
+                ErrorCode::Conflict,
+                "Git status scan generation no longer matches its active request.",
+            )));
+        }
+        let current_generation = self.five_track.shared.git.generation(repository);
+        if current_generation != generation {
+            if let Ok(mut scans) = self.five_track.shared.git_status_scans.lock() {
+                if scans
+                    .get(repository_id)
+                    .is_some_and(|active| active.generation == generation)
+                {
+                    scans.remove(repository_id);
+                }
             }
             return Err(DesktopHostError::Control(ControlError::new(
                 ErrorCode::Conflict,
                 "Git repository changed while its status snapshot was loading; refresh and retry.",
             )));
         }
+        let snapshot = result.snapshot.clone();
         let cached = CachedStatusSnapshot {
             repository: repository.clone(),
-            page_indexes: Arc::new(GitStatusPageIndexes::from_snapshot(&result.snapshot)),
-            snapshot: Arc::new(result.snapshot.clone()),
+            page_indexes: Arc::new(GitStatusPageIndexes::from_snapshot(&snapshot)),
+            snapshot: Arc::new(snapshot),
+            scan_started_at,
             captured_at: Instant::now(),
         };
         if let Ok(mut cache) = self.five_track.shared.git_status_cache.lock() {
@@ -986,6 +1005,7 @@ impl DesktopControlState {
                         &repository,
                         &repository_id,
                         active.generation,
+                        active.started_at,
                         result,
                     )?;
                     self.complete_status_page_response(request, &params, &repository_id, &cached)
@@ -2280,12 +2300,16 @@ fn flush_repository_change_after_debounce(
         }
     };
     let (snapshot, reason) = snapshot;
-    let generation = shared.git.mark_repository_changed(&snapshot.repository);
-    if let Ok(mut scans) = shared.git_status_scans.lock() {
-        if let Some(active) = scans.remove(&snapshot.repository_id) {
-            active.scan.cancel();
-        }
+    let covered_by_completed_scan = snapshot.last_event_at.is_some_and(|event_at| {
+        completed_status_scan_covers_event(&shared, &snapshot.repository_id, event_at)
+    });
+    if covered_by_completed_scan {
+        return;
     }
+    let generation = shared.git.mark_repository_changed(&snapshot.repository);
+    // Let an exact scan already in progress complete. Cancelling on every filesystem event can
+    // starve repositories with generated files or active agents; completion reconciles the
+    // snapshot to the latest generation before publishing it.
     if let Ok(mut cache) = shared.git_status_cache.lock() {
         cache.remove(&snapshot.repository_id);
     }
@@ -2300,6 +2324,19 @@ fn flush_repository_change_after_debounce(
             },
         );
     }
+}
+
+fn completed_status_scan_covers_event(
+    shared: &FiveTrackShared,
+    repository_id: &str,
+    event_at: Instant,
+) -> bool {
+    shared
+        .git_status_cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(repository_id).cloned())
+        .is_some_and(|cached| cached.scan_started_at >= event_at)
 }
 
 fn status_content_hash(snapshot: &StatusSnapshot) -> u64 {
@@ -5613,6 +5650,131 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&repository_id));
+        fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn completed_status_scan_never_relabels_stale_results_after_a_worktree_change() {
+        let repository_path = create_git_repository("status-overlap-change");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .expect("resolved repository");
+        let repository_id = repository_id(&repository);
+        let active = host
+            .start_status_scan(&repository, &repository_id, 250)
+            .expect("active status scan");
+        let scan_generation = active.generation;
+        assert!(host
+            .five_track
+            .shared
+            .git_status_scans
+            .lock()
+            .unwrap()
+            .contains_key(&repository_id));
+        let snapshot = StatusSnapshot {
+            summary: agentmux_vcs::StatusSummary {
+                repository_root: repository.root().to_string(),
+                branch: Some("main".to_string()),
+                head: None,
+                upstream: None,
+                ahead: 0,
+                behind: 0,
+                file_count: 0,
+                staged_count: 0,
+                unstaged_count: 0,
+                untracked_count: 0,
+                conflict_count: 0,
+                generation: scan_generation,
+            },
+            files: Vec::new(),
+        };
+        let changed_generation = host
+            .five_track
+            .shared
+            .git
+            .mark_repository_changed(&repository);
+
+        let error = match host.install_completed_status_scan(
+            "ws_overlap",
+            &repository,
+            &repository_id,
+            scan_generation,
+            active.started_at,
+            Arc::new(StatusReadResult {
+                snapshot,
+                metrics: agentmux_vcs::StatusReadMetrics {
+                    stdout_bytes: 0,
+                    first_change_after: None,
+                    completed_after: Duration::ZERO,
+                },
+            }),
+        ) {
+            Ok(_) => panic!("overlapping change must reject the stale completed snapshot"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            DesktopHostError::Control(ref control) if control.code == ErrorCode::Conflict
+        ));
+        assert_eq!(
+            host.five_track.shared.git.generation(&repository),
+            changed_generation
+        );
+        assert!(!host
+            .five_track
+            .shared
+            .git_status_cache
+            .lock()
+            .unwrap()
+            .contains_key(&repository_id));
+        assert!(!host
+            .five_track
+            .shared
+            .git_status_scans
+            .lock()
+            .unwrap()
+            .contains_key(&repository_id));
+        fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
+    }
+
+    #[test]
+    fn completed_status_scan_covers_only_earlier_watcher_events() {
+        let repository_path = create_git_repository("status-covered-event");
+        let host = DesktopControlState::new_in_memory().expect("desktop state");
+        let repository = host
+            .five_track
+            .shared
+            .git
+            .require_repository(&GitContext::native(
+                repository_path.to_string_lossy().to_string(),
+            ))
+            .expect("resolved repository");
+        let (repository_id, cached) = host
+            .status_snapshot("ws_covered", &repository)
+            .expect("cached status snapshot");
+        let earlier = cached
+            .scan_started_at
+            .checked_sub(Duration::from_millis(1))
+            .expect("earlier instant");
+        let during_or_later = cached.scan_started_at + Duration::from_millis(1);
+
+        assert!(completed_status_scan_covers_event(
+            &host.five_track.shared,
+            &repository_id,
+            earlier,
+        ));
+        assert!(!completed_status_scan_covers_event(
+            &host.five_track.shared,
+            &repository_id,
+            during_or_later,
+        ));
         fs::remove_dir_all(repository_path).expect("temporary repository cleanup");
     }
 
