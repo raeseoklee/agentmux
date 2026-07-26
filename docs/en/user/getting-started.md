@@ -10,6 +10,14 @@
   Linux development shells, durable tmux sessions, and most AI-agent workflows
   on Windows.
 - `tmux` is required inside WSL when using durable WSL-tmux sessions.
+- Pane workers and tmux integrations require their underlying agent CLI inside
+  the selected WSL distribution. Install and authenticate `codex`, `claude`,
+  or the relevant integration executable in that Linux environment; a command
+  that resolves only through `/mnt/c/...` is a Windows installation and may not
+  run as a Linux worker.
+- MCP tools that inspect or modify workspaces require the AgentMux desktop and
+  its local control plane to be running. Protocol discovery and setup preview
+  are the only operations that work without the desktop.
 
 ## Install
 
@@ -17,7 +25,8 @@
 2. Verify the artifact attestation:
 
    ```powershell
-   gh attestation verify .\AgentMux_0.1.3_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+   $installer = Get-ChildItem .\AgentMux_*_x64-setup.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+   gh attestation verify $installer.FullName --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
    ```
 
 3. Run the installer.
@@ -56,6 +65,26 @@ sessions are needed:
 sudo apt update
 sudo apt install tmux
 ```
+
+Install each agent CLI inside the same distribution that AgentMux will use. For
+example, a WSL-native Codex installation can be placed in the user-local prefix:
+
+```bash
+npm install -g --prefix "$HOME/.local" @openai/codex@latest
+hash -r
+command -v codex
+codex --version
+```
+
+`command -v codex` should report a Linux path such as
+`/home/<user>/.local/bin/codex`, not `/mnt/c/Users/.../codex`. Run the agent once
+and complete its provider login before asking AgentMux to start pane workers.
+Apply the same rule to Claude Code and other integrations.
+
+Before starting an MCP-managed visible team, set the workspace project root,
+select the intended default WSL distribution, and open a terminal in that
+workspace. These values provide the inherited working directory and runtime for
+new workers.
 
 WSL support does not imply native Linux desktop support. AgentMux runs as a
 Windows application and uses WSL as a Windows-hosted execution environment.

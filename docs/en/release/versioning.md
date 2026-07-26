@@ -14,8 +14,9 @@ npm run version:check
 Set the next version:
 
 ```powershell
-npm run version:set -- 0.1.9
-npm run version:check -- --tag v0.1.9
+$version = Read-Host "Release version (for example 0.1.26)"
+npm run version:set -- $version
+npm run version:check -- --tag "v$version"
 ```
 
 The version script updates:
@@ -48,7 +49,8 @@ release assets, and publishes them to the GitHub Release.
 After downloading the installer from a GitHub Release:
 
 ```powershell
-gh attestation verify .\AgentMux_0.1.9_x64-setup.exe --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
+$installer = Get-ChildItem .\AgentMux_*_x64-setup.exe | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+gh attestation verify $installer.FullName --repo raeseoklee/agentmux --signer-workflow raeseoklee/agentmux/.github/workflows/release.yml
 ```
 
 The release notes include the exact command and installer hash for each release.

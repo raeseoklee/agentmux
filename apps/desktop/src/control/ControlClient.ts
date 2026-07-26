@@ -3346,6 +3346,10 @@ class BrowserPreviewControlClient implements ControlClient {
   private readonly sidebarStates = new Map<string, SidebarState>();
   private readonly gitStatuses = new Map<string, GitStatus>();
   private readonly gitReviewThreads = new Map<string, GitReviewThread>();
+  private heldGitStatusPage: {
+    wait: Promise<void>;
+    release: () => void;
+  } | null = null;
   private heldGitReviewCreate: {
     wait: Promise<void>;
     release: () => void;
@@ -3461,6 +3465,8 @@ class BrowserPreviewControlClient implements ControlClient {
         this.nextGitStatusPageFailure =
           message ?? "Git status snapshot is no longer available; refresh page zero.";
       },
+      holdGitStatusPage: () => this.holdGitStatusPage(),
+      releaseGitStatusPage: () => this.releaseGitStatusPage(),
       setGitStatusFileCount: (count) =>
         this.setPreviewGitStatusFileCount(count),
       holdGitReviewCreate: () => this.holdGitReviewCreate(),
@@ -4910,6 +4916,7 @@ class BrowserPreviewControlClient implements ControlClient {
       paneId: options.paneId ?? null,
       query: options.query?.trim() || null,
     });
+    await this.heldGitStatusPage?.wait;
     const [status, summary] = await Promise.all([
       this.getGitStatus(workspaceId),
       this.getGitStatusSummary(
@@ -5390,6 +5397,21 @@ class BrowserPreviewControlClient implements ControlClient {
         conflict: false,
       };
     });
+  }
+
+  private holdGitStatusPage(): void {
+    if (this.heldGitStatusPage) return;
+    let release: () => void = () => {};
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.heldGitStatusPage = { wait, release };
+  }
+
+  private releaseGitStatusPage(): void {
+    const held = this.heldGitStatusPage;
+    this.heldGitStatusPage = null;
+    held?.release();
   }
 
   private holdGitReviewCreate(): void {
@@ -8382,6 +8404,8 @@ interface BrowserPreviewApi {
     query: string | null;
   }>;
   failNextGitStatusPage(message?: string): void;
+  holdGitStatusPage(): void;
+  releaseGitStatusPage(): void;
   setGitStatusFileCount(count: number): void;
   holdGitReviewCreate(): void;
   releaseGitReviewCreate(): void;

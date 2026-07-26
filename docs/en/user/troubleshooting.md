@@ -34,6 +34,53 @@ sudo apt install tmux
 
 Then restart AgentMux or reopen the affected terminal.
 
+## A WSL Agent Worker Finds the Windows CLI
+
+AgentMux pane workers run inside the selected WSL distribution. Check the
+executable there:
+
+```bash
+command -v codex
+command -v claude
+```
+
+A path under `/mnt/c/Users/...` is a Windows installation imported through the
+WSL `PATH`. It may be discoverable but still fail as a Linux worker. Install the
+agent CLI inside the selected distribution, ensure its Linux bin directory
+precedes Windows paths, complete provider authentication, and retry.
+
+For Codex, an error such as `Missing optional dependency
+@openai/codex-linux-x64` means WSL invoked the Windows npm installation. One
+user-local repair is:
+
+```bash
+npm install -g --prefix "$HOME/.local" @openai/codex@latest
+hash -r
+command -v codex
+codex --version
+codex login
+```
+
+The resolved command should be a Linux path such as
+`/home/<user>/.local/bin/codex`.
+
+## MCP Works on Windows but Is Missing in WSL
+
+Windows and WSL clients use different home directories and configuration
+files. `agentmux mcp setup --client codex` and `--client claude` target the
+Windows user configuration by default. Register the MCP server again from the
+WSL-native client when the lead agent runs inside an AgentMux WSL pane. See
+[Configure Codex](./mcp.md#configure-codex) and
+[Configure Claude Code](./mcp.md#configure-claude-code) for the commands.
+
+If registration exists but health checking fails, keep the AgentMux desktop
+open and run the installed Windows executable from WSL:
+
+```bash
+/mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  mcp doctor --profile standard --json
+```
+
 ## A Restored Pane Is Empty
 
 An empty restored pane usually means the layout was restored but the terminal

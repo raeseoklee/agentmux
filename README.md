@@ -35,7 +35,11 @@ Requirements:
 
 - Windows 10 or Windows 11.
 - WSL is optional for PowerShell/cmd workflows.
-- WSL with `tmux` is recommended for durable Linux agent sessions.
+- WSL with `tmux` is required for durable Linux agent sessions.
+- An agent launched in a WSL pane must be installed and authenticated inside
+  that same WSL distribution. A Windows-only `codex`, `claude`, or other agent
+  executable found through the imported Windows `PATH` is not a substitute for
+  the Linux CLI.
 
 ## Quick Start
 

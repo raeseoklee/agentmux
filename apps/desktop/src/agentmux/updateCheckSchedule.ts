@@ -11,6 +11,14 @@ export type UpdateLifecycleStatus =
   | "error"
   | "unsupported";
 
+export function shouldStartAutomaticUpdateCheck(
+  configLoaded: boolean,
+  autoCheck: boolean,
+  startupCheckStarted: boolean,
+): boolean {
+  return configLoaded && autoCheck && !startupCheckStarted;
+}
+
 export function shouldPauseAutomaticUpdateChecks(
   status: UpdateLifecycleStatus,
   hasUpdateResource: boolean,

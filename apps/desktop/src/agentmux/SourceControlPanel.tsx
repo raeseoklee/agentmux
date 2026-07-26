@@ -88,6 +88,7 @@ type Row =
 
 const PAGE_SIZE = 250;
 const MAX_STATUS_VIEW_CACHE_ENTRIES = 24;
+const statusViewCache = new Map<string, CachedStatusView>();
 const MIN_CHANGE_HEIGHT = 120;
 const MIN_DIFF_HEIGHT = 180;
 const SPLIT_RATIO_STORAGE_KEY = "agentmux.sourceControl.changeListRatio.v1";
@@ -285,7 +286,6 @@ export function SourceControlPanel({
   const worktreeSequence = useRef(0);
   const loadedGeneration = useRef<number | null>(null);
   const loadedRepositoryId = useRef<string | null>(null);
-  const statusViewCache = useRef(new Map<string, CachedStatusView>());
   const lastRefresh = useRef(0);
   const eventTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const retryTimer = useRef<ReturnType<typeof window.setTimeout> | null>(null);
@@ -490,7 +490,7 @@ export function SourceControlPanel({
       const expectedTarget = captureTarget();
       const query = serverQueryRef.current;
       const cacheKey = statusViewCacheKey(expectedTarget.key, query);
-      const cachedView = statusViewCache.current.get(cacheKey) ?? null;
+      const cachedView = statusViewCache.get(cacheKey) ?? null;
       const requestedGeneration = reuseLoadedSnapshot
         ? loadedGeneration.current
         : null;
@@ -589,7 +589,7 @@ export function SourceControlPanel({
         setChanges(page.changes);
         setNextCursor(page.nextCursor ?? null);
         setFilteredCount(page.totalCount ?? null);
-        rememberStatusView(statusViewCache.current, cacheKey, {
+        rememberStatusView(statusViewCache, cacheKey, {
           summary: nextSummary,
           changes: page.changes,
           nextCursor: page.nextCursor ?? null,
@@ -683,7 +683,7 @@ export function SourceControlPanel({
       setChanges((current) => {
         const merged = [...current, ...page.changes];
         rememberStatusView(
-          statusViewCache.current,
+          statusViewCache,
           statusViewCacheKey(operationTarget.key, query),
           {
             summary,
@@ -746,7 +746,7 @@ export function SourceControlPanel({
     }
     setLoadingMore(false);
     setBusy(false);
-    const cachedView = statusViewCache.current.get(
+    const cachedView = statusViewCache.get(
       statusViewCacheKey(expectedTarget.key, serverQueryRef.current),
     );
     setSummary(cachedView?.summary ?? null);
@@ -763,7 +763,7 @@ export function SourceControlPanel({
     setWorktrees([]);
     setCommitMessage("");
     setError(null);
-    void refresh(!cachedView, false);
+    void refresh(!cachedView, Boolean(cachedView));
     void client
       .getWorkspace(workspace.workspaceId)
       .then((detail) => {
@@ -786,7 +786,7 @@ export function SourceControlPanel({
     if (previousQueryRef.current === serverQuery) return;
     previousQueryRef.current = serverQuery;
     setLoadingMore(false);
-    const cachedView = statusViewCache.current.get(
+    const cachedView = statusViewCache.get(
       statusViewCacheKey(targetKeyRef.current, serverQuery),
     );
     setSummary(cachedView?.summary ?? null);

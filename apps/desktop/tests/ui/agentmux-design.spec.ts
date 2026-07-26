@@ -1888,6 +1888,36 @@ test("source control keeps the last complete snapshot while a transient refresh 
     .toBeGreaterThan(1);
 });
 
+test("source control restores its cached snapshot immediately after the panel is reopened", async ({
+  page,
+}) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-status-git-button").click();
+  let panel = page.getByTestId("source-control-panel");
+  await expect(panel.getByText("main", { exact: true })).toBeVisible();
+  await expect(panel.getByTestId("source-control-change-working")).toHaveCount(1);
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { holdGitStatusPage(): void };
+    }).__AGENTMUX_PREVIEW__?.holdGitStatusPage();
+  });
+  await panel.getByRole("button", { name: "Close" }).click();
+  await page.locator(".agentmux-status-git-button").click();
+  panel = page.getByTestId("source-control-panel");
+
+  await expect(panel.getByText("main", { exact: true })).toBeVisible({
+    timeout: 300,
+  });
+  await expect(panel.getByTestId("source-control-change-working")).toHaveCount(1);
+
+  await page.evaluate(() => {
+    (window as unknown as {
+      __AGENTMUX_PREVIEW__?: { releaseGitStatusPage(): void };
+    }).__AGENTMUX_PREVIEW__?.releaseGitStatusPage();
+  });
+});
+
 test("pane browser button opens a browser in an adjacent split", async ({ page }) => {
   await bootPreview(page);
   await page.locator(".agentmux-new-terminal-tab").click();
