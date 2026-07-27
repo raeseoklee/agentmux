@@ -150,6 +150,7 @@ export interface AgentTelemetry {
   teamMutationId?: string | null;
   teamMutationOwnerId?: string | null;
   teamAutoAdopt?: boolean | null;
+  teamAutoReleaseCompleted?: boolean | null;
   teamIdempotencyKey?: string | null;
   teamMemberIdempotencyKey?: string | null;
 }
@@ -8615,6 +8616,7 @@ interface AgentTelemetryWire {
   team_mutation_id?: string | null;
   team_mutation_owner_id?: string | null;
   team_auto_adopt?: boolean | null;
+  team_auto_release_completed?: boolean | null;
   team_idempotency_key?: string | null;
   team_member_idempotency_key?: string | null;
 }
@@ -9247,6 +9249,7 @@ function mapAgentTelemetry(
     teamMutationId: value.team_mutation_id,
     teamMutationOwnerId: value.team_mutation_owner_id,
     teamAutoAdopt: value.team_auto_adopt,
+    teamAutoReleaseCompleted: value.team_auto_release_completed,
     teamIdempotencyKey: value.team_idempotency_key,
     teamMemberIdempotencyKey: value.team_member_idempotency_key,
   };

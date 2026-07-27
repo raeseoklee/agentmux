@@ -643,6 +643,7 @@ pub struct AgentTelemetry {
     pub team_mutation_id: Option<String>,
     pub team_mutation_owner_id: Option<String>,
     pub team_auto_adopt: Option<bool>,
+    pub team_auto_release_completed: Option<bool>,
     pub team_idempotency_key: Option<String>,
     pub team_member_idempotency_key: Option<String>,
 }
@@ -675,6 +676,7 @@ impl AgentTelemetry {
             && self.team_mutation_id.is_none()
             && self.team_mutation_owner_id.is_none()
             && self.team_auto_adopt.is_none()
+            && self.team_auto_release_completed.is_none()
             && self.team_idempotency_key.is_none()
             && self.team_member_idempotency_key.is_none()
     }
@@ -3612,6 +3614,10 @@ mod tests {
 
         telemetry.team_mutation_id = None;
         telemetry.team_auto_adopt = Some(false);
+        assert!(!telemetry.is_empty());
+
+        telemetry.team_auto_adopt = None;
+        telemetry.team_auto_release_completed = Some(true);
         assert!(!telemetry.is_empty());
     }
 

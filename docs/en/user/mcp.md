@@ -99,13 +99,21 @@ Windows `PATH`. Diagnose wrapper-based integrations before launch:
 agentmux integrations doctor claude-teams --distribution Ubuntu --json
 ```
 
+Wrapper-based integrations also require WSL-to-Windows interoperability because
+their Linux-side `tmux` shim calls the Windows `agentmux.exe` control plane.
+The `/init` bridge used for MCP stdio avoids a direct PE spawn by the MCP client,
+but it does not replace the interop registration required by later worker and
+shim callbacks. Verify both `/proc/sys/fs/binfmt_misc/WSLInterop` and a simple
+Windows command before starting a team. See the troubleshooting guide if either
+check fails.
+
 | Tool | Profile | Purpose |
 | --- | --- | --- |
 | `agent_worker_list` | `read` | List AgentMux-managed tmux integration workers and independent Codex pane workers. |
 | `agent_integration_status` | `read` | Diagnose Claude Teams, OMO, OMX, or OMC wrapper and WSL readiness, using the selected workspace's default WSL distribution when available. |
 | `agent_team_list` | `read` | Reconstruct adaptive teams and their live membership from persisted agent telemetry. |
 | `agent_worker_start` | `standard` | Split the active pane or create a tab, then start `claude-teams`, `omo`, `omx`, `omc`, or `codex-pane`. |
-| `agent_team_start` | `standard` | Create an adaptive team manifest around the current terminal. Seed workers are optional. |
+| `agent_team_start` | `standard` | Create an adaptive team manifest around the current terminal. Seed workers are optional and completed-worker cleanup defaults to enabled. |
 | `agent_team_spawn` | `standard` | Add one top-level worker with generation and idempotency protection, then reflow the managed layout. |
 | `agent_team_release` | `full` | Terminate and release one worker owned by the selected team, then reflow the remaining workers. |
 | `agent_team_reflow` | `standard` | Recompute managed pane ratios, or preview them with `dry_run`, without moving foreign panes. |
@@ -191,6 +199,16 @@ fails, the pane remains visible and the worker remains a team member so it can
 be retried safely. Settlement is compare-and-set protected; a stale completion
 cannot overwrite a newer team generation.
 
+Adaptive teams default `auto_release_completed` to `false`, so completed worker
+panes stay visible for follow-up tasks, debugging, and transcript review. When
+`"auto_release_completed": true` is explicitly set, the MCP server still requires
+two conditions before it closes a pane: the worker agent state must remain
+`completed` after the grace period, and the underlying terminal session must be
+closed (`exited`, `failed`, or `terminated`). A provider `Stop` hook only means
+the current turn finished; it is recorded as reusable `idle` state rather than
+process completion. Workers in `waiting_for_input`, `idle`, `running`, or
+`failed` remain visible so the lead can respond or inspect the state.
+
 ### Layout and tmux auto-adoption
 
 Each worker pane keeps its own live terminal output subscription. Non-focused
@@ -249,6 +267,24 @@ surprising than reporting a dirty layout.
 `/agent` thread. `claude-teams`, `omo`, `omx`, and `omc` launch tmux-compatible
 lead processes whose descendants can be auto-adopted. `agent_worker_send` and
 generic `agent_worker_stop` reject ordinary terminal sessions.
+
+Managed Claude launches default to `--permission-mode auto`; pass an explicit
+`--permission-mode manual` (or another supported Claude mode) in `args` to opt
+out. Independent managed Codex panes default to `--ask-for-approval never` so a
+delegated command failure is returned to Codex instead of leaving the pane at an
+approval prompt; pass an explicit `--ask-for-approval` value to override it.
+These defaults do not use either vendor's dangerous sandbox-bypass flag.
+
+The terminal that calls `agent_team_start` is registered as the team's `main`
+member and is shown as an agent-team session alongside its workers. A submitted
+`agent_worker_send` writes the instruction and its Enter key as one ordered PTY
+input operation. Semantic questions that still require lead judgment remain
+visible through `agent_attention_list`; the lead can inspect the worker with
+`terminal_read` and answer with `agent_worker_send`.
+
+`terminal_read` returns plain model-readable text and removes terminal control
+sequences. The desktop terminal remains the source of truth for the fully
+rendered TUI screen.
 
 The shim captures the WSL-side `PATH` separately when it crosses into
 `agentmux.exe`; it never copies the Windows process `PATH` into a Linux child.
@@ -319,13 +355,18 @@ so register AgentMux from inside that distribution after installing Codex:
 
 ```bash
 codex mcp add agentmux -- \
-  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  /init \
+  /mnt/c/Windows/System32/cmd.exe \
+  /d /q /c \
+  'C:\Users\<Windows-user>\AppData\Local\AgentMux\agentmux.exe' \
   mcp serve --profile standard
 codex mcp get agentmux
 ```
 
-The WSL command relies on Windows interoperability to launch the installed
-`agentmux.exe`. Keep the AgentMux desktop running while checking MCP health or
+The `/init` and `cmd.exe` bridge lets the WSL client spawn a Linux executable
+while Windows interoperability launches the installed `agentmux.exe`. This
+avoids `ENOEXEC` failures from clients that call `posix_spawn` directly on a
+Windows PE file. Keep the AgentMux desktop running while checking MCP health or
 using workspace tools.
 
 ## Configure Claude Code
@@ -343,14 +384,40 @@ stdio server from inside WSL:
 
 ```bash
 claude mcp add --scope user --transport stdio agentmux -- \
-  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  /init \
+  /mnt/c/Windows/System32/cmd.exe \
+  /d /q /c \
+  'C:\Users\<Windows-user>\AppData\Local\AgentMux\agentmux.exe' \
   mcp serve --profile standard
 claude mcp get agentmux
 ```
 
-For Claude Code Agent Teams whose tmux descendants should become AgentMux
-panes, start the lead through `agentmux integrations launch claude-teams` and
-use an adaptive team with `auto_adopt_tmux: true`.
+`agentmux integrations launch claude-teams` is not required for an MCP-managed
+adaptive team. If Claude is already running in an AgentMux terminal and the MCP
+server is connected, call `agent_team_start` in that session and add workers
+with `agent_team_spawn`. The running desktop provides the control plane, but it
+does not by itself turn an existing Claude process into a team.
+
+When a worker selects a WSL distribution, AgentMux carries that choice through
+both the `wsl-direct` terminal boundary and the nested integration launcher. The
+equivalent explicit CLI form is:
+
+```bash
+/mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  integrations launch claude-teams --distribution Ubuntu -- \
+  --model opus
+```
+
+The `--` separates AgentMux launch options from Claude arguments. This prevents
+a Windows `agentmux.exe` reached through WSL interop from silently launching a
+Windows Claude process because WSL environment markers were not inherited.
+
+The launch command is required when Claude Code's native Agent Teams should
+route their own tmux descendants into AgentMux, unless the current lead was
+already started with the AgentMux integration environment. Environment and shim
+changes cannot be injected into an existing process: finish or preserve its
+work, restart only that lead with `agentmux integrations launch claude-teams`,
+then use an adaptive team with `auto_adopt_tmux: true`.
 
 `setup` is preview-only unless `--install` is present. Installation preserves
 unrelated settings, rejects an unrelated server already named `agentmux`, and
