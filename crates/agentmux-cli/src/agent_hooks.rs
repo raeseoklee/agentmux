@@ -20,9 +20,9 @@ const EVENTS: &[(&str, &str)] = &[
     ("UserPromptSubmit", "running"),
     ("PermissionRequest", "waiting_for_input"),
     ("Notification", "waiting_for_input"),
-    ("Stop", "completed"),
+    ("Stop", "idle"),
     ("SubagentStart", "started"),
-    ("SubagentStop", "completed"),
+    ("SubagentStop", "idle"),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

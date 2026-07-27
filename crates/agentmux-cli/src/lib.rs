@@ -57,12 +57,12 @@ use agentmux_ipc::{
     SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusSetParams,
     SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
     SurfaceCreateMarkdownParams, SurfaceSummaryResult, SystemCapabilitiesResult,
-    SystemIdentifyParams, SystemIdentifyResult, WorkspaceCloseParams, WorkspaceCloseResult,
-    WorkspaceCreateParams, WorkspaceDetailResult, WorkspaceGroupCreateParams,
-    WorkspaceGroupIdParams, WorkspaceGroupListParams, WorkspaceGroupListResult,
-    WorkspaceGroupMemberParams, WorkspaceGroupResult, WorkspaceGroupUpdateParams,
-    WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams, WorkspaceSummaryResult,
-    DEFAULT_CONTROL_PIPE_NAME,
+    SystemIdentifyParams, SystemIdentifyResult, TerminalPlacementResult, TerminalSplitParams,
+    WorkspaceCloseParams, WorkspaceCloseResult, WorkspaceCreateParams, WorkspaceDetailResult,
+    WorkspaceGroupCreateParams, WorkspaceGroupIdParams, WorkspaceGroupListParams,
+    WorkspaceGroupListResult, WorkspaceGroupMemberParams, WorkspaceGroupResult,
+    WorkspaceGroupUpdateParams, WorkspaceIdParams, WorkspaceListResult, WorkspaceRenameParams,
+    WorkspaceSummaryResult, DEFAULT_CONTROL_PIPE_NAME,
 };
 use tungstenite::handshake::server::ErrorResponse as WsErrorResponse;
 use tungstenite::http::StatusCode as WsStatusCode;
@@ -680,6 +680,7 @@ struct AgentIntegrationLaunchOptions {
     kind: AgentIntegrationKind,
     workspace_id: Option<String>,
     base_dir: Option<String>,
+    distribution: Option<String>,
     args: Vec<String>,
 }
 
@@ -2973,11 +2974,11 @@ fn parse_u32_option(value: &str, option: &str) -> Result<u32, CliError> {
 fn validate_agent_hook_state(value: &str) -> Result<(), CliError> {
     if matches!(
         value,
-        "started" | "running" | "waiting_for_input" | "completed" | "failed" | "exited"
+        "started" | "running" | "idle" | "waiting_for_input" | "completed" | "failed" | "exited"
     ) {
         Ok(())
     } else {
-        Err(CliError::InvalidArgs(format!("--state must be started, running, waiting_for_input, completed, failed, or exited; got '{value}'.")))
+        Err(CliError::InvalidArgs(format!("--state must be started, running, idle, waiting_for_input, completed, failed, or exited; got '{value}'.")))
     }
 }
 fn validate_agent_hook_source(value: &str) -> Result<(), CliError> {
@@ -5775,12 +5776,51 @@ fn parse_agent_integration_launch_options(
     kind: AgentIntegrationKind,
     args: &[String],
 ) -> Result<AgentIntegrationLaunchOptions, CliError> {
+    let mut invoke = ControlInvokeOptions::from_env();
+    let mut workspace_id = workspace_from_env();
+    let mut base_dir = None;
+    let mut distribution = None;
+    let mut forwarded = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        if args[index] == "--" {
+            forwarded.extend_from_slice(&args[index + 1..]);
+            break;
+        }
+        if parse_common_control_option(args, &mut index, &mut invoke)? {
+            continue;
+        }
+        match args[index].as_str() {
+            "--workspace" => {
+                workspace_id = Some(option_value(args, index, "--workspace")?.to_string());
+                index += 2;
+            }
+            "--base-dir" => {
+                base_dir = Some(option_value(args, index, "--base-dir")?.to_string());
+                index += 2;
+            }
+            "--distribution" => {
+                distribution = Some(option_value(args, index, "--distribution")?.to_string());
+                index += 2;
+            }
+            _ => {
+                // The integration command has its own option surface. Stop parsing at the
+                // first unknown token so existing direct invocations keep forwarding their
+                // arguments unchanged. Callers can use `--` to disambiguate collisions.
+                forwarded.extend_from_slice(&args[index..]);
+                break;
+            }
+        }
+    }
+
     Ok(AgentIntegrationLaunchOptions {
-        invoke: ControlInvokeOptions::from_env(),
+        invoke,
         kind,
-        workspace_id: workspace_from_env(),
-        base_dir: None,
-        args: args.to_vec(),
+        workspace_id,
+        base_dir,
+        distribution,
+        args: forwarded,
     })
 }
 
@@ -11829,13 +11869,15 @@ where
         options.args,
         options.kind == AgentIntegrationKind::Omo,
     )?;
-    let status = run_agent_integration_runtime(&runtime).map_err(|error| {
-        CliError::Control(format!(
-            "failed to launch {} integration command '{}': {error}",
-            runtime.kind.command_name(),
-            runtime.command
-        ))
-    })?;
+    let status = run_agent_integration_runtime(&runtime, options.distribution.as_deref()).map_err(
+        |error| {
+            CliError::Control(format!(
+                "failed to launch {} integration command '{}': {error}",
+                runtime.kind.command_name(),
+                runtime.command
+            ))
+        },
+    )?;
     if status.success() {
         Ok(())
     } else {
@@ -11850,8 +11892,12 @@ where
 
 fn run_agent_integration_runtime(
     runtime: &AgentIntegrationRuntime,
+    distribution: Option<&str>,
 ) -> io::Result<std::process::ExitStatus> {
-    if let Some(distribution) = wsl_distribution_from_env() {
+    let inherited_distribution = wsl_distribution_from_env();
+    let distribution =
+        resolve_agent_integration_distribution(distribution, inherited_distribution.as_deref());
+    if let Some(distribution) = distribution {
         let launcher = std::env::current_exe()?;
         let spec = build_agent_integration_wsl_command(runtime, &distribution, &launcher)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
@@ -11864,6 +11910,22 @@ fn run_agent_integration_runtime(
         command.env(key, value);
     }
     command.status()
+}
+
+fn resolve_agent_integration_distribution(
+    explicit: Option<&str>,
+    inherited: Option<&str>,
+) -> Option<String> {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            inherited
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12471,6 +12533,35 @@ where
 {
     let (workspace_id, pane_id) =
         resolve_tmux_workspace_and_pane(&invoke, workspace_id, target_pane_id)?;
+    let detail = load_workspace_detail(&invoke, &workspace_id)?;
+    let session_id = session_id_for_pane(&detail, &pane_id);
+    let mut terminated_session = false;
+    if let Some(session_id) = session_id.as_deref() {
+        let session = detail
+            .sessions
+            .iter()
+            .find(|candidate| candidate.session_id == session_id);
+        let already_closed = session
+            .map(|session| {
+                matches!(
+                    session.state.as_str(),
+                    "exited" | "failed" | "terminated" | "disconnected" | "detached" | "lost"
+                )
+            })
+            .unwrap_or(false);
+        if !already_closed {
+            let terminate = invoke_control(
+                "session.terminate",
+                &SessionTerminateParams {
+                    session_id: session_id.to_string(),
+                    mode: "kill".to_string(),
+                },
+                &invoke,
+            )?;
+            response_result::<serde_json::Value>(&terminate)?;
+            terminated_session = true;
+        }
+    }
     let response = invoke_control(
         "pane.close",
         &PaneCloseParams {
@@ -12481,7 +12572,11 @@ where
         &invoke,
     )?;
     if invoke.json {
-        return write_json_response(&response, output);
+        let mut value = response_result::<serde_json::Value>(&response)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("terminated_session".to_string(), terminated_session.into());
+        }
+        return write_json_value(&value, output);
     }
     response_result::<WorkspaceDetailResult>(&response)?;
     writeln!(output, "ok")?;
@@ -12783,17 +12878,23 @@ where
     let pane_id = split_plan.target_pane_id;
     let axis = split_plan.axis;
     let team_mutation = split_plan.team_mutation;
+    let command = tmux_command_or_default_shell(command, &context);
     let split = invoke_control(
-        "pane.split",
-        &PaneSplitParams {
-            workspace_id: workspace_id.clone(),
-            pane_id: pane_id.clone(),
+        "terminal.split",
+        &tmux_terminal_split_params(
+            workspace_id.clone(),
+            pane_id.clone(),
             axis,
-            ratio: None,
-        },
+            command,
+            &context,
+        ),
         &invoke,
-    );
-    let split = match split {
+    )
+    .and_then(|response| {
+        let result = response_result::<TerminalPlacementResult>(&response)?;
+        Ok((response, result))
+    });
+    let (split_response, result) = match split {
         Ok(split) => split,
         Err(error) => {
             if let Some(mutation) = team_mutation.as_ref() {
@@ -12807,63 +12908,14 @@ where
             return Err(error);
         }
     };
-    let detail: WorkspaceDetailResult = response_result(&split)?;
-    let new_pane_id = split_child_pane_id(&detail, &pane_id).ok_or_else(|| {
-        CliError::Control("Could not resolve the newly split AgentMux pane.".to_string())
-    })?;
-
-    let mut session_id = None;
-    let command = tmux_command_or_default_shell(command, &context);
-    if !command.is_empty() {
-        let spawn = invoke_control(
-            "session.spawn",
-            &SessionSpawnParams {
-                workspace_id: workspace_id.clone(),
-                backend: context.backend_kind.clone(),
-                backend_profile: None,
-                command,
-                cwd: context.cwd.clone(),
-                env: tmux_integration_child_env(),
-                columns: 120,
-                rows: 30,
-                durability: Some("ephemeral".to_string()),
-                placement: Some("active_pane".to_string()),
-                pane_id: Some(new_pane_id.clone()),
-            },
-            &invoke,
-        )
-        .and_then(|response| {
-            let result = response_result::<SessionSpawnResult>(&response)?;
-            Ok((response, result))
-        });
-        let (spawn_response, result) = match spawn {
-            Ok(result) => result,
-            Err(error) => {
-                let error = rollback_tmux_pane_after_spawn_failure(
-                    &workspace_id,
-                    &new_pane_id,
-                    error,
-                    |method, params| {
-                        let response = invoke_control(method, params, &invoke)?;
-                        response_result::<serde_json::Value>(&response).map(|_| ())
-                    },
-                );
-                if let Some(mutation) = team_mutation.as_ref() {
-                    mark_tmux_agent_team_layout_dirty(
-                        &invoke,
-                        &workspace_id,
-                        mutation,
-                        &format!("reserved worker spawn failed: {error}"),
-                    );
-                }
-                return Err(error);
-            }
-        };
+    let new_pane_id = result.pane_id.clone();
+    let session_id = result.session_id.clone();
+    if let Some(session_id) = session_id.as_deref() {
         register_tmux_agent_team_metadata(
             &invoke,
             TmuxAgentTeamMetadataContext {
                 workspace_id: &workspace_id,
-                session_id: &result.session_id,
+                session_id,
                 parent_session_id: context.session_id.as_deref(),
                 parent_pane_id: Some(&pane_id),
                 action: "split-window",
@@ -12871,21 +12923,16 @@ where
                 mutation: team_mutation.as_ref(),
             },
         )?;
-        if invoke.json {
-            return write_json_response(&spawn_response, output);
-        }
-        session_id = Some(result.session_id);
+    }
+    if invoke.json {
+        return write_json_response(&split_response, output);
     }
 
     let context = SystemIdentifyResult {
         in_agentmux: true,
         workspace_id: Some(workspace_id),
         pane_id: Some(new_pane_id.clone()),
-        surface_id: detail
-            .panes
-            .iter()
-            .find(|pane| pane.pane_id == new_pane_id)
-            .and_then(|pane| pane.mounted_surface_id.clone()),
+        surface_id: result.surface_id,
         session_id,
         cwd: context.cwd,
         backend_kind: context.backend_kind,
@@ -12921,30 +12968,6 @@ where
     )
 }
 
-fn rollback_tmux_pane_after_spawn_failure<F>(
-    workspace_id: &str,
-    pane_id: &str,
-    spawn_error: CliError,
-    rollback: F,
-) -> CliError
-where
-    F: FnOnce(&str, &PaneCloseParams) -> Result<(), CliError>,
-{
-    let rollback_result = rollback(
-        "pane.close",
-        &PaneCloseParams {
-            workspace_id: workspace_id.to_string(),
-            pane_id: pane_id.to_string(),
-            surface_policy: "close_surface".to_string(),
-        },
-    );
-    preserve_error_with_tmux_rollback(
-        spawn_error,
-        rollback_result,
-        &format!("newly split pane '{pane_id}'"),
-    )
-}
-
 fn preserve_error_with_tmux_rollback(
     original_error: CliError,
     rollback_result: Result<(), CliError>,
@@ -12966,6 +12989,30 @@ fn tmux_command_or_default_shell(
         tmux_default_shell_command(context)
     } else {
         command
+    }
+}
+
+fn tmux_terminal_split_params(
+    workspace_id: String,
+    pane_id: String,
+    axis: String,
+    command: Vec<String>,
+    context: &SystemIdentifyResult,
+) -> TerminalSplitParams {
+    TerminalSplitParams {
+        workspace_id,
+        pane_id,
+        axis,
+        ratio: None,
+        behavior: Some("clone_current".to_string()),
+        backend: context.backend_kind.clone(),
+        backend_profile: None,
+        command,
+        env: tmux_integration_child_env(),
+        cwd: context.cwd.clone(),
+        columns: None,
+        rows: None,
+        durability: Some("ephemeral".to_string()),
     }
 }
 
@@ -13170,6 +13217,9 @@ fn resolve_tmux_agent_team_split_plan(
     team.layout_root_pane_id = main_telemetry.layout_root_pane_id.clone();
     team.main_ratio = main_telemetry.main_ratio.clone();
     team.max_workers = main_telemetry.max_workers.or(team.max_workers);
+    team.auto_release_completed = main_telemetry
+        .team_auto_release_completed
+        .or(team.auto_release_completed);
     let worker_sessions = agents
         .sessions
         .iter()
@@ -13707,6 +13757,7 @@ fn tmux_integration_child_env() -> Vec<EnvVarParam> {
         "AGENTMUX_TEAM_MAX_WORKERS",
         "AGENTMUX_TEAM_WORKER_NAME",
         "AGENTMUX_TEAM_AUTO_ADOPT",
+        "AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED",
     ];
     INHERITED_KEYS
         .iter()
@@ -13780,6 +13831,10 @@ fn build_tmux_agent_team_metadata(
                     .map(|mutation| mutation.mutation_id.clone()),
                 team_mutation_owner_id: None,
                 team_auto_adopt: team.team_id.as_ref().map(|_| true),
+                team_auto_release_completed: team
+                    .team_id
+                    .as_ref()
+                    .map(|_| team.auto_release_completed.unwrap_or(false)),
                 team_idempotency_key: None,
                 team_member_idempotency_key: None,
             }),
@@ -13809,6 +13864,7 @@ struct TmuxAgentTeamEnvironment {
     layout_root_pane_id: Option<String>,
     main_ratio: Option<String>,
     max_workers: Option<u16>,
+    auto_release_completed: Option<bool>,
 }
 
 fn tmux_agent_team_environment() -> TmuxAgentTeamEnvironment {
@@ -13825,6 +13881,11 @@ fn tmux_agent_team_environment() -> TmuxAgentTeamEnvironment {
         main_ratio: non_empty_environment_value("AGENTMUX_TEAM_MAIN_RATIO"),
         max_workers: non_empty_environment_value("AGENTMUX_TEAM_MAX_WORKERS")
             .and_then(|value| value.parse().ok()),
+        auto_release_completed: Some(
+            non_empty_environment_value("AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED").is_some_and(
+                |value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+            ),
+        ),
     }
 }
 
@@ -15029,6 +15090,7 @@ fn prepare_agent_integration_runtime(
 ) -> Result<AgentIntegrationRuntime, CliError> {
     let base_dir = resolve_cmuxterm_base_dir(base_dir)?;
     let mut runtime = setup_agent_integration_files(kind, &base_dir, args)?;
+    apply_default_agent_autonomy(kind, &mut runtime.args);
     if install_packages && kind == AgentIntegrationKind::Omo {
         let distribution = wsl_distribution_from_env();
         runtime.package_install = Some(ensure_omo_package_installed_for_distribution(
@@ -15113,6 +15175,23 @@ fn prepare_agent_integration_runtime(
     Ok(runtime)
 }
 
+fn apply_default_agent_autonomy(kind: AgentIntegrationKind, args: &mut Vec<String>) {
+    if kind != AgentIntegrationKind::ClaudeTeams
+        || args.iter().any(|arg| {
+            arg == "--permission-mode"
+                || arg.starts_with("--permission-mode=")
+                || arg == "--dangerously-skip-permissions"
+        })
+    {
+        return;
+    }
+
+    // Claude's `auto` mode is designed for delegated interactive sessions and
+    // does not disable its sandbox. Put the default before positional prompts;
+    // an explicit caller policy always wins by suppressing this insertion.
+    args.splice(0..0, ["--permission-mode".to_string(), "auto".to_string()]);
+}
+
 fn setup_agent_integration_files(
     kind: AgentIntegrationKind,
     base_dir: &Path,
@@ -15165,7 +15244,7 @@ fn setup_agent_integration_files(
 
 fn write_tmux_shim_files(shim_dir: &Path) -> Result<(), CliError> {
     let script_path = shim_dir.join("tmux");
-    let script = "#!/usr/bin/env sh\nAGENTMUX_WSL_PATH=$PATH\nexport AGENTMUX_WSL_PATH\nfor agentmux_key in AGENTMUX_AGENT_INTEGRATION CMUX_AGENT_INTEGRATION AGENTMUX_EXE CMUX_EXE AGENTMUX_WSL_PATH CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS OPENCODE_CONFIG_DIR AGENTMUX_ORIGINAL_NODE_OPTIONS CMUX_ORIGINAL_NODE_OPTIONS NODE_OPTIONS AGENTMUX_TEAM_ID AGENTMUX_TEAM_ROLE AGENTMUX_TEAM_MAIN_SESSION_ID AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID AGENTMUX_TEAM_MAIN_RATIO AGENTMUX_TEAM_MAX_WORKERS AGENTMUX_TEAM_WORKER_NAME AGENTMUX_TEAM_AUTO_ADOPT; do\n  case \":${WSLENV-}:\" in\n    *\":${agentmux_key}:\"*) ;;\n    *) WSLENV=\"${WSLENV:+${WSLENV}:}${agentmux_key}\" ;;\n  esac\ndone\nexport WSLENV\nif [ -n \"$AGENTMUX_EXE\" ]; then\n  exec \"$AGENTMUX_EXE\" __tmux-compat \"$@\"\nfi\nif [ -n \"$CMUX_EXE\" ]; then\n  exec \"$CMUX_EXE\" __tmux-compat \"$@\"\nfi\nif command -v agentmux >/dev/null 2>&1; then\n  exec agentmux __tmux-compat \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux __tmux-compat \"$@\"\nfi\nexec agentmux.exe __tmux-compat \"$@\"\n";
+    let script = "#!/usr/bin/env sh\nAGENTMUX_WSL_PATH=$PATH\nexport AGENTMUX_WSL_PATH\nfor agentmux_key in AGENTMUX_AGENT_INTEGRATION CMUX_AGENT_INTEGRATION AGENTMUX_EXE CMUX_EXE AGENTMUX_WSL_PATH CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS OPENCODE_CONFIG_DIR AGENTMUX_ORIGINAL_NODE_OPTIONS CMUX_ORIGINAL_NODE_OPTIONS NODE_OPTIONS AGENTMUX_TEAM_ID AGENTMUX_TEAM_ROLE AGENTMUX_TEAM_MAIN_SESSION_ID AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID AGENTMUX_TEAM_MAIN_RATIO AGENTMUX_TEAM_MAX_WORKERS AGENTMUX_TEAM_WORKER_NAME AGENTMUX_TEAM_AUTO_ADOPT AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED; do\n  case \":${WSLENV-}:\" in\n    *\":${agentmux_key}:\"*) ;;\n    *) WSLENV=\"${WSLENV:+${WSLENV}:}${agentmux_key}\" ;;\n  esac\ndone\nexport WSLENV\nif [ -n \"$AGENTMUX_EXE\" ]; then\n  exec \"$AGENTMUX_EXE\" __tmux-compat \"$@\"\nfi\nif [ -n \"$CMUX_EXE\" ]; then\n  exec \"$CMUX_EXE\" __tmux-compat \"$@\"\nfi\nif command -v agentmux >/dev/null 2>&1; then\n  exec agentmux __tmux-compat \"$@\"\nfi\nif command -v cmux >/dev/null 2>&1; then\n  exec cmux __tmux-compat \"$@\"\nfi\nexec agentmux.exe __tmux-compat \"$@\"\n";
     fs::write(&script_path, script).map_err(CliError::Io)?;
     set_executable_if_supported(&script_path)?;
 
@@ -17396,21 +17475,6 @@ fn pane_id_for_session(detail: &WorkspaceDetailResult, session_id: &str) -> Opti
         .map(|pane| pane.pane_id.clone())
 }
 
-fn split_child_pane_id(detail: &WorkspaceDetailResult, parent_pane_id: &str) -> Option<String> {
-    let mut fallback = None;
-    for pane in detail
-        .panes
-        .iter()
-        .filter(|pane| pane.parent_pane_id.as_deref() == Some(parent_pane_id))
-    {
-        if pane.mounted_surface_id.is_none() {
-            return Some(pane.pane_id.clone());
-        }
-        fallback = Some(pane.pane_id.clone());
-    }
-    fallback
-}
-
 fn first_leaf_id_in_detail(detail: &WorkspaceDetailResult, pane_id: &str) -> Option<String> {
     let pane = detail.panes.iter().find(|pane| pane.pane_id == pane_id)?;
     if pane.kind == "leaf" {
@@ -19623,6 +19687,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_integration_distribution_wins_over_inherited_context() {
+        assert_eq!(
+            resolve_agent_integration_distribution(Some(" Ubuntu-24.04 "), Some("Debian"))
+                .as_deref(),
+            Some("Ubuntu-24.04")
+        );
+        assert_eq!(
+            resolve_agent_integration_distribution(None, Some(" Debian ")).as_deref(),
+            Some("Debian")
+        );
+        assert_eq!(
+            resolve_agent_integration_distribution(Some("  "), None),
+            None
+        );
+    }
+
+    #[test]
     fn path_to_wsl_value_converts_windows_drive_paths() {
         assert_eq!(
             path_to_wsl_value(Path::new(r"D:\work\repo")).unwrap(),
@@ -20178,6 +20259,23 @@ HKEY_CURRENT_USER\Environment
             vec!["--madmax".to_string(), "--high".to_string()]
         );
 
+        let wsl_launch = parse_agent_integration_launch_options(
+            AgentIntegrationKind::ClaudeTeams,
+            &[
+                "--distribution".to_string(),
+                "Ubuntu-24.04".to_string(),
+                "--".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(wsl_launch.distribution.as_deref(), Some("Ubuntu-24.04"));
+        assert_eq!(
+            wsl_launch.args,
+            vec!["--model".to_string(), "opus".to_string()]
+        );
+
         let install = parse_agent_integration_install_options(&[
             "--json".to_string(),
             "--base-dir".to_string(),
@@ -20214,6 +20312,36 @@ HKEY_CURRENT_USER\Environment
         assert_eq!(doctor.kind, Some(AgentIntegrationKind::Omo));
         assert_eq!(doctor.base_dir.as_deref(), Some(r"D:\agentmux-cmuxterm"));
         assert_eq!(doctor.distribution.as_deref(), Some("Ubuntu"));
+    }
+
+    #[test]
+    fn claude_teams_defaults_to_auto_permission_mode() {
+        let mut args = vec!["Review the failing tests".to_string()];
+        apply_default_agent_autonomy(AgentIntegrationKind::ClaudeTeams, &mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--permission-mode".to_string(),
+                "auto".to_string(),
+                "Review the failing tests".to_string(),
+            ]
+        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn claude_teams_preserves_explicit_permission_modes() {
+        for explicit in [
+            vec!["--permission-mode".to_string(), "manual".to_string()],
+            vec!["--permission-mode=plan".to_string()],
+            vec!["--dangerously-skip-permissions".to_string()],
+        ] {
+            let mut args = explicit.clone();
+            apply_default_agent_autonomy(AgentIntegrationKind::ClaudeTeams, &mut args);
+            assert_eq!(args, explicit);
+        }
     }
 
     #[test]
@@ -21152,29 +21280,6 @@ HKEY_CURRENT_USER\Environment
     }
 
     #[test]
-    fn tmux_split_window_spawn_failure_closes_new_pane_and_surface() {
-        let mut rollback_called = false;
-        let error = rollback_tmux_pane_after_spawn_failure(
-            "ws_1",
-            "pane_created",
-            CliError::Control("session spawn failed".to_string()),
-            |method, params| {
-                rollback_called = true;
-                assert_eq!(method, "pane.close");
-                assert_eq!(params.workspace_id, "ws_1");
-                assert_eq!(params.pane_id, "pane_created");
-                assert_eq!(params.surface_policy, "close_surface");
-                Ok(())
-            },
-        );
-
-        assert!(rollback_called);
-        assert!(
-            matches!(error, CliError::Control(ref message) if message == "session spawn failed")
-        );
-    }
-
-    #[test]
     fn tmux_spawn_failure_reports_primary_and_rollback_errors() {
         let error = rollback_tmux_workspace_after_spawn_failure(
             "ws_created",
@@ -21240,6 +21345,41 @@ HKEY_CURRENT_USER\Environment
     }
 
     #[test]
+    fn tmux_split_uses_atomic_terminal_placement_with_adaptive_size() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let context = SystemIdentifyResult {
+            in_agentmux: true,
+            workspace_id: Some("ws_1".to_string()),
+            pane_id: Some("pane_main".to_string()),
+            surface_id: Some("surf_main".to_string()),
+            session_id: Some("ses_main".to_string()),
+            cwd: Some(r"D:\work".to_string()),
+            backend_kind: Some("conpty".to_string()),
+            control_pipe: DEFAULT_CONTROL_PIPE_NAME.to_string(),
+        };
+
+        let params = tmux_terminal_split_params(
+            "ws_1".to_string(),
+            "pane_main".to_string(),
+            "vertical".to_string(),
+            vec!["claude".to_string()],
+            &context,
+        );
+
+        assert_eq!(params.workspace_id, "ws_1");
+        assert_eq!(params.pane_id, "pane_main");
+        assert_eq!(params.axis, "vertical");
+        assert_eq!(params.behavior.as_deref(), Some("clone_current"));
+        assert_eq!(params.backend.as_deref(), Some("conpty"));
+        assert_eq!(params.cwd.as_deref(), Some(r"D:\work"));
+        assert_eq!(params.command, vec!["claude".to_string()]);
+        assert_eq!(params.durability.as_deref(), Some("ephemeral"));
+        assert!(params.ratio.is_none());
+        assert!(params.columns.is_none());
+        assert!(params.rows.is_none());
+    }
+
+    #[test]
     fn tmux_integration_child_env_preserves_markers_without_overwriting_wsl_path() {
         let _env_lock = ENV_LOCK.lock().unwrap();
         let previous_marker = std::env::var_os("AGENTMUX_AGENT_INTEGRATION");
@@ -21248,6 +21388,7 @@ HKEY_CURRENT_USER\Environment
         let previous_team_id = std::env::var_os("AGENTMUX_TEAM_ID");
         let previous_main_session_id = std::env::var_os("AGENTMUX_TEAM_MAIN_SESSION_ID");
         let previous_worker_name = std::env::var_os("AGENTMUX_TEAM_WORKER_NAME");
+        let previous_auto_release = std::env::var_os("AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED");
         std::env::set_var("AGENTMUX_AGENT_INTEGRATION", "claude-teams");
         std::env::set_var("PATH", r"C:\Windows\System32");
         std::env::set_var(
@@ -21257,6 +21398,7 @@ HKEY_CURRENT_USER\Environment
         std::env::set_var("AGENTMUX_TEAM_ID", "team_1");
         std::env::set_var("AGENTMUX_TEAM_MAIN_SESSION_ID", "session_main");
         std::env::set_var("AGENTMUX_TEAM_WORKER_NAME", "worker_1");
+        std::env::set_var("AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED", "1");
 
         let env = tmux_integration_child_env();
         assert!(env.iter().any(|entry| {
@@ -21275,6 +21417,9 @@ HKEY_CURRENT_USER\Environment
         }));
         assert!(env.iter().any(|entry| {
             entry.key == "AGENTMUX_TEAM_WORKER_NAME" && entry.value == "worker_1"
+        }));
+        assert!(env.iter().any(|entry| {
+            entry.key == "AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED" && entry.value == "1"
         }));
 
         if let Some(value) = previous_marker {
@@ -21307,6 +21452,11 @@ HKEY_CURRENT_USER\Environment
         } else {
             std::env::remove_var("AGENTMUX_TEAM_WORKER_NAME");
         }
+        if let Some(value) = previous_auto_release {
+            std::env::set_var("AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED", value);
+        } else {
+            std::env::remove_var("AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED");
+        }
     }
 
     #[test]
@@ -21319,6 +21469,7 @@ HKEY_CURRENT_USER\Environment
             "AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID",
             "AGENTMUX_TEAM_MAIN_RATIO",
             "AGENTMUX_TEAM_MAX_WORKERS",
+            "AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED",
         ];
         let previous = keys
             .iter()
@@ -21330,6 +21481,7 @@ HKEY_CURRENT_USER\Environment
         std::env::set_var("AGENTMUX_TEAM_LAYOUT_ROOT_PANE_ID", "pane_root");
         std::env::set_var("AGENTMUX_TEAM_MAIN_RATIO", "0.55");
         std::env::set_var("AGENTMUX_TEAM_MAX_WORKERS", "4");
+        std::env::set_var("AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED", "0");
 
         let mutation = TmuxAgentTeamMutation {
             team: tmux_agent_team_environment(),
@@ -21365,6 +21517,7 @@ HKEY_CURRENT_USER\Environment
         assert_eq!(telemetry.max_workers, Some(4));
         assert_eq!(telemetry.team_generation, Some(2));
         assert_eq!(telemetry.team_mutation_id.as_deref(), Some("tmux:test"));
+        assert_eq!(telemetry.team_auto_release_completed, Some(false));
 
         for (key, value) in previous {
             if let Some(value) = value {

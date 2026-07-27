@@ -67,11 +67,11 @@ use agentmux_ipc::{
     PaneUnmountSurfaceParams, ProfileCreateParams, ProfileIdParams, ProfileListResult,
     ProfileSummaryResult, ProfileUpdateParams, RecoveryDiagnosticsResult, RecoverySessionResult,
     RequestEnvelope, ResponseEnvelope, ResponseOutcome, SessionAttachParams, SessionIdParams,
-    SessionSendPasteParams, SessionSendTextParams, SessionSpawnParams, SessionSpawnResult,
-    SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams, SidebarLogListResult,
-    SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams, SidebarStateResult,
-    SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult, SidebarStatusSetParams,
-    SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
+    SessionResizeParams, SessionSendPasteParams, SessionSendTextParams, SessionSpawnParams,
+    SessionSpawnResult, SessionSummaryResult, SidebarLogAddParams, SidebarLogListParams,
+    SidebarLogListResult, SidebarLogResult, SidebarProgressResult, SidebarProgressSetParams,
+    SidebarStateResult, SidebarStatusKeyParams, SidebarStatusListResult, SidebarStatusResult,
+    SidebarStatusSetParams, SidebarWorkspaceParams, SurfaceCloseParams, SurfaceCreateBrowserParams,
     SurfaceCreateMarkdownParams, SurfaceMoveWorkspaceParams, SurfaceMoveWorkspaceResult,
     SurfaceSummaryResult, SystemCapabilitiesResult, SystemIdentifyParams, SystemIdentifyResult,
     TeamMessageListParams, TeamMessageListResult, TeamMessageMarkReadParams, TeamMessageResult,
@@ -1434,16 +1434,20 @@ impl DesktopControlState {
                     .map(|session| store.load_session_launch_spec(&session.session_id))
                     .transpose()?
                     .flatten();
-                let columns = params
-                    .columns
-                    .or_else(|| launch_spec.as_ref().map(|spec| spec.columns))
+                let source_columns = launch_spec
+                    .as_ref()
+                    .map(|spec| spec.columns)
                     .unwrap_or(120)
                     .max(1);
-                let rows = params
-                    .rows
-                    .or_else(|| launch_spec.as_ref().map(|spec| spec.rows))
+                let source_rows = launch_spec
+                    .as_ref()
+                    .map(|spec| spec.rows)
                     .unwrap_or(30)
                     .max(1);
+                let (target_columns, target_rows) =
+                    split_target_terminal_size(&params.axis, ratio, source_columns, source_rows);
+                let columns = params.columns.unwrap_or(target_columns).max(1);
+                let rows = params.rows.unwrap_or(target_rows).max(1);
                 let open_params = source_session.as_ref().map(|session| {
                     let backend = params
                         .backend
@@ -2691,6 +2695,7 @@ impl DesktopControlState {
             "session.send_text" => {
                 self.persist_detected_agent_launch_from_send_text(control, request)
             }
+            "session.resize" => self.persist_session_resize(request),
             "agent.set_state" => self.persist_agent_set_state(control, response),
             "agent.clear_attention" => self.persist_agent_clear_attention(request),
             _ => Ok(()),
@@ -2720,6 +2725,23 @@ impl DesktopControlState {
             response,
             persist_terminal_spawn_transaction,
         )
+    }
+
+    fn persist_session_resize(&self, request: &RequestEnvelope) -> Result<(), DesktopHostError> {
+        let params: SessionResizeParams = request.parse_params()?;
+        let Ok(mut store) = self.store.lock() else {
+            return Err(DesktopHostError::StateUnavailable(
+                "desktop store state is unavailable".to_string(),
+            ));
+        };
+        let Some(mut launch_spec) = store.load_session_launch_spec(&params.session_id)? else {
+            return Ok(());
+        };
+        launch_spec.columns = params.columns.max(1);
+        launch_spec.rows = params.rows.max(1);
+        launch_spec.updated_at = timestamp();
+        store.upsert_session_launch_spec(&launch_spec)?;
+        Ok(())
     }
 
     fn persist_spawn_with(
@@ -9745,6 +9767,21 @@ fn normalize_terminal_split_behavior(value: &str) -> Result<String, DesktopHostE
                 "Config ui.terminal_split_behavior must be 'clone_current' or 'empty'; got '{other}'."
             ),
         ))),
+    }
+}
+
+fn split_target_terminal_size(
+    axis: &str,
+    source_ratio: f64,
+    source_columns: u16,
+    source_rows: u16,
+) -> (u16, u16) {
+    let target_ratio = 1.0 - source_ratio;
+    let scale = |value: u16| ((f64::from(value) * target_ratio).round() as u16).max(1);
+    match axis {
+        "vertical" => (scale(source_columns), source_rows.max(1)),
+        "horizontal" => (source_columns.max(1), scale(source_rows)),
+        _ => (source_columns.max(1), source_rows.max(1)),
     }
 }
 
@@ -17505,6 +17542,19 @@ mod tests {
     }
 
     #[test]
+    fn terminal_split_target_size_tracks_the_new_side_of_the_layout() {
+        assert_eq!(
+            split_target_terminal_size("vertical", 0.4, 140, 48),
+            (84, 48)
+        );
+        assert_eq!(
+            split_target_terminal_size("horizontal", 0.5, 84, 48),
+            (84, 24)
+        );
+        assert_eq!(split_target_terminal_size("vertical", 0.9, 1, 1), (1, 1));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn terminal_split_clones_launch_spec_audits_and_rolls_back_failed_spawn() {
         let state = DesktopControlState::new();
@@ -17547,6 +17597,35 @@ mod tests {
             ),
         );
         let source_pane_id = response_string_field(&opened, "pane_id");
+        let source_session_id = response_string_field(&opened, "session_id");
+
+        // The UI resize is the production signal that records the current
+        // source geometry. A later split must derive the new pane's initial
+        // size from this value, not from the original 101x37 launch default.
+        let resized = agentmux_control(
+            &state,
+            RequestEnvelope::new(
+                "req_terminal_source_resize",
+                "session.resize",
+                serde_json::json!({
+                    "session_id": source_session_id,
+                    "columns": 140,
+                    "rows": 48
+                })
+                .to_string(),
+                DESKTOP_CONTROL_TOKEN,
+            ),
+        );
+        assert!(matches!(resized.outcome, ResponseOutcome::Ok { .. }));
+        let resized_launch_spec = state
+            .store
+            .lock()
+            .unwrap()
+            .load_session_launch_spec(&source_session_id)
+            .unwrap()
+            .expect("resized source launch spec");
+        assert_eq!(resized_launch_spec.columns, 140);
+        assert_eq!(resized_launch_spec.rows, 48);
 
         let split = agentmux_control(
             &state,
@@ -17570,8 +17649,8 @@ mod tests {
             }),
         );
         let split_value = response_value(&split);
-        assert_eq!(split_value["columns"], 101);
-        assert_eq!(split_value["rows"], 37);
+        assert_eq!(split_value["columns"], 84);
+        assert_eq!(split_value["rows"], 48);
         assert_eq!(split_value["backend"], "conpty");
         assert_eq!(split_value["backend_profile"], "Windows PowerShell");
         assert_eq!(split_value["rolled_back"], false);
@@ -17584,8 +17663,8 @@ mod tests {
             .load_session_launch_spec(cloned_session_id)
             .unwrap()
             .expect("cloned terminal launch spec");
-        assert_eq!(launch_spec.columns, 101);
-        assert_eq!(launch_spec.rows, 37);
+        assert_eq!(launch_spec.columns, 84);
+        assert_eq!(launch_spec.rows, 48);
         assert_eq!(
             launch_spec.backend_profile.as_deref(),
             Some("Windows PowerShell")

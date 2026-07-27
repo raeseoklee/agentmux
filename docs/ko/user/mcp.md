@@ -116,13 +116,37 @@ Linux 도구를 Windows `PATH`의 프로그램으로 대체하지 않습니다. 
 agentmux integrations doctor claude-teams --distribution Ubuntu --json
 ```
 
+wrapper 기반 통합은 Linux 쪽 `tmux` shim이 Windows `agentmux.exe` 제어
+플레인을 다시 호출하므로 WSL-to-Windows interop도 필요합니다. MCP stdio에
+사용하는 `/init` bridge는 MCP 클라이언트의 직접 PE spawn 오류만 피하며, 이후
+워커와 shim callback에 필요한 interop 등록을 대신하지 않습니다. 팀을 시작하기
+전에 다음 두 검사를 모두 통과해야 합니다.
+
+```bash
+test -e /proc/sys/fs/binfmt_misc/WSLInterop
+/mnt/c/Windows/System32/cmd.exe /d /q /c echo interop-ok
+```
+
+`WSLInterop`이 없고 실행 중인 에이전트를 중단할 수 없다면 현재 WSL 인스턴스에
+표준 interpreter를 일시 등록합니다.
+
+```bash
+sudo sh -c 'echo ":WSLInterop:M::MZ::/init:P" > /proc/sys/fs/binfmt_misc/register'
+```
+
+등록 후 위 두 검사를 다시 실행하고 실패한 워커만 재시도하십시오. 이 등록은
+메모리에만 존재하므로 WSL 인스턴스가 종료되면 사라질 수 있습니다. 모든 작업과
+tmux Session이 끝난 뒤에는 PowerShell에서 `wsl --terminate Ubuntu`로 해당
+배포판만 재시작해 자동 등록이 복구되는지 확인할 수 있습니다. 이 명령은 해당
+배포판의 모든 프로세스를 종료하므로 작업 중에는 실행하지 마십시오.
+
 | 도구 | 프로필 | 용도 |
 | --- | --- | --- |
 | `agent_worker_list` | `read` | AgentMux가 관리하는 tmux 통합 워커와 독립 Codex 페인 워커 조회 |
 | `agent_integration_status` | `read` | 선택한 워크스페이스의 기본 WSL 배포판을 우선하여 Claude Teams, OMO, OMX, OMC wrapper와 WSL 준비 상태 진단 |
 | `agent_team_list` | `read` | 저장된 에이전트 텔레메트리에서 적응형 팀과 현재 구성원 조회 |
 | `agent_worker_start` | `standard` | 현재 페인을 분할하거나 새 탭을 만들고 `claude-teams`, `omo`, `omx`, `omc`, `codex-pane` 시작 |
-| `agent_team_start` | `standard` | 현재 터미널을 중심으로 적응형 팀 매니페스트 생성. 초기 워커는 선택 사항 |
+| `agent_team_start` | `standard` | 현재 터미널을 중심으로 적응형 팀 매니페스트 생성. 초기 워커는 선택 사항이며 완료 워커 자동 정리가 기본 활성화됨 |
 | `agent_team_spawn` | `standard` | 세대 및 멱등성 보호를 적용해 워커 한 개를 추가하고 관리 레이아웃 재배치 |
 | `agent_team_release` | `full` | 선택한 팀이 소유한 워커 한 개를 종료·회수하고 남은 워커 재배치 |
 | `agent_team_reflow` | `standard` | 외부 페인을 이동하지 않고 관리 영역 비율 재계산. `dry_run` 지원 |
@@ -200,6 +224,17 @@ AgentMux는 토폴로지를 바꾸기 전에 다음 세대를 원자적으로 �
 종료가 실패하면 페인과 멤버십을 그대로 유지하므로 안전하게 다시 시도할 수 있습니다.
 완료 반영은 CAS로 보호되어 오래된 요청이 더 새로운 팀 generation을 덮어쓸 수 없습니다.
 
+적응형 팀은 `auto_release_completed`의 기본값이 `true`입니다. 메인 MCP 서버는
+관리 워커의 수명주기를 감시하고 `completed`가 된 뒤 5초 동안 기다린 다음 상태를
+다시 확인하여 위와 같은 generation 안전 회수 경로로 세션과 페인을 정리합니다.
+유예 시간에 다음 턴을 시작한 워커는 유지됩니다. `waiting_for_input` 또는 `failed`
+워커도 lead의 응답과 오류 확인이 필요하므로 닫지 않습니다. 후속 작업이나 디버깅을
+위해 워커를 계속 유지하려면 `agent_team_start`에
+`"auto_release_completed": false`를 지정하십시오.
+provider가 자체 팀 메시지로만 완료를 알리는 경우 lead는 해당 관리 세션을
+`agent_set_state`로 `completed` 처리합니다. 그러면 lifecycle hook을 보내지 않는
+provider도 같은 감시기가 정리할 수 있습니다.
+
 ### 레이아웃과 tmux 자동 편입
 
 각 워커 페인은 독립적인 라이브 터미널 출력 구독을 가지므로 포커스되지 않아도
@@ -252,6 +287,23 @@ MCP로 만든 워커가 실패하면 세션을 종료하고 페인을 닫으며,
 `claude-teams`, `omo`, `omx`, `omc`는 하위 프로세스를 자동 편입할 수 있는 tmux
 호환 lead를 시작합니다. `agent_worker_send`와 범용 `agent_worker_stop`은 일반
 터미널 세션을 거부합니다.
+
+관리되는 Claude 실행은 기본적으로 `--permission-mode auto`를 사용합니다.
+수동 승인이 필요하면 `args`에 `--permission-mode manual` 또는 Claude가 지원하는
+다른 모드를 명시하십시오. 독립 Codex pane은 권한 질문에서 멈추지 않고 실패를
+Codex에 돌려주도록 기본적으로 `--ask-for-approval never`를 사용하며, 필요하면
+명시적인 `--ask-for-approval` 값으로 덮어쓸 수 있습니다. 두 기본값 모두 vendor의
+위험한 sandbox 우회 옵션은 사용하지 않습니다.
+
+`agent_team_start`를 호출한 터미널은 팀의 `main` 멤버로 등록되고 worker와 함께
+agent-team 세션으로 표시됩니다. 제출이 활성화된 `agent_worker_send`는 지시와
+Enter를 하나의 순서가 보장된 PTY 입력으로 보냅니다. lead의 의미 판단이 필요한
+질문은 `agent_attention_list`에 남으며, lead는 `terminal_read`로 worker를 확인한 뒤
+`agent_worker_send`로 답할 수 있습니다.
+
+`terminal_read`는 모델이 읽을 수 있는 일반 텍스트를 반환하며 ANSI 등 터미널
+제어문자를 제거합니다. 완전히 렌더링된 TUI 화면의 기준은 데스크톱 terminal
+pane입니다.
 
 shim은 WSL에서 Windows `agentmux.exe`로 넘어갈 때 Linux 쪽 `PATH`를 별도
 변수로 캡처하며 Windows 프로세스의 `PATH`를 Linux 자식에 복사하지 않습니다.
@@ -309,14 +361,19 @@ Pane에서 실행되는 네이티브 Codex는 `/home/<linux-user>/.codex/config.
 
 ```bash
 codex mcp add agentmux -- \
-  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  /init \
+  /mnt/c/Windows/System32/cmd.exe \
+  /d /q /c \
+  'C:\Users\<Windows-user>\AppData\Local\AgentMux\agentmux.exe' \
   mcp serve --profile standard
 codex mcp get agentmux
 ```
 
-WSL 명령은 Windows interop으로 설치된 `agentmux.exe`를 실행합니다. MCP 상태를
-확인하거나 Workspace 도구를 사용할 때는 AgentMux 데스크톱을 실행해 두어야
-합니다.
+`/init`과 `cmd.exe` bridge는 WSL 클라이언트가 Linux 실행 파일인 `/init`을
+spawn한 뒤 Windows interop으로 설치된 `agentmux.exe`를 실행하게 합니다. 따라서
+Windows PE 파일을 직접 `posix_spawn`할 때 발생하는 `ENOEXEC` 오류를 피하면서
+stdio를 유지합니다. MCP 상태를 확인하거나 Workspace 도구를 사용할 때는
+AgentMux 데스크톱을 실행해 두어야 합니다.
 
 ## Claude Code 설정
 
@@ -334,13 +391,39 @@ agentmux mcp setup --client claude --profile standard --install --json
 
 ```bash
 claude mcp add --scope user --transport stdio agentmux -- \
-  /mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  /init \
+  /mnt/c/Windows/System32/cmd.exe \
+  /d /q /c \
+  'C:\Users\<Windows-user>\AppData\Local\AgentMux\agentmux.exe' \
   mcp serve --profile standard
 claude mcp get agentmux
 ```
 
-Claude Code Agent Teams가 만든 tmux descendant를 AgentMux Pane으로 자동
-편입하려면 `agentmux integrations launch claude-teams`로 lead를 시작하고
+MCP가 관리하는 적응형 팀에는 `agentmux integrations launch claude-teams`가
+필수는 아닙니다. Claude가 이미 AgentMux terminal에서 실행 중이고 MCP가 연결돼
+있다면 그 세션에서 `agent_team_start`를 호출하고 `agent_team_spawn`으로 worker를
+추가하면 됩니다. AgentMux 데스크톱 실행은 제어 플레인을 제공할 뿐, 기존 Claude
+프로세스를 자동으로 팀으로 바꾸지는 않습니다.
+
+워커에 WSL 배포판을 지정하면 AgentMux는 그 값을 `wsl-direct` 터미널 생성뿐 아니라
+중첩된 integration launcher와 최종 에이전트 프로세스까지 전달합니다. 동일한 동작을
+CLI에서 명시하려면 다음과 같이 실행합니다.
+
+```bash
+/mnt/c/Users/<Windows-user>/AppData/Local/AgentMux/agentmux.exe \
+  integrations launch claude-teams --distribution Ubuntu -- \
+  --model opus
+```
+
+`--` 뒤는 Claude 인자입니다. 따라서 WSL interop으로 실행된 Windows
+`agentmux.exe`가 WSL 환경 표식을 상속받지 못했더라도 Windows Claude를 잘못
+실행하지 않습니다.
+
+Claude Code의 네이티브 Agent Teams가 직접 만드는 tmux descendant를 AgentMux
+Pane으로 자동 편입하려면 현재 lead가 이미 AgentMux 통합 환경으로 시작된 경우를
+제외하고 launch 명령이 필요합니다. 실행 중인 프로세스에는 shim과 환경 변수를
+나중에 주입할 수 없으므로 작업을 보존한 뒤 해당 lead만
+`agentmux integrations launch claude-teams`로 다시 시작하고
 `auto_adopt_tmux: true`인 적응형 팀을 사용하십시오.
 
 `--install`이 없으면 설정 파일을 수정하지 않습니다. 설치 시 기존의 관련

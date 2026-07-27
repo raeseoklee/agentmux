@@ -40,6 +40,8 @@ Requirements:
   that same WSL distribution. A Windows-only `codex`, `claude`, or other agent
   executable found through the imported Windows `PATH` is not a substitute for
   the Linux CLI.
+- WSL-to-Windows interoperability must be active for tmux-compatible
+  integrations that call back into the installed AgentMux control plane.
 
 ## Quick Start
 

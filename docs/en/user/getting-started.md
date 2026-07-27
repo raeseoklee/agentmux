@@ -15,6 +15,9 @@
   or the relevant integration executable in that Linux environment; a command
   that resolves only through `/mnt/c/...` is a Windows installation and may not
   run as a Linux worker.
+- WSL-to-Windows interoperability must be active for tmux-compatible
+  integrations. Their WSL-side shims call back into the Windows
+  `agentmux.exe` control plane.
 - MCP tools that inspect or modify workspaces require the AgentMux desktop and
   its local control plane to be running. Protocol discovery and setup preview
   are the only operations that work without the desktop.
@@ -85,6 +88,17 @@ Before starting an MCP-managed visible team, set the workspace project root,
 select the intended default WSL distribution, and open a terminal in that
 workspace. These values provide the inherited working directory and runtime for
 new workers.
+
+Verify WSL interoperability before launching a tmux-compatible integration:
+
+```bash
+test -e /proc/sys/fs/binfmt_misc/WSLInterop
+/mnt/c/Windows/System32/cmd.exe /d /q /c echo interop-ok
+```
+
+If the registration is missing or the Windows command reports `Exec format
+error`, follow the live-session and restart guidance in
+[Troubleshooting](./troubleshooting.md#a-tmux-integration-reports-exec-format-error).
 
 WSL support does not imply native Linux desktop support. AgentMux runs as a
 Windows application and uses WSL as a Windows-hosted execution environment.

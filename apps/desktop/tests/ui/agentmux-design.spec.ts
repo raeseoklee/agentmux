@@ -3425,6 +3425,38 @@ test("OMC telemetry bar renders", async ({ page }) => {
   await expect(page.getByText("[OMC]").first()).toBeVisible({ timeout: 5000 });
 });
 
+test("managed team main is identified in terminal telemetry", async ({ page }) => {
+  await bootPreview(page);
+  await page.locator(".agentmux-new-terminal-tab").click();
+  const pane = page
+    .locator("[data-agentmux-pane][data-agentmux-terminal-session]")
+    .first();
+  const sessionId = await pane.getAttribute("data-agentmux-terminal-session");
+  expect(sessionId).not.toBeNull();
+
+  await page.evaluate((targetSessionId) => {
+    window.__AGENTMUX_PREVIEW__?.syntheticAgentState({
+      sessionId: targetSessionId ?? undefined,
+      state: "running",
+      telemetry: {
+        activity: "agent_team",
+        session: "claude-teams:main",
+        teamId: "team-visible-main",
+        teamRole: "main",
+        teamMode: "adaptive",
+        teamStatus: "ready",
+      },
+    });
+  }, sessionId);
+
+  await expect(page.getByText("agent_team").first()).toBeVisible({
+    timeout: 5000,
+  });
+  await expect(page.locator('[data-agentmux-team-role="main"]').first()).toHaveText(
+    "team:main",
+  );
+});
+
 test("sidebar metadata renders status progress and logs", async ({ page }) => {
   await bootPreview(page);
 

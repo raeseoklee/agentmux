@@ -200,6 +200,13 @@ The system is composed of:
 | FR-033 | The system shall expose health and diagnostics for runtime processes. | Should | API test |
 | FR-034 | The system shall provide user-visible recovery states for disconnected or failed backend sessions. | Must | UI automation |
 | FR-035 | The system shall provide a safe close flow for sessions with running foreground processes. | Should | UI automation |
+| FR-036 | An MCP-created agent team shall register the invoking terminal as the team main and every managed child as a worker, and the desktop shall expose those roles consistently. | Must | MCP integration, UI automation |
+| FR-037 | A managed-worker instruction submitted with Enter shall reach the PTY as one ordered input operation containing the literal instruction followed by exactly one submit key. | Must | Backend integration |
+| FR-038 | Managed Claude and Codex workers shall default to a non-blocking approval policy suitable for delegated work while preserving an explicit per-launch manual-policy override. | Must | CLI/MCP contract test |
+| FR-039 | A terminal created by splitting a pane shall start with dimensions derived from the target side of the split, using the latest successfully applied source-session size rather than stale launch defaults. | Must | Tauri and real-terminal integration |
+| FR-040 | MCP terminal reads shall return model-readable plain text without ANSI, OSC, or other terminal control sequences by default. | Must | MCP contract test |
+| FR-041 | A WSL distribution selected for an MCP-managed worker shall remain explicit across terminal creation, nested AgentMux integration launch, and the final agent process; an inherited Windows environment shall not silently change that worker to a Windows process. | Must | CLI/MCP contract test, WSL integration |
+| FR-042 | Adaptive teams shall automatically terminate and close a managed worker pane after that worker remains in the completed lifecycle state for a bounded grace period, with automatic cleanup enabled by default and an explicit per-team opt-out. Failed or waiting-for-input workers shall remain visible, and cleanup shall preserve generation-safe membership removal and layout reflow. | Must | MCP lifecycle integration, real-terminal integration |
 
 ### 4.2 Performance Requirements
 
@@ -259,6 +266,7 @@ The system is composed of:
 | UR-005 | The UI shall provide accessible focus indicators. | Should | Accessibility review |
 | UR-006 | Text in buttons, tabs, and panes shall not overlap at supported window sizes. | Must | Visual QA |
 | UR-007 | The system shall provide useful error messages for WSL, shell, tmux, IPC, and restore failures. | Must | Fault injection |
+| UR-008 | The UI shall identify the main and worker roles of a managed team without requiring the user to infer membership from pane placement. | Must | UI automation |
 
 ### 4.6 Compatibility Requirements
 
@@ -776,10 +784,11 @@ Every user-visible backend error shall include:
 | FR-020 to FR-025 | Parser Tests, UI Automation |
 | FR-026 to FR-028 | Browser Tests |
 | FR-029 to FR-035 | Config Tests, Fault Injection |
+| FR-036 to FR-042 | MCP Contract Tests, Backend Tests, Tauri Integration, UI Automation |
 | PR-001 to PR-012 | Performance Tests |
 | RR-001 to RR-010 | Persistence Tests, Fault Injection |
 | SR-001 to SR-010 | Security Tests, Documentation Review |
-| UR-001 to UR-007 | UI Automation, Visual QA |
+| UR-001 to UR-008 | UI Automation, Visual QA |
 | CR-001 to CR-006 | Compatibility Matrix, API Tests |
 
 ## 8. Performance Benchmark Plan

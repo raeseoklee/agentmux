@@ -3301,8 +3301,7 @@ export function AgentmuxTerminalApp() {
       const session = sessionById.get(sessionId);
       const exitIntent = exitIntentSessionIdsRef.current.has(sessionId);
       const shouldClose =
-        session?.state === "exited" ||
-        (exitIntent && (!session || isClosedTerminalState(session.state)));
+        exitIntent && (!session || isClosedTerminalState(session.state));
       if (!shouldClose) {
         continue;
       }
@@ -11750,6 +11749,17 @@ function OmcBar({
     push(
       <span key="activity" style={{ color: activityColor, fontWeight: 600 }}>
         {activity}
+      </span>,
+    );
+  }
+  if (telemetry.teamRole) {
+    push(
+      <span
+        key="team-role"
+        data-agentmux-team-role={telemetry.teamRole}
+        style={{ color: "var(--fg3)", fontWeight: 600 }}
+      >
+        team:{telemetry.teamRole}
       </span>,
     );
   }

@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -52,6 +52,8 @@ const MAX_EVENT_COUNT: usize = 500;
 const DEFAULT_BROWSER_READ_BYTES: usize = 262_144;
 const MAX_BROWSER_READ_BYTES: usize = 1_048_576;
 const MAX_AGENT_TEAM_WORKERS: usize = 8;
+const AGENT_TEAM_COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const AGENT_TEAM_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 const MAX_STANDARD_REVIEW_SCOPE_THREADS: usize = 500;
 const READ_TOOL_NAMES: &[&str] = &[
     "agentmux_context",
@@ -649,6 +651,7 @@ pub(super) struct AgentMuxMcpServer {
     control: Arc<dyn ControlTransport>,
     standard_caller_binding: Option<StandardCallerBinding>,
     team_operations: Arc<tokio::sync::Mutex<()>>,
+    team_cleanup_watchers: Arc<tokio::sync::Mutex<HashSet<String>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -687,6 +690,7 @@ impl AgentMuxMcpServer {
             control,
             standard_caller_binding,
             team_operations: Arc::new(tokio::sync::Mutex::new(())),
+            team_cleanup_watchers: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             tool_router,
         }
     }
@@ -1212,14 +1216,33 @@ impl AgentMuxMcpServer {
         &self,
         Parameters(params): Parameters<TerminalReadParams>,
     ) -> CallToolResult {
-        self.call(
-            "session.read_recent",
-            json!({
-                "session_id": params.session_id,
-                "max_bytes": params.max_bytes.unwrap_or(65_536).clamp(1, MAX_TERMINAL_READ_BYTES),
-            }),
-        )
-        .await
+        let mut value = match self
+            .invoke_value(
+                "session.read_recent",
+                json!({
+                    "session_id": params.session_id,
+                    "max_bytes": params.max_bytes.unwrap_or(65_536).clamp(1, MAX_TERMINAL_READ_BYTES),
+                }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(message) => return control_error_result("session.read_recent", message),
+        };
+        if let Some(result) = value.as_object_mut() {
+            let (plain_text, removed_control_sequences) = result
+                .get("text")
+                .and_then(Value::as_str)
+                .map(plain_terminal_text)
+                .unwrap_or_default();
+            result.insert("text".to_string(), json!(plain_text));
+            result.insert("format".to_string(), json!("plain"));
+            result.insert(
+                "control_sequences_removed".to_string(),
+                json!(removed_control_sequences),
+            );
+        }
+        CallToolResult::structured(value)
     }
 
     /// List sessions that are waiting for input, permission, or other user attention.
@@ -3032,6 +3055,10 @@ impl AgentMuxMcpServer {
             telemetry.insert("team_generation".to_string(), json!(team.generation));
             telemetry.insert("team_auto_adopt".to_string(), json!(team.auto_adopt_tmux));
             telemetry.insert(
+                "team_auto_release_completed".to_string(),
+                json!(team.auto_release_completed),
+            );
+            telemetry.insert(
                 "team_member_idempotency_key".to_string(),
                 json!(team.member_idempotency_key),
             );
@@ -3081,7 +3108,26 @@ impl AgentMuxMcpServer {
             None => None,
         };
         let kind = AgentWorkerKind::from(params.kind);
-        let command = match build_agent_worker_command(kind, params.args) {
+        let distribution = match kind {
+            AgentWorkerKind::Integration(_) => self
+                .resolve_agent_integration_distribution_for_workspace(
+                    Some(workspace_id.clone()),
+                    params.distribution.clone(),
+                )
+                .await
+                .map_err(|message| control_error_result("workspace.get", message)),
+            AgentWorkerKind::CodexPane => Ok(params
+                .distribution
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)),
+        };
+        let distribution = match distribution {
+            Ok(distribution) => distribution,
+            Err(result) => return result,
+        };
+        let command = match build_agent_worker_command(kind, distribution.as_deref(), params.args) {
             Ok(command) => command,
             Err(message) => return control_error_result("agent.worker.start", message),
         };
@@ -3094,7 +3140,7 @@ impl AgentMuxMcpServer {
                     "workspace_id": workspace_id.clone(),
                     "pane_id": Value::Null,
                     "backend": "wsl-direct",
-                    "backend_profile": params.distribution,
+                    "backend_profile": distribution,
                     "command": command,
                     "cwd": cwd,
                     "env": team_env,
@@ -3118,7 +3164,7 @@ impl AgentMuxMcpServer {
                     "ratio": params.ratio,
                     "behavior": "clone_current",
                     "backend": "wsl-direct",
-                    "backend_profile": params.distribution,
+                    "backend_profile": distribution,
                     "command": command,
                     "cwd": cwd,
                     "env": team_env,
@@ -3318,6 +3364,10 @@ impl AgentMuxMcpServer {
                 .get("team_auto_adopt")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            auto_release_completed: telemetry
+                .get("team_auto_release_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             idempotency_key: telemetry
                 .get("team_idempotency_key")
                 .and_then(Value::as_str)
@@ -3347,6 +3397,109 @@ impl AgentMuxMcpServer {
             main,
             members,
         })
+    }
+
+    fn ensure_agent_team_cleanup_watcher(&self, team_id: String) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let registered = {
+                let mut watchers = server.team_cleanup_watchers.lock().await;
+                watchers.insert(team_id.clone())
+            };
+            if !registered {
+                return;
+            }
+
+            loop {
+                tokio::time::sleep(AGENT_TEAM_COMPLETION_POLL_INTERVAL).await;
+                let team = match server.load_agent_team(&team_id).await {
+                    Ok(team) => team,
+                    Err(_) => break,
+                };
+                if !team.auto_release_completed {
+                    break;
+                }
+                if team.status == "provisioning"
+                    || completed_agent_team_worker_ids(&team).is_empty()
+                {
+                    continue;
+                }
+
+                // A stop hook can briefly publish completed while a follow-up turn is
+                // starting. Re-read after a visible grace period before closing anything.
+                tokio::time::sleep(AGENT_TEAM_COMPLETION_GRACE).await;
+                let _ = server
+                    .release_completed_agent_team_workers_once(&team_id)
+                    .await;
+            }
+
+            server.team_cleanup_watchers.lock().await.remove(&team_id);
+        });
+    }
+
+    async fn release_completed_agent_team_workers_once(
+        &self,
+        team_id: &str,
+    ) -> Result<Vec<Value>, String> {
+        let team = self.load_agent_team(team_id).await?;
+        if !team.auto_release_completed || team.status == "provisioning" {
+            return Ok(Vec::new());
+        }
+        let candidate_ids = completed_agent_team_worker_ids(&team);
+        let mut released = Vec::with_capacity(candidate_ids.len());
+
+        for session_id in candidate_ids {
+            let current = self.load_agent_team(team_id).await?;
+            if !current.auto_release_completed || current.status == "provisioning" {
+                break;
+            }
+            let still_completed = current.members.iter().any(|member| {
+                member.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+                    && member
+                        .pointer("/telemetry/team_role")
+                        .and_then(Value::as_str)
+                        != Some("main")
+                    && member.get("state").and_then(Value::as_str) == Some("completed")
+            });
+            if !still_completed {
+                continue;
+            }
+            let topology = self
+                .invoke_value(
+                    "workspace.get",
+                    json!({ "workspace_id": current.workspace_id }),
+                )
+                .await?;
+            if !session_is_terminal_closed(&topology, &session_id) {
+                released.push(json!({
+                    "session_id": session_id,
+                    "status": "preserved",
+                    "reason": "agent state is completed but the terminal session is still reusable",
+                }));
+                continue;
+            }
+
+            let result = self
+                .agent_team_release(Parameters(AgentTeamReleaseToolParams {
+                    team_id: team_id.to_string(),
+                    expected_generation: None,
+                    session_id: Some(session_id.clone()),
+                    name: None,
+                    mode: Some("soft".to_string()),
+                }))
+                .await;
+            if result.is_error == Some(true) {
+                released.push(json!({
+                    "session_id": session_id,
+                    "status": "retry_pending",
+                    "error": call_tool_result_error_message(&result),
+                }));
+            } else if let Some(value) = result.structured_content {
+                released.push(value);
+            }
+        }
+
+        Ok(released)
     }
 
     async fn find_agent_team_by_idempotency(
@@ -3450,9 +3603,10 @@ impl AgentMuxMcpServer {
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default();
-        telemetry
-            .entry("activity".to_string())
-            .or_insert_with(|| json!("agent"));
+        // Team ownership is a stronger classification than the generic agent
+        // launch detected for this terminal. Keep it explicit so the main pane
+        // is presented and lifecycle-managed as part of the team.
+        telemetry.insert("activity".to_string(), json!("agent_team"));
         telemetry.insert("team_id".to_string(), json!(team.team_id));
         telemetry.insert("team_role".to_string(), json!("main"));
         telemetry.insert("team_mode".to_string(), json!(team.mode));
@@ -3471,6 +3625,10 @@ impl AgentMuxMcpServer {
         telemetry.remove("team_mutation_id");
         telemetry.remove("team_mutation_owner_id");
         telemetry.insert("team_auto_adopt".to_string(), json!(team.auto_adopt_tmux));
+        telemetry.insert(
+            "team_auto_release_completed".to_string(),
+            json!(team.auto_release_completed),
+        );
         telemetry.insert(
             "default_worker_kind".to_string(),
             json!(team.default_worker_kind),
@@ -3509,7 +3667,7 @@ impl AgentMuxMcpServer {
                     "mutation_id": mutation_id,
                     "claim": true,
                     "claim_telemetry": {
-                        "activity": "agent",
+                        "activity": "agent_team",
                         "team_id": team.team_id,
                         "team_role": "main",
                         "team_mode": team.mode,
@@ -3520,6 +3678,7 @@ impl AgentMuxMcpServer {
                         "max_workers": team.max_workers as u16,
                         "team_generation": generation,
                         "team_auto_adopt": team.auto_adopt_tmux,
+                        "team_auto_release_completed": team.auto_release_completed,
                         "team_idempotency_key": team.idempotency_key,
                         "default_worker_kind": team.default_worker_kind,
                         "distribution": team.distribution,
@@ -3944,7 +4103,7 @@ impl AgentMuxMcpServer {
         rollback
     }
 
-    /// Create a main-left, equal-height worker-stack-right layout and start all named workers.
+    /// Create a main-left, equal-height worker-stack-right layout and start named workers.
     #[tool(
         name = "agent_team_start",
         annotations(
@@ -3985,6 +4144,7 @@ impl AgentMuxMcpServer {
                 .await
             {
                 Ok(Some(team)) => {
+                    self.ensure_agent_team_cleanup_watcher(team.team_id.clone());
                     if team.status == "provisioning" {
                         match self.recover_agent_team_if_abandoned(&team).await {
                             Ok(true) => match self.load_agent_team(&team.team_id).await {
@@ -4078,6 +4238,7 @@ impl AgentMuxMcpServer {
             .await
         {
             Ok(Some(existing)) => {
+                self.ensure_agent_team_cleanup_watcher(existing.team_id.clone());
                 let requested_key = params.idempotency_key.as_deref().map(str::trim);
                 if requested_key.is_some_and(|key| !key.is_empty())
                     && existing.idempotency_key.as_deref() == requested_key
@@ -4146,6 +4307,7 @@ impl AgentMuxMcpServer {
             status: "new".to_string(),
             mutation_id: None,
             auto_adopt_tmux: params.auto_adopt_tmux.unwrap_or(true),
+            auto_release_completed: params.auto_release_completed.unwrap_or(false),
             idempotency_key: params.idempotency_key.clone(),
             mode: mode.key().to_string(),
             default_worker_kind: default_worker_kind.key().to_string(),
@@ -4196,6 +4358,7 @@ impl AgentMuxMcpServer {
                 worker_index: index + 1,
                 generation: team.generation,
                 auto_adopt_tmux: team.auto_adopt_tmux,
+                auto_release_completed: team.auto_release_completed,
                 member_idempotency_key: None,
             };
             let (axis, ratio) = if index == 0 {
@@ -4355,6 +4518,7 @@ impl AgentMuxMcpServer {
                         worker_index: index + 1,
                         generation: team.generation,
                         auto_adopt_tmux: team.auto_adopt_tmux,
+                        auto_release_completed: team.auto_release_completed,
                         member_idempotency_key: None,
                     }),
                 )
@@ -4415,6 +4579,8 @@ impl AgentMuxMcpServer {
             );
         }
 
+        self.ensure_agent_team_cleanup_watcher(team.team_id.clone());
+
         CallToolResult::structured(json!({
             "team_id": team_id,
             "mode": mode.key(),
@@ -4422,6 +4588,7 @@ impl AgentMuxMcpServer {
             "generation": team.generation,
             "max_workers": max_workers,
             "auto_adopt_tmux": team.auto_adopt_tmux,
+            "auto_release_completed": team.auto_release_completed,
             "workspace_id": workspace_id,
             "layout": layout.key(),
             "main": {
@@ -4434,6 +4601,12 @@ impl AgentMuxMcpServer {
             "worker_count": worker_results.len(),
             "workers": worker_results,
             "rollback_policy": "reverse-created-workers-on-failure",
+            "lead_policy": {
+                "completed_worker_cleanup": if team.auto_release_completed { "after-terminal-exit" } else { "preserve" },
+                "completion_grace_seconds": AGENT_TEAM_COMPLETION_GRACE.as_secs(),
+                "keep_attention_states": ["waiting_for_input", "failed"],
+                "completion_fallback": "publish completed with agent_set_state for reporting only; automatic pane release still requires the terminal session to be closed",
+            },
         }))
     }
 
@@ -4648,6 +4821,7 @@ impl AgentMuxMcpServer {
             worker_index,
             generation: next_generation,
             auto_adopt_tmux: team.auto_adopt_tmux,
+            auto_release_completed: team.auto_release_completed,
             member_idempotency_key: params.idempotency_key.clone(),
         };
         let launch = self
@@ -4935,6 +5109,7 @@ impl AgentMuxMcpServer {
         {
             return control_error_result("agent.team.settle", message);
         }
+        self.ensure_agent_team_cleanup_watcher(refreshed.team_id.clone());
         CallToolResult::structured(json!({
             "team_id": refreshed.team_id,
             "generation": refreshed.generation,
@@ -5066,30 +5241,27 @@ impl AgentMuxMcpServer {
             Ok(session_id) => session_id,
             Err(result) => return result,
         };
+        let submitted = params.submit.unwrap_or(true);
+        let mut input = params.text;
+        if submitted {
+            // Keep the instruction and submit key in one backend write. Two
+            // control calls can be observed as separate input turns by an
+            // interactive TUI even when both calls are individually accepted.
+            input.push('\r');
+        }
         if let Err(message) = self
             .invoke_value(
                 "session.send_text",
-                json!({ "session_id": session_id, "text": params.text }),
+                json!({ "session_id": session_id, "text": input }),
             )
             .await
         {
             return control_error_result("session.send_text", message);
         }
-        let submitted = params.submit.unwrap_or(true);
-        if submitted {
-            if let Err(message) = self
-                .invoke_value(
-                    "session.send_key",
-                    json!({ "session_id": session_id, "key": "enter" }),
-                )
-                .await
-            {
-                return control_error_result("session.send_key", message);
-            }
-        }
         CallToolResult::structured(json!({
             "session_id": session_id,
             "submitted": submitted,
+            "input_operation": if submitted { "atomic_line" } else { "literal_text" },
         }))
     }
 
@@ -5617,7 +5789,7 @@ impl ServerHandler for AgentMuxMcpServer {
             }
         };
         let instructions = format!(
-            "Authenticated local AgentMux control using the '{}' capability profile. {profile_boundary} Use agentmux_context first when workspace, pane, surface, or session IDs were not supplied explicitly. Grant standard only to trusted clients and use full only for approved administrative operations.",
+            "Authenticated local AgentMux control using the '{}' capability profile. {profile_boundary} Use agentmux_context first when workspace, pane, surface, or session IDs were not supplied explicitly. agent_team_start registers the caller as main and preserves completed workers by default; if auto_release_completed is enabled, cleanup still requires both completed agent state and a closed terminal session. Waiting or failed workers remain visible. Grant standard only to trusted clients and use full only for approved administrative operations.",
             self.profile.as_str(),
         );
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -5763,6 +5935,19 @@ fn terminal_location_for_pane(topology: &Value, pane_id: &str) -> Option<(String
         .get("session_id")?
         .as_str()?;
     Some((surface_id.to_string(), session_id.to_string()))
+}
+
+fn session_is_terminal_closed(topology: &Value, session_id: &str) -> bool {
+    topology
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| {
+            sessions.iter().find(|session| {
+                session.get("session_id").and_then(Value::as_str) == Some(session_id)
+            })
+        })
+        .and_then(|session| session.get("state").and_then(Value::as_str))
+        .is_some_and(|state| matches!(state, "exited" | "failed" | "terminated"))
 }
 
 fn empty_split_target(detail: &Value, source_pane_id: &str) -> Option<String> {
@@ -6144,6 +6329,8 @@ struct AgentTeamStartToolParams {
     mode: Option<AgentTeamModeParam>,
     /// Automatically adopt descendants created through the AgentMux tmux shim. Defaults to true.
     auto_adopt_tmux: Option<bool>,
+    /// Close completed worker panes after terminal exit and a short grace period. Defaults to false.
+    auto_release_completed: Option<bool>,
     /// Optional caller-stable key used to discover an existing team after retries.
     idempotency_key: Option<String>,
     /// Safety ceiling for top-level workers. Defaults to 8.
@@ -6263,6 +6450,7 @@ const AGENT_TEAM_TELEMETRY_KEYS: &[&str] = &[
     "team_mutation_id",
     "team_mutation_owner_id",
     "team_auto_adopt",
+    "team_auto_release_completed",
     "team_idempotency_key",
     "team_member_idempotency_key",
     "default_worker_kind",
@@ -6332,6 +6520,7 @@ struct AgentTeamWorkerRegistration {
     worker_index: usize,
     generation: u64,
     auto_adopt_tmux: bool,
+    auto_release_completed: bool,
     member_idempotency_key: Option<String>,
 }
 
@@ -6379,6 +6568,7 @@ struct LoadedAgentTeam {
     status: String,
     mutation_id: Option<String>,
     auto_adopt_tmux: bool,
+    auto_release_completed: bool,
     idempotency_key: Option<String>,
     mode: String,
     default_worker_kind: String,
@@ -6502,6 +6692,15 @@ fn agent_team_launch_env(team: &AgentTeamWorkerRegistration) -> Vec<Value> {
             "AGENTMUX_TEAM_AUTO_ADOPT",
             if team.auto_adopt_tmux { "1" } else { "0" }.to_string(),
         ),
+        (
+            "AGENTMUX_TEAM_AUTO_RELEASE_COMPLETED",
+            if team.auto_release_completed {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+        ),
     ]
     .into_iter()
     .map(|(key, value)| json!({ "key": key, "value": value }))
@@ -6528,6 +6727,19 @@ fn agent_team_managed_members(team: &LoadedAgentTeam) -> Vec<&Value> {
                 .pointer("/telemetry/team_role")
                 .and_then(Value::as_str)
                 != Some("main")
+        })
+        .collect()
+}
+
+fn completed_agent_team_worker_ids(team: &LoadedAgentTeam) -> Vec<String> {
+    agent_team_managed_members(team)
+        .into_iter()
+        .filter(|member| member.get("state").and_then(Value::as_str) == Some("completed"))
+        .filter_map(|member| {
+            member
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
         })
         .collect()
 }
@@ -6563,6 +6775,7 @@ fn agent_team_summary(team: &LoadedAgentTeam, reused: bool) -> Value {
         "generation": team.generation,
         "max_workers": team.max_workers,
         "auto_adopt_tmux": team.auto_adopt_tmux,
+        "auto_release_completed": team.auto_release_completed,
         "main": team.main,
         "worker_count": agent_team_managed_members(team).len(),
         "descendant_count": workers.len().saturating_sub(agent_team_top_workers(team).len()),
@@ -6760,6 +6973,128 @@ fn is_managed_worker_session(session: &Value) -> bool {
         || worker_name.is_some_and(|name| name.starts_with("codex-pane:"))
 }
 
+/// Convert a raw PTY transcript into bounded, model-readable text. This is not
+/// a replacement for the desktop's terminal emulator: cursor-addressed TUIs
+/// still render most accurately in the visible pane. It does ensure that MCP
+/// clients never receive JSON strings full of ANSI/OSC control payloads.
+fn plain_terminal_text(value: &str) -> (String, usize) {
+    #[derive(Clone, Copy)]
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+        String,
+        StringEscape,
+    }
+
+    let mut state = State::Ground;
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut removed = 0usize;
+    for byte in value.as_bytes() {
+        state = match state {
+            State::Ground => match *byte {
+                0x1b => {
+                    removed += 1;
+                    State::Escape
+                }
+                b'\n' | b'\r' | b'\t' | 0x08 => {
+                    bytes.push(*byte);
+                    State::Ground
+                }
+                0x00..=0x1f | 0x7f => {
+                    removed += 1;
+                    State::Ground
+                }
+                _ => {
+                    bytes.push(*byte);
+                    State::Ground
+                }
+            },
+            State::Escape => {
+                removed += 1;
+                match *byte {
+                    b'[' => State::Csi,
+                    b']' => State::Osc,
+                    b'P' | b'X' | b'^' | b'_' => State::String,
+                    _ => State::Ground,
+                }
+            }
+            State::Csi => {
+                removed += 1;
+                if (0x40..=0x7e).contains(byte) {
+                    State::Ground
+                } else {
+                    State::Csi
+                }
+            }
+            State::Osc => {
+                removed += 1;
+                match *byte {
+                    0x07 => State::Ground,
+                    0x1b => State::OscEscape,
+                    _ => State::Osc,
+                }
+            }
+            State::OscEscape => {
+                removed += 1;
+                if *byte == b'\\' {
+                    State::Ground
+                } else {
+                    State::Osc
+                }
+            }
+            State::String => {
+                removed += 1;
+                if *byte == 0x1b {
+                    State::StringEscape
+                } else {
+                    State::String
+                }
+            }
+            State::StringEscape => {
+                removed += 1;
+                if *byte == b'\\' {
+                    State::Ground
+                } else {
+                    State::String
+                }
+            }
+        };
+    }
+
+    let stripped = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    let mut lines = Vec::new();
+    let mut blank_lines = 0usize;
+    for raw_line in stripped.split('\n') {
+        let active_line = raw_line.rsplit('\r').next().unwrap_or_default();
+        let mut line = Vec::with_capacity(active_line.len());
+        for character in active_line.chars() {
+            if character == '\u{8}' {
+                line.pop();
+            } else {
+                line.push(character);
+            }
+        }
+        let line = line.into_iter().collect::<String>();
+        let line = line.trim_end().to_string();
+        if line.is_empty() {
+            blank_lines += 1;
+            if blank_lines > 2 {
+                continue;
+            }
+        } else {
+            blank_lines = 0;
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    (lines.join("\n"), removed)
+}
+
 fn resolve_agent_integration_distribution(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(str::trim)
@@ -6781,6 +7116,7 @@ fn resolve_agent_integration_distribution(explicit: Option<&str>) -> Option<Stri
 
 fn build_agent_worker_command(
     kind: AgentWorkerKind,
+    distribution: Option<&str>,
     mut args: Vec<String>,
 ) -> Result<Vec<String>, String> {
     match kind {
@@ -6788,6 +7124,9 @@ fn build_agent_worker_command(
             let mut command = vec!["codex".to_string()];
             if !args.iter().any(|arg| arg == "--no-alt-screen") {
                 command.push("--no-alt-screen".to_string());
+            }
+            if !codex_args_set_approval_policy(&args) {
+                command.extend(["--ask-for-approval".to_string(), "never".to_string()]);
             }
             command.append(&mut args);
             Ok(command)
@@ -6802,10 +7141,25 @@ fn build_agent_worker_command(
                 "launch".to_string(),
                 integration.command_name().to_string(),
             ];
+            if let Some(distribution) = distribution {
+                command.extend(["--distribution".to_string(), distribution.to_string()]);
+            }
+            if !args.is_empty() {
+                command.push("--".to_string());
+            }
             command.append(&mut args);
             Ok(command)
         }
     }
+}
+
+fn codex_args_set_approval_policy(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-a" | "--ask-for-approval" | "--dangerously-bypass-approvals-and-sandbox"
+        ) || arg.starts_with("--ask-for-approval=")
+    })
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Serialize)]
@@ -7525,6 +7879,8 @@ mod tests {
         let standard_instructions = standard_info.instructions.expect("instructions");
         assert!(standard_instructions.contains("trusted write and command-execution profile"));
         assert!(standard_instructions.contains("execute arbitrary terminal commands"));
+        assert!(standard_instructions.contains("preserves completed workers by default"));
+        assert!(standard_instructions.contains("closed terminal session"));
         let full_instructions = full.get_info().instructions.expect("instructions");
         assert!(full_instructions.contains("administrative profile"));
         assert!(full_instructions.contains("destructive lifecycle"));
@@ -8733,6 +9089,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_worker_defaults_to_non_blocking_approval_without_bypassing_sandbox() {
+        let command = build_agent_worker_command(
+            AgentWorkerKind::CodexPane,
+            None,
+            vec!["Review the failing tests".to_string()],
+        )
+        .expect("codex worker command");
+        assert_eq!(command[0], "codex");
+        assert!(command
+            .windows(2)
+            .any(|args| { args == ["--ask-for-approval".to_string(), "never".to_string()] }));
+        assert!(command.iter().any(|arg| arg == "--no-alt-screen"));
+        assert!(!command
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn codex_worker_preserves_an_explicit_manual_approval_policy() {
+        let command = build_agent_worker_command(
+            AgentWorkerKind::CodexPane,
+            None,
+            vec!["--ask-for-approval".to_string(), "on-request".to_string()],
+        )
+        .expect("codex worker command");
+        assert_eq!(
+            command
+                .iter()
+                .filter(|arg| arg.as_str() == "--ask-for-approval")
+                .count(),
+            1
+        );
+        assert!(command.iter().any(|arg| arg == "on-request"));
+        assert!(!command.iter().any(|arg| arg == "never"));
+    }
+
+    #[test]
     fn agent_team_start_schema_exposes_layout_and_runtime_bounds() {
         let schema = schemars::schema_for!(AgentTeamStartToolParams);
         let value = serde_json::to_value(schema).expect("agent team start schema");
@@ -8807,6 +9200,31 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "session.read_recent");
         assert_eq!(calls[0].1["max_bytes"], MAX_TERMINAL_READ_BYTES);
+    }
+
+    #[tokio::test]
+    async fn terminal_read_removes_terminal_control_sequences() {
+        let (server, _) = test_server([(
+            "session.read_recent",
+            json!({
+                "session_id": "session-1",
+                "text": "\u{1b}[31mfailed\u{1b}[0m\r\n\u{1b}]0;worker-title\u{7}ready\u{8}!",
+                "byte_count": 47
+            }),
+        )]);
+        let result = server
+            .terminal_read(Parameters(TerminalReadParams {
+                session_id: "session-1".to_string(),
+                max_bytes: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let value = result.structured_content.expect("plain terminal result");
+        assert_eq!(value["format"], "plain");
+        assert_eq!(value["text"], "failed\nread!");
+        assert!(value["control_sequences_removed"].as_u64().unwrap() > 0);
+        assert_eq!(value["byte_count"], 47);
     }
 
     #[tokio::test]
@@ -9010,13 +9428,78 @@ mod tests {
         assert_eq!(calls[1].1["pane_id"], "pane-source");
         assert_eq!(calls[1].1["behavior"], "clone_current");
         assert_eq!(calls[1].1["backend"], "wsl-direct");
+        assert_eq!(calls[1].1["backend_profile"], "Ubuntu");
         let command = calls[1].1["command"].as_array().expect("worker command");
         assert_eq!(command[1], "integrations");
         assert_eq!(command[2], "launch");
         assert_eq!(command[3], "claude-teams");
+        assert_eq!(command[4], "--distribution");
+        assert_eq!(command[5], "Ubuntu");
+        assert_eq!(command[6], "--");
+        assert_eq!(command[7], "--model");
+        assert_eq!(command[8], "opus");
         assert_eq!(calls[2].0, "agent.set_state");
         assert_eq!(calls[2].1["telemetry"]["activity"], "agent_team");
         assert_eq!(calls[2].1["telemetry"]["session"], "claude-teams:worker");
+    }
+
+    #[tokio::test]
+    async fn integration_worker_carries_workspace_default_distribution_into_nested_launch() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "system.identify",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-source",
+                        "cwd": "/workspace/project"
+                    }),
+                ),
+                (
+                    "workspace.get",
+                    json!({
+                        "workspace": {"default_wsl_distribution": "Ubuntu-24.04"}
+                    }),
+                ),
+                (
+                    "terminal.split",
+                    json!({
+                        "workspace_id": "workspace-1",
+                        "pane_id": "pane-worker",
+                        "surface_id": "surface-worker",
+                        "session_id": "session-worker"
+                    }),
+                ),
+                ("agent.set_state", json!({"session_id": "session-worker"})),
+            ],
+        );
+
+        let result = server
+            .agent_worker_start(Parameters(AgentWorkerStartToolParams {
+                workspace_id: None,
+                pane_id: None,
+                name: Some("reviewer".to_string()),
+                kind: AgentWorkerKindParam::ClaudeTeams,
+                distribution: None,
+                placement: None,
+                axis: None,
+                ratio: None,
+                cwd: None,
+                args: Vec::new(),
+                columns: None,
+                rows: None,
+                durability: None,
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls[1].0, "workspace.get");
+        assert_eq!(calls[2].1["backend_profile"], "Ubuntu-24.04");
+        let command = calls[2].1["command"].as_array().expect("worker command");
+        assert_eq!(command[4], "--distribution");
+        assert_eq!(command[5], "Ubuntu-24.04");
     }
 
     #[tokio::test]
@@ -9071,6 +9554,7 @@ mod tests {
                 main_ratio: None,
                 mode: None,
                 auto_adopt_tmux: None,
+                auto_release_completed: None,
                 idempotency_key: Some("project-analysis".to_string()),
                 max_workers: Some(4),
                 default_worker_kind: Some(AgentWorkerKindParam::CodexPane),
@@ -9090,13 +9574,23 @@ mod tests {
         assert_eq!(value["max_workers"], 4);
         assert_eq!(value["generation"], 1);
         assert_eq!(value["status"], "ready");
+        assert_eq!(value["auto_release_completed"], false);
+        assert_eq!(value["lead_policy"]["completed_worker_cleanup"], "preserve");
+        assert_eq!(value["lead_policy"]["completion_grace_seconds"], 5);
         let calls = transport.calls.lock().expect("scripted calls lock");
         assert!(calls.iter().all(|(method, _)| method != "terminal.split"));
         assert_eq!(calls[4].0, "agent.team.reserve");
         assert_eq!(calls[4].1["claim"], true);
+        assert_eq!(calls[4].1["claim_telemetry"]["activity"], "agent_team");
         let manifest = calls.last().expect("main manifest call");
         assert_eq!(manifest.0, "agent.team.settle");
+        assert_eq!(manifest.1["telemetry"]["activity"], "agent_team");
+        assert_eq!(manifest.1["telemetry"]["team_role"], "main");
         assert_eq!(manifest.1["telemetry"]["team_mode"], "adaptive");
+        assert_eq!(
+            manifest.1["telemetry"]["team_auto_release_completed"],
+            false
+        );
         assert_eq!(
             manifest.1["telemetry"]["team_idempotency_key"],
             "project-analysis"
@@ -9803,6 +10297,10 @@ mod tests {
                         "surfaces": [
                             {"surface_id": "surface-main", "session_id": "session-main"},
                             {"surface_id": "surface-worker", "session_id": "session-worker"}
+                        ],
+                        "sessions": [
+                            {"session_id": "session-main", "workspace_id": "workspace-1", "backend_kind": "wsl-direct", "state": "running", "exit_code": null, "backend_native_id": null, "cwd": null},
+                            {"session_id": "session-worker", "workspace_id": "workspace-1", "backend_kind": "wsl-direct", "state": "exited", "exit_code": 0, "backend_native_id": null, "cwd": null}
                         ]
                     })),
                 ),
@@ -9819,7 +10317,8 @@ mod tests {
                     "workspace.get",
                     Ok(json!({
                         "panes": [{"pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"}],
-                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}]
+                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}],
+                        "sessions": [{"session_id": "session-main", "workspace_id": "workspace-1", "backend_kind": "wsl-direct", "state": "running", "exit_code": null, "backend_native_id": null, "cwd": null}]
                     })),
                 ),
                 ("agent.list", Ok(after)),
@@ -9849,6 +10348,243 @@ mod tests {
         assert_eq!(calls[4].0, "pane.close");
         assert_eq!(calls[5].0, "agent.set_state");
         assert_eq!(calls[5].1["session_id"], "session-worker");
+    }
+
+    #[tokio::test]
+    async fn completed_team_worker_is_automatically_released_after_recheck() {
+        let before = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-root",
+                        "team_generation": 1,
+                        "team_auto_release_completed": true
+                    }
+                },
+                {
+                    "session_id": "session-worker",
+                    "workspace_id": "workspace-1",
+                    "state": "completed",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "backend"
+                    }
+                }
+            ]
+        });
+        let after = json!({
+            "sessions": [{
+                "session_id": "session-main",
+                "workspace_id": "workspace-1",
+                "state": "running",
+                "telemetry": {
+                    "team_id": "team-1",
+                    "team_role": "main",
+                    "team_mode": "adaptive",
+                    "layout_root_pane_id": "pane-root",
+                    "team_generation": 2,
+                    "team_auto_release_completed": true
+                }
+            }]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(before.clone())),
+                ("agent.list", Ok(before.clone())),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                            {"pane_id": "pane-main", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-worker", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-worker", "session_id": "session-worker"}
+                        ],
+                        "sessions": [
+                            {"session_id": "session-main", "workspace_id": "workspace-1", "backend_kind": "wsl-direct", "state": "running", "exit_code": null, "backend_native_id": null, "cwd": null},
+                            {"session_id": "session-worker", "workspace_id": "workspace-1", "backend_kind": "wsl-direct", "state": "exited", "exit_code": 0, "backend_native_id": null, "cwd": null}
+                        ]
+                    })),
+                ),
+                ("agent.list", Ok(before)),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                            {"pane_id": "pane-main", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"},
+                            {"pane_id": "pane-worker", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+                        ],
+                        "surfaces": [
+                            {"surface_id": "surface-main", "session_id": "session-main"},
+                            {"surface_id": "surface-worker", "session_id": "session-worker"}
+                        ]
+                    })),
+                ),
+                ("agent.team.reserve", Ok(json!({"generation": 2}))),
+                ("session.terminate", Ok(json!({"terminated": true}))),
+                ("pane.close", Ok(json!({"closed": true}))),
+                (
+                    "agent.set_state",
+                    Ok(json!({"session_id": "session-worker"})),
+                ),
+                ("agent.list", Ok(after.clone())),
+                ("agent.list", Ok(after.clone())),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [{"pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-main"}],
+                        "surfaces": [{"surface_id": "surface-main", "session_id": "session-main"}]
+                    })),
+                ),
+                ("agent.list", Ok(after)),
+                (
+                    "agent.team.settle",
+                    Ok(json!({"session_id": "session-main"})),
+                ),
+            ],
+        );
+
+        let released = server
+            .release_completed_agent_team_workers_once("team-1")
+            .await
+            .expect("automatic release pass");
+
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0]["released_session_id"], "session-worker");
+        assert_eq!(released[0]["pane_closed"], true);
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls
+            .iter()
+            .any(|(method, _)| method == "session.terminate"));
+        assert!(calls.iter().any(|(method, _)| method == "pane.close"));
+    }
+
+    #[tokio::test]
+    async fn automatic_release_preserves_completed_worker_until_terminal_exits() {
+        let team = json!({
+            "sessions": [
+                {
+                    "session_id": "session-main",
+                    "workspace_id": "workspace-1",
+                    "state": "running",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "main",
+                        "team_mode": "adaptive",
+                        "layout_root_pane_id": "pane-root",
+                        "team_generation": 1,
+                        "team_auto_release_completed": true
+                    }
+                },
+                {
+                    "session_id": "session-worker",
+                    "workspace_id": "workspace-1",
+                    "state": "completed",
+                    "telemetry": {
+                        "team_id": "team-1",
+                        "team_role": "worker",
+                        "worker_name": "backend"
+                    }
+                }
+            ]
+        });
+        let (server, transport) = scripted_server_for_profile(
+            McpProfile::Standard,
+            [
+                ("agent.list", Ok(team.clone())),
+                ("agent.list", Ok(team)),
+                (
+                    "workspace.get",
+                    Ok(json!({
+                        "panes": [
+                            {"pane_id": "pane-root", "kind": "split", "split_axis": "vertical", "split_ratio": 0.5},
+                            {"pane_id": "pane-worker", "parent_pane_id": "pane-root", "kind": "leaf", "mounted_surface_id": "surface-worker"}
+                        ],
+                        "surfaces": [{"surface_id": "surface-worker", "session_id": "session-worker"}],
+                        "sessions": [{"session_id": "session-worker", "workspace_id": "workspace-1", "backend_kind": "wsl-direct", "state": "running", "exit_code": null, "backend_native_id": null, "cwd": null}]
+                    })),
+                ),
+            ],
+        );
+
+        let released = server
+            .release_completed_agent_team_workers_once("team-1")
+            .await
+            .expect("automatic release pass");
+
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0]["session_id"], "session-worker");
+        assert_eq!(released[0]["status"], "preserved");
+        let calls = transport.calls.lock().expect("scripted calls lock");
+        assert!(calls
+            .iter()
+            .all(|(method, _)| method != "session.terminate"));
+        assert!(calls.iter().all(|(method, _)| method != "pane.close"));
+    }
+
+    #[tokio::test]
+    async fn automatic_release_keeps_attention_and_opted_out_workers_visible() {
+        for (state, auto_release_completed) in [
+            ("waiting_for_input", true),
+            ("failed", true),
+            ("completed", false),
+        ] {
+            let (server, transport) = scripted_server_for_profile(
+                McpProfile::Standard,
+                [(
+                    "agent.list",
+                    Ok(json!({
+                        "sessions": [
+                            {
+                                "session_id": "session-main",
+                                "workspace_id": "workspace-1",
+                                "state": "running",
+                                "telemetry": {
+                                    "team_id": "team-1",
+                                    "team_role": "main",
+                                    "layout_root_pane_id": "pane-root",
+                                    "team_generation": 1,
+                                    "team_auto_release_completed": auto_release_completed
+                                }
+                            },
+                            {
+                                "session_id": "session-worker",
+                                "workspace_id": "workspace-1",
+                                "state": state,
+                                "telemetry": {
+                                    "team_id": "team-1",
+                                    "team_role": "worker"
+                                }
+                            }
+                        ]
+                    })),
+                )],
+            );
+
+            let released = server
+                .release_completed_agent_team_workers_once("team-1")
+                .await
+                .expect("non-releasable worker pass");
+            assert!(
+                released.is_empty(),
+                "state={state}, auto={auto_release_completed}"
+            );
+            let calls = transport.calls.lock().expect("scripted calls lock");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "agent.list");
+        }
     }
 
     #[tokio::test]
@@ -10039,6 +10775,7 @@ mod tests {
                 main_ratio: Some(0.55),
                 mode: None,
                 auto_adopt_tmux: None,
+                auto_release_completed: None,
                 idempotency_key: None,
                 max_workers: None,
                 default_worker_kind: None,
@@ -10227,6 +10964,7 @@ mod tests {
                 main_ratio: None,
                 mode: None,
                 auto_adopt_tmux: None,
+                auto_release_completed: None,
                 idempotency_key: None,
                 max_workers: None,
                 default_worker_kind: None,
@@ -10319,6 +11057,7 @@ mod tests {
                 main_ratio: None,
                 mode: None,
                 auto_adopt_tmux: None,
+                auto_release_completed: None,
                 idempotency_key: None,
                 max_workers: None,
                 default_worker_kind: None,
@@ -10373,7 +11112,6 @@ mod tests {
                     }),
                 ),
                 ("session.send_text", json!({"accepted": true})),
-                ("session.send_key", json!({"accepted": true})),
             ],
         );
         let result = server
@@ -10385,12 +11123,54 @@ mod tests {
             }))
             .await;
         assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.structured_content.unwrap()["input_operation"],
+            "atomic_line"
+        );
         let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "agent.list");
         assert_eq!(calls[1].0, "session.send_text");
-        assert_eq!(calls[1].1["text"], "Review the failing test");
-        assert_eq!(calls[2].0, "session.send_key");
-        assert_eq!(calls[2].1["key"], "enter");
+        assert_eq!(calls[1].1["text"], "Review the failing test\r");
+    }
+
+    #[tokio::test]
+    async fn agent_worker_send_without_submit_preserves_literal_text() {
+        let (server, transport) = test_server_for_profile(
+            McpProfile::Standard,
+            [
+                (
+                    "agent.list",
+                    json!({
+                        "sessions": [{
+                            "session_id": "session-worker",
+                            "telemetry": {
+                                "activity": "agent_team",
+                                "session": "claude-teams:worker"
+                            }
+                        }]
+                    }),
+                ),
+                ("session.send_text", json!({"accepted": true})),
+            ],
+        );
+        let result = server
+            .agent_worker_send(Parameters(AgentWorkerSendToolParams {
+                workspace_id: None,
+                session_id: Some("session-worker".to_string()),
+                text: "draft only".to_string(),
+                submit: Some(false),
+            }))
+            .await;
+
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(
+            result.structured_content.unwrap()["input_operation"],
+            "literal_text"
+        );
+        let calls = transport.calls.lock().expect("fake calls lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].1["text"], "draft only");
     }
 
     #[tokio::test]
