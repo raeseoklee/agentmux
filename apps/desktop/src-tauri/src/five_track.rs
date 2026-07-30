@@ -4819,7 +4819,7 @@ impl DesktopControlState {
             .to_string(),
             self.control_token.clone(),
         ));
-        self.persist_agent_set_state(&mut control, &response)
+        self.persist_agent_set_state(&mut control, &response, true)
     }
 
     pub(super) fn reassert_verified_hook_states(&self) {
@@ -6930,6 +6930,22 @@ mod tests {
         bundle.sessions.extend(active.sessions);
         bundle.workspace.active_pane_id = "pane_active_other".to_string();
         save_bundle(&host, &bundle);
+        host.store
+            .lock()
+            .unwrap()
+            .upsert_agent_state(&PersistedAgentState {
+                session_id: spawned.session_id.clone(),
+                workspace_id: "ws_hooks".to_string(),
+                state: "running".to_string(),
+                attention: false,
+                reason: Some("Agent started: claude --dangerously-skip-permissions -c".to_string()),
+                updated_at: "2026-07-22T00:00:00Z".to_string(),
+                telemetry_json: Some(
+                    r#"{"activity":"agent","session":"claude --dangerously-skip-permissions -c"}"#
+                        .to_string(),
+                ),
+            })
+            .unwrap();
 
         let accepted: AgentHookStateResult = decode_ok(host.handle_request(test_request(
             "hook_state",
@@ -6955,6 +6971,10 @@ mod tests {
             .unwrap()
             .expect("hook state persisted");
         assert_eq!(persisted.state, "running");
+        assert_eq!(
+            normalized_restored_agent_command_label(&persisted).as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
         assert!(host
             .store
             .lock()

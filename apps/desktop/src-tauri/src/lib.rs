@@ -2696,7 +2696,7 @@ impl DesktopControlState {
                 self.persist_detected_agent_launch_from_send_text(control, request)
             }
             "session.resize" => self.persist_session_resize(request),
-            "agent.set_state" => self.persist_agent_set_state(control, response),
+            "agent.set_state" => self.persist_agent_set_state(control, response, true),
             "agent.clear_attention" => self.persist_agent_clear_attention(request),
             _ => Ok(()),
         };
@@ -2975,7 +2975,7 @@ impl DesktopControlState {
             params,
             self.control_token.clone(),
         ));
-        self.persist_agent_set_state(control, &response)?;
+        self.persist_agent_set_state(control, &response, false)?;
         if let Some(cwd) = launch.cwd.as_deref() {
             let Ok(mut store) = self.store.lock() else {
                 return Err(DesktopHostError::StateUnavailable(
@@ -3014,6 +3014,7 @@ impl DesktopControlState {
         &self,
         control: &mut DesktopRuntimeControl,
         response: &ResponseEnvelope,
+        preserve_existing_launch_label: bool,
     ) -> Result<(), DesktopHostError> {
         let result: AgentStateResult = response_result_json(response)?;
         {
@@ -3022,7 +3023,12 @@ impl DesktopControlState {
                     "desktop store state is unavailable".to_string(),
                 ));
             };
-            store.upsert_agent_state(&persisted_agent_state_from_result(&result, &timestamp()))?;
+            let mut next = persisted_agent_state_from_result(&result, &timestamp());
+            if preserve_existing_launch_label {
+                let existing = store.load_agent_state(&next.session_id)?;
+                preserve_more_specific_agent_launch_label(existing.as_ref(), &mut next);
+            }
+            store.upsert_agent_state(&next)?;
         }
         self.persist_notifications_from_control(control, Some(&result.workspace_id))
     }
@@ -3093,7 +3099,7 @@ impl DesktopControlState {
                     .to_string(),
                     self.control_token.clone(),
                 ));
-                self.persist_agent_set_state(&mut control, &set)?;
+                self.persist_agent_set_state(&mut control, &set, true)?;
                 return Ok(AgentTeamReserveResult {
                     team_id: params.team_id,
                     main_session_id: params.main_session_id,
@@ -3138,7 +3144,7 @@ impl DesktopControlState {
                         .to_string(),
                         self.control_token.clone(),
                     ));
-                    self.persist_agent_set_state(&mut control, &set)?;
+                    self.persist_agent_set_state(&mut control, &set, true)?;
                 }
                 return Ok(AgentTeamReserveResult {
                     team_id: telemetry.team_id.clone().unwrap_or(params.team_id),
@@ -3188,7 +3194,7 @@ impl DesktopControlState {
                         .to_string(),
                         self.control_token.clone(),
                     ));
-                    self.persist_agent_set_state(&mut control, &set)?;
+                    self.persist_agent_set_state(&mut control, &set, true)?;
                 }
                 return Ok(AgentTeamReserveResult {
                     team_id: params.team_id,
@@ -3234,7 +3240,7 @@ impl DesktopControlState {
                 .to_string(),
                 self.control_token.clone(),
             ));
-            self.persist_agent_set_state(&mut control, &set)?;
+            self.persist_agent_set_state(&mut control, &set, true)?;
             Ok(AgentTeamReserveResult {
                 team_id: params.team_id,
                 main_session_id: params.main_session_id,
@@ -3311,7 +3317,7 @@ impl DesktopControlState {
                 .to_string(),
                 self.control_token.clone(),
             ));
-            self.persist_agent_set_state(&mut control, &set)?;
+            self.persist_agent_set_state(&mut control, &set, true)?;
             Ok(AgentTeamSettleResult {
                 team_id: params.team_id,
                 main_session_id: params.main_session_id,
@@ -3370,7 +3376,7 @@ impl DesktopControlState {
                 .to_string(),
                 self.control_token.clone(),
             ));
-            self.persist_agent_set_state(&mut control, &set)?;
+            self.persist_agent_set_state(&mut control, &set, true)?;
             Ok(AgentTeamRecoverResult {
                 team_id: params.team_id,
                 main_session_id: params.main_session_id,
@@ -3477,7 +3483,10 @@ impl DesktopControlState {
         };
         let now = timestamp();
         for state in states {
-            store.upsert_agent_state(&persisted_agent_state_from_result(&state, &now))?;
+            let mut next = persisted_agent_state_from_result(&state, &now);
+            let existing = store.load_agent_state(&next.session_id)?;
+            preserve_more_specific_agent_launch_label(existing.as_ref(), &mut next);
+            store.upsert_agent_state(&next)?;
         }
         for notification in notifications {
             store.upsert_notification(&persisted_notification_from_result(&notification))?;
@@ -14718,25 +14727,130 @@ fn normalized_restored_agent_command_label(state: &PersistedAgentState) -> Optio
 }
 
 fn restored_agent_command_label(state: &PersistedAgentState) -> Option<String> {
-    state
+    let mut candidates = Vec::new();
+    if let Some(session) = state
         .telemetry_json
         .as_deref()
         .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok())
         .and_then(|telemetry| telemetry.session)
-        .or_else(|| {
-            state
-                .reason
-                .as_deref()
-                .and_then(|reason| reason.strip_prefix("Agent started:"))
-                .or_else(|| {
-                    state
-                        .reason
-                        .as_deref()
-                        .and_then(|reason| reason.strip_prefix("Agent restored:"))
-                })
-                .map(str::trim)
-                .map(ToString::to_string)
+    {
+        candidates.push(session);
+    }
+    if let Some(reason_label) = agent_launch_label_from_reason(state.reason.as_deref()) {
+        candidates.push(reason_label.to_string());
+    }
+    most_specific_restored_agent_command_label(candidates)
+}
+
+fn agent_launch_label_from_reason(reason: Option<&str>) -> Option<&str> {
+    reason
+        .and_then(|reason| reason.strip_prefix("Agent started:"))
+        .or_else(|| reason.and_then(|reason| reason.strip_prefix("Agent restored:")))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn most_specific_restored_agent_command_label<I>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            restored_agent_command_specificity(&candidate).map(|specificity| {
+                let normalized = normalize_restored_agent_launch(&candidate)
+                    .unwrap_or_else(|| candidate.clone());
+                (specificity, normalized)
+            })
         })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, command)| command)
+}
+
+fn restored_agent_command_specificity(command_line: &str) -> Option<(u16, usize)> {
+    let normalized = normalize_restored_agent_launch(command_line)?;
+    let tokens = split_command_line(&normalized)?;
+    let mut score = 0u16;
+    for token in tokens.iter().skip(1) {
+        score = score.saturating_add(match token.as_str() {
+            "--dangerously-skip-permissions" => 1000,
+            "--resume" | "resume" => 500,
+            "--last" => 120,
+            "-c" | "--continue" => 80,
+            token if token.starts_with('-') => 40,
+            _ => 10,
+        });
+    }
+    Some((score, tokens.len()))
+}
+
+fn preserve_more_specific_agent_launch_label(
+    existing: Option<&PersistedAgentState>,
+    next: &mut PersistedAgentState,
+) {
+    if !matches!(
+        next.state.as_str(),
+        "running" | "waiting_for_input" | "idle"
+    ) {
+        return;
+    }
+    let Some(existing) = existing else {
+        return;
+    };
+    if !should_restore_agent_state(existing) {
+        return;
+    }
+    let Some(existing_label) = normalized_restored_agent_command_label(existing) else {
+        return;
+    };
+    let Some(existing_launcher) = restored_agent_launcher_name(&existing_label) else {
+        return;
+    };
+    let next_label = normalized_restored_agent_command_label(next);
+    if let Some(next_label) = next_label.as_deref() {
+        if restored_agent_launcher_name(next_label).as_deref() != Some(existing_launcher.as_str()) {
+            return;
+        }
+        let existing_score = restored_agent_command_specificity(&existing_label).unwrap_or((0, 0));
+        let next_score = restored_agent_command_specificity(next_label).unwrap_or((0, 0));
+        if next_score >= existing_score {
+            return;
+        }
+    }
+    set_persisted_agent_launch_label(next, &existing_label);
+}
+
+fn restored_agent_launcher_name(command_line: &str) -> Option<String> {
+    split_command_line(command_line)?
+        .first()
+        .map(|word| agent_command_name(word))
+}
+
+fn set_persisted_agent_launch_label(state: &mut PersistedAgentState, command_line: &str) {
+    if let Some(prefix) = state.reason.as_deref().and_then(|reason| {
+        if reason.starts_with("Agent restored:") {
+            Some("Agent restored:")
+        } else if reason.starts_with("Agent started:") {
+            Some("Agent started:")
+        } else {
+            None
+        }
+    }) {
+        state.reason = Some(format!("{prefix} {command_line}"));
+    }
+    let mut telemetry = state
+        .telemetry_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok())
+        .unwrap_or_default();
+    telemetry
+        .activity
+        .get_or_insert_with(|| "agent".to_string());
+    telemetry.session = Some(command_line.to_string());
+    if telemetry.ctx.is_none() {
+        telemetry.ctx = restored_agent_launcher_name(command_line);
+    }
+    state.telemetry_json = serde_json::to_string(&telemetry).ok();
 }
 
 fn persisted_command_already_launches_agent(command: &[String]) -> bool {
@@ -19563,6 +19677,84 @@ mod tests {
     }
 
     #[test]
+    fn restored_agent_launch_line_prefers_more_specific_state_label() {
+        let session = PersistedSession {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            backend_kind: "conpty".to_string(),
+            backend_attachment_id: None,
+            backend_native_id: None,
+            cwd: Some("D:\\work".to_string()),
+            command: vec!["powershell.exe".to_string(), "-NoLogo".to_string()],
+            state: "disconnected".to_string(),
+            exit_code: None,
+            durability: "ephemeral".to_string(),
+            created_at: "before".to_string(),
+            last_seen_at: None,
+            updated_at: "before".to_string(),
+        };
+        let state = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude --dangerously-skip-permissions -c".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude -c"}"#.to_string()),
+        };
+
+        assert_eq!(
+            restored_agent_launch_line(&session, &state).as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
+    }
+
+    #[test]
+    fn persisted_agent_state_preserves_more_specific_existing_launch_label() {
+        let existing = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent started: claude --dangerously-skip-permissions -c".to_string()),
+            updated_at: "before".to_string(),
+            telemetry_json: Some(
+                r#"{"activity":"agent","session":"claude --dangerously-skip-permissions -c"}"#
+                    .to_string(),
+            ),
+        };
+        let mut next = PersistedAgentState {
+            session_id: "ses_shell".to_string(),
+            workspace_id: "ws_agent".to_string(),
+            state: "running".to_string(),
+            attention: false,
+            reason: Some("Agent restored: claude -c".to_string()),
+            updated_at: "after".to_string(),
+            telemetry_json: Some(r#"{"activity":"agent","session":"claude -c"}"#.to_string()),
+        };
+
+        preserve_more_specific_agent_launch_label(Some(&existing), &mut next);
+
+        assert_eq!(
+            normalized_restored_agent_command_label(&next).as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
+        assert_eq!(
+            next.reason.as_deref(),
+            Some("Agent restored: claude --dangerously-skip-permissions -c")
+        );
+        let telemetry = next
+            .telemetry_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<AgentTelemetry>(json).ok())
+            .expect("telemetry remains valid");
+        assert_eq!(
+            telemetry.session.as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
+    }
+
+    #[test]
     fn restored_agent_launch_line_repairs_mangled_known_flag_fragments() {
         // A corrupted echo once persisted `claude --dan[C` as the agent label
         // (the tail of an ANSI escape spliced into the flag). The clean prefix
@@ -20205,10 +20397,10 @@ mod tests {
         assert_eq!(
             state.completed_terminal_input_lines(
                 "ses_manual",
-                "ude --dangerously-skip-permissions\r"
+                "ude --dangerously-skip-permissions -c\r"
             ),
             vec![DetectedAgentLaunch {
-                command_line: "claude --dangerously-skip-permissions".to_string(),
+                command_line: "claude --dangerously-skip-permissions -c".to_string(),
                 cwd: None,
             }]
         );
