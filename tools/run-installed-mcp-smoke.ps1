@@ -33,6 +33,75 @@ $uninstaller = Join-Path $installRoot "uninstall.exe"
 $previewRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("agentmux-mcp-preview-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $previewRoot | Out-Null
 
+function Test-PathStartsWithDirectory {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Directory
+  )
+
+  try {
+    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd("\", "/")
+    $fullDirectory = [System.IO.Path]::GetFullPath($Directory).TrimEnd("\", "/")
+  } catch {
+    return $false
+  }
+  if ($fullPath.Equals($fullDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $true
+  }
+  return $fullPath.StartsWith($fullDirectory + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-AgentMuxInstallRootProcess {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root
+  )
+
+  return @(
+    Get-CimInstance Win32_Process |
+      Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and
+        (Test-PathStartsWithDirectory -Path $_.ExecutablePath -Directory $Root)
+      }
+  )
+}
+
+function Stop-AgentMuxInstallRootProcess {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root,
+
+    [Parameter(Mandatory = $true)]
+    [string]$Reason
+  )
+
+  $processes = @(Get-AgentMuxInstallRootProcess -Root $Root)
+  foreach ($process in $processes) {
+    Write-Warning ("Stopping AgentMux smoke process {0} ({1}) before {2}." -f $process.ProcessId, $process.ExecutablePath, $Reason)
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+
+  if ($processes.Count -gt 0) {
+    Start-Sleep -Milliseconds 500
+  }
+}
+
+function Assert-NoAgentMuxInstallRootProcess {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Root
+  )
+
+  $remaining = @(Get-AgentMuxInstallRootProcess -Root $Root)
+  if ($remaining.Count -gt 0) {
+    $descriptions = @($remaining | ForEach-Object { "$($_.ProcessId): $($_.ExecutablePath)" })
+    throw "MCP smoke left AgentMux processes running under $Root. $($descriptions -join '; ')"
+  }
+}
+
 function Invoke-CliCheck {
   param(
     [Parameter(Mandatory = $true)]
@@ -98,6 +167,8 @@ try {
     throw "The installed package did not contain agentmux.exe at $cli"
   }
 
+  Stop-AgentMuxInstallRootProcess -Root $installRoot -Reason "running MCP CLI smoke"
+
   Invoke-CliCheck -Arguments @("mcp", "help") -ExpectedText @("serve|doctor|setup") | Out-Null
   Invoke-CliCheck -Arguments @("mcp", "serve", "--help") -ExpectedText @("read|standard|full") | Out-Null
   Invoke-CliCheck -Arguments @("mcp", "doctor", "--help") -ExpectedText @("--json", "read|standard|full") | Out-Null
@@ -109,12 +180,15 @@ try {
 
   Write-Host "Installed AgentMux MCP smoke passed: $cli"
 } finally {
+  Stop-AgentMuxInstallRootProcess -Root $installRoot -Reason "uninstalling MCP smoke install"
   if ($installed -and -not $KeepInstalled -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
     $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @("/S") -Wait -PassThru
     if ($uninstallProcess.ExitCode -ne 0) {
       Write-Warning "AgentMux uninstaller exited with code $($uninstallProcess.ExitCode)."
     }
   }
+  Stop-AgentMuxInstallRootProcess -Root $installRoot -Reason "finishing MCP smoke cleanup"
+  Assert-NoAgentMuxInstallRootProcess -Root $installRoot
   if (Test-Path -LiteralPath $previewRoot) {
     $resolvedPreview = [System.IO.Path]::GetFullPath($previewRoot)
     $resolvedTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())

@@ -189,6 +189,28 @@ jobs:
             -InstallerPath $installer.FullName `
             -InstallDir (Join-Path $env:RUNNER_TEMP "AgentMuxMcpSmoke")
 
+      - name: Cleanup installed MCP smoke processes
+        if: always()
+        shell: pwsh
+        run: |
+          $installRoot = [System.IO.Path]::GetFullPath((Join-Path $env:RUNNER_TEMP "AgentMuxMcpSmoke")).TrimEnd("\", "/")
+          Get-CimInstance Win32_Process |
+            Where-Object {
+              if ([string]::IsNullOrWhiteSpace($_.ExecutablePath)) {
+                $false
+              } else {
+                try {
+                  [System.IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($installRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+                } catch {
+                  $false
+                }
+              }
+            } |
+            ForEach-Object {
+              Write-Warning ("Stopping leftover AgentMux MCP smoke process {0}: {1}" -f $_.ProcessId, $_.ExecutablePath)
+              Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+
       - name: Collect release assets
         id: assets
         shell: pwsh

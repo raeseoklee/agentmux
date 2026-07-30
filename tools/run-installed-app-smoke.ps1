@@ -104,6 +104,27 @@ function Invoke-ProcessCapture {
   }
 }
 
+function Stop-ProcessTree {
+  param([int]$ProcessId)
+
+  $children = @(
+    Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
+  )
+  foreach ($child in $children) {
+    Stop-ProcessTree -ProcessId $child.ProcessId
+  }
+
+  $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+  if ($process) {
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    try {
+      $process.WaitForExit(5000) | Out-Null
+    } catch {
+      # The process may already be gone after Stop-Process returns.
+    }
+  }
+}
+
 function Write-JsonFile {
   param([object]$Value, [string]$Path)
 
@@ -412,9 +433,11 @@ workspace creation, native ConPTY session spawn, and terminal output capture.
 "@
   Set-Content -Encoding UTF8 -LiteralPath (Join-Path $OutputDir "README.md") -Value $readme
 } finally {
-  if ($appProcess -and -not $appProcess.HasExited) {
-    Stop-Process -Id $appProcess.Id -Force
-    $appProcess.WaitForExit()
+  if ($appProcess) {
+    $appProcess.Refresh()
+    if (-not $appProcess.HasExited) {
+      Stop-ProcessTree -ProcessId $appProcess.Id
+    }
   }
   foreach ($name in $previous.Keys) {
     if ($null -eq $previous[$name]) {
