@@ -579,8 +579,12 @@ impl DesktopControlState {
         let generation = self.five_track.shared.git.generation(repository);
         if let Ok(cache) = self.five_track.shared.git_status_cache.lock() {
             if let Some(entry) = cache.get(&repository_id) {
-                if entry.snapshot.summary.generation == generation {
-                    validate_generation(requested_generation, generation)?;
+                let cached_generation = entry.snapshot.summary.generation;
+                if requested_generation
+                    .map(|requested| requested == cached_generation)
+                    .unwrap_or(cached_generation == generation)
+                {
+                    validate_generation(requested_generation, cached_generation)?;
                     return Ok((repository_id, entry.clone()));
                 }
             }
@@ -2309,10 +2313,9 @@ fn flush_repository_change_after_debounce(
     let generation = shared.git.mark_repository_changed(&snapshot.repository);
     // Let an exact scan already in progress complete. Cancelling on every filesystem event can
     // starve repositories with generated files or active agents; completion reconciles the
-    // snapshot to the latest generation before publishing it.
-    if let Ok(mut cache) = shared.git_status_cache.lock() {
-        cache.remove(&snapshot.repository_id);
-    }
+    // snapshot to the latest generation before publishing it. Keep the completed snapshot alive
+    // for cursors that already reference its generation; fresh page-zero requests ignore stale
+    // generations and replace this entry after the next completed scan.
     if let Some(app) = app {
         let _ = app.emit(
             EVENT_GIT_REPOSITORY_CHANGED,
@@ -4819,7 +4822,7 @@ impl DesktopControlState {
             .to_string(),
             self.control_token.clone(),
         ));
-        self.persist_agent_set_state(&mut control, &response)
+        self.persist_agent_set_state(&mut control, &response, true)
     }
 
     pub(super) fn reassert_verified_hook_states(&self) {
@@ -6930,6 +6933,22 @@ mod tests {
         bundle.sessions.extend(active.sessions);
         bundle.workspace.active_pane_id = "pane_active_other".to_string();
         save_bundle(&host, &bundle);
+        host.store
+            .lock()
+            .unwrap()
+            .upsert_agent_state(&PersistedAgentState {
+                session_id: spawned.session_id.clone(),
+                workspace_id: "ws_hooks".to_string(),
+                state: "running".to_string(),
+                attention: false,
+                reason: Some("Agent started: claude --dangerously-skip-permissions -c".to_string()),
+                updated_at: "2026-07-22T00:00:00Z".to_string(),
+                telemetry_json: Some(
+                    r#"{"activity":"agent","session":"claude --dangerously-skip-permissions -c"}"#
+                        .to_string(),
+                ),
+            })
+            .unwrap();
 
         let accepted: AgentHookStateResult = decode_ok(host.handle_request(test_request(
             "hook_state",
@@ -6955,6 +6974,10 @@ mod tests {
             .unwrap()
             .expect("hook state persisted");
         assert_eq!(persisted.state, "running");
+        assert_eq!(
+            normalized_restored_agent_command_label(&persisted).as_deref(),
+            Some("claude --dangerously-skip-permissions -c")
+        );
         assert!(host
             .store
             .lock()
