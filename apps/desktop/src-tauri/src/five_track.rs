@@ -579,8 +579,12 @@ impl DesktopControlState {
         let generation = self.five_track.shared.git.generation(repository);
         if let Ok(cache) = self.five_track.shared.git_status_cache.lock() {
             if let Some(entry) = cache.get(&repository_id) {
-                if entry.snapshot.summary.generation == generation {
-                    validate_generation(requested_generation, generation)?;
+                let cached_generation = entry.snapshot.summary.generation;
+                if requested_generation
+                    .map(|requested| requested == cached_generation)
+                    .unwrap_or(cached_generation == generation)
+                {
+                    validate_generation(requested_generation, cached_generation)?;
                     return Ok((repository_id, entry.clone()));
                 }
             }
@@ -2309,10 +2313,9 @@ fn flush_repository_change_after_debounce(
     let generation = shared.git.mark_repository_changed(&snapshot.repository);
     // Let an exact scan already in progress complete. Cancelling on every filesystem event can
     // starve repositories with generated files or active agents; completion reconciles the
-    // snapshot to the latest generation before publishing it.
-    if let Ok(mut cache) = shared.git_status_cache.lock() {
-        cache.remove(&snapshot.repository_id);
-    }
+    // snapshot to the latest generation before publishing it. Keep the completed snapshot alive
+    // for cursors that already reference its generation; fresh page-zero requests ignore stale
+    // generations and replace this entry after the next completed scan.
     if let Some(app) = app {
         let _ = app.emit(
             EVENT_GIT_REPOSITORY_CHANGED,
