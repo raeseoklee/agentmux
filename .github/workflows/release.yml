@@ -67,40 +67,50 @@ jobs:
         timeout-minutes: 5
         env:
           GH_TOKEN: ${{ github.token }}
-          GIT_TERMINAL_PROMPT: "0"
         run: |
           $ErrorActionPreference = "Stop"
           $tag = "${{ steps.version.outputs.tag }}"
           $sha = "${{ github.sha }}"
-          git fetch --no-tags origin main --force
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to fetch origin/main for release source verification."
-          }
-          git fetch --no-tags origin "refs/tags/${tag}:refs/tags/${tag}" --force
-          if ($LASTEXITCODE -ne 0) {
-            throw "Release tag $tag does not exist on origin. Create it from a verified main commit first."
-          }
-
-          git merge-base --is-ancestor $sha origin/main
-          if ($LASTEXITCODE -ne 0) {
-            throw "Release commit $sha is not contained in origin/main."
-          }
-
-          $tagSha = (git rev-list -n 1 $tag).Trim()
-          if (-not $tagSha) {
-            throw "Release tag $tag does not exist. Create it from a verified main commit first."
-          }
-          if ($tagSha -ne $sha) {
-            throw "Release tag $tag points to $tagSha, but this workflow is building $sha."
-          }
-
-          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
             Accept = "application/vnd.github+json"
             "X-GitHub-Api-Version" = "2022-11-28"
             "User-Agent" = "agentmux-release"
           }
+          function Invoke-GitHubJson {
+            param([Parameter(Mandatory = $true)][string]$Uri)
+            Invoke-RestMethod -Uri $Uri -Headers $headers -Method Get -TimeoutSec 30
+          }
+
+          $tagRefUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+          try {
+            $tagRef = Invoke-GitHubJson $tagRefUri
+          } catch {
+            $response = $_.Exception.Response
+            $statusCode = if ($response) { [int]$response.StatusCode } else { 0 }
+            if ($statusCode -eq 404) {
+              throw "Release tag $tag does not exist on origin. Create it from a verified main commit first."
+            }
+            throw
+          }
+
+          $tagType = [string]$tagRef.object.type
+          $tagSha = [string]$tagRef.object.sha
+          if ($tagType -eq "tag") {
+            $tagObject = Invoke-GitHubJson ([string]$tagRef.object.url)
+            $tagSha = [string]$tagObject.object.sha
+          }
+          if ($tagSha -ne $sha) {
+            throw "Release tag $tag points to $tagSha, but this workflow is building $sha."
+          }
+
+          $compare = Invoke-GitHubJson "https://api.github.com/repos/$env:GITHUB_REPOSITORY/compare/$sha...main"
+          $compareStatus = [string]$compare.status
+          if ($compareStatus -notin @("ahead", "identical")) {
+            throw "Release commit $sha is not contained in main. GitHub compare status: $compareStatus."
+          }
+
+          $releaseUri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
           try {
             Invoke-WebRequest -Uri $releaseUri -Headers $headers -Method Get -TimeoutSec 30 -UseBasicParsing | Out-Null
             throw "Release $tag already exists. Published release assets are immutable; use a new version."
@@ -112,25 +122,36 @@ jobs:
             }
           }
 
+      - name: Wait for successful main CI
+        shell: pwsh
+        timeout-minutes: 30
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sha = "${{ github.sha }}"
           $deadline = (Get-Date).AddMinutes(25)
           do {
             $runs = gh run list `
               --repo $env:GITHUB_REPOSITORY `
               --workflow ci.yml `
               --commit $sha `
-              --json databaseId,status,conclusion `
+              --json databaseId,status,conclusion,headBranch,url `
               --limit 20 | ConvertFrom-Json
             $successful = @($runs | Where-Object {
-              $_.status -eq "completed" -and $_.conclusion -eq "success"
+              $_.headBranch -eq "main" -and $_.status -eq "completed" -and $_.conclusion -eq "success"
             })
             if ($successful.Count -gt 0) {
-              Write-Host "Found successful CI run $($successful[0].databaseId) for $sha."
+              Write-Host "Found successful main CI run $($successful[0].databaseId) for $sha."
               break
             }
             $failed = @($runs | Where-Object {
-              $_.status -eq "completed" -and $_.conclusion -notin @("success", "skipped")
+              $_.headBranch -eq "main" -and $_.status -eq "completed" -and $_.conclusion -notin @("success", "skipped")
             })
-            if ($failed.Count -gt 0 -and @($runs | Where-Object { $_.status -ne "completed" }).Count -eq 0) {
+            $activeMainRuns = @($runs | Where-Object {
+              $_.headBranch -eq "main" -and $_.status -ne "completed"
+            })
+            if ($failed.Count -gt 0 -and $activeMainRuns.Count -eq 0) {
               throw "CI completed without a successful run for release commit $sha."
             }
             if ((Get-Date) -ge $deadline) {
